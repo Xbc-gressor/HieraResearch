@@ -1,0 +1,25 @@
+name = "autoresearch-baseline"
+description = "Original torch-based autoresearch pretraining task."
+
+[env]
+type = "uv"
+project = "tasks/autoresearch-baseline"
+
+[run]
+working_dir = "tasks/autoresearch-baseline"
+command = "uv run python train.py"
+prepare_command = "uv run python prepare.py"
+timeout_seconds = 600
+log_template = "run-{run_id}.log"
+
+[result]
+metric = "val_bpb"
+lower_is_better = true
+parser = "tools/parse_result.py"
+required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
+results_file = "results.tsv"
+
+[constraints]
+editable_files = ["train.py"]
+readonly_files = ["prepare.py"]
+allow_dependencies = false

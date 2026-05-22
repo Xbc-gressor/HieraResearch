@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""CMA-ES hyperparameter search for one autoresearch candidate.
+
+Encodes the candidate's SEARCH_SPACE into a continuous bounded vector
+(int → rounded continuous, categorical → integer index, log-float → log
+space), runs cma.CMAEvolutionStrategy with the configured budget.
+
+Reads prior trials from tune_report.json; picks the prior with the highest
+score as the CMA-ES initial mean (x0). Other priors are not directly used
+by CMA-ES (it is a population method, not surrogate-based), but they
+remain accessible in tune_report.json for downstream consumers.
+
+Each evaluated point is appended to tune_report.json under
+phase_c.stages[cmaes] as it completes.
+
+Evaluates configurations via prepare.evaluate_config_for_tuning (which
+internally uses the no-lock test_score_for_tuning helper).
+Requires `cma` in the task's uv environment.
+
+Invoked by the tuner-orchestrator agent when n_dims ≥ 16.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+from _common import (  # noqa: E402
+    PatienceMonitor,
+    append_trial,
+    cast_params_to_search_space,
+    load_candidate_modules,
+    prior_best_score,
+    read_prior_trials,
+    search_space_for_json,
+    write_json,
+)
+
+
+def build_codec(search_space: dict, base_params: dict):
+    """Build (keys, lower, upper, x0, decode) for a continuous CMA-ES vector."""
+    keys = list(search_space.keys())
+    lower = []
+    upper = []
+    x0 = []
+    decoders = []
+
+    for key in keys:
+        entry = search_space[key]
+        kind = entry[0]
+        base_value = base_params.get(key)
+
+        if kind == "float":
+            low, high = float(entry[1]), float(entry[2])
+            if len(entry) >= 4 and entry[3] == "log":
+                lo, hi = math.log10(low), math.log10(high)
+                lower.append(lo)
+                upper.append(hi)
+                x0.append(math.log10(base_value) if base_value else (lo + hi) / 2)
+                decoders.append(("float_log", key))
+            else:
+                lower.append(low)
+                upper.append(high)
+                x0.append(
+                    float(base_value) if base_value is not None else (low + high) / 2
+                )
+                decoders.append(("float", key))
+        elif kind == "int":
+            low, high = int(entry[1]), int(entry[2])
+            lower.append(low - 0.5)
+            upper.append(high + 0.5)
+            x0.append(
+                float(base_value) if base_value is not None else (low + high) / 2
+            )
+            decoders.append(("int", key, low, high))
+        elif kind == "categorical":
+            choices = list(entry[1])
+            n = len(choices)
+            lower.append(-0.5)
+            upper.append(n - 0.5)
+            if base_value in choices:
+                x0.append(float(choices.index(base_value)))
+            else:
+                x0.append((n - 1) / 2)
+            decoders.append(("categorical", key, choices))
+        else:
+            raise ValueError(f"unknown SEARCH_SPACE entry: {entry}")
+
+    def encode(params: dict) -> np.ndarray:
+        vec = []
+        for dec in decoders:
+            kind = dec[0]
+            if kind == "float":
+                vec.append(float(params[dec[1]]))
+            elif kind == "float_log":
+                vec.append(math.log10(float(params[dec[1]])))
+            elif kind == "int":
+                vec.append(float(params[dec[1]]))
+            elif kind == "categorical":
+                _, key, choices = dec
+                vec.append(float(choices.index(params[key])) if params[key] in choices else 0.0)
+        return np.asarray(vec, dtype=float)
+
+    def decode(x: np.ndarray) -> dict:
+        out = {}
+        for value, dec in zip(x, decoders):
+            kind = dec[0]
+            if kind == "float":
+                out[dec[1]] = float(value)
+            elif kind == "float_log":
+                out[dec[1]] = float(10 ** value)
+            elif kind == "int":
+                _, key, low, high = dec
+                clipped = max(low, min(high, int(round(float(value)))))
+                out[key] = clipped
+            elif kind == "categorical":
+                _, key, choices = dec
+                idx = max(0, min(len(choices) - 1, int(round(float(value)))))
+                out[key] = choices[idx]
+        return out
+
+    return keys, lower, upper, x0, encode, decode
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--candidate-path", required=True, type=Path)
+    parser.add_argument("--task-dir", required=True, type=Path)
+    parser.add_argument("--tune-report-json", required=True, type=Path)
+    parser.add_argument("--popsize", type=int, default=8)
+    parser.add_argument("--max-evals", type=int, default=64)
+    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument("--lower-is-better", action="store_true")
+    parser.add_argument("--sigma0", type=float, default=0.3)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    try:
+        import cma
+    except ImportError:
+        write_json({
+            "method": "cmaes",
+            "status": "rejected",
+            "reason": "cma not installed in the task uv environment",
+        })
+        return 0
+
+    train_module, prepare_module = load_candidate_modules(args.candidate_path)
+    base_params = dict(train_module.BASE_PARAMS)
+    search_space = train_module.SEARCH_SPACE
+    make_model = train_module.make_model
+    evaluate = prepare_module.evaluate_config_for_tuning
+
+    prior_trials = read_prior_trials(args.tune_report_json)
+    best_prior = None
+    if prior_trials:
+        if args.lower_is_better:
+            best_prior = min(prior_trials, key=lambda t: t.get("score", math.inf))
+        else:
+            best_prior = max(prior_trials, key=lambda t: t.get("score", -math.inf))
+    seed_params = best_prior["params"] if best_prior else base_params
+
+    keys, lower, upper, x0_default, encode, decode = build_codec(
+        search_space, seed_params
+    )
+    try:
+        x0 = encode(seed_params)
+        x0 = [max(low, min(high, float(v))) for low, high, v in zip(lower, upper, x0)]
+    except Exception:
+        x0 = x0_default
+
+    es = cma.CMAEvolutionStrategy(
+        x0,
+        args.sigma0,
+        {
+            "bounds": [lower, upper],
+            "popsize": args.popsize,
+            "seed": args.seed,
+            "verbose": -9,
+            "verb_disp": 0,
+        },
+    )
+
+    started = time.time()
+    best_params = dict(seed_params)
+    best_score = math.inf if args.lower_is_better else -math.inf
+    evals = 0
+    early_stopped = False
+    early_stop_reason = "none"
+
+    monitor = PatienceMonitor(
+        patience=args.patience,
+        lower_is_better=args.lower_is_better,
+        start_best=prior_best_score(prior_trials, args.lower_is_better),
+    )
+
+    while evals < args.max_evals:
+        if es.stop():
+            early_stopped = True
+            early_stop_reason = "cma_internal"
+            break
+        xs = es.ask()
+        fitnesses = []
+        stop_now = False
+        for x in xs:
+            if evals >= args.max_evals:
+                break
+            params = decode(np.asarray(x))
+            params = cast_params_to_search_space(params, search_space)
+            score = evaluate(make_model, params)
+            append_trial(
+                args.tune_report_json, "cmaes", {"params": params, "score": score}
+            )
+            # CMA-ES minimizes; convert to fitness based on direction.
+            fitnesses.append(score if args.lower_is_better else -score)
+            improved = (
+                score < best_score if args.lower_is_better else score > best_score
+            )
+            if improved:
+                best_score = score
+                best_params = params
+            evals += 1
+            if monitor.update(score):
+                early_stopped = True
+                early_stop_reason = "patience"
+                stop_now = True
+                break
+        if len(fitnesses) == len(xs):
+            es.tell(xs, fitnesses)
+        if stop_now:
+            break
+
+    elapsed = time.time() - started
+
+    write_json({
+        "method": "cmaes",
+        "status": "ok",
+        "best_params": best_params,
+        "best_score": best_score,
+        "trials_completed": evals,
+        "prior_trials_seen": len(prior_trials),
+        "x0_from_prior": best_prior is not None,
+        "popsize": args.popsize,
+        "early_stopped": early_stopped,
+        "early_stop_reason": early_stop_reason,
+        "elapsed_seconds": round(elapsed, 1),
+        "search_space": search_space_for_json(search_space),
+    })
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

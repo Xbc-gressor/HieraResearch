@@ -1,0 +1,32 @@
+name = "tabular-model-search"
+description = "CPU-friendly tabular classification model search on noisy synthetic sklearn datasets."
+
+[env]
+type = "uv"
+project = "tasks/tabular-model-search"
+
+[run]
+working_dir = "tasks/tabular-model-search"
+command = "uv run python train.py"
+timeout_seconds = 300
+log_template = "run-{run_id}.log"
+
+[candidate]
+enabled = true
+root_template = "runs/{task_name}/{tag}/candidates/{run_id}"
+copy_files = ["prepare.py", "train.py"]
+entrypoint = "train.py"
+editable_files = ["train.py"]
+readonly_files = ["prepare.py"]
+
+[result]
+metric = "mean_test_accuracy"
+lower_is_better = false
+parser = "tools/parse_result.py"
+required_patterns = ["^score:", "^best_model:"]
+results_file = "results.tsv"
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml", "uv.lock"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true

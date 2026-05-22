@@ -8,16 +8,23 @@ wheels/
 
 # Virtual environments
 .venv
+tasks/*/.venv/
 worktrees/
 results/
 queue/
 
-# Agent prompt files (generated per-session by launchers)
-CLAUDE.md
+# Codex per-session generated agent prompt
 AGENTS.md
+
+# Claude Code local-only settings
+.claude/settings.local.json
 
 # Experimental code/artifacts
 dev/
 
 # Results file
 results.tsv
+run.log
+runs/
+tasks/*/run.log
+tasks/*/results.tsv
