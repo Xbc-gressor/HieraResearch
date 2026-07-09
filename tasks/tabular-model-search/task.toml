@@ -7,24 +7,20 @@ project = "tasks/tabular-model-search"
 
 [run]
 working_dir = "tasks/tabular-model-search"
-command = "uv run python train.py"
 timeout_seconds = 300
-log_template = "run-{run_id}.log"
 
-[candidate]
-enabled = true
-root_template = "runs/{task_name}/{tag}/candidates/{run_id}"
-copy_files = ["prepare.py", "train.py"]
-entrypoint = "train.py"
-editable_files = ["train.py"]
-readonly_files = ["prepare.py"]
+# The single config→score evaluation function. Semantics + hard rules live in
+# TASK.md's `## Evaluation Contract`. score_fn(make_model, params) -> float,
+# lower-is-better; it is the ONE surface (warm-start eval + Phase C tuning), no
+# separate official run. (No seed phase: the loop bootstraps with `fresh`.)
+[evaluation]
+score_fn = "evaluate_config"
 
 [result]
-metric = "mean_test_accuracy"
-lower_is_better = false
+metric = "neg_mean_test_accuracy"
 parser = "tools/parse_result.py"
 required_patterns = ["^score:", "^best_model:"]
-results_file = "results.tsv"
+results_file = "ledger.json"
 
 [constraints]
 editable_files = ["train.py", "pyproject.toml", "uv.lock"]

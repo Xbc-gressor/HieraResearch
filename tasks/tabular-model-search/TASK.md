@@ -6,19 +6,53 @@ noisy synthetic sklearn datasets.
 
 ## Goal
 
-Maximize `mean_test_accuracy`, the mean accuracy on fixed hidden test splits
-averaged across the configured tabular datasets. Higher is better.
+Maximize accuracy on the fixed hidden test splits, averaged across the
+configured tabular datasets. The framework **always minimizes**, so this task
+reports `neg_mean_test_accuracy = -mean(accuracy)` and the optimizer minimizes
+it — **lower (more negative) is better**, equivalent to higher accuracy.
+
+## Evaluation Contract
+
+Authoritative description of how a candidate must train, score, and report for
+this task. `task.toml` holds the machine-readable config (`[evaluation].score_fn`,
+`[result]` metric, `[constraints]` file boundaries); this section holds the prose
+contract that subagents read before writing or tuning a candidate. When this
+section and `task.toml` disagree, `task.toml` wins for values it actually declares.
+
+There is **one global `config → score` function** and **no separate official
+run**: a candidate is never executed as `python train.py`. Its score is produced
+where `make_model` is evaluated against that function by the tuner scripts.
+
+- **Construct**: the candidate's `train.py` exposes `make_model(dataset, params)`
+  returning an unfitted sklearn-style estimator (`.fit` / `.predict`), plus the
+  tuner contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) that
+  `tunable-contract-extractor` writes at step 0+1.
+- **Train**: `prepare.load_datasets()` returns `DatasetSplit` items; train only
+  on `dataset.x_train` / `dataset.y_train`.
+- **Score**: `evaluation.score_fn` (`prepare.evaluate_config(make_model, params)`)
+  is the ONE evaluation surface — the tuner scripts call it for warm-start eval
+  and Phase C search. It builds + fits + scores on the held-out test split for
+  every dataset and returns the mean negative accuracy (lower is better). The
+  value it returns **is** the candidate's `final_best_score`; there is no
+  separate official run to re-score it.
+
+Rules:
+
+- Do not inspect, reconstruct, or repeatedly query the hidden test labels.
+- Do not catch broad training or scoring exceptions to fabricate a score. If a
+  candidate cannot build/fit/score, let it fail so the run is recorded as `crash`.
+- One candidate strategy per `train.py`; do not enumerate competing candidates.
+  Use training-only validation for any in-candidate model selection.
 
 ## Files
 
-- `train.py`: baseline candidate template. During autonomous experiments, copy
-  it into a run-local candidate directory and edit the copied `train.py`.
-- `prepare.py`: fixed synthetic datasets, train/test splits, and hidden test
-  scoring helpers. Do not modify during normal experiments.
+- `train.py`: no task-root baseline is provided; `candidate-writer` writes each
+  candidate's `train.py` (a `fresh` candidate from scratch from a `background.md`
+  try-first direction, or informed by parents for `improve`/`crossover`).
+- `prepare.py`: fixed synthetic datasets, train/test splits, and the single
+  `evaluate_config` scoring function. Do not modify during normal experiments.
 - `pyproject.toml`: task-local uv environment. Dependency changes are allowed
   when a new CPU-friendly tabular model package is needed.
-- `tools/parse_result.py`: generic parser for the task summary, configured by
-  `task.toml`.
 - `task.toml`: machine-readable run and result contract.
 
 ## Program Mapping
@@ -26,31 +60,28 @@ averaged across the configured tabular datasets. Higher is better.
 This task follows the repository-level `program.md` protocol with these
 task-specific file roles:
 
-- Baseline template entrypoint: `train.py`
-- Normal editable experiment surface: `runs/tabular-model-search/<tag>/candidates/<run_id>/train.py`
-- Fixed data split and hidden evaluation layer: `prepare.py`
-- Result parser: `tools/parse_result.py`
-- Baseline template run command: `uv run python train.py`
-- Candidate run command: `uv --directory tasks/tabular-model-search run python <candidate-dir>/train.py`
+- Editable experiment surface: `runs/tabular-model-search/<tag>/candidates/<run_id>/train.py`
+- Fixed data split + the one `config → score` function: `prepare.py`
+- Scoring: the tuner scripts call `prepare.evaluate_config(make_model, params)`
+  (warm-start eval + Phase C); there is no `python train.py` run.
 
-This task follows the same `prepare.py` / `train.py` split as the LLM
-pretraining baseline: `prepare.py` fixes the data and benchmark contract, while
-`train.py` is the editable experiment surface. The training process belongs in
-`train.py`; after training, `train.py` passes the fitted estimator into
-`prepare.test_accuracy()`. The immutable train/test split, hidden test labels,
-and final summary formatting belong in `prepare.py`. Candidate code receives
-only training arrays. Each hidden test split may be scored once per process; use
-training-only validation inside `train.py` for model selection.
+`prepare.py` fixes the data and the scoring contract; the candidate's `train.py`
+exposes `make_model(dataset, params)` + the tuner contract. Candidate code
+receives only training arrays. The test split is the optimization target (one
+`config → score` function, no separate held-out official run); use training-only
+validation inside the candidate for any in-candidate model selection.
 
 Candidate granularity:
 
 - One candidate directory is one candidate.
 - Each candidate directory must contain `prepare.py` and `train.py`.
 - `prepare.py` is copied from the task root and treated as readonly.
-- `train.py` is copied from the current best candidate, or from the task root
-  for the baseline, then edited for the new proposal.
-- Do not enumerate many competing candidates inside a single `train.py` run.
-- Compare the resulting `mean_test_accuracy` across run IDs in the run ledger.
+- A candidate's `train.py` is written by `candidate-writer` — from scratch for a
+  `fresh` candidate, or informed by the parent candidates' `train.py` for an
+  `improve`/`crossover` candidate.
+- Do not enumerate many competing candidates inside a single `train.py`.
+- Compare the resulting `neg_mean_test_accuracy` across run IDs in the run
+  ledger (lower is better).
 
 ## Search Space
 
@@ -80,8 +111,9 @@ Acceptable dependency additions:
 
 Comparison rules:
 
-- Primary score is the mean of per-dataset held-out test accuracies.
-- Higher `mean_test_accuracy` is better.
+- Primary score is `neg_mean_test_accuracy` = the negative mean of per-dataset
+  held-out test accuracies.
+- Lower (more negative) `neg_mean_test_accuracy` is better.
 - Compare different candidates across runs, not inside one run.
 - Prefer simpler models when the score is effectively tied.
 - Avoid changes that only overfit one dataset while harming the average.
@@ -93,73 +125,48 @@ Comparison rules:
 
 ## Run
 
-From the repository root:
+There is **no `python train.py` run** for this task: a candidate is scored only
+where the tuner scripts call `evaluate_config` (one `config → score` function, no
+separate official run). To evaluate a candidate by hand:
 
 ```bash
+# 1. Sync the task env (once).
 uv --directory tasks/tabular-model-search sync
-uv --directory tasks/tabular-model-search run python train.py
+
+# 2. Create the candidate directory — copies prepare.py only; candidate-writer
+#    writes train.py (do NOT pre-copy a baseline train.py).
+python tools/new_candidate.py tabular-model-search <tag> <run_id> --skip-entrypoint
+
+# 3. Once train.py + _warm_configs.json exist (candidate-writer +
+#    tunable-contract-extractor), score the K warm configs against evaluate_config
+#    in the task-local uv env (step 0+1):
+uv --directory tasks/tabular-model-search run python tools/tuners/warmstart_eval.py \
+  --candidate-path   runs/tabular-model-search/<tag>/candidates/<run_id>/train.py \
+  --configs-json     runs/tabular-model-search/<tag>/candidates/<run_id>/_warm_configs.json \
+  --tune-report-json runs/tabular-model-search/<tag>/candidates/<run_id>/tune_report.json
 ```
 
-During autonomous experiments, create a candidate directory first:
+Normally the experiment loop drives this through its agents
+(`tunable-contract-extractor` for step 0+1, `tuner-orchestrator` for the decoupled
+deep-tuning), not by hand; see `program.md`. Candidate files under `runs/` are
+intentionally outside git.
 
-```bash
-python tools/new_candidate.py tabular-model-search <tag> 000
-python tools/new_candidate.py tabular-model-search <tag> 001 --from-candidate 000
-```
+## Scoring And Recording
 
-Then run the copied candidate entrypoint with the task-local uv environment:
+There is **no run-log summary** — a candidate is never run as a script. The tuner
+scripts call `prepare.evaluate_config(make_model, params)` (warm-start eval +
+Phase C) and the score is written straight to `ledger.json` via `tools/ledger.py`:
 
-```bash
-uv --directory tasks/tabular-model-search run python "$(pwd)/runs/tabular-model-search/<tag>/candidates/<run_id>/train.py"
-```
+- `tunable-contract-extractor` (step 0+1) records the warm-start best as the
+  candidate's `final_best_score` (= `best_warm_score`) with `ledger.py record-run`,
+  and the warm metadata with `set-tuning` (no `--mark-tuned`).
+- `tuner-orchestrator`, if it selects the candidate, lowers `final_best_score` in
+  place with the tuned best (`record-run` + `set-tuning --mark-tuned`).
 
-Redirect output to a run log under:
-
-```text
-runs/tabular-model-search/<tag>/
-```
-
-Parse the log with `--commit worktree` because candidate files under `runs/`
-are intentionally outside git:
-
-```bash
-python tools/parse_result.py \
-  runs/tabular-model-search/<tag>/run-<run_id>.log \
-  --run-id <run_id> \
-  --commit worktree \
-  --append runs/tabular-model-search/<tag>/results.tsv \
-  --description "<short idea>"
-```
-
-## Output Format
-
-The script prints a final summary like:
-
-```text
----
-metric:           mean_test_accuracy
-score:            0.668122
-best_model:       extra_trees_baseline
-dataset_scores:   noisy_binary=0.807143 sparse_multiclass=0.634259 high_dimensional=0.562963
-fit_seconds:      0.9
-num_datasets:     3
-num_candidates:   1
-```
-
-A completed run must include the patterns listed in `task.toml`.
-`prepare.py` owns the summary field names and formatting; candidate `train.py`
-files should train estimators, call `test_accuracy(estimator, dataset)`, collect
-scores, and call the fixed print helpers. The generic parser writes `run_id`,
-`commit`, `metric`, `value`, `best_model`, `status`, and `description` columns.
-
-The `results.tsv` header for this task is:
-
-```text
-run_id	commit	metric	value	best_model	status	description
-```
-
-When parser status is left as `auto`, completed runs are marked `keep` only if
-their `score` strictly improves over the best previous kept value in
-`results.tsv`. Completed non-improving runs are marked `discard`; logs without a
-complete summary are marked `crash`. When `--append` is used, the parser also
-updates `runs/tabular-model-search/<tag>/loop_state.md` from the ledger.
+The candidate's result lives in `runs/tabular-model-search/<tag>/ledger.json`
+(one record per run; see `.claude/rules/ledger.md`). `ledger.py record-run`
+computes the keep/discard status: a completed run is `keep` only if its
+`final_best_score` strictly improves over the best previous kept value in the
+ledger, otherwise `discard`; a candidate that cannot be evaluated is `crash`
+(`final_best_score` `+inf`). `record-run` also regenerates
+`runs/tabular-model-search/<tag>/loop_state.md` from the ledger.

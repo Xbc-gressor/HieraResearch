@@ -6,9 +6,8 @@ phase_c stages) and injects them into the Optuna study as completed trials
 so TPE can use them as a prior. Each new trial is also appended back to
 tune_report.json under phase_c.stages[bo] as it completes.
 
-Evaluates configurations via prepare.evaluate_config_for_tuning (which
-internally uses the no-lock test_score_for_tuning helper).
-Requires `optuna` in the task's uv environment.
+Evaluates configurations via the task's one `config → score` function
+(`score_fn`). Requires `optuna` in the task's uv environment.
 
 Invoked by the tuner-orchestrator agent when 3 ≤ n_dims ≤ 15.
 """
@@ -22,13 +21,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
+    resolve_score_fn,
+    timed_eval,
+    load_run_cfg,
     PatienceMonitor,
     append_trial,
     cast_params_to_search_space,
     load_candidate_modules,
     prior_best_score,
+    read_deferred_configs,
     read_prior_trials,
     search_space_for_json,
+    set_stage_meta,
     write_json,
 )
 
@@ -69,17 +73,28 @@ def build_distributions(search_space: dict):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-path", required=True, type=Path)
-    parser.add_argument("--task-dir", required=True, type=Path)
     parser.add_argument("--tune-report-json", required=True, type=Path)
-    parser.add_argument("--n-trials", type=int, default=30)
-    parser.add_argument("--patience", type=int, default=6)
-    parser.add_argument("--lower-is-better", action="store_true")
+    parser.add_argument("--n-trials", type=int, default=None)
+    parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    # per-run framework overrides (Phase-3 OFAT): <run_dir>/framework_cfg.json tuner.*
+    # explicit flag wins; else framework_cfg.json; else the historical defaults.
+    _rc = load_run_cfg(args.candidate_path, "tuner")
+    # Defaults are data-driven (dev_plan/hpo-benchmark-report.md): patience=6 was
+    # the main HPO suppressor; budget ~40.
+    n_trials = args.n_trials if args.n_trials is not None else int(_rc.get("bo_n_trials", 40))
+    # patience: explicit flag > framework_cfg.tuner.bo_patience (fixed) > ADAPTIVE.
+    # Adaptive (computed after SEARCH_SPACE loads, needs n_dims): min(cap, max(floor,
+    # 1.5*n_dims)) — low/mid-dim save budget, high-dim ramps to the cap. Benchmark:
+    # ~94% of fixed-20's improvement at ~64% of the trial cost.
+    patience_override = args.patience if args.patience is not None else _rc.get("bo_patience")
 
     try:
         import optuna
     except ImportError:
+        set_stage_meta(args.tune_report_json, "bo", status="rejected")
         write_json({
             "method": "bo",
             "status": "rejected",
@@ -92,11 +107,20 @@ def main() -> int:
     train_module, prepare_module = load_candidate_modules(args.candidate_path)
     search_space = train_module.SEARCH_SPACE
     make_model = train_module.make_model
-    evaluate = prepare_module.evaluate_config_for_tuning
+    evaluate = resolve_score_fn(prepare_module, args.candidate_path)
 
-    sampler = optuna.samplers.TPESampler(seed=args.seed)
-    direction = "minimize" if args.lower_is_better else "maximize"
-    study = optuna.create_study(direction=direction, sampler=sampler)
+    n_dims = len(search_space)
+    if patience_override is not None:
+        patience = int(patience_override)
+    else:  # adaptive: cap at bo_patience_cap (20), floor at bo_patience_floor (12)
+        cap = int(_rc.get("bo_patience_cap", 20))
+        floor = int(_rc.get("bo_patience_floor", 12))
+        patience = int(min(cap, max(floor, round(1.5 * n_dims))))
+
+    # multivariate TPE ("tpe+") was the top optimizer in the benchmark — it models
+    # parameter interactions, beating plain TPE/cmaes esp. at high dims.
+    sampler = optuna.samplers.TPESampler(seed=args.seed, multivariate=True, group=True, n_startup_trials=10)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
 
     distributions = build_distributions(search_space)
     prior_trials = read_prior_trials(args.tune_report_json)
@@ -119,10 +143,25 @@ def main() -> int:
         except Exception:
             continue
 
+    # Deferred warm configs (proposed at step 0+1 but not evaluated there): enqueue
+    # them as the FIRST trials so BO evaluates them before TPE. They are EXTRA points
+    # on top of the TPE budget (n_trials += n_enqueued), so deep-search depth is
+    # unchanged — the saving was purely the evals skipped on un-promoted candidates.
+    n_enqueued = 0
+    for d_params in read_deferred_configs(args.tune_report_json):
+        d_params = {k: v for k, v in d_params.items() if k in distributions}
+        if set(d_params.keys()) != set(distributions.keys()):
+            continue
+        try:
+            study.enqueue_trial(d_params)
+            n_enqueued += 1
+        except Exception:
+            continue
+    n_trials = n_trials + n_enqueued
+
     monitor = PatienceMonitor(
-        patience=args.patience,
-        lower_is_better=args.lower_is_better,
-        start_best=prior_best_score(prior_trials, args.lower_is_better),
+        patience=patience,
+        start_best=prior_best_score(prior_trials),
     )
     early_stopped = {"flag": False, "reason": "none"}
 
@@ -131,7 +170,16 @@ def main() -> int:
     def objective(trial):
         params = {k: suggest(trial, k, search_space[k]) for k in search_space}
         params = cast_params_to_search_space(params, search_space)
-        score = evaluate(make_model, params)
+        try:
+            score = timed_eval(evaluate, make_model, params, args.candidate_path)
+        except Exception as exc:
+            # Record the failure so it is auditable in tune_report, then re-raise
+            # so Optuna (catch= below) marks this trial FAILED and moves on.
+            append_trial(
+                args.tune_report_json, "bo",
+                {"params": params, "score": None, "error": repr(exc)},
+            )
+            raise
         append_trial(
             args.tune_report_json, "bo", {"params": params, "score": score}
         )
@@ -147,9 +195,10 @@ def main() -> int:
 
     study.optimize(
         objective,
-        n_trials=args.n_trials,
+        n_trials=n_trials,
         show_progress_bar=False,
         callbacks=[patience_callback],
+        catch=(Exception,),
     )
 
     elapsed = time.time() - started
@@ -159,6 +208,25 @@ def main() -> int:
         for t in study.trials
         if t.value is not None and t.state == optuna.trial.TrialState.COMPLETE
     ]
+    if not completed_trials:
+        # Every trial (and any injected prior) errored: surface a failed stage
+        # instead of crashing on study.best_value or mislabeling this "ok".
+        set_stage_meta(args.tune_report_json, "bo", status="failed",
+                       elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped["flag"])
+        write_json({
+            "method": "bo",
+            "status": "failed",
+            "reason": "all BO trials errored; no completed trial",
+            "early_stopped": early_stopped["flag"],
+            "early_stop_reason": early_stopped["reason"],
+            "elapsed_seconds": round(elapsed, 1),
+            "search_space": search_space_for_json(search_space),
+        })
+        return 0
+
+    set_stage_meta(args.tune_report_json, "bo", status="ok",
+                   elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped["flag"])
+
     best_params = cast_params_to_search_space(dict(study.best_params), search_space)
     best_score = float(study.best_value)
 
@@ -169,6 +237,8 @@ def main() -> int:
         "best_score": best_score,
         "trials_completed": len(completed_trials) - len(prior_trials),
         "prior_trials_injected": len(prior_trials),
+        "n_dims": n_dims,
+        "patience": patience,
         "early_stopped": early_stopped["flag"],
         "early_stop_reason": early_stopped["reason"],
         "elapsed_seconds": round(elapsed, 1),

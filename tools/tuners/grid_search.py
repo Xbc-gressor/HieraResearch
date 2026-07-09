@@ -3,7 +3,7 @@
 
 Reads the candidate's SEARCH_SPACE, expands each entry to a discrete grid,
 shuffles the combos with a fixed seed for fair patience early-stopping,
-and evaluates each combo via prepare.evaluate_config_for_tuning. Each
+and evaluates each combo via the task's `score_fn`. Each
 trial is appended incrementally to tune_report.json under
 phase_c.stages[grid].
 
@@ -31,13 +31,17 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
+    resolve_score_fn,
+    timed_eval,
     PatienceMonitor,
     append_trial,
     cast_params_to_search_space,
     load_candidate_modules,
     prior_best_score,
+    read_deferred_configs,
     read_prior_trials,
     search_space_for_json,
+    set_stage_meta,
     write_json,
 )
 
@@ -62,19 +66,17 @@ def expand_entry(entry, resolution: int) -> list:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-path", required=True, type=Path)
-    parser.add_argument("--task-dir", required=True, type=Path)
     parser.add_argument("--tune-report-json", required=True, type=Path)
     parser.add_argument("--resolution", type=int, default=5)
     parser.add_argument("--max-trials", type=int, default=100)
     parser.add_argument("--patience", type=int, default=6)
-    parser.add_argument("--lower-is-better", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     train_module, prepare_module = load_candidate_modules(args.candidate_path)
     search_space = train_module.SEARCH_SPACE
     make_model = train_module.make_model
-    evaluate = prepare_module.evaluate_config_for_tuning
+    evaluate = resolve_score_fn(prepare_module, args.candidate_path)
 
     keys = list(search_space.keys())
     grids = [expand_entry(search_space[k], args.resolution) for k in keys]
@@ -83,6 +85,7 @@ def main() -> int:
         total *= len(g)
 
     if total > args.max_trials:
+        set_stage_meta(args.tune_report_json, "grid", status="rejected")
         write_json({
             "method": "grid",
             "status": "rejected",
@@ -100,26 +103,37 @@ def main() -> int:
     rng = random.Random(args.seed)
     rng.shuffle(combos)
 
+    # Evaluate the deferred warm configs FIRST (proposed at step 0+1 but not
+    # evaluated there), then the grid sweep. They count as normal trials.
+    deferred = [cast_params_to_search_space(dict(p), search_space)
+                for p in read_deferred_configs(args.tune_report_json)]
+    param_dicts = deferred + [cast_params_to_search_space(dict(zip(keys, combo)), search_space)
+                              for combo in combos]
+
     prior_trials = read_prior_trials(args.tune_report_json)
     monitor = PatienceMonitor(
         patience=args.patience,
-        lower_is_better=args.lower_is_better,
-        start_best=prior_best_score(prior_trials, args.lower_is_better),
+        start_best=prior_best_score(prior_trials),
     )
 
     started = time.time()
     best_params = None
-    best_score = math.inf if args.lower_is_better else -math.inf
+    best_score = math.inf
     trials_done = 0
     early_stopped = False
     early_stop_reason = "none"
 
-    for combo in combos:
-        params = cast_params_to_search_space(dict(zip(keys, combo)), search_space)
-        score = evaluate(make_model, params)
+    for params in param_dicts:
+        try:
+            score = timed_eval(evaluate, make_model, params, args.candidate_path)
+        except Exception as exc:
+            # A bad param combo must not kill the sweep: record it and skip.
+            append_trial(args.tune_report_json, "grid",
+                         {"params": params, "score": None, "error": repr(exc)})
+            continue
         append_trial(args.tune_report_json, "grid", {"params": params, "score": score})
         trials_done += 1
-        improved = score < best_score if args.lower_is_better else score > best_score
+        improved = score < best_score
         if improved:
             best_score = score
             best_params = params
@@ -130,11 +144,31 @@ def main() -> int:
 
     elapsed = time.time() - started
 
+    if best_params is None:
+        # Every combo errored — surface a failed stage instead of "ok" with a null best.
+        set_stage_meta(args.tune_report_json, "grid", status="failed",
+                       elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped)
+        write_json({
+            "method": "grid",
+            "status": "failed",
+            "reason": "all grid trials errored; no completed trial",
+            "trials_completed": trials_done,
+            "trials_planned": total,
+            "early_stopped": early_stopped,
+            "early_stop_reason": early_stop_reason,
+            "elapsed_seconds": round(elapsed, 1),
+            "search_space": search_space_for_json(search_space),
+        })
+        return 0
+
+    set_stage_meta(args.tune_report_json, "grid", status="ok",
+                   elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped)
+
     write_json({
         "method": "grid",
         "status": "ok",
         "best_params": best_params,
-        "best_score": best_score if trials_done > 0 else None,
+        "best_score": best_score,
         "trials_completed": trials_done,
         "trials_planned": total,
         "early_stopped": early_stopped,

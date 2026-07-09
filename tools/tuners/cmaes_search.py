@@ -5,17 +5,16 @@ Encodes the candidate's SEARCH_SPACE into a continuous bounded vector
 (int → rounded continuous, categorical → integer index, log-float → log
 space), runs cma.CMAEvolutionStrategy with the configured budget.
 
-Reads prior trials from tune_report.json; picks the prior with the highest
-score as the CMA-ES initial mean (x0). Other priors are not directly used
-by CMA-ES (it is a population method, not surrogate-based), but they
+Reads prior trials from tune_report.json; picks the best prior in the task's
+metric direction as the CMA-ES initial mean (x0). Other priors are not directly
+used by CMA-ES (it is a population method, not surrogate-based), but they
 remain accessible in tune_report.json for downstream consumers.
 
 Each evaluated point is appended to tune_report.json under
 phase_c.stages[cmaes] as it completes.
 
-Evaluates configurations via prepare.evaluate_config_for_tuning (which
-internally uses the no-lock test_score_for_tuning helper).
-Requires `cma` in the task's uv environment.
+Evaluates configurations via the task's one `config → score` function
+(`score_fn`). Requires `cma` in the task's uv environment.
 
 Invoked by the tuner-orchestrator agent when n_dims ≥ 16.
 """
@@ -32,13 +31,17 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
+    resolve_score_fn,
+    timed_eval,
     PatienceMonitor,
     append_trial,
     cast_params_to_search_space,
     load_candidate_modules,
     prior_best_score,
+    read_deferred_configs,
     read_prior_trials,
     search_space_for_json,
+    set_stage_meta,
     write_json,
 )
 
@@ -131,12 +134,10 @@ def build_codec(search_space: dict, base_params: dict):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-path", required=True, type=Path)
-    parser.add_argument("--task-dir", required=True, type=Path)
     parser.add_argument("--tune-report-json", required=True, type=Path)
     parser.add_argument("--popsize", type=int, default=8)
     parser.add_argument("--max-evals", type=int, default=64)
     parser.add_argument("--patience", type=int, default=6)
-    parser.add_argument("--lower-is-better", action="store_true")
     parser.add_argument("--sigma0", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -144,6 +145,7 @@ def main() -> int:
     try:
         import cma
     except ImportError:
+        set_stage_meta(args.tune_report_json, "cmaes", status="rejected")
         write_json({
             "method": "cmaes",
             "status": "rejected",
@@ -155,15 +157,12 @@ def main() -> int:
     base_params = dict(train_module.BASE_PARAMS)
     search_space = train_module.SEARCH_SPACE
     make_model = train_module.make_model
-    evaluate = prepare_module.evaluate_config_for_tuning
+    evaluate = resolve_score_fn(prepare_module, args.candidate_path)
 
     prior_trials = read_prior_trials(args.tune_report_json)
     best_prior = None
     if prior_trials:
-        if args.lower_is_better:
-            best_prior = min(prior_trials, key=lambda t: t.get("score", math.inf))
-        else:
-            best_prior = max(prior_trials, key=lambda t: t.get("score", -math.inf))
+        best_prior = min(prior_trials, key=lambda t: t.get("score", math.inf))
     seed_params = best_prior["params"] if best_prior else base_params
 
     keys, lower, upper, x0_default, encode, decode = build_codec(
@@ -189,16 +188,33 @@ def main() -> int:
 
     started = time.time()
     best_params = dict(seed_params)
-    best_score = math.inf if args.lower_is_better else -math.inf
+    best_score = math.inf
     evals = 0
+    any_success = False
     early_stopped = False
     early_stop_reason = "none"
 
     monitor = PatienceMonitor(
         patience=args.patience,
-        lower_is_better=args.lower_is_better,
-        start_best=prior_best_score(prior_trials, args.lower_is_better),
+        start_best=prior_best_score(prior_trials),
     )
+
+    # Deferred warm configs (proposed at step 0+1, not evaluated there): evaluate
+    # them up front so the rare cmaes path doesn't lose them. Recorded + considered
+    # for best (select-best ranks the whole report); they are EXTRA — not charged to
+    # the cmaes `evals` budget (cmaes still seeds x0 from the best evaluated prior).
+    for d_params in read_deferred_configs(args.tune_report_json):
+        params = cast_params_to_search_space(dict(d_params), search_space)
+        try:
+            score = timed_eval(evaluate, make_model, params, args.candidate_path)
+        except Exception as exc:
+            append_trial(args.tune_report_json, "cmaes",
+                         {"params": params, "score": None, "error": repr(exc)})
+            continue
+        append_trial(args.tune_report_json, "cmaes", {"params": params, "score": score})
+        any_success = True
+        if score < best_score:
+            best_score, best_params = score, params
 
     while evals < args.max_evals:
         if es.stop():
@@ -206,23 +222,31 @@ def main() -> int:
             early_stop_reason = "cma_internal"
             break
         xs = es.ask()
-        fitnesses = []
+        results = []  # [(x, fitness_or_None)] — None marks a failed evaluation
         stop_now = False
         for x in xs:
             if evals >= args.max_evals:
                 break
             params = decode(np.asarray(x))
             params = cast_params_to_search_space(params, search_space)
-            score = evaluate(make_model, params)
+            try:
+                score = timed_eval(evaluate, make_model, params, args.candidate_path)
+            except Exception as exc:
+                # One bad param region must not kill the whole search: record the
+                # failure for audit and carry it as a penalty placeholder below.
+                append_trial(args.tune_report_json, "cmaes",
+                             {"params": params, "score": None, "error": repr(exc)})
+                results.append((x, None))
+                evals += 1
+                continue
             append_trial(
                 args.tune_report_json, "cmaes", {"params": params, "score": score}
             )
-            # CMA-ES minimizes; convert to fitness based on direction.
-            fitnesses.append(score if args.lower_is_better else -score)
-            improved = (
-                score < best_score if args.lower_is_better else score > best_score
-            )
-            if improved:
+            any_success = True
+            # CMA-ES minimizes and scores are lower-is-better → fitness = score.
+            fit = score
+            results.append((x, fit))
+            if score < best_score:
                 best_score = score
                 best_params = params
             evals += 1
@@ -231,12 +255,39 @@ def main() -> int:
                 early_stop_reason = "patience"
                 stop_now = True
                 break
-        if len(fitnesses) == len(xs):
-            es.tell(xs, fitnesses)
+        # Tell CMA-ES only a full generation; failed points take the generation's
+        # worst (finite) fitness so the distribution steers away — never inf/nan,
+        # which would break the covariance update.
+        succ = [f for _, f in results if f is not None]
+        if succ and len(results) == len(xs):
+            penalty = max(succ)
+            es.tell(xs, [f if f is not None else penalty for _, f in results])
         if stop_now:
             break
 
     elapsed = time.time() - started
+
+    if not any_success:
+        # Every evaluated trial errored — surface a failed stage instead of
+        # writing the seed defaults as if they were a real "ok" best.
+        set_stage_meta(args.tune_report_json, "cmaes", status="failed",
+                       elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped)
+        write_json({
+            "method": "cmaes",
+            "status": "failed",
+            "reason": "all CMA-ES trials errored; no completed trial",
+            "trials_completed": evals,
+            "prior_trials_seen": len(prior_trials),
+            "popsize": args.popsize,
+            "early_stopped": early_stopped,
+            "early_stop_reason": early_stop_reason,
+            "elapsed_seconds": round(elapsed, 1),
+            "search_space": search_space_for_json(search_space),
+        })
+        return 0
+
+    set_stage_meta(args.tune_report_json, "cmaes", status="ok",
+                   elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped)
 
     write_json({
         "method": "cmaes",

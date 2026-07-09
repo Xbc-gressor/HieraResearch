@@ -1,0 +1,17 @@
+[project]
+name = "tabular-blind"
+version = "0.1.0"
+description = "Synthetic tabular classification with a hidden generating process."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0.0",
+    "scikit-learn>=1.5.0",
+    "xgboost>=2.1.0",
+    "lightgbm>=4.0.0",
+    "catboost>=1.2.0",
+    "optuna>=3.6.0",
+    "cma>=3.3.0",
+    "cmaes>=0.10.0",
+    "smac>=2.0",
+    "imbalanced-learn>=0.12.0",
+]

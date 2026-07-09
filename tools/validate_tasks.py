@@ -15,10 +15,12 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$")
 REQUIRED_TOP_LEVEL = {"name", "description"}
 REQUIRED_SECTIONS = {
     "env": {"type", "project"},
-    "run": {"working_dir", "command", "timeout_seconds", "log_template"},
-    "result": {"metric", "lower_is_better", "parser", "required_patterns", "results_file"},
+    "run": {"working_dir", "timeout_seconds"},
+    "evaluation": {"score_fn"},
+    "result": {"metric", "parser", "required_patterns", "results_file"},
     "constraints": {"editable_files", "readonly_files", "allow_dependencies"},
 }
+EVALUATION_CONTRACT_HEADING = "## Evaluation Contract"
 
 
 def strip_comment(line: str) -> str:
@@ -74,6 +76,14 @@ def validate_task(task_dir: Path) -> list[str]:
         if not (task_dir / filename).exists():
             errors.append(f"{task_dir}: missing {filename}")
 
+    task_md = task_dir / "TASK.md"
+    if task_md.exists():
+        if EVALUATION_CONTRACT_HEADING not in task_md.read_text(errors="replace"):
+            errors.append(
+                f"{task_md}: missing required '{EVALUATION_CONTRACT_HEADING}' section "
+                f"(the candidate train/score/report/tune contract)"
+            )
+
     task_toml = task_dir / "task.toml"
     if not task_toml.exists():
         return errors
@@ -116,20 +126,22 @@ def validate_task(task_dir: Path) -> list[str]:
         working_dir = run.get("working_dir")
         if working_dir and not (ROOT / working_dir).is_dir():
             errors.append(f"{task_toml}: run.working_dir does not exist: {working_dir}")
-        if not isinstance(run.get("command"), str) or not run.get("command"):
-            errors.append(f"{task_toml}: run.command must be a non-empty string")
         if not isinstance(run.get("timeout_seconds"), int):
             errors.append(f"{task_toml}: run.timeout_seconds must be an integer")
-        log_template = run.get("log_template")
-        if not isinstance(log_template, str) or "{run_id}" not in log_template:
-            errors.append(f"{task_toml}: run.log_template must include '{{run_id}}'")
+
+    evaluation = data.get("evaluation", {})
+    if isinstance(evaluation, dict):
+        for key in ("score_fn",):  # tuning_fn retired (single config->score surface)
+            value = evaluation.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value:
+                errors.append(f"{task_toml}: evaluation.{key} must be a non-empty string")
 
     result = data.get("result", {})
     if isinstance(result, dict):
         if not isinstance(result.get("metric"), str) or not result.get("metric"):
             errors.append(f"{task_toml}: result.metric must be a non-empty string")
-        if not isinstance(result.get("lower_is_better"), bool):
-            errors.append(f"{task_toml}: result.lower_is_better must be a boolean")
         parser = result.get("parser")
         if not isinstance(parser, str):
             errors.append(f"{task_toml}: result.parser must be a string")
@@ -147,6 +159,41 @@ def validate_task(task_dir: Path) -> list[str]:
         if not isinstance(result.get("results_file"), str) or not result.get("results_file"):
             errors.append(f"{task_toml}: result.results_file must be a non-empty string")
 
+    seed = data.get("seed")
+    seed_entrypoint = "train.py"
+    seed_can_generate_entrypoint = True
+    if seed is not None:
+        if not isinstance(seed, dict):
+            errors.append(f"{task_toml}: [seed] must be a table")
+        else:
+            target_count = seed.get("target_count", 3)
+            if not isinstance(target_count, int) or target_count < 1:
+                errors.append(f"{task_toml}: seed.target_count must be a positive integer")
+            tune = seed.get("tune", False)
+            if not isinstance(tune, bool):
+                errors.append(f"{task_toml}: seed.tune must be a boolean")
+            elif tune:
+                errors.append(f"{task_toml}: seed.tune must be false; seed candidates are not tuned")
+            entrypoint = seed.get("entrypoint", "train.py")
+            if not isinstance(entrypoint, str) or not entrypoint:
+                errors.append(f"{task_toml}: seed.entrypoint must be a non-empty string")
+            else:
+                seed_entrypoint = entrypoint
+                seed_can_generate_entrypoint = True
+            provided = seed.get("provided", [])
+            if not isinstance(provided, list) or not all(isinstance(item, str) for item in provided):
+                errors.append(f"{task_toml}: seed.provided must be a list of strings")
+            else:
+                for item in provided:
+                    relative_path = Path(item)
+                    candidates = []
+                    if relative_path.is_absolute():
+                        candidates.append(relative_path)
+                    else:
+                        candidates.extend([task_dir / relative_path, ROOT / relative_path])
+                    if not any(path.is_file() for path in candidates):
+                        errors.append(f"{task_toml}: seed.provided entry does not exist: {item}")
+
     constraints = data.get("constraints", {})
     if isinstance(constraints, dict):
         for key in ("editable_files", "readonly_files"):
@@ -156,6 +203,12 @@ def validate_task(task_dir: Path) -> list[str]:
                 continue
             for item in value:
                 if not (task_dir / item).exists():
+                    if (
+                        key == "editable_files"
+                        and seed_can_generate_entrypoint
+                        and item == seed_entrypoint
+                    ):
+                        continue
                     errors.append(f"{task_toml}: constraints.{key} entry does not exist: {item}")
         if not isinstance(constraints.get("allow_dependencies"), bool):
             errors.append(f"{task_toml}: constraints.allow_dependencies must be a boolean")
@@ -165,29 +218,33 @@ def validate_task(task_dir: Path) -> list[str]:
         if not isinstance(candidate, dict):
             errors.append(f"{task_toml}: [candidate] must be a table")
         else:
-            if not isinstance(candidate.get("enabled"), bool):
-                errors.append(f"{task_toml}: candidate.enabled must be a boolean")
             root_template = candidate.get("root_template")
-            if not isinstance(root_template, str) or not root_template:
-                errors.append(f"{task_toml}: candidate.root_template must be a non-empty string")
-            else:
-                for placeholder in ("{task_name}", "{tag}", "{run_id}"):
-                    if placeholder not in root_template:
-                        errors.append(
-                            f"{task_toml}: candidate.root_template must include {placeholder}"
-                        )
+            if root_template is not None:
+                if not isinstance(root_template, str) or not root_template:
+                    errors.append(f"{task_toml}: candidate.root_template must be a non-empty string")
+                else:
+                    for placeholder in ("{task_name}", "{tag}", "{run_id}"):
+                        if placeholder not in root_template:
+                            errors.append(
+                                f"{task_toml}: candidate.root_template must include {placeholder}"
+                            )
             copy_files = candidate.get("copy_files")
-            if not isinstance(copy_files, list) or not all(isinstance(item, str) for item in copy_files):
-                errors.append(f"{task_toml}: candidate.copy_files must be a list of strings")
-            else:
-                for item in copy_files:
-                    if not (task_dir / item).is_file():
-                        errors.append(f"{task_toml}: candidate.copy_files entry does not exist: {item}")
+            if copy_files is not None:
+                if not isinstance(copy_files, list) or not all(isinstance(item, str) for item in copy_files):
+                    errors.append(f"{task_toml}: candidate.copy_files must be a list of strings")
+                else:
+                    for item in copy_files:
+                        if not (task_dir / item).is_file():
+                            errors.append(f"{task_toml}: candidate.copy_files entry does not exist: {item}")
             entrypoint = candidate.get("entrypoint")
-            if not isinstance(entrypoint, str) or not entrypoint:
-                errors.append(f"{task_toml}: candidate.entrypoint must be a non-empty string")
-            elif isinstance(copy_files, list) and entrypoint not in copy_files:
-                errors.append(f"{task_toml}: candidate.entrypoint must be listed in copy_files")
+            if entrypoint is not None:
+                if not isinstance(entrypoint, str) or not entrypoint:
+                    errors.append(f"{task_toml}: candidate.entrypoint must be a non-empty string")
+                elif isinstance(copy_files, list) and entrypoint not in copy_files:
+                    errors.append(f"{task_toml}: candidate.entrypoint must be listed in copy_files")
+            elif isinstance(copy_files, list):
+                if "train.py" not in copy_files:
+                    errors.append(f"{task_toml}: candidate.copy_files must include default entrypoint train.py")
             for key in ("editable_files", "readonly_files"):
                 value = candidate.get(key)
                 if value is None:

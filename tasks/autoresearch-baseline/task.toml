@@ -7,17 +7,26 @@ project = "tasks/autoresearch-baseline"
 
 [run]
 working_dir = "tasks/autoresearch-baseline"
-command = "uv run python train.py"
 prepare_command = "uv run python prepare.py"
 timeout_seconds = 600
-log_template = "run-{run_id}.log"
+
+[seed]
+target_count = 1
+provided = ["train.py"]
+entrypoint = "train.py"
+tune = false
+
+# The single score_fn. This legacy task scores a full training run
+# (evaluate_bpb(model, ...), model->score), NOT the generic config->score tuner
+# contract, so it is not run through the S-GoT tuner. Semantics live in TASK.md.
+[evaluation]
+score_fn = "evaluate_bpb"
 
 [result]
 metric = "val_bpb"
-lower_is_better = true
 parser = "tools/parse_result.py"
 required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
-results_file = "results.tsv"
+results_file = "ledger.json"
 
 [constraints]
 editable_files = ["train.py"]

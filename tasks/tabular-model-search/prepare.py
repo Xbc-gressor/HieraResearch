@@ -1,7 +1,15 @@
-"""Fixed data preparation and test scoring for tabular-model-search.
+"""Fixed data preparation and the single config→score evaluation for
+tabular-model-search.
 
-Do not modify this file during normal experiments. Edit `train.py` to change
-the candidate implementation and training logic.
+Do not modify this file during normal experiments. A candidate's tunable
+construction lives in its own `train.py` (`make_model` + the tuner contract);
+this file owns the data splits and the one scoring function.
+
+Scores follow the framework convention that **lower is better**: this task
+reports `neg_mean_test_accuracy = -mean(accuracy)`, so minimizing it is the same
+as maximizing accuracy. `evaluate_config` is the **one** evaluation surface —
+warm-start eval and Phase C tuning both call it; there is no separate official
+run, so the score it returns IS the candidate's score.
 """
 
 from __future__ import annotations
@@ -16,7 +24,7 @@ from sklearn.model_selection import train_test_split
 
 RANDOM_SEED = 42
 TEST_SIZE = 0.30
-METRIC = "mean_test_accuracy"
+METRIC = "neg_mean_test_accuracy"  # negative mean accuracy: lower is better
 
 
 @dataclass(frozen=True)
@@ -34,7 +42,6 @@ class EvaluationResult:
 
 
 _TEST_DATA: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-_USED_TEST_SCORES: set[str] = set()
 _DATASETS_CACHE: list["DatasetSplit"] | None = None
 
 
@@ -89,7 +96,6 @@ def load_datasets() -> list[DatasetSplit]:
     if _DATASETS_CACHE is not None:
         return _DATASETS_CACHE
     _TEST_DATA.clear()
-    _USED_TEST_SCORES.clear()
     _DATASETS_CACHE = [
         _make_dataset(
             name="noisy_binary",
@@ -134,61 +140,29 @@ def load_datasets() -> list[DatasetSplit]:
     return _DATASETS_CACHE
 
 
-def test_accuracy(estimator: object, dataset: DatasetSplit) -> float:
-    """Score a fitted estimator on the fixed hidden test split.
+def evaluate_config(make_model, params: dict) -> float:
+    """The single `config → score` evaluation function (lower is better).
 
-    Each dataset may be scored once per process. Used by the main candidate
-    `run_candidate()` to produce the official run score.
-    """
-    if dataset.name in _USED_TEST_SCORES:
-        raise RuntimeError(f"test score already consumed for dataset: {dataset.name}")
-    try:
-        x_test, y_test = _TEST_DATA[dataset.name]
-    except KeyError as exc:
-        raise KeyError(f"unknown dataset split: {dataset.name}") from exc
-    predictions = estimator.predict(x_test)
-    _USED_TEST_SCORES.add(dataset.name)
-    return float(accuracy_score(y_test, predictions))
+    The **one** evaluation surface (task.toml `[evaluation].score_fn`), called by
+    the tuner scripts under tools/tuners/ for both warm-start eval and Phase C
+    search. Builds an estimator via `make_model(dataset, params)` for each
+    dataset, fits on the training split, scores on the fixed held-out test split,
+    and returns the mean **negative** test accuracy across datasets. There is no
+    separate official run, so this value IS the candidate's score; the test split
+    is the optimization target, so the score is an optimistic estimate by
+    construction.
 
-
-def evaluate_config_for_tuning(make_model, params: dict) -> float:
-    """Score one hyperparameter configuration across all task datasets.
-
-    Called by tuner scripts under tools/tuners/. Builds an estimator via
-    make_model for each dataset, fits on the training split, and scores on
-    the test split via test_score_for_tuning (no one-shot lock). Returns
-    the mean test accuracy across datasets — the task's optimization
-    target during tuning.
-
-    Task-specific evaluation logic lives here so tuner scripts stay
-    generic. A different task (e.g., LLM pretraining) would define its own
-    evaluate_config_for_tuning implementing whatever training/scoring loop
-    fits its surface.
+    A different task would define its own `score_fn` (named in its task.toml)
+    implementing whatever training/scoring loop fits its surface.
     """
     datasets = load_datasets()
     scores = []
     for dataset in datasets:
         estimator = make_model(dataset, params)
         estimator.fit(dataset.x_train, dataset.y_train)
-        scores.append(test_score_for_tuning(estimator, dataset))
-    return float(np.mean(scores))
-
-
-def test_score_for_tuning(estimator: object, dataset: DatasetSplit) -> float:
-    """Score on the test split WITHOUT consuming the one-shot lock.
-
-    Intended for tuner scripts under tools/tuners/ that need to evaluate many
-    configurations on the test set during hyperparameter search. This
-    intentionally treats the test split as the optimization target rather
-    than an unbiased benchmark; the final candidate score reported via
-    `test_accuracy` (called once per dataset in run_candidate) is therefore
-    a biased estimate after tuning.
-    """
-    try:
         x_test, y_test = _TEST_DATA[dataset.name]
-    except KeyError as exc:
-        raise KeyError(f"unknown dataset split: {dataset.name}") from exc
-    return float(accuracy_score(y_test, estimator.predict(x_test)))
+        scores.append(-float(accuracy_score(y_test, estimator.predict(x_test))))
+    return float(np.mean(scores))
 
 
 def format_scores(scores: dict[str, float]) -> str:

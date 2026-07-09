@@ -47,6 +47,14 @@ def main() -> int:
         help="Candidate id or path whose train.py should seed this candidate.",
     )
     parser.add_argument(
+        "--skip-entrypoint",
+        action="store_true",
+        help=(
+            "Do not copy the entrypoint file; candidate-writer writes it "
+            "later. Mutually exclusive with --from-candidate."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite copied files if the candidate directory already exists.",
@@ -75,6 +83,10 @@ def main() -> int:
         parser.error("candidate.copy_files must be a list of strings")
     if not isinstance(entrypoint, str):
         parser.error("candidate.entrypoint must be a string")
+    if args.skip_entrypoint and args.from_candidate:
+        parser.error("--skip-entrypoint and --from-candidate are mutually exclusive")
+    if args.skip_entrypoint:
+        copy_files = [item for item in copy_files if item != entrypoint]
 
     dest = candidate_path(template, args.task_name, args.tag, args.run_id)
     if dest.exists() and any(dest.iterdir()) and not args.force:
