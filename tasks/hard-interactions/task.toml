@@ -1,0 +1,28 @@
+name = "hard-interactions"
+description = "Hard synthetic tabular classification with high-order feature interactions and large headroom."
+
+[env]
+type = "uv"
+project = "tasks/hard-interactions"
+
+[run]
+working_dir = "tasks/hard-interactions"
+timeout_seconds = 600
+
+# The single config->score evaluation function. Semantics + hard rules live in
+# TASK.md's `## Evaluation Contract`. score_fn(make_model, params) -> float,
+# lower-is-better; it is the ONE surface (warm-start eval + Phase C tuning), no
+# separate official run. (No seed phase: the loop bootstraps with `fresh`.)
+[evaluation]
+score_fn = "evaluate_config"
+
+[result]
+metric = "neg_mean_test_accuracy"
+parser = "tools/parse_result.py"
+required_patterns = ["^score:", "^best_model:"]
+results_file = "ledger.json"
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml", "uv.lock"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true

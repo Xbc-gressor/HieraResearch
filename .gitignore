@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+tasks/*/.venv/
+worktrees/
+results/
+queue/
+
+# opencode local-only settings
+.opencode/settings.local.json
+
+# Experimental code/artifacts
+dev/
+
+# Results file
+results.tsv
+run.log
+runs/
+tasks/*/run.log
+tasks/*/results.tsv

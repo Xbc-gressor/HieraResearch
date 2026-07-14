@@ -1,0 +1,34 @@
+name = "autoresearch-baseline"
+description = "Original torch-based autoresearch pretraining task."
+
+[env]
+type = "uv"
+project = "tasks/autoresearch-baseline"
+
+[run]
+working_dir = "tasks/autoresearch-baseline"
+prepare_command = "uv run python prepare.py"
+timeout_seconds = 600
+
+[seed]
+target_count = 1
+provided = ["train.py"]
+entrypoint = "train.py"
+tune = false
+
+# The single score_fn. This legacy task scores a full training run
+# (evaluate_bpb(model, ...), model->score), NOT the generic config->score tuner
+# contract, so it is not run through the S-GoT tuner. Semantics live in TASK.md.
+[evaluation]
+score_fn = "evaluate_bpb"
+
+[result]
+metric = "val_bpb"
+parser = "tools/parse_result.py"
+required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
+results_file = "ledger.json"
+
+[constraints]
+editable_files = ["train.py"]
+readonly_files = ["prepare.py"]
+allow_dependencies = false

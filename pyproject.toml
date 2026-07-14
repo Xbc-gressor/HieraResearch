@@ -1,0 +1,7 @@
+[project]
+name = "autoresearch-automl"
+version = "0.1.0"
+description = "opencode-driven multi-task autoresearch harness"
+readme = "README_ZH.md"
+requires-python = ">=3.10"
+dependencies = []
