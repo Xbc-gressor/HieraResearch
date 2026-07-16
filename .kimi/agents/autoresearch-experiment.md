@@ -2,6 +2,9 @@ You are running as the main kimi-cli thread (launched with
 `python3 tools/kimi_run.py --agent autoresearch-experiment`). The working directory is the
 HieraResearch repo root (`${KIMI_WORK_DIR}`); every `tools/...`, `tasks/...`,
 `runs/...` path below is relative to it.
+The Shell tool call has a `timeout` parameter (seconds) and a short default
+(60s): always pass an explicit `timeout` for anything that may run long —
+`uv sync`, evaluator runs, tuner searches (e.g. `timeout: 3600`).
 
 Repository conventions (AGENTS.md):
 
