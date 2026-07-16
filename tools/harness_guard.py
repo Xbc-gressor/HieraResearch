@@ -142,14 +142,41 @@ def delegation_violation(agent: str, prompt: str) -> str | None:
     return None
 
 
-def _claude_hook() -> int:
+def spawn_closure_violation(agent: str, prompt: str, allowed: set[str] | None) -> str | None:
+    """Enforce the orchestrator's exact spawn set when `allowed` is given.
+
+    kimi-cli's Agent tool description always mentions the built-in coder/explore
+    types in its static prose, which can invite out-of-closure spawns; deny them
+    deterministically. A bare `resume` (no subagent_type) is allowed through.
+    """
+    if allowed is None:
+        return None
+    if not agent:
+        if not prompt:  # resume-only call carries no spawn intent
+            return None
+        return (
+            "Agent calls must name subagent_type explicitly (one of: "
+            + ", ".join(sorted(allowed))
+            + "); the built-in default would escape the role closure."
+        )
+    if agent not in allowed:
+        return (
+            f"subagent_type {agent!r} is not one of the HieraResearch role "
+            f"agents ({', '.join(sorted(allowed))}); spawn only the bounded "
+            "role agents declared by the orchestrator."
+        )
+    return None
+
+
+def _claude_hook(allowed: set[str] | None = None) -> int:
     payload = json.load(sys.stdin)
     if payload.get("tool_name") != "Agent":
         return 0
     tool_input = payload.get("tool_input") or {}
-    reason = delegation_violation(
-        str(tool_input.get("subagent_type") or ""),
-        str(tool_input.get("prompt") or ""),
+    agent = str(tool_input.get("subagent_type") or "")
+    prompt = str(tool_input.get("prompt") or "")
+    reason = spawn_closure_violation(agent, prompt, allowed) or delegation_violation(
+        agent, prompt
     )
     if reason is None:
         return 0
@@ -167,6 +194,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--opencode-check", metavar="AGENT")
     parser.add_argument("--compact-result", metavar="AGENT")
+    parser.add_argument(
+        "--allowed-subagents",
+        metavar="CSV",
+        help="comma-separated spawn closure; deny any other subagent_type "
+        "(used by the kimi-cli hook; omit for the Claude runtime)",
+    )
     args = parser.parse_args()
     if args.compact_result is not None:
         print(compact_task_result(args.compact_result, sys.stdin.read()))
@@ -177,7 +210,12 @@ def main() -> int:
             print(reason)
             return 3
         return 0
-    return _claude_hook()
+    allowed = (
+        {name.strip() for name in args.allowed_subagents.split(",") if name.strip()}
+        if args.allowed_subagents
+        else None
+    )
+    return _claude_hook(allowed)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+# HieraResearch kimi-cli hook registrations.
+#
+# kimi-cli has no project-level config file, so `tools/kimi_run.py` merges these
+# entries into the user's ~/.kimi/config.toml at launch time and passes the
+# result via `kimi --config`. `${HIERA_ROOT}` expands to this repo's absolute
+# root (the kimi-side equivalent of Claude's ${CLAUDE_PROJECT_DIR}).
+#
+# The guard reads the same hook JSON protocol as Claude Code's PreToolUse hook
+# (tool_name / tool_input.subagent_type / tool_input.prompt) and answers with
+# the same `hookSpecificOutput.permissionDecision` payload, both of which
+# kimi-cli's Hooks (Beta) system uses verbatim.
+
+# --allowed-subagents pins the spawn closure to exactly the six role agents:
+# kimi-cli's Agent tool prose always advertises its built-in coder/explore
+# types, and without this the orchestrator could escape the role boundary.
+[[hooks]]
+event = "PreToolUse"
+matcher = "Agent"
+command = "python3 ${HIERA_ROOT}/tools/harness_guard.py --allowed-subagents background-researcher,idea-generator,experience-extractor,candidate-writer,tunable-contract-extractor,tuner-orchestrator"
+timeout = 10

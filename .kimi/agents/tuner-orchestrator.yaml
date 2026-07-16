@@ -1,0 +1,14 @@
+# Claude-side equivalent: .claude/agents/tuner-orchestrator.md (tools: Read, Write, Edit, Bash, Glob)
+version: 1
+agent:
+  name: tuner-orchestrator
+  extend: ./_common.yaml
+  system_prompt_path: ./tuner-orchestrator.md
+  allowed_tools:
+    - "kimi_cli.tools.shell:Shell"
+    - "kimi_cli.tools.file:ReadFile"
+    - "kimi_cli.tools.file:WriteFile"
+    - "kimi_cli.tools.file:StrReplaceFile"
+    - "kimi_cli.tools.file:Glob"
+    - "kimi_cli.tools.file:Grep"
+  subagents:

@@ -1,0 +1,19 @@
+# Base for HieraResearch loop subagents (not launched directly).
+# Strips main-thread-only tools; each child adds its own exclusions on top.
+version: 1
+agent:
+  name: hiera-child-base
+  extend: default
+  exclude_tools:
+    - "kimi_cli.tools.agent:Agent"              # no nested spawning
+    - "kimi_cli.tools.ask_user:AskUserQuestion" # report ambiguity to the caller instead
+    - "kimi_cli.tools.todo:SetTodoList"
+    - "kimi_cli.tools.plan:ExitPlanMode"
+    - "kimi_cli.tools.plan.enter:EnterPlanMode"
+    - "kimi_cli.tools.file:ReadMediaFile"
+    - "kimi_cli.tools.background:TaskList"      # sequential foreground work only
+    - "kimi_cli.tools.background:TaskOutput"
+    - "kimi_cli.tools.background:TaskStop"
+    - "kimi_cli.tools.web:SearchWeb"            # web access is background-researcher-only
+    - "kimi_cli.tools.web:FetchURL"
+  subagents:                                    # clear built-in coder/explore/plan

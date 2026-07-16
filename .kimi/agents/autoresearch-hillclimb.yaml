@@ -1,0 +1,19 @@
+# The deliberately simple comparison baseline, launched as the main thread:
+#   python3 tools/kimi_run.py --agent autoresearch-hillclimb
+# Claude-side equivalent: .claude/agents/autoresearch-hillclimb.md
+# (tools: Read, Write, Edit, Bash, Glob — no Agent tool, spawns nothing).
+version: 1
+agent:
+  name: autoresearch-hillclimb
+  extend: default
+  system_prompt_path: ./autoresearch-hillclimb.md
+  exclude_tools:
+    - "kimi_cli.tools.agent:Agent"              # the baseline must stay subagent-free
+    - "kimi_cli.tools.web:SearchWeb"
+    - "kimi_cli.tools.web:FetchURL"
+    - "kimi_cli.tools.ask_user:AskUserQuestion"
+    - "kimi_cli.tools.todo:SetTodoList"
+    - "kimi_cli.tools.plan:ExitPlanMode"
+    - "kimi_cli.tools.plan.enter:EnterPlanMode"
+    - "kimi_cli.tools.file:ReadMediaFile"
+  subagents:

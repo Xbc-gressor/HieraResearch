@@ -1,0 +1,55 @@
+# The run-level orchestrator, launched as the main thread:
+#   python3 tools/kimi_run.py --agent autoresearch-experiment
+# Claude-side equivalent: .claude/agents/autoresearch-experiment.md, whose
+# `tools: Agent(background-researcher,...,tuner-orchestrator), ...` allow-list is
+# expressed here as the `subagents:` map — the Agent tool can spawn exactly
+# these six role agents and nothing else.
+version: 1
+agent:
+  name: autoresearch-experiment
+  extend: default
+  system_prompt_path: ./autoresearch-experiment.md
+  exclude_tools:
+    - "kimi_cli.tools.web:SearchWeb"            # web access is background-researcher-only
+    - "kimi_cli.tools.web:FetchURL"
+    - "kimi_cli.tools.ask_user:AskUserQuestion"
+    - "kimi_cli.tools.todo:SetTodoList"
+    - "kimi_cli.tools.plan:ExitPlanMode"
+    - "kimi_cli.tools.plan.enter:EnterPlanMode"
+    - "kimi_cli.tools.file:ReadMediaFile"
+  subagents:
+    background-researcher:
+      path: ./background-researcher.yaml
+      description: >
+        Setup-time evidence researcher for one run (required once, before the
+        loop). Writes <run_dir>/background.md plus background_retrieval.json:
+        scoped, credibility-stamped tf-* directions that steer fresh candidates.
+    idea-generator:
+      path: ./idea-generator.yaml
+      description: >
+        Once per round: SELECT this round's actions via tools/got_select.py
+        decide (never override op/parents), IDEATE each into a concrete idea,
+        and persist one ledger record per action. Returns a compact receipt.
+    candidate-writer:
+      path: ./candidate-writer.yaml
+      description: >
+        Implement exactly one candidate's train.py from its persisted ledger
+        record. No shell, no evaluation, no tuning — file output only.
+    tunable-contract-extractor:
+      path: ./tunable-contract-extractor.yaml
+      description: >
+        Step 0+1 for one candidate: behavior-preserving PARAM_SCHEMA/make_model
+        refactor, K warm configs + SEARCH_SPACE, eval-K with inline crash
+        diagnosis, records best_warm_score. Never deep-tunes.
+    tuner-orchestrator:
+      path: ./tuner-orchestrator.yaml
+      description: >
+        Once per round, on the run dir (not a candidate): the deterministic
+        promotion gate selects at most one candidate and deep-tunes it in
+        place (Phase C + apply + ledger). A null selection is a valid no-op.
+    experience-extractor:
+      path: ./experience-extractor.yaml
+      description: >
+        Every 5 rounds: regenerate the ledger's global experience block
+        (levers, lessons, per-direction run-local evidence) from the DAG.
+        Never edits records or background.md.

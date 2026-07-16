@@ -15,6 +15,8 @@ queue/
 
 # Codex per-session generated agent prompt
 AGENTS.md
+# ...except the repo root one, which documents the kimi-cli runtime (.kimi/)
+!/AGENTS.md
 
 # Claude Code local-only settings
 .claude/settings.local.json

@@ -1,0 +1,29 @@
+# Claude-side equivalent: .claude/agents/background-researcher.md
+# (tools: WebSearch, WebFetch, Read, Write, Glob, Bash — the only web-capable agent).
+# Extends default directly (not _common.yaml) to keep the web tools.
+# Can run standalone as the main thread: kimi --agent-file .kimi/agents/background-researcher.yaml
+version: 1
+agent:
+  name: background-researcher
+  extend: default
+  system_prompt_path: ./background-researcher.md
+  allowed_tools:
+    - "kimi_cli.tools.shell:Shell"
+    - "kimi_cli.tools.file:ReadFile"
+    - "kimi_cli.tools.file:WriteFile"
+    - "kimi_cli.tools.file:Glob"
+    - "kimi_cli.tools.file:Grep"
+    - "kimi_cli.tools.web:SearchWeb"
+    - "kimi_cli.tools.web:FetchURL"
+  exclude_tools:
+    - "kimi_cli.tools.agent:Agent"
+    - "kimi_cli.tools.ask_user:AskUserQuestion"
+    - "kimi_cli.tools.todo:SetTodoList"
+    - "kimi_cli.tools.plan:ExitPlanMode"
+    - "kimi_cli.tools.plan.enter:EnterPlanMode"
+    - "kimi_cli.tools.file:ReadMediaFile"
+    - "kimi_cli.tools.file:StrReplaceFile"
+    - "kimi_cli.tools.background:TaskList"
+    - "kimi_cli.tools.background:TaskOutput"
+    - "kimi_cli.tools.background:TaskStop"
+  subagents:
