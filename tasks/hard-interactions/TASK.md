@@ -90,6 +90,7 @@ scripts call `evaluate_config`. To evaluate a candidate by hand:
 
 ```bash
 uv --directory tasks/hard-interactions sync
+# Requires an existing <run_id> ledger record; also derives _candidate_brief.json.
 python tools/new_candidate.py hard-interactions <tag> <run_id> --skip-entrypoint
 # after candidate-writer + tunable-contract-extractor produce train.py + _warm_configs.json:
 uv --directory tasks/hard-interactions run python tools/tuners/warmstart_eval.py \

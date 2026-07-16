@@ -78,13 +78,26 @@ would remove the independent contexts required by this project.
   `candidate-writer`, `tunable-contract-extractor`, and `tuner-orchestrator`
   (crashes are diagnosed inline via the `crash-diagnosis` skill). Use one
   instance per concurrent experiment.
-- `background-researcher` — external-knowledge scout for one task, run **once at
-  setup, before the loop (required)** — the only setup step. Surveys the
-  literature/web for techniques that fit the task (within `allow_dependencies`)
-  and writes `<run_dir>/background.md` with a **`tf-*`-tagged try-first list** that
-  every `idea-generator` `fresh` candidate draws from, steering the search beyond
-  the ledger's own history. Web-grounded, read-only on task/ledger, runs no
-  experiments.
+- `background-researcher` — setup-time evidence researcher for one task, used
+  **before the loop (required)** as the only setup step. It plans
+  multiple research questions, uses a frozen local corpus for the reproducible
+  condition or explicitly selected DeepXiv/Jina open-world modules, gracefully
+  tolerates backend failure, deduplicates and balances candidates across queries, progressively
+  reads them in explicit grounding/novelty budget lanes, and looks for
+  counterevidence. It writes `<run_dir>/background.md` plus the visited-source
+  trace `<run_dir>/background_retrieval.json`. Sources, structured `g-*` negative
+  guidance, and stable `tf-*` hypotheses use the same typed scope axes. The
+  contract derives containment mechanically: only directly matched guidance may
+  change a direction's priority or eligibility, while free-text Pitfalls are
+  nonbinding. Weak or contested negatives can only caution; binding guidance
+  needs directly scoped primary empirical evidence and retains an out-of-scope
+  `scope_probe` instead of erasing adjacent mechanisms. Each direction also carries a separate
+  literature-credibility stamp, required local comparisons, reopening
+  conditions, and traceable sources; an arXiv upload is not validation. The
+  registry is checked by `tools/background_contract.py` and steers every `fresh`
+  candidate.
+  See `docs/background-research.md` for the sibling-project audit, evidence
+  semantics, fallback behavior, and validation contract.
 - `idea-generator` — produce the next generation in two steps: **SELECT** — run
   `got_select decide` (deterministic graph search) for this round's actions (a
   bootstrap/stall `fresh`, or ≤B `improve`/`crossover`); **IDEATE** — turn each
@@ -93,10 +106,14 @@ would remove the independent contexts required by this project.
   `background.md` to decide *what* each selected action becomes. Replaces the old
   `idea-proposer` skill.
 - `experience-extractor` — periodically (every N generations) distill global
-  experience (promising regions / dead-ends / per-dataset bottlenecks) from
-  the ledger records into the `experience` block via
-  `tools/ledger.py set-experience`. Reads many records, emits a compact
-  regenerated summary.
+  experience from the ledger into the `experience` block. Besides levers,
+  dead-ends, and bottlenecks, it joins candidate ancestry to `background.md` by
+  stable `tf-*` id and assigns each direction a separate run-local status:
+  `untested`, `inconclusive`, `supported_here`, `contradicted_here`, or `mixed`.
+  Decisive statuses require direct coverage of the direction's named comparators;
+  missing arms remain `inconclusive`. It never rewrites the external literature
+  stamp; the direction evidence is validated against the actual DAG before
+  `tools/ledger.py set-experience`.
 - `candidate-writer` — implement one candidate's `train.py`. Receives **just
   the target candidate dir**; reads its own ledger record (added by
   `idea-generator`) for the full `idea` + `source_run_ids`, derives
@@ -149,6 +166,8 @@ environment.
 ```bash
 python tools/validate_skills.py
 python tools/validate_tasks.py
+python tools/validate_background.py
+python tools/validate_search_backends.py
 ```
 
 ## Adding A Task

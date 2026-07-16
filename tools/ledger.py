@@ -30,6 +30,7 @@ the tuning block; `record-run` fills the run result and computes `status`.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import sys
@@ -273,6 +274,7 @@ def _write_loop_state(ledger_path: Path, data: dict, config: dict) -> Path:
     records = data["records"]
     last = records[-1] if records else {}
     best = _best_kept_record(data)
+    phase, stop_condition = _run_phase(ledger_path, data)
 
     best_run_id = best.get("run_id", "none") if best else "none"
     best_dir = (
@@ -282,7 +284,7 @@ def _write_loop_state(ledger_path: Path, data: dict, config: dict) -> Path:
     lines = [
         f"task: {task_name}",
         f"tag: {tag}",
-        "phase: running",
+        f"phase: {phase}",
         f"next_run_id: {_next_run_id(data)}",
         f"best_run_id: {best_run_id}",
         f"best_score: {_fmt_score(best.get('final_best_score')) if best else 'none'}",
@@ -291,7 +293,7 @@ def _write_loop_state(ledger_path: Path, data: dict, config: dict) -> Path:
         f"last_run_id: {last.get('run_id', 'none')}",
         f"last_status: {last.get('status', 'none')}",
         f"last_score: {_fmt_score(last.get('final_best_score'))}",
-        "active_stop_condition: none",
+        f"active_stop_condition: {stop_condition}",
         f"notes: {last.get('description') or 'none'}",
     ]
     state_path = ledger_path.parent / "loop_state.md"
@@ -477,6 +479,36 @@ def _evaluations_done(data: dict) -> dict:
     return {"evaluations_done": total, "n_candidates": len(records), "per_candidate": per}
 
 
+def _framework_budget(ledger_path: Path) -> Optional[int]:
+    """Read the run-local global evaluation budget, if one is configured."""
+    path = ledger_path.parent / "framework_cfg.json"
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text()).get("max_evaluations")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _run_phase(ledger_path: Path, data: dict) -> tuple[str, str]:
+    """Return the truthful derived phase and stop condition for a run."""
+    state = data.get("run_state") if isinstance(data.get("run_state"), dict) else {}
+    budget = _framework_budget(ledger_path)
+    if budget is None:
+        saved_budget = state.get("evaluation_budget")
+        if isinstance(saved_budget, int) and not isinstance(saved_budget, bool):
+            budget = saved_budget
+    attempted = _evaluations_done(data)["evaluations_done"]
+    if state.get("phase") == "blocked":
+        return "blocked", str(state.get("active_stop_condition") or "unspecified_blocker")
+    if budget is not None and attempted >= budget:
+        return "completed", "evaluation_budget_reached"
+    # Completion cannot survive new evidence that the configured budget has not
+    # been reached. This prevents premature success claims.
+    return "running", "none"
+
+
 def cmd_evaluations(args) -> int:
     data = _load_ledger(Path(args.ledger))
     result = _evaluations_done(data)
@@ -485,6 +517,76 @@ def cmd_evaluations(args) -> int:
         result["remaining"] = max(0, args.budget - result["evaluations_done"])
         result["reached"] = result["evaluations_done"] >= args.budget
     print(json.dumps(result))
+    return 0
+
+
+def cmd_brief(args) -> int:
+    """Emit the small coordinator view; omit records and large experience text."""
+    ledger_path = Path(args.ledger)
+    data = _load_ledger(ledger_path)
+    records = data.get("records", [])
+    best = _best_kept_record(data)
+    last = records[-1] if records else None
+    evals = _evaluations_done(data)
+    attempted = evals["evaluations_done"]
+    budget = args.budget if args.budget is not None else _framework_budget(ledger_path)
+    phase, stop_condition = _run_phase(ledger_path, data)
+    if budget is not None and attempted >= budget and phase != "blocked":
+        phase, stop_condition = "completed", "evaluation_budget_reached"
+    experience = data.get("experience") if isinstance(data.get("experience"), dict) else {}
+    result = {
+        "task": data.get("task"), "tag": data.get("tag"), "metric": data.get("metric"),
+        "phase": phase, "active_stop_condition": stop_condition,
+        "next_run_id": _next_run_id(data), "n_candidates": len(records),
+        "status_counts": dict(Counter(r.get("status") for r in records)),
+        "op_counts": dict(Counter(r.get("op") for r in records)),
+        "pending_run_ids": [r.get("run_id") for r in records if r.get("status") == "pending"],
+        "best": None if best is None else {
+            "run_id": best.get("run_id"), "score": best.get("final_best_score"),
+            "candidate_name": best.get("candidate_name"),
+        },
+        "last": None if last is None else {
+            "run_id": last.get("run_id"), "status": last.get("status"),
+            "score": last.get("final_best_score"),
+        },
+        "evaluations_attempted": attempted,
+        "budget": budget,
+        "remaining": None if budget is None else max(0, budget - attempted),
+        "reached": None if budget is None else attempted >= budget,
+        "experience_updated_at_run": experience.get("updated_at_run"),
+        "experience_generation": experience.get("generation"),
+    }
+    print(json.dumps(result, separators=(",", ":")))
+    return 0
+
+
+def cmd_set_phase(args) -> int:
+    """Persist a blocked/running state; completion is budget-derived only."""
+    ledger_path = Path(args.ledger)
+    data = _load_ledger(ledger_path)
+    if args.phase == "completed":
+        budget = args.budget if args.budget is not None else _framework_budget(ledger_path)
+        attempted = _evaluations_done(data)["evaluations_done"]
+        if budget is None or attempted < budget:
+            raise SystemExit(
+                "cannot mark completed before a configured evaluation budget is reached "
+                f"(attempted={attempted}, budget={budget})"
+            )
+    if args.phase == "blocked" and not args.stop_condition:
+        raise SystemExit("--stop-condition is required for phase=blocked")
+    data["run_state"] = {
+        "phase": args.phase,
+        "active_stop_condition": args.stop_condition or (
+            "evaluation_budget_reached" if args.phase == "completed" else "none"
+        ),
+    }
+    if args.phase == "completed" and budget is not None:
+        data["run_state"]["evaluation_budget"] = budget
+    _save_ledger(ledger_path, data)
+    task_name = args.task or infer_task_name([ledger_path]) or data.get("task")
+    config = load_task_config(task_name) if task_name else {}
+    _write_loop_state(ledger_path, data, config)
+    print(json.dumps(data["run_state"], separators=(",", ":")))
     return 0
 
 
@@ -589,6 +691,18 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--budget", type=int, default=None,
                     help="optional max_evaluations; adds remaining/reached to the output")
     ev.set_defaults(func=cmd_evaluations)
+
+    brief = sub.add_parser("brief", parents=[common],
+                           help="Print the compact coordinator view without full records")
+    brief.add_argument("--budget", type=int, default=None)
+    brief.set_defaults(func=cmd_brief)
+
+    phase = sub.add_parser("set-phase", parents=[common])
+    phase.add_argument("--phase", required=True, choices=["running", "blocked", "completed"])
+    phase.add_argument("--stop-condition")
+    phase.add_argument("--budget", type=int, default=None,
+                       help="explicit evaluation budget when framework_cfg.json has none")
+    phase.set_defaults(func=cmd_set_phase)
 
     state = sub.add_parser("loop-state", parents=[common])
     state.set_defaults(func=cmd_loop_state)

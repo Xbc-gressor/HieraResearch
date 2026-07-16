@@ -133,8 +133,9 @@ separate official run). To evaluate a candidate by hand:
 # 1. Sync the task env (once).
 uv --directory tasks/tabular-model-search sync
 
-# 2. Create the candidate directory — copies prepare.py only; candidate-writer
-#    writes train.py (do NOT pre-copy a baseline train.py).
+# 2. After ledger.py add-record has persisted <run_id>, create the candidate
+#    directory. This copies prepare.py and derives _candidate_brief.json;
+#    candidate-writer writes train.py (do NOT pre-copy a baseline train.py).
 python tools/new_candidate.py tabular-model-search <tag> <run_id> --skip-entrypoint
 
 # 3. Once train.py + _warm_configs.json exist (candidate-writer +

@@ -92,8 +92,8 @@ tag: <你的运行标签>
 ```text
 读取 program.md / task.toml / TASK.md
         ↓
-background-researcher: 外部知识侦察 → <run_dir>/background.md
-    (设置阶段，必需一次；产生 tf-* try-first 优先级列表)
+background-researcher: 多后端知识侦察 → background.md + background_retrieval.json
+    (设置阶段，必需一次；产生带研究范围、迁移边界和 scope-probe 的 tf-* 优先级列表)
         ↓
 (每 N 轮) experience-extractor: 提炼全局经验 → ledger.json experience 块
         ↓
@@ -102,9 +102,9 @@ idea-generator:
             (bootstrap/stall → fresh; 否则在前沿上 PUCB → ≤B improve/crossover)
     IDEATE: 将每个行动转化为具体想法 → ledger.py add-record --op ...
         ↓
-对每个行动: tools/new_candidate.py --skip-entrypoint → 创建候选目录(仅 prepare.py)
+对每个行动: tools/new_candidate.py --skip-entrypoint → 创建候选目录(prepare.py + 精简 _candidate_brief.json)
         ↓
-candidate-writer: 读取账本记录 (idea + source_run_ids) → 写 candidate/train.py
+candidate-writer: 读取候选简报 (idea + source_run_ids；无 shell 权限) → 写 candidate/train.py
         ↓
 step 0+1: tunable-contract-extractor
     ① 制作 PARAM_SCHEMA + 重构 make_model
@@ -188,12 +188,23 @@ LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
 
 ### 5.2 background-researcher
 
-外部知识侦察员，**在设置期间必需一次**（在循环之前；唯一的设置步骤）。读取 `TASK.md` / `task.toml`（优化目标、数据特征、`allow_dependencies` 约束），使用 WebSearch/WebFetch 研究适合此任务的技术（模型家族、特征处理、集成、超参数范围、陷阱），产生 `<run_dir>/background.md`——一个**带 ID 的优先级列表（`tf-01`、`tf-02`、...）**。
+证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置步骤）。读取 `TASK.md` / `task.toml`（优化目标、数据特征、`allow_dependencies` 约束），先分解多个研究问题。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend；DeepXiv 是显式选择的 open-world 学术条件，Jina 仅作为显式 live-web fallback/ablation。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序，再轮询补齐各 query 的覆盖。随后按 grounding lane（6000 tokens）渐进阅读，并同时寻找反证、复现和官方工件。它产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`。
+
+来源、结构化的负面指导 `g-*` 与每个 `tf-*` 方向使用同一组类型化范围轴：模型家族、数据情境、指标、干预机制、评估协议。`tools/background_contract.py` 根据这些轴机械地计算包含关系；智能体不再自行填写“适用/不适用”。只有范围直接覆盖方向的结构化指导才能改变优先级或资格；`unverified` / `contested` 负面证据只能提示，不能降级或排除。Markdown 中未注册的负面 Pitfall 会使合约校验失败，也永远不是选择输入。每条有约束力的负面指导必须由范围直接匹配、未撤回的主要实证来源支持，并保留一个范围外 `scope_probe`，因此一个学习器与全局干预上的结论不能消灭范围外的邻近集成机制。
+
+每个 `tf-*` 方向同时记录具体 claim、可检验预期、必要的本地比较、重开条件、来源及其 `supports` / `contradicts` / `context` 关系，以及独立的文献可信度标签：`unverified` / `preliminary` / `corroborated` / `replicated` / `contested`。标签是证据印章而非真值；单独上传到 arXiv 不视为验证。`tools/background_contract.py validate` 会检查 ID 连续性、来源引用、来源→指导范围包含关系及排除证据门槛，并要求 `replicated` 有独立复现证据、`contested` 有明确反证。
+
+Direction registry 中的每个来源必须在 retrieval manifest 中存在成功的 grounding visit；只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude `WebSearch` / `WebFetch` 仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
+
+冻结语料的约定路径是 `tasks/<task>/background_corpus.json`；普通 open-world 开发可不提供，但 frozen / network-disabled 评测必须提供该文件或显式等价路径。
+
+设计来源、兄弟项目审计、fallback 和双轴语义详见 `docs/background-research.md`。
 
 - 来自 `idea-generator` 的每个 `fresh` 候选方案从此列表消耗一个未消耗的方向（`source_run_ids` 持有 `tf-*` 标签），引导搜索超越账本自身的历史
-- 网络为基础（每个声明可追溯；无虚构论文）；对任务/账本只读；不运行实验
+- `experience-extractor` 用同一 `tf-*` ID 把运行证据接回外部假设，但把运行内状态单独存放在 ledger experience 中，不改写 `background.md` 的文献可信度
+- 证据为基础（每个声明可追溯；无虚构论文）；对任务/账本只读；不运行实验
 - 如果搜索停滞，可以重新运行以注入新的外部方向
-- `model: opus`（一次性 + 指导整个搜索；优先考虑质量）
+- `model: inherit`（继承调用会话的模型配置）
 
 ### 5.3 idea-generator
 
@@ -206,7 +217,9 @@ LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
 
 ### 5.4 experience-extractor
 
-每 N 轮运行一次（非每个候选方案），从 `ledger.json` 提炼**全局经验**——有前景的区域、死胡同、每数据集瓶颈——使用 `tools/ledger.py set-experience` 在账本顶层重新生成 `experience` 块。读取许多记录，产生紧凑摘要；`idea-generator` 在下次 IDEATE 期间读取它。
+每 N 轮运行一次（非每个候选方案），从 `ledger.json` 提炼**全局经验**——有前景的区域、死胡同、每数据集瓶颈和 change→Δ lever——并通过 `tools/background_contract.py lineage` 将候选血统连接到 `background.md` 的 `tf-*` 假设。它使用 `tools/ledger.py set-experience` 在账本顶层重新生成 `experience` 块；`idea-generator` 在下次 IDEATE 期间读取它。
+
+`direction_evidence` 为每个 `tf-*` 保存运行内状态 `untested` / `inconclusive` / `supported_here` / `contradicted_here` / `mixed`，并附直接运行、单源后代、组合后代和证据边。v2 还记录 `claim_coverage`、实际比较的 run ids 与缺失比较臂；没有直接覆盖 registry 指定的比较项时不能写支持/反驳结论。文献可信度与运行内状态是两个并行维度：前者描述外部证据，后者只描述当前任务/运行。写入前由 `background_contract.py validate-experience` 对照真实 DAG 校验，避免把 crossover 的成功错误归因给所有祖先方向；experience-extractor 不编辑 `background.md`。
 
 ### 5.5 candidate-writer
 
@@ -294,7 +307,7 @@ python tools/new_candidate.py <task-name> <tag> <run_id> --from-candidate <best_
 ```
 
 - 默认：复制 `prepare.py` 和任务根的 `train.py`（提供的基线）
-- `--skip-entrypoint`：仅复制 `prepare.py`；`train.py` 稍后由 candidate-writer 编写（`fresh` 和所有 `improve`/`crossover` 候选方案的标准）
+- `--skip-entrypoint`：要求对应账本记录已存在，复制 `prepare.py` 并从该记录生成精简 `_candidate_brief.json`；`train.py` 稍后由 candidate-writer 编写（`fresh` 和所有 `improve`/`crossover` 候选方案的标准）
 - `--from-candidate`：从历史候选复制 `train.py`（兼容性保留；正常流程不再使用——`improve`/`crossover` 候选方案引用代码由 candidate-writer 自己从 `source_run_ids` 派生，而非预复制）
 
 ### 7.2 ledger.py
@@ -335,7 +348,29 @@ runs/<task-name>/<tag>/loop_state.md
 - `got_cdag.py`：结构互补性 `c̃_dag`——开发 DAG 上的影响扩散向量 + 余弦
 - `got_select.py`：SELECT 层。`idea-generator` 调用 `python tools/got_select.py decide --ledger <path>` 获取本轮的行动：bootstrap/stall fresh 规则，或在前沿叶子上 PUCB（`Q=geomean(V)·(1+c̃_dag)`，`P=softmax(ḡ_op/τ)`）采样 ≤B `improve`/`crossover`。所有全局派生量从记录重新计算；无持久状态。
 
-### 7.5 validate_skills.py
+### 7.5 background_contract.py
+
+`background.md` 与运行证据之间的确定性合约层：
+
+- `validate`：检查 Direction registry JSON、连续稳定的 `tf-*` ID、来源引用、文献可信度、五轴研究范围、来源→负面指导的直接包含、排除证据门槛、每条有约束力指导的范围外 scope-probe、grounding visit，以及 ledger 中是否存在未知方向
+- `preflight`：只向 orchestrator 返回背景维护动作；耗尽的 legacy v1 registry 返回 `refresh_background`，该动作不会进入 idea-generator 的状态接口
+- `lineage`：沿 DAG 传播每个候选的起源 `tf-*` 集合，并区分直接 fresh、单源后代和多源组合后代
+- `validate-experience`：检查 experience 中每个方向的双轴标签、claim coverage、必需比较项和证据 run ids 是否与 background + DAG 一致；缺少比较臂时不能写 `supported_here`/`contradicted_here`
+
+`python tools/validate_background.py` 使用合成 DAG 回归这些合约。
+
+### 7.6 search_backends.py
+
+受 Arbor 检索层启发的轻量适配器，但不导入 Arbor runtime：
+
+- 本地 frozen-corpus backend 是可复现条件；DeepXiv / Jina 必须显式启用且单个失败不阻塞其他结果
+- canonical work/URL 去重，统计不同 query 与 backend 的支持数，并平衡每个 query 的候选覆盖
+- `visit` 渐进阅读并自动写 visit receipt；Claude WebFetch 可用 `record-visit` 接入
+- 独立的 `grounding=6000` 与 `novelty=2048` token lane
+- 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash 和访问内容 hash；token 永不进入运行产物
+- `python tools/validate_search_backends.py` 提供完全离线的回归检查
+
+### 7.7 validate_skills.py
 
 检查 `.claude/skills/` 结构和元数据。
 
@@ -343,7 +378,7 @@ runs/<task-name>/<tag>/loop_state.md
 python tools/validate_skills.py
 ```
 
-### 7.6 validate_tasks.py
+### 7.8 validate_tasks.py
 
 检查 `tasks/` 任务包结构和 `task.toml`。
 
@@ -351,7 +386,7 @@ python tools/validate_skills.py
 python tools/validate_tasks.py
 ```
 
-### 7.7 tools/tuners/
+### 7.9 tools/tuners/
 
 调优脚本：
 
@@ -507,5 +542,3 @@ runs/<task>/<tag>/framework_cfg.json
 **优先级**：显式 CLI 标志 > `framework_cfg.json` > 代码默认值
 
 该文件被 git 忽略（`runs/` 仅本地）。完整的带注释参考（所有可用键及其语义）见 `tasks/framework_cfg.example.json`。
-
-

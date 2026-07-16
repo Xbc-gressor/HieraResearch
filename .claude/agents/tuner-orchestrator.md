@@ -1,27 +1,10 @@
 ---
 name: tuner-orchestrator
 description: |
-  Decoupled deep-tuning step (design §15) — run once per loop round, NOT per candidate. Every idea is proposed and evaluated at step 0+1 only (warm-start best-of-K); the expensive step-2 search is decoupled: this agent reads the WHOLE population and picks ONE candidate to deep-tune in place. It first runs `tools/tuners/tune_tools.py select-candidate` (the promotion gate + greedy `best_warm_score` selection: population ≥ N_min and the best untuned candidate in the top (100−P)% — replaces the old per-candidate Phase B), and if a candidate is eligible, runs Phase C (one method by dimensionality via `select-method`: grid ≤ 2 / **bo (multivariate TPE) for ≥ 3** — cmaes dropped as the high-dim default per the HPO benchmark, step-1 warm trials injected as priors) + the Apply step (`select-best` → `apply_base_params` into `BASE_PARAMS`) + records the tuned score **in place** via `record-run` (final_best_score + status) and the tuning fields via `set-tuning --mark-tuned` (`tune: true`). There is **no separate official run** — tuning used the same one global `config → score` function, so the tuned best IS the candidate's new score. If no candidate is eligible (early, or the top tier is already tuned), it is a clean no-op.
-
-  Examples:
-
-  <example>
-  Context: a loop round just generated and ran two new ideas at step 0+1; time for the decoupled tuning step.
-  user: "这一轮的调优"
-  assistant: "I'll spawn tuner-orchestrator on the run dir. It runs `tune_tools.py select-candidate` — population is 14 and the best untuned candidate 009 (best_warm_score 0.12) is at percentile 86 ≥ 80, so it's chosen. n_dims is 5 → BO, 30 trials with 009's step-1 warm trials as Optuna priors; select-best + apply_base_params write the tuned config into 009's BASE_PARAMS, then record-run writes the tuned score (final_best_score) + status and set-tuning --mark-tuned records the tuning fields. The graph reads 009's lower score next round — no re-run."
-  <commentary>
-  Selection is over the whole population (not a passed candidate); the gate lives in select-candidate. One candidate tuned per round, in place.
-  </commentary>
-  </example>
-
-  <example>
-  Context: only 6 candidates exist so far (below N_min), or the whole top-20% is already tuned.
-  user: "这一轮的调优"
-  assistant: "select-candidate returns run_id=null (population 6 < n_min 10, or best untuned below the top-20% gate). tuner-orchestrator reports tuned_run_id=none and stops — a valid no-op. The loop keeps generating; tuning resumes when a new top-tier idea appears."
-  <commentary>
-  Decoupled tuning is gated: breadth first early, and it stops once the promising tier is realized. No-op is expected and correct.
-  </commentary>
-  </example>
+  Run the deterministic population promotion gate once per round, deep-tune at
+  most its one selected candidate, apply the best config, and persist the tuned
+  score/metadata. A null selection is a valid no-op. Never warm-start, select by
+  hand, or tune a second candidate.
 tools: Read, Write, Edit, Bash, Glob
 model: inherit
 color: pink
@@ -254,3 +237,5 @@ fields are `n/a`/`0` and `applied` is `false`.
 - **Cleanup.** Delete `<candidate_dir>/_final_params.json` after applying.
   `_warm_configs.json` / `_search_space.json` belong to step 0/1 — leave them.
   `tune_report.json` is durable output and stays.
+- **Compact return.** Never paste trials, configs, reports, tracebacks, source,
+  diffs, or command output; return only the receipt fields above.

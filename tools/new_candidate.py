@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import shutil
 from pathlib import Path
@@ -15,6 +16,7 @@ from validate_tasks import ROOT, parse_task_toml
 DEFAULT_COPY_FILES = ["prepare.py", "train.py"]
 DEFAULT_ENTRYPOINT = "train.py"
 DEFAULT_TEMPLATE = "runs/{task_name}/{tag}/candidates/{run_id}"
+BRIEF_FILENAME = "_candidate_brief.json"
 
 
 def candidate_path(template: str, task_name: str, tag: str, run_id: str) -> Path:
@@ -37,6 +39,28 @@ def resolve_source_candidate(
     return candidate_path(template, task_name, tag, from_candidate)
 
 
+def candidate_brief(ledger_path: Path, run_id: str) -> dict | None:
+    """Return the immutable implementation fields for one persisted record."""
+    if not ledger_path.is_file():
+        return None
+    try:
+        data = json.loads(ledger_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    for record in data.get("records", []):
+        if record.get("run_id") == run_id:
+            return {
+                "schema_version": 1,
+                "run_id": run_id,
+                "op": record.get("op"),
+                "idea": record.get("idea"),
+                "change": record.get("change"),
+                "source_run_ids": record.get("source_run_ids") or [],
+                "candidate_name": record.get("candidate_name"),
+            }
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("task_name", help="Task folder name under tasks/.")
@@ -50,8 +74,9 @@ def main() -> int:
         "--skip-entrypoint",
         action="store_true",
         help=(
-            "Do not copy the entrypoint file; candidate-writer writes it "
-            "later. Mutually exclusive with --from-candidate."
+            "Do not copy the entrypoint; require its ledger record and write "
+            f"{BRIEF_FILENAME} for candidate-writer. Mutually exclusive with "
+            "--from-candidate."
         ),
     )
     parser.add_argument(
@@ -88,6 +113,13 @@ def main() -> int:
     if args.skip_entrypoint:
         copy_files = [item for item in copy_files if item != entrypoint]
 
+    ledger_path = ROOT / "runs" / args.task_name / args.tag / "ledger.json"
+    brief = candidate_brief(ledger_path, args.run_id) if args.skip_entrypoint else None
+    if args.skip_entrypoint and brief is None:
+        parser.error(
+            f"--skip-entrypoint requires ledger record {args.run_id}: {ledger_path}"
+        )
+
     dest = candidate_path(template, args.task_name, args.tag, args.run_id)
     if dest.exists() and any(dest.iterdir()) and not args.force:
         parser.error(f"candidate directory already exists and is not empty: {dest}")
@@ -116,10 +148,16 @@ def main() -> int:
             parser.error(f"target file already exists: {target}")
         shutil.copy2(source, target)
 
+    brief_path = dest / BRIEF_FILENAME
+    if brief is not None and not args.dry_run:
+        brief_path.write_text(json.dumps(brief, indent=2) + "\n")
+
     entrypoint_path = dest / entrypoint
     task_project = config.get("env", {}).get("project", f"tasks/{args.task_name}")
     print(f"candidate_dir: {dest.relative_to(ROOT)}")
     print(f"entrypoint:    {entrypoint_path.relative_to(ROOT)}")
+    if brief is not None:
+        print(f"brief:         {brief_path.relative_to(ROOT)}")
     print(
         "run_command:   "
         f"uv --directory {shlex.quote(str(task_project))} "

@@ -1,27 +1,10 @@
 ---
 name: tunable-contract-extractor
 description: |
-  Make one candidate `train.py` tunable AND evaluate its warm-start configs — the step-0 + step-1 agent. Three segments in one invocation: ① behavior-preservingly refactor construction into `make_model(dataset, params)` and declare `PARAM_SCHEMA` (kinds only); ② run `lineage-evidence`, propose in one shot {K warm configs (default 5; per-run override via `framework_cfg.json` tuner.K) + a `SEARCH_SPACE`}, run a code↔config consistency pre-check, then self-run `check-search-space` + `apply_search_space` to finalize `SEARCH_SPACE`; ③ evaluate the first **K_eval** (default 3, `framework_cfg.json` tuner.K_eval, via `--k-eval`) of the K configs with `warmstart_eval.py` (sequential, resumable, stop-on-crash), diagnosing every crash inline via the `crash-diagnosis` skill — config-invalid → fix the config, code-incompatible → minimally fix `train.py` (preferred, ≤10 fixes) — until those score (writes `BASE_PARAMS` = best-of-K_eval + `phase_a`) or the candidate is abandoned. The remaining K−K_eval configs are **deferred** (stored params-only; the decoupled deep-tuner evaluates them first, only if this candidate is promoted). It RUNS the candidate (segment ③ — the one global `config → score` function, there is no separate official run) and records its own verdict to the ledger (on success: `record-run` writes the score+status and `set-tuning` the warm metadata, NO `--mark-tuned`; on abandon: `record-run --status crash`). Spawned for every new candidate (`fresh`/`improve`/`crossover` alike) after `candidate-writer` returns. Deep-tuning (step 2) is decoupled — `tuner-orchestrator` selects one candidate per round to tune — so every candidate stops at step 0+1 here.
-
-  Examples:
-
-  <example>
-  Context: candidate-writer just returned candidate 007's train.py; its idea crossed parents 003 and 005.
-  user: "007 写好了，做 step 0+1"
-  assistant: "I'll spawn tunable-contract-extractor on runs/.../candidates/007/train.py with source_run_ids=003,005. ① refactor make_model + PARAM_SCHEMA; ② lineage-evidence on 003,005 → propose 5 configs + SEARCH_SPACE → consistency pre-check → check-search-space + apply_search_space; ③ run warmstart_eval, diagnose each crash via the crash-diagnosis skill (fix config or code), until all 5 score → BASE_PARAMS = best-of-K′ + phase_a, then record-run (score+status) + set-tuning (warm metadata, no --mark-tuned). The decoupled tuner-orchestrator may later select it."
-  <commentary>
-  One invocation does step 0 (contract + propose) AND step 1 (eval-K with inline crash diagnosis). It writes BASE_PARAMS and runs the candidate.
-  </commentary>
-  </example>
-
-  <example>
-  Context: idea-generator recorded a fresh candidate 001 (op fresh, source_run_ids ["tf-03"] — a try-first direction, no parent).
-  user: "给 fresh 001 做 step 0+1"
-  assistant: "I'll spawn tunable-contract-extractor on 001's train.py with source_run_ids=tf-03 (a direction tag, not a parent → no lineage) — it proposes the 5 configs from PARAM_SCHEMA + dataset knowledge alone, evaluates them (fixing any crash inline), writes BASE_PARAMS = best-of-K′. Every candidate stops at step 0+1 here; deep-tuning is decoupled."
-  <commentary>
-  Fresh candidates run step 0+1 too — step 0+1 IS the evaluation, there is no separate official run. A tf-* source tag = no lineage = propose without parents.
-  </commentary>
-  </example>
+  Refactor one candidate into the tunable contract, create and validate its warm
+  configs/search space, evaluate K_eval configs with bounded crash repair, and
+  persist score plus tuning metadata. Never deep-tune or delegate candidate
+  implementation; return only a compact receipt.
 tools: Read, Edit, Write, Bash, Glob, Skill
 model: inherit
 color: yellow
@@ -279,22 +262,19 @@ Return the crashed verdict; the main loop skips this candidate.
 
 ## Output Format
 
-Return exactly this shape — no extra prose:
+Return exactly this compact receipt — no extra prose:
 
 ```text
-train_py:      <absolute path>
-status:        ok | crash
-param_schema:  <one line: key=kind, ...>
-n_dims:        <number of PARAM_SCHEMA keys>
-search_space:  <one line finalized: key=kind(lo..hi|opts), ...>
-best_warm:     <best_warm_score, or "n/a" when status=crash>
-k_survived:    <how many of the K configs scored>
-fixes_applied: <code fixes: N; config fixes: M; "none">
-checks:        lint-schema=ok; check-search-space=ok (expansions: <keys, or none>)
-lineage:       <parents used, or "none (seed/explore)">
-diff:          <unified diff of all train.py edits (segment ① + any segment ③ fixes)>
-notes:         <one paragraph: tunable choices, lineage used, what crashed + how fixed>
-confidence:    <high | medium | low>
+status: <ok | crash>
+train_py: <absolute path>
+ledger_recorded: <yes | no>
+best_warm: <score | n/a>
+trials_completed: <int>
+n_dims: <int>
+checks: lint-schema=<ok|failed>; check-search-space=<ok|failed>
+fixes: code=<N>; config=<M>
+risk_flags: <short flags | none>
+confidence: <high | medium | low>
 ```
 
 ## Boundaries
@@ -313,3 +293,5 @@ confidence:    <high | medium | low>
   candidate dir). Never edit `prepare.py` or any `readonly_files`. If the only way
   to fix a crash is a forbidden edit (readonly file / new dependency), that crash
   is `abandon`.
+- **Compact return.** Never return code, diffs, schemas, configs, search spaces,
+  tracebacks, reports, or command output; these already exist in run-local files.

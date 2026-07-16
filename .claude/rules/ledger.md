@@ -43,7 +43,8 @@ Mutate it only through the helper:
   "task": "<task-name>",
   "tag": "<tag>",
   "metric": "<result.metric>",
-  "records": [ { "<record>" }, ... ]
+  "records": [ { "<record>" }, ... ],
+  "experience": { "<regenerated global interpretation>" }
 }
 ```
 
@@ -77,3 +78,33 @@ unavailable fields are `null`, never omitted.
 `keep` (scores are always lower-is-better; a crash scores `+inf`). The helper is
 the source of truth; if `loop_state.md` disagrees, regenerate it with
 `ledger.py loop-state`.
+
+## Direction evidence
+
+The optional top-level `experience.direction_evidence` array joins external
+hypotheses from `background.md` to run-local evidence using the stable `tf-*`
+tag stored on each fresh root. It keeps two axes separate:
+
+- `literature_credibility` is copied from `background.md` and describes the
+  inspected external evidence (`unverified` / `preliminary` / `corroborated` /
+  `replicated` / `contested`).
+- `run_status` is regenerated from this ledger (`untested` / `inconclusive` /
+  `supported_here` / `contradicted_here` / `mixed`).
+- Registry v2 also stores `claim_coverage` (`none` / `partial` / `direct`),
+  `comparison_runs`, and `missing_comparisons`. A decisive run status requires
+  direct coverage of the direction's named comparisons by at least two scored
+  non-crash runs; otherwise the status remains `inconclusive`.
+
+Registry v2 external guidance and direction scopes use the same typed axes.
+Selection status is derived by `background_contract.py directions`; a prose
+Pitfall cannot block a direction, and scope-mismatched guidance cannot change its
+priority. Direct `supported_here` or `mixed` evidence may reopen an external
+exclusion without rewriting the external credibility stamp.
+
+Before storing a regenerated experience block, validate it with
+`tools/background_contract.py validate-experience`. This checks that every
+direction appears once, the external stamp was not rewritten, and the recorded
+direct, descendant, combination, and comparison run ids match scored DAG
+records. It cannot infer whether free-form candidate code implements the claimed
+arm, so the extractor must check the record semantics. The experience block
+remains advisory; candidate records and scores are the hard truth.

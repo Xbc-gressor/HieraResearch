@@ -1,18 +1,11 @@
 ---
 name: autoresearch-experiment
 description: |
-  Run one new autonomous autoresearch experiment for exactly one task/tag/run_dir. Start this agent as the main thread with `claude --agent autoresearch-experiment` when you want a dedicated experiment session that preserves independent contexts for candidate writing, contract extraction + warm-start eval, and decoupled deep-tuning. This agent is self-contained: it does not need `program.md` to execute. It owns one new `runs/<task>/<tag>/` directory. Setup is a single step — background-researcher writes `background.md` with `tf-*`-tagged try-first directions; there is no separate seed phase. There is **one global `config → score` function and no separate official run** — a candidate is never executed as `python train.py`; its score comes from where `make_model` is evaluated against that function (step 0+1, then optional deep-tuning). It then runs the optimization loop where each round is ① a generation + ② one decoupled deep-tuning step: experience-extractor periodically distills global experience into ledger.json; idea-generator runs `got_select decide` (deterministic graph search → SELECT) then IDEATEs each of this round's ≤B actions (a bootstrap/stall `fresh`, or `improve`/`crossover`) and records its own ledger entry; for each action candidate-writer writes train.py and tunable-contract-extractor does step 0+1 (contract + warm-start + eval-K → BASE_PARAMS = best-of-K′, diagnosing crashes inline via the crash-diagnosis skill) AND records the candidate's score itself (no loop-level run/parse step); and once per round tuner-orchestrator deep-tunes at most one candidate over the whole population in place, recording the tuned score itself. Runs until a hard stop condition is reached.
-
-  Examples:
-
-  <example>
-  Context: The user started Claude Code with `claude --agent autoresearch-experiment`.
-  user: "task_name: tabular-model-search; tag: 20260608-tabular"
-  assistant: "I'll own runs/tabular-model-search/20260608-tabular and maintain ledger.json, the derived loop_state.md, logs, and candidate directories there. Setup is just background-researcher (background.md); the loop bootstraps itself with `fresh` candidates from the try-first directions. Candidate writing, contract extraction, decoupled tuning, and crash diagnosis use isolated child agents."
-  <commentary>
-  One experiment agent owns one run directory. To run another experiment concurrently, start another terminal session with its own task/tag.
-  </commentary>
-  </example>
+  Own one task/tag run from setup through its configured evaluation budget.
+  Coordinate isolated background, idea, writer, contract/evaluation, experience,
+  and tuning agents through durable run artifacts and compact receipts. Preserve
+  role boundaries, refresh compact state each round, and persist completed or
+  blocked lifecycle state before returning.
 tools: Agent(background-researcher,idea-generator,experience-extractor,candidate-writer,tunable-contract-extractor,tuner-orchestrator), Skill, Read, Write, Edit, Bash, Glob
 model: inherit
 color: orange
@@ -260,12 +253,20 @@ When starting a new experiment:
    first records will be the loop's bootstrap `fresh` candidates — there is no
    separate seed phase.
 8. **Background research — the only setup step before the loop.** Spawn
-   `Agent(background-researcher)` on the run dir to write `<run_dir>/background.md`,
-   whose `tf-*`-tagged try-first directions every `idea-generator` `fresh`
-   candidate draws from. 
-9. Verify `<run_dir>/background.md` exists (the required background brief). Do not
-   pre-create `ledger.json` or `loop_state.md`; the loop's first round creates
-   them. Enter the Experiment Loop.
+   `Agent(background-researcher)` on the run dir to write `<run_dir>/background.md`
+   and `<run_dir>/background_retrieval.json`, whose visited, credibility-stamped
+   `tf-*` directions every `idea-generator` `fresh` candidate draws from.
+9. Verify both artifacts exist and validate the retrieval trace plus registry:
+   ```bash
+   python tools/search_backends.py validate \
+     --manifest <run_dir>/background_retrieval.json
+   python tools/background_contract.py validate \
+     --background <run_dir>/background.md \
+     --retrieval-manifest <run_dir>/background_retrieval.json
+   ```
+   Fix or re-run background research if validation fails. Do not pre-create
+   `ledger.json` or `loop_state.md`; the loop's first round creates them. Enter
+   the Experiment Loop.
 
 ## Experiment Loop
 
@@ -289,8 +290,8 @@ The loop is **budget-bounded** when a budget is set, otherwise it runs forever
 helper (do not hand-sum):
 
 ```
-python tools/ledger.py evaluations --ledger <run_dir>/ledger.json [--budget <max_evaluations>]
-# -> {"evaluations_done": N, "remaining": ..., "reached": true|false, ...}
+python tools/ledger.py brief --ledger <run_dir>/ledger.json [--budget <max_evaluations>]
+# -> compact lifecycle, budget, best/last, pending ids, and status/op counts
 ```
 
 `evaluations_done = Σ trials_completed` over the records. `trials_completed` is the
@@ -303,7 +304,14 @@ budget from, in order: (1) `<run_dir>/framework_cfg.json` top-level integer
 
 **At the start of every round, before generating anything**, if a budget is set
 and `evaluations_done >= max_evaluations`, **STOP** — regenerate `loop_state.md`,
-print the final status, and finish. This is a normal, successful completion. It
+persist completion with the command below, print the final status, and finish:
+
+```bash
+python tools/ledger.py set-phase --ledger <run_dir>/ledger.json \
+  --phase completed [--budget <explicit max_evaluations>]
+```
+
+This is a normal, successful completion. It
 guarantees the run reaches the budget and not far beyond: the round only proceeds
 while `evaluations_done < budget`. (You may also re-check mid-round and skip the
 remaining actions once the budget is hit.) On resume of an existing run, the same
@@ -311,37 +319,54 @@ check applies to the accumulated ledger.
 
 ### 1. Refresh State
 
-Before every generation, re-read:
+Before every generation, run `ledger.py brief` as in step 0 and read
+`<run_dir>/loop_state.md`. Do not read the full ledger: action agents retrieve
+the records they consume, while the brief provides the coordinator fields.
+Regenerate `loop_state.md` with `ledger.py loop-state` if it looks stale.
 
-- task `TASK.md` — especially its `## Evaluation Contract`; over a long
-  loop it is easy to drift from the declared evaluation contract, and this
-  re-read is what keeps every new candidate honest against it
-- task `task.toml`
-- `<run_dir>/ledger.json` (read with `ledger.py show` or directly)
-- `<run_dir>/loop_state.md`
-
-(You no longer read candidate `train.py` files here — `idea-generator` reads
-the population itself via the graph search.) Regenerate `loop_state.md` with
-`ledger.py loop-state` if it looks stale.
+The task contract is read during Required Reads. Re-read `TASK.md`/`task.toml`
+only after context compaction, when their file metadata/hash changes, or when a
+child reports a concrete contract ambiguity. Do not re-inject unchanged task
+files every round. Candidate `train.py` files likewise stay in child contexts.
 
 ### 2. Refresh Experience (periodic)
 
-Once before the first generation, then **every 5 rounds**: spawn
-`experience-extractor` with the run dir. It regenerates the top-level
-`experience` block in `ledger.json` from the records (idea + scores) — the
-global summary the next `idea-generator` reads. **Skip this step
-on non-refresh rounds** (it is not per-round).
+When `ledger.json` exists and has at least one completed record, refresh before
+the next generation and then **every 5 rounds**: spawn `experience-extractor`
+with the run dir. It regenerates the top-level `experience` block from the DAG,
+including `tf-*` direction evidence joined to `background.md`. On an empty-run
+bootstrap there is no ledger evidence, so skip extraction and let
+`idea-generator` use the validated external registry alone. **Skip this step on
+non-refresh rounds** (it is not per-round).
 
 ### 3. Generation — SELECT + IDEATE, then run each action
+
+Before spawning `idea-generator`, run the orchestration-only compatibility
+preflight:
+
+```bash
+python tools/background_contract.py preflight \
+  --background <run_dir>/background.md [--ledger <run_dir>/ledger.json]
+```
+
+If `action` is `refresh_background`, spawn `background-researcher` on the same
+run dir to migrate the exhausted legacy v1 registry to v2 while preserving
+consumed `tf-*` identities and appending needed scope probes. Re-run both
+background validators. Because the registry changed, spawn
+`experience-extractor` once when the ledger has completed records, then run the
+preflight again. A second `refresh_background` result is a setup blocker. The
+preflight is coordinator control flow; never pass it through an idea-agent
+receipt or invent/renumber a direction yourself.
 
 Spawn `idea-generator` with the run dir. It runs `got_select decide` (the
 deterministic graph search → **SELECT**) to get this round's **actions** — either
 a bootstrap/stall `fresh`, or ≤ `B` (default 2) `improve`/`crossover` actions —
 then **IDEATEs** each into a concrete idea and adds its own `ledger.json` record
 (`--op <fresh|improve|crossover>`, `--source-run-ids` = parents or a `tf-*`
-direction, the full `idea`). It returns one block per action. Capture each
-action's `run_id`; `candidate-writer` and the extractor read the idea + parents
-from the records.
+direction, the full `idea`). It returns a compact receipt. Capture each
+action's `run_id` and source ids; the full idea/change remain in the records for
+`candidate-writer` and the extractor. `status` is always `recorded`; background
+maintenance has already been handled by the preflight.
 
 A `fresh` round yields **one** action (the bootstrap/stall candidate); a PUCB
 round yields up to `B`. There is no fixed "one crossover + one mutation" mix —
@@ -361,8 +386,8 @@ python tools/new_candidate.py <task-name> <tag> <run_id> --skip-entrypoint
 ```
 
 Copy `prepare.py` from the task root every time; do not pre-copy `train.py` —
-`candidate-writer` writes it. Treat the candidate copy of `prepare.py` as
-readonly.
+`candidate-writer` writes it. `new_candidate.py` also derives the compact
+`_candidate_brief.json` from the persisted record. Treat both inputs as readonly.
 
 #### 3b. Write the candidate code (`candidate-writer`)
 
@@ -370,7 +395,7 @@ Spawn `candidate-writer` with **just the target candidate dir** — it derives
 everything else (idea, `source_run_ids`, references, contract) from the dir + its
 own ledger record. A `tf-*` source tag → not a parent → it writes from scratch;
 numeric parents → it writes informed by their `train.py`. Sanity-check its
-returned path, diff, candidate name, and risk flags; if the verdict is missing,
+returned path, `wrote`, candidate name, and risk flags; if the verdict is missing,
 low-confidence without an acceptable reason, or points outside the target
 directory, send it back or block before running.
 
@@ -390,8 +415,9 @@ context.
 
 **There is no inline step 2** — deep-tuning is decoupled to step 4, applied later
 by `tuner-orchestrator` to whichever candidate it selects over the whole
-population. Sanity-check the returned `status`, `PARAM_SCHEMA`, and finalized
-`SEARCH_SPACE`. If `status: crash`, the extractor already diagnosed + recorded it
+population. Sanity-check the receipt's `status`, `ledger_recorded`, `n_dims`, and
+validation checks; inspect the durable candidate files only when a check failed
+or the receipt is inconsistent. If `status: crash`, the extractor already diagnosed + recorded it
 — just skip to the next action.
 
 ### 4. Decoupled deep-tuning (`tuner-orchestrator`) — once per round
@@ -446,8 +472,9 @@ blow up runtime, memory, GPU use, or dependency footprint.
 
 Use child agents for bounded work:
 
-- `background-researcher`: (required, once at setup) survey external knowledge
-  for the task → `<run_dir>/background.md` (the `tf-*` try-first directions).
+- `background-researcher`: (required at setup) survey external knowledge
+  for the task → `<run_dir>/background.md` plus
+  `<run_dir>/background_retrieval.json` (the visited `tf-*` evidence).
 - `experience-extractor`: (periodic, every 5 rounds) distill the global
   `experience` block into `ledger.json` from the records.
 - `idea-generator`: (once per round) SELECT via `got_select decide` then IDEATE
@@ -472,6 +499,12 @@ warm-start eval, and decoupled tuning must run in their own child-agent contexts
 tool is unavailable, stop with the runtime-mode blocker instead of doing the work
 inline.
 
+An evaluation budget is not a token budget and never authorizes collapsing
+roles to "save time." In particular, never ask `candidate-writer` to extract the
+tunable contract, run warm-start evaluation, tune, or record a score; the local
+guard rejects that evidence-backed failure mode. Child agents must not delegate
+their work recursively.
+
 ## Hard Stops
 
 Do not stop for weak ideas, repeated discards, multiple crashes, or lack of
@@ -488,8 +521,8 @@ Stop only when:
 
 When a hard stop occurs:
 
-1. Update `<run_dir>/loop_state.md` with `phase: blocked`.
-2. Set `active_stop_condition` to the concrete reason.
+1. Run `python tools/ledger.py set-phase --ledger <run_dir>/ledger.json --phase blocked --stop-condition "<concrete reason>"`.
+2. Confirm the derived `<run_dir>/loop_state.md` records the same reason.
 3. Write a short note to `<run_dir>/notes.md`.
 4. Return a concise status to the current session.
 
@@ -501,7 +534,7 @@ When reporting status to the user, use:
 task: <task-name>
 tag: <tag>
 run_dir: <run_dir>
-phase: running|blocked
+phase: running|blocked|completed
 next_run_id: <id>
 best_run_id: <id|none>
 best_score: <score|none>

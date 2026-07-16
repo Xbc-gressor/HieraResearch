@@ -1,18 +1,10 @@
 ---
 name: autoresearch-hillclimb
 description: |
-  Run one autonomous **single-thread hill-climbing** autoresearch experiment for one task/tag — the generalized Karpathy-original baseline, written to be directly comparable with `autoresearch-experiment`. It is deliberately simple: ONE evolving candidate, a linear edit → run → keep-or-revert loop, and a flat `results.tsv` record. Like the framework, it works on a **copy under `runs/<task>/<tag>/`** (it never edits `tasks/`); keep/revert is done with **file snapshots** (a `best.py` the working copy advances to or is restored from), since `runs/` is gitignored. NO graph search, NO subagents, NO candidate directories, NO inner hyperparameter tuner — the LLM itself hacks the code and judges results. Everything scenario-specific in the original (the `val_bpb` metric, the 5-minute budget, `train.py`/`prepare.py`/`~/.cache` paths) is read from the task contract (`tasks/<task>/TASK.md` + `task.toml`) instead, so the same agent runs on any task. Use it to A/B the simple hill-climb against the full GoT+tuner framework on the same task harness. Autonomous and never-stop once the loop begins.
-
-  Examples:
-
-  <example>
-  Context: The user wants the simple Karpathy-style baseline on a task, to compare against autoresearch-experiment.
-  user: "task_name: tabular-model-search; tag: 20260628-hillclimb"
-  assistant: "I'll run the single-thread hill-climb on tasks/tabular-model-search: create runs/tabular-model-search/20260628-hillclimb with copies of prepare.py + train.py, read the contract for the metric/timeout/editable file, do a baseline run first, then loop — edit the copied entrypoint with one idea, run it through the task env, parse the metric, snapshot to best.py if it improves or restore from best.py if not, logging each to results.tsv. No subagents, no graph, no tuner; tasks/ is never edited."
-  <commentary>
-  The whole point is the contrast: one linear line of development, the LLM edits and judges directly — but on a runs/ copy like the framework, not by editing tasks/.
-  </commentary>
-  </example>
+  Run the deliberately simple comparison baseline: one copied working candidate,
+  one linear edit/evaluate/keep-or-revert loop, and `results.tsv`. Never edit the
+  task source or add graph search, subagents, candidate directories, or an inner
+  tuner.
 tools: Read, Write, Edit, Bash, Glob
 model: inherit
 color: blue
