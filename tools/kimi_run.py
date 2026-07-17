@@ -51,9 +51,24 @@ def supports_agent_files(binary: str) -> bool:
     return "--agent-file" in result.stdout + result.stderr
 
 
+def path_hits(name: str) -> list[str]:
+    """All matches for `name` on PATH, in PATH order (`which -a` semantics).
+
+    shutil.which returns only the first hit; here a stale 0.x binary earlier in
+    PATH must not hide a current install later in PATH (e.g. a uv-tool kimi-cli
+    in ~/.local/bin shadowed by an old ~/.kimi-code/bin/kimi).
+    """
+    hits = []
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(directory or ".", name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            hits.append(candidate)
+    return hits
+
+
 def find_kimi() -> str:
     """Locate a kimi executable that supports agent files."""
-    candidates = [os.environ.get("KIMI_BIN"), shutil.which("kimi")]
+    candidates = [os.environ.get("KIMI_BIN"), *path_hits("kimi")]
     candidates += sorted(
         glob.glob(
             os.path.expanduser(
