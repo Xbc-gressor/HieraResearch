@@ -9,6 +9,7 @@ service part of the repository contract.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OFFLINE_ENV = "HIERA_RETRIEVAL_OFFLINE"
 DISABLED_ENV = "HIERA_RETRIEVAL_DISABLE_BACKENDS"
 DISABLE_NATIVE_WEB_ENV = "HIERA_RETRIEVAL_DISABLE_NATIVE_WEB"
+DEEPXIV_INSTALL_COMMAND = "uv tool install deepxiv-sdk==0.3.1"
 
 
 def _set_disabled(env: dict[str, str], *names: str) -> None:
@@ -31,6 +33,46 @@ def _native_web_args(enabled: bool) -> list[str]:
     # Use --flag=value because these Claude CLI options are variadic; a separate
     # value token could consume the positional prompt as another tool pattern.
     return [f"{flag}=WebSearch,WebFetch"]
+
+
+def probe_deepxiv(env: dict[str, str]) -> tuple[bool, str]:
+    """Run the adapter's network-free capability probe for launcher preflight."""
+    process = subprocess.run(
+        [sys.executable, "tools/search_backends.py", "probe", "--backend", "deepxiv"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    try:
+        payload = json.loads(process.stdout)
+    except json.JSONDecodeError:
+        detail = (process.stderr or process.stdout).strip() or "probe returned invalid output"
+        return False, detail
+    return bool(payload.get("available")), str(payload.get("error") or "unavailable")
+
+
+def deepxiv_preflight(
+    condition: str, available: bool, detail: str
+) -> tuple[list[str], bool]:
+    """Return operator-facing diagnostics and whether launch must stop."""
+    if condition not in {"full", "no-native-web"} or available:
+        return [], False
+    lines = [
+        "DeepXiv client is unavailable. Install it once during workspace provisioning:",
+        f"  {DEEPXIV_INSTALL_COMMAND}",
+        "The CLI obtains its free token automatically on first use.",
+        f"Probe detail: {detail}",
+    ]
+    if condition == "no-native-web":
+        lines.append(
+            "The no-native-web condition has no permitted retrieval fallback; "
+            "the Claude run was not started."
+        )
+        return lines, True
+    lines.append("Continuing the full condition with its permitted native-web fallback.")
+    return lines, False
 
 
 def build_launch(
@@ -152,6 +194,14 @@ def main() -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    if args.condition in {"full", "no-native-web"}:
+        available, detail = probe_deepxiv(env)
+        diagnostics, blocking = deepxiv_preflight(args.condition, available, detail)
+        for line in diagnostics:
+            print(line, file=sys.stderr)
+        if blocking:
+            return 2
 
     if args.dry_run:
         print("environment:")

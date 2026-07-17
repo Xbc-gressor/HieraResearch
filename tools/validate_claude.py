@@ -12,6 +12,7 @@ from run_background import (
     DISABLE_NATIVE_WEB_ENV,
     OFFLINE_ENV,
     build_launch,
+    deepxiv_preflight,
 )
 
 
@@ -198,6 +199,17 @@ def main() -> int:
         errors.append("no-native-web launch does not explicitly deny Claude native web tools")
     if not full_command[-1].startswith("Run background research only for runs/"):
         errors.append("Claude launcher prompt was consumed or misplaced")
+
+    full_diagnostics, full_blocked = deepxiv_preflight(
+        "full", False, "client unavailable"
+    )
+    strict_diagnostics, strict_blocked = deepxiv_preflight(
+        "no-native-web", False, "client unavailable"
+    )
+    if full_blocked or not any("uv tool install deepxiv-sdk==0.3.1" in line for line in full_diagnostics):
+        errors.append("full launch does not warn with the DeepXiv provisioning command")
+    if not strict_blocked or not any("was not started" in line for line in strict_diagnostics):
+        errors.append("no-native-web does not block before Claude when DeepXiv is absent")
 
     if errors:
         print("Claude integration validation failed:")

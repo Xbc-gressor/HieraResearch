@@ -39,6 +39,18 @@
 
 ### 3.2 运行实验
 
+如需 live DeepXiv 文献覆盖，先由用户在机器/工作区初始化阶段安装一次兼容的
+CLI（智能体运行期间不会自行安装）：
+
+```bash
+uv tool install deepxiv-sdk==0.3.1
+python tools/search_backends.py probe --backend deepxiv
+```
+
+CLI 会在第一次真实请求时自动申请并保存免费 token。`frozen` 和
+`no-deepxiv` 条件不需要此安装；`full` 缺少 CLI 时会警告并使用允许的网页
+fallback，`no-native-web` 缺少 CLI 时会在启动 Claude 前直接停止。
+
 要启动完整的自主实验，以实验智能体为主线程启动专用 Claude Code 会话：
 
 ```bash

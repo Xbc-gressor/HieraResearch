@@ -23,6 +23,7 @@ from search_backends import (
     merge_candidates,
     new_manifest,
     select_balanced,
+    unavailable_probe_payload,
     validate_manifest,
 )
 
@@ -44,6 +45,16 @@ def main() -> int:
     assert canonical_key("https://arxiv.org/abs/2203.11171v4") == "arxiv:2203.11171"
     assert canonical_key("https://www.alphaxiv.org/pdf/2203.11171") == "arxiv:2203.11171"
     assert canonical_key("https://Example.com/a/?utm_source=x") == "example.com/a"
+    unavailable_deepxiv = unavailable_probe_payload(
+        "deepxiv", "RuntimeError: DeepXiv CLI is unavailable"
+    )
+    assert unavailable_deepxiv["install_command"] == (
+        "uv tool install deepxiv-sdk==0.3.1"
+    )
+    intentionally_disabled = unavailable_probe_payload(
+        "deepxiv", "RuntimeError: DeepXiv is disabled by test"
+    )
+    assert "install_command" not in intentionally_disabled
 
     with tempfile.TemporaryDirectory() as tmp:
         offline_env = dict(os.environ)
@@ -242,6 +253,33 @@ def main() -> int:
         )
         assert disabled_probe.returncode == 1
         assert "disabled" in disabled_probe.stdout
+
+        failed_manifest_path = Path(tmp) / "disabled-search.json"
+        disabled_search = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "search",
+                "--manifest",
+                str(failed_manifest_path),
+                "--backend",
+                "deepxiv",
+                "--query",
+                "regularized trees",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=disabled_env,
+        )
+        assert disabled_search.returncode == 1
+        disabled_payload = json.loads(disabled_search.stdout)
+        assert disabled_payload["ok"] is False
+        assert disabled_payload["manifest_valid"] is True
+        assert disabled_payload["dispatch_results"] == 0
+        failed_manifest = json.loads(failed_manifest_path.read_text())
+        assert failed_manifest["backend_failures"]
+        assert validate_manifest(failed_manifest) == []
 
         implicit_external = subprocess.run(
             [

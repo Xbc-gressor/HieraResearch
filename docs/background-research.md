@@ -160,6 +160,18 @@ For a live or ablation condition, initialize a distinct run tag and launch the
 Claude background agent through the condition-aware wrapper:
 
 ```bash
+# One-time machine/workspace provisioning for live DeepXiv coverage.
+uv tool install deepxiv-sdk==0.3.1
+python tools/search_backends.py probe --backend deepxiv
+```
+
+Installing the client and obtaining a token are separate lifecycle steps. The
+human/operator installs the pinned CLI once; its first live request obtains and
+persists the free token automatically. The background agent never installs
+packages. DeepXiv is unnecessary for `no-deepxiv` and `frozen`; it is optional
+with a warning for `full` and required for `no-native-web`.
+
+```bash
 python tools/init_run.py <task-name> <tag>
 python tools/run_background.py <task-name> <tag> --condition full
 # Alternatives: no-deepxiv, no-native-web, or frozen --frozen-corpus <path>
@@ -217,8 +229,10 @@ sibling checkout:
 python tools/search_backends.py probe --backend deepxiv
 ```
 
-The probe is network-free and secret-free. An unavailable result is a retained
-coverage condition, not permission to search the machine or install the client.
+The probe is network-free and secret-free. When the client is absent, it prints
+the one-time operator installation command. For an already-running agent, an
+unavailable result is a retained coverage condition, not permission for that
+agent to search the machine or install the client.
 
 ## Two evidence axes
 

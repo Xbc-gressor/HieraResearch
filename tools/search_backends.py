@@ -38,6 +38,7 @@ MAX_SELECTED = 18
 HTTP_TIMEOUT = 45
 OFFLINE_ENV = "HIERA_RETRIEVAL_OFFLINE"
 DISABLED_BACKENDS_ENV = "HIERA_RETRIEVAL_DISABLE_BACKENDS"
+DEEPXIV_INSTALL_COMMAND = "uv tool install deepxiv-sdk==0.3.1"
 
 _ARXIV_RE = re.compile(
     r"(?:arxiv\.org|alphaxiv\.org)/(?:abs|pdf)/([a-z-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?",
@@ -589,6 +590,29 @@ def describe_backend(backend: SearchBackend) -> dict[str, Any]:
     return description
 
 
+def unavailable_probe_payload(backend: str, error: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "backend": backend,
+        "available": False,
+        "error": error,
+    }
+    if backend == "deepxiv" and "disabled by" not in error:
+        payload.update(
+            {
+                "install_command": DEEPXIV_INSTALL_COMMAND,
+                "install_when": (
+                    "during workspace provisioning, before a full or "
+                    "no-native-web live retrieval run"
+                ),
+                "token_note": (
+                    "the installed CLI obtains its free token automatically on first use"
+                ),
+            }
+        )
+    return payload
+
+
 def merge_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
@@ -1036,17 +1060,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     backends, failures = build_backends([args.backend], args.frozen_corpus)
     if not backends:
         error = failures[0]["error"] if failures else "backend unavailable"
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "backend": args.backend,
-                    "available": False,
-                    "error": error,
-                },
-                indent=2,
-            )
-        )
+        print(json.dumps(unavailable_probe_payload(args.backend, error), indent=2))
         return 1
     print(json.dumps({"ok": True, **describe_backend(backends[0])}, indent=2))
     return 0
@@ -1277,11 +1291,13 @@ def cmd_search(args: argparse.Namespace) -> int:
     errors = validate_manifest(manifest)
     if not errors:
         save_manifest(args.manifest, manifest)
-    print(json.dumps({"ok": not errors, "selected": manifest["selected_keys"],
+    succeeded = bool(raw) and not errors
+    print(json.dumps({"ok": succeeded, "manifest_valid": not errors,
+                      "selected": manifest["selected_keys"],
                       "dispatch_results": len(raw),
                       "failures": unavailable_events + failures,
                       "errors": errors}, indent=2))
-    return 0 if raw and not errors else 1
+    return 0 if succeeded else 1
 
 
 def cmd_visit(args: argparse.Namespace) -> int:

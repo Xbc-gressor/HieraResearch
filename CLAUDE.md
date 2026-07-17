@@ -101,6 +101,11 @@ would remove the independent contexts required by this project.
   auto-approves only that control plane and blocks direct probes, raw network
   commands, arbitrary Python, and candidate execution. Use
   `tools/run_background.py` for controlled retrieval-only conditions.
+  Operators who select live DeepXiv coverage provision the client once with
+  `uv tool install deepxiv-sdk==0.3.1`; the CLI obtains its free token on first
+  use. Agents must never perform this installation themselves. The launcher
+  warns when `full` lacks the optional client and blocks `no-native-web`, where
+  no permitted fallback exists.
   See `docs/background-research.md` for the sibling-project audit, evidence
   semantics, fallback behavior, and validation contract.
 - `idea-generator` — produce the next generation in two steps: **SELECT** — run
