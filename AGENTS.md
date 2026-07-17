@@ -135,6 +135,7 @@ python tools/validate_skills.py
 python tools/validate_tasks.py
 python tools/validate_background.py
 python tools/validate_search_backends.py
+python tools/validate_claude.py
 ```
 
 ## Adding A Task

@@ -365,10 +365,15 @@ runs/<task-name>/<tag>/loop_state.md
 
 - 本地 frozen-corpus backend 是可复现条件；DeepXiv / Jina 必须显式启用且单个失败不阻塞其他结果
 - canonical work/URL 去重，统计不同 query 与 backend 的支持数，并平衡每个 query 的候选覆盖
-- `visit` 渐进阅读并自动写 visit receipt；Claude WebFetch 可用 `record-visit` 接入
+- `probe` 只检查本地 DeepXiv 适配器发现，不联网、不扫描工作区外目录；禁止 `which` / import / `find /` / `curl` 式预检
+- search 追加稳定 query id、精确 hit、调用、失败和 visit，不会用后续搜索覆盖已有检索轨迹
+- Claude WebSearch 用 `record-search` 接入，WebFetch 用 `record-visit` 接入
+- `visit` 强制 DeepXiv `head → 精确命名 section` 渐进阅读；head/preview 不能单独支撑高于 `unverified` 的 claim
 - 独立的 `grounding=6000` 与 `novelty=2048` token lane
-- 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash 和访问内容 hash；token 永不进入运行产物
+- `HIERA_RETRIEVAL_OFFLINE`、backend-disable 和 agent-scoped hook 机械禁止条件绕过；许可的 adapter/validator Python 命令自动批准，直接 `train.py` 被拒绝
+- 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash、访问内容 hash 与截断前后长度；token 永不进入运行产物
 - `python tools/validate_search_backends.py` 提供完全离线的回归检查
+- `python tools/validate_claude.py` 检查 Claude hook、直接候选执行防护与四种检索启动条件
 
 ### 7.7 validate_skills.py
 

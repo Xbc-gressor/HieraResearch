@@ -50,10 +50,15 @@ its narrow `_candidate_brief.json` before launch.
 
 ## Claude Code
 
-`.claude/settings.json` installs a main status line, subagent status lines, and a
-PreToolUse delegation guard. The status line is local and does not invoke a
-model. For historical or full-session attribution, point the monitor at a main
-JSONL transcript:
+`.claude/settings.json` installs a main status line, subagent status lines, a
+PreToolUse delegation guard, and a runtime Bash guard. The Bash guard denies
+direct `train.py` execution and auto-approves only named HieraResearch
+control-plane scripts; arbitrary Python is forced back to an explicit approval
+even if a broad interpreter allow rule exists. The background researcher adds a
+lifecycle-scoped hook that narrows Bash further to retrieval/validation commands
+and denies raw network or machine inspection. The status line is local and does
+not invoke a model. For historical
+or full-session attribution, point the monitor at a main JSONL transcript:
 
 ```bash
 python tools/harness_watch.py --source claude \

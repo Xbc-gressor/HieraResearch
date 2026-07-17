@@ -9,6 +9,15 @@ description: |
 tools: WebSearch, WebFetch, Read, Write, Glob, Bash
 model: inherit
 color: blue
+hooks:
+  PreToolUse:
+    - matcher: "Bash|WebSearch|WebFetch"
+      hooks:
+        - type: command
+          command: python3
+          args:
+            - "${CLAUDE_PROJECT_DIR}/tools/harness_guard.py"
+            - "--background-tools"
 ---
 
 # Background Researcher
@@ -72,6 +81,21 @@ Use the run-local retrieval manifest at
 `<run_dir>/background_retrieval.json`. It records which questions ran, which
 backends answered, how duplicate results merged, and which sources were opened.
 
+`tools/search_backends.py` is the sole interface to DeepXiv. It already prefers
+an installed CLI and otherwise discovers the optional workspace sibling with
+the correct `PYTHONPATH`. **Never** preflight DeepXiv with `which`, a Python
+`import`, Glob, Read, `ls` of a sibling path, `find`, `curl`, or any other direct
+checkout or connectivity inspection. If availability needs checking, run only
+this network-free adapter probe and then invoke adapter search directly:
+
+```bash
+python tools/search_backends.py probe --backend deepxiv
+```
+
+An unavailable probe is a recorded coverage condition, not a reason to inspect,
+install, or bypass the optional component. The agent-scoped PreToolUse guard
+enforces this boundary and auto-approves the sanctioned adapter commands.
+
 1. Choose the retrieval condition explicitly. For a reproducible benchmark or
    publication comparison, use the task-provided
    `tasks/<task>/background_corpus.json` (a pinned object with `corpus_id`,
@@ -85,6 +109,10 @@ backends answered, how duplicate results merged, and which sources were opened.
    opt into `--backend deepxiv`. Use `--backend jina` only as a separately noted
    live-web fallback/ablation, not an invisible default. Do not mix frozen and
    live results in the main reproducible condition.
+   When `HIERA_RETRIEVAL_OFFLINE=1` is present, frozen retrieval is mandatory:
+   every search and visit must pass `--frozen-corpus`; DeepXiv, Jina, direct
+   HTTP, externally recorded visits, and native web tools are rejected
+   mechanically. Do not attempt to bypass that condition.
 
 2. Dispatch the planned questions together through the local adapter:
    ```bash
@@ -105,7 +133,9 @@ backends answered, how duplicate results merged, and which sources were opened.
    canonicalizes URLs, deduplicates across backends and queries, ranks by the
    number of **distinct** supporting queries, then balances the selected set so
    one broad query cannot erase the others. Backend and query agreement are
-   retrieval signals, not scientific corroboration.
+   retrieval signals, not scientific corroboration. Follow-up searches append
+   stable query identities, exact hit-level candidates, calls, failures, and
+   visits; they never replace an earlier dispatch.
 3. Read selected sources through the adapter so visits are recorded. Background
    research always uses the `grounding` lane (6000-token budget):
    ```bash
@@ -113,9 +143,15 @@ backends answered, how duplicate results merged, and which sources were opened.
      --manifest <run_dir>/background_retrieval.json --lane grounding \
      --url <url> --view <head|section|preview|full_text|auto> --section <name>
    ```
-   Omit `--section` unless `--view section` is used. For papers, triage metadata
-   and section maps first, then read relevant method, results, limitations, or
-   appendix sections. In the frozen condition, append
+   Omit `--section` unless `--view section` is used. For a DeepXiv paper, first
+   retain `--view head`, copy an exact section name from that retained map, and
+   then retain the relevant method, results, limitations, or appendix section.
+   A `brief`, `preview`, or `head` is triage: it may ground context or an
+   explicitly `unverified` abstract-level direction, but it cannot by itself
+   support or contradict a direction or guidance item stamped `preliminary` or
+   stronger. Use `--view full_text` only when the retained head exposes no
+   sections or after a named-section failure has been recorded. The adapter and
+   final contract enforce this order. In the frozen condition, append
    `--frozen-corpus <pinned-corpus.json>` to replay retained content without
    network access. Outside that condition, `auto` uses DeepXiv for arXiv and a
    direct HTTP fetch for other sources; Jina visiting is explicit via
@@ -123,14 +159,26 @@ backends answered, how duplicate results merged, and which sources were opened.
 4. If the local backends miss an evidence class, use targeted `WebSearch` for
    later versions, independent reproductions, official repositories, benchmark
    records, and primary artifacts. Use `WebFetch` only after triage. After every
-   successful WebFetch that will appear in the Direction registry, write the
-   returned content to a temporary run-local file and append a receipt that
+   native WebSearch, create `<run_dir>/.retrieval-tmp/` if needed, write its
+   exact URL/title/snippet rows to a temporary JSON object there under `results`,
+   append that query to the manifest, and delete the temporary file after the
+   receipt is stored:
+   ```bash
+   python tools/search_backends.py record-search \
+     --manifest <run_dir>/background_retrieval.json --lane grounding \
+     --query "<the exact query>" --status success \
+     --results-file <run_dir>/.retrieval-tmp/search-results.json
+   ```
+   Record a failed native query with `--status failed --error "<reason>"`
+   instead. After every successful WebFetch that will appear in the Direction
+   registry, write the returned content to a temporary file under
+   `<run_dir>/.retrieval-tmp/` and append a receipt that
    retains and hashes that exact content:
    ```bash
    python tools/search_backends.py record-visit \
      --manifest <run_dir>/background_retrieval.json --lane grounding \
      --backend claude-webfetch --view page --status success \
-     --content-file <temporary-fetched-content> --url <url>
+     --content-file <run_dir>/.retrieval-tmp/fetched-content.txt --url <url>
    ```
    Record failures too, with `--status failed --error "<reason>"`. Never claim a
    source merely because it appeared in a search snippet.
@@ -400,7 +448,11 @@ stay consumed; the appended probe becomes the next fresh option.
   Every `g-*` item must appear in the section declared by its registry entry.
 - **Visited or excluded.** Every Direction-registry source must have a successful
   grounding-lane visit in `background_retrieval.json`. A search hit, snippet,
-  generated TLDR, or novelty-only visit is insufficient.
+  generated TLDR, or novelty-only visit is insufficient. For claim-bearing
+  DeepXiv papers above `unverified`, a `head` receipt is also insufficient: it
+  must be followed by a successful exact named-section read, or by the
+  constrained full-text fallback after no section map or a recorded section
+  failure.
 - **Steer, don't decide.** You bias the search with external knowledge; the
   genetic `idea-generator` still chooses each generation, and the tuner still
   finds the numbers. Your brief is advice, not a fixed plan. Only structured,

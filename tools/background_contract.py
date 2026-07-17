@@ -76,6 +76,14 @@ RUN_STATUS = {
 }
 CONFIDENCE = {"low", "med", "high"}
 CLAIM_COVERAGE = {"none", "partial", "direct"}
+TRIAGE_VIEWS = {
+    "brief",
+    "head",
+    "preview",
+    "abstract",
+    "metadata",
+    "search_snippet",
+}
 
 
 class ContractError(ValueError):
@@ -297,27 +305,9 @@ def validate_registry(
                 else:
                     source_keys[key] = source_id
 
-    if retrieval_manifest is not None:
-        errors.extend(validate_manifest(retrieval_manifest))
-        if retrieval_manifest.get("retrieval_condition") == "mixed":
-            errors.append(
-                "background evidence cannot mix frozen and live retrieval in one condition"
-            )
-        visited_grounding = {
-            visit.get("canonical_key")
-            for visit in retrieval_manifest.get("visits", [])
-            if isinstance(visit, dict)
-            and visit.get("status") == "success"
-            and visit.get("lane") == "grounding"
-        }
-        for source_id, url in source_urls.items():
-            if canonical_key(url) not in visited_grounding:
-                errors.append(
-                    f"source {source_id} was not successfully visited in the grounding lane"
-                )
-
     direction_ids: list[str] = []
     direction_by_id: dict[str, dict[str, Any]] = {}
+    claim_bearing_papers: set[str] = set()
     required_text = (
         "title",
         "claim",
@@ -386,6 +376,14 @@ def validate_registry(
                     errors.append(f"{link_where}.role must be one of {sorted(EVIDENCE_ROLES)}")
                 else:
                     evidence_roles.append(role)
+                    linked_source = source_by_id.get(source_id)
+                    if (
+                        credibility != "unverified"
+                        and role in {"supports", "contradicts"}
+                        and linked_source is not None
+                        and linked_source.get("type") == "paper"
+                    ):
+                        claim_bearing_papers.add(str(source_id))
         if credibility == "contested" and "contradicts" not in evidence_roles:
             errors.append(f"{where} is contested but cites no contradicting evidence")
         if credibility == "replicated":
@@ -464,6 +462,12 @@ def validate_registry(
                     continue
                 evidence_roles.append(role)
                 source = source_by_id.get(source_id, {})
+                if (
+                    credibility != "unverified"
+                    and role in {"supports", "contradicts"}
+                    and source.get("type") == "paper"
+                ):
+                    claim_bearing_papers.add(str(source_id))
                 relation = scope_relation(source.get("studied_scope"), item.get("scope"))
                 if (
                     role == "supports"
@@ -538,6 +542,85 @@ def validate_registry(
                 "binding external guidance requires an out-of-scope scope_probe direction; "
                 f"unprobed guidance: {unprobed_guidance}"
             )
+
+    if retrieval_manifest is not None:
+        errors.extend(validate_manifest(retrieval_manifest))
+        if retrieval_manifest.get("retrieval_condition") == "mixed":
+            errors.append(
+                "background evidence cannot mix frozen and live retrieval in one condition"
+            )
+
+        visited_grounding: set[str] = set()
+        substantive_grounding: set[str] = set()
+        deepxiv_heads: dict[str, dict[str, Any]] = {}
+        for index, visit in enumerate(retrieval_manifest.get("visits", [])):
+            if not isinstance(visit, dict) or visit.get("lane") != "grounding":
+                continue
+            key = visit.get("canonical_key")
+            if not isinstance(key, str) or not key:
+                continue
+            status = visit.get("status")
+            backend = visit.get("backend")
+            view = visit.get("view")
+
+            if status == "failed" and view == "section" and key in deepxiv_heads:
+                if visit.get("section") in deepxiv_heads[key]["sections"]:
+                    deepxiv_heads[key]["section_failed"] = True
+                continue
+            if status != "success":
+                continue
+            visited_grounding.add(key)
+
+            if backend != "deepxiv":
+                if view not in TRIAGE_VIEWS:
+                    substantive_grounding.add(key)
+                continue
+            if view == "head":
+                try:
+                    head = json.loads(visit.get("content", ""))
+                except (TypeError, json.JSONDecodeError):
+                    head = None
+                raw_sections = head.get("sections") if isinstance(head, dict) else None
+                if not isinstance(raw_sections, list):
+                    errors.append(
+                        f"retrieval visits[{index}] DeepXiv head has no valid section map"
+                    )
+                    deepxiv_heads.pop(key, None)
+                    continue
+                section_names: set[str] = set()
+                for section in raw_sections:
+                    name = section.get("name") if isinstance(section, dict) else section
+                    if isinstance(name, str) and name.strip():
+                        section_names.add(name.strip())
+                deepxiv_heads[key] = {
+                    "sections": section_names,
+                    "section_failed": False,
+                }
+            elif view == "section" and key in deepxiv_heads:
+                if visit.get("section") in deepxiv_heads[key]["sections"]:
+                    substantive_grounding.add(key)
+                else:
+                    errors.append(
+                        f"retrieval visits[{index}] DeepXiv section does not exactly "
+                        "match its preceding head"
+                    )
+            elif view == "full_text" and key in deepxiv_heads:
+                state = deepxiv_heads[key]
+                if not state["sections"] or state["section_failed"]:
+                    substantive_grounding.add(key)
+
+        for source_id, url in source_urls.items():
+            key = canonical_key(url)
+            if key not in visited_grounding:
+                errors.append(
+                    f"source {source_id} was not successfully visited in the grounding lane"
+                )
+            elif source_id in claim_bearing_papers and key not in substantive_grounding:
+                errors.append(
+                    f"source {source_id} is claim-bearing paper evidence but has only "
+                    "triage-level grounding; DeepXiv evidence requires head then a named "
+                    "section (full_text only after no section map or a recorded section failure)"
+                )
 
     if ledger is not None:
         for record in ledger.get("records", []):

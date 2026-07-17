@@ -398,6 +398,56 @@ def main() -> int:
         )
     assert validate_registry(REGISTRY, retrieval_manifest=retrieval) == []
 
+    deepxiv_head_only = new_manifest()
+    add_visit(
+        deepxiv_head_only,
+        url=REGISTRY["sources"][0]["url"],
+        lane="grounding",
+        backend="deepxiv",
+        view="head",
+        status="success",
+        content=json.dumps({"title": "Tree study", "sections": [{"name": "Methods"}]}),
+    )
+    for source in REGISTRY["sources"][1:]:
+        add_visit(
+            deepxiv_head_only,
+            url=source["url"],
+            lane="grounding",
+            backend="fixture",
+            view="full_text",
+            status="success",
+            content="inspected primary source content" * 20,
+        )
+    errors = validate_registry(REGISTRY, retrieval_manifest=deepxiv_head_only)
+    assert any("triage-level grounding" in error for error in errors), errors
+
+    deepxiv_grounded = copy.deepcopy(deepxiv_head_only)
+    add_visit(
+        deepxiv_grounded,
+        url=REGISTRY["sources"][0]["url"],
+        lane="grounding",
+        backend="deepxiv",
+        view="section",
+        section="Methods",
+        status="success",
+        content="inspected methods and results" * 20,
+    )
+    assert validate_registry(REGISTRY, retrieval_manifest=deepxiv_grounded) == []
+
+    deepxiv_wrong_section = copy.deepcopy(deepxiv_head_only)
+    add_visit(
+        deepxiv_wrong_section,
+        url=REGISTRY["sources"][0]["url"],
+        lane="grounding",
+        backend="deepxiv",
+        view="section",
+        section="Guessed section",
+        status="success",
+        content="content from an unverified section name",
+    )
+    errors = validate_registry(REGISTRY, retrieval_manifest=deepxiv_wrong_section)
+    assert any("does not exactly match" in error for error in errors), errors
+
     mixed_retrieval = copy.deepcopy(retrieval)
     mixed_retrieval["retrieval_condition"] = "mixed"
     errors = validate_registry(REGISTRY, retrieval_manifest=mixed_retrieval)

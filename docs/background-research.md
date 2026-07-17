@@ -156,6 +156,21 @@ python tools/search_backends.py visit \
   --frozen-corpus <corpus.json> --lane grounding --url <selected-url>
 ```
 
+For a live or ablation condition, initialize a distinct run tag and launch the
+Claude background agent through the condition-aware wrapper:
+
+```bash
+python tools/init_run.py <task-name> <tag>
+python tools/run_background.py <task-name> <tag> --condition full
+# Alternatives: no-deepxiv, no-native-web, or frozen --frozen-corpus <path>
+```
+
+The wrapper aligns the prompt, `HIERA_RETRIEVAL_OFFLINE`, explicit backend
+disable switches, and Claude's native WebSearch/WebFetch availability. The
+background agent also has an agent-scoped tool hook: sanctioned adapter and
+contract commands are auto-approved, while direct Python, `train.py`, `curl`,
+machine-wide discovery, and direct DeepXiv inspection are denied.
+
 ## Retrieval manifest
 
 `<run_dir>/background_retrieval.json` is the mechanical trace paired with the
@@ -164,12 +179,19 @@ human-readable background brief. It records:
 - the decomposed questions and their retrieval lane;
 - backend failures without discarding surviving results;
 - canonical, cross-query deduplicated candidates;
+- exact hit-level candidates retained across follow-up searches;
 - distinct-query and distinct-backend support;
 - a balanced selected set with shared results first and per-query coverage
   afterward;
 - successful and failed visits, content depth, and token budget.
 - raw backend responses, timestamps, backend/client versions when available,
   frozen-corpus identity, and response/content SHA-256 hashes.
+
+Search is append-only. Repeated dispatches reuse an identical query's stable id
+or allocate the next `q-NN`, then merge new hits without deleting earlier
+queries, calls, failures, selections, or visits. Claude-native WebSearch results
+enter the same trace through `record-search`; cited WebFetch content enters via
+`record-visit`.
 
 The `grounding` lane has a 6000-token reading budget. The separate `novelty`
 lane has a 2048-token budget. A novelty-only visit cannot support a Direction
@@ -182,15 +204,21 @@ recorded explicitly after a successful tool response; this provides deterministi
 artifact consistency, although it cannot independently inspect Claude's private
 tool transcript the way Arbor's integrated runtime can.
 
-From the workspace layout used during development, the no-install smoke test is:
+DeepXiv paper reads are progressive and enforced. Retain `head` first, then use
+an exact section name from that retained map. A head/preview is triage only for
+claims above `unverified`. Full text is permitted only when the head exposes no
+sections or after an exact named-section failure has been recorded. Receipts
+retain both original and truncated content sizes.
+
+Check optional DeepXiv discovery without importing or inspecting an installed or
+sibling checkout:
 
 ```bash
-PYTHONPATH=.. python -m deepxiv_sdk.deepxiv_sdk.cli search \
-  "tabular machine learning benchmark" --limit 1 --format json
+python tools/search_backends.py probe --backend deepxiv
 ```
 
-The first call may create the free token in `~/.env`. This command is an
-optional provider check, not part of deterministic repository validation.
+The probe is network-free and secret-free. An unavailable result is a retained
+coverage condition, not permission to search the machine or install the client.
 
 ## Two evidence axes
 
@@ -340,14 +368,16 @@ python tools/background_contract.py validate-experience \
   --background <run_dir>/background.md --ledger <run_dir>/ledger.json
 python tools/validate_background.py
 python tools/validate_search_backends.py
+python tools/validate_claude.py
 ```
 
 The contract validator checks registry structure, stable and contiguous `tf-*`
 ids, source relationships, studied-scope fields, credibility prerequisites,
 source-to-guidance scope containment, exclusion evidence thresholds,
 Markdown-to-guidance alignment, out-of-scope probe coverage for binding
-guidance, unknown ledger tags, lineage attribution, copied literature stamps,
-claim coverage, and scored comparison runs. The frozen contract fixture
+guidance, substantive head→section grounding, unknown ledger tags, lineage
+attribution, copied literature stamps, claim coverage, and scored comparison
+runs. The frozen contract fixture
 exercises the general failure mode: guidance for one learner and global
 intervention directly deprioritizes an exact replication, while a neighboring
 ensemble mechanism is a scope mismatch and remains active.

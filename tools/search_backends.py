@@ -3,8 +3,9 @@
 
 Frozen-corpus search and every artifact-integrity check use only the standard
 library. DeepXiv, Jina, and Claude-native WebSearch/WebFetch are explicit,
-optional coverage adapters; successful external visits can be recorded with
-``record-visit`` so the same manifest integrity checks still apply.
+optional coverage adapters; successful native searches and external visits can
+be retained with ``record-search`` and ``record-visit`` so the same manifest
+integrity checks still apply.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ LANE_BUDGETS = {"novelty": 2048, "grounding": 6000}
 MAX_SHARED = 6
 MAX_SELECTED = 18
 HTTP_TIMEOUT = 45
+OFFLINE_ENV = "HIERA_RETRIEVAL_OFFLINE"
+DISABLED_BACKENDS_ENV = "HIERA_RETRIEVAL_DISABLE_BACKENDS"
 
 _ARXIV_RE = re.compile(
     r"(?:arxiv\.org|alphaxiv\.org)/(?:abs|pdf)/([a-z-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?",
@@ -43,6 +46,21 @@ _ARXIV_RE = re.compile(
 _VERSION_RE = re.compile(r"v\d+$", re.IGNORECASE)
 _TAG_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _HTML_RE = re.compile(r"<[^>]+>")
+
+
+def offline_mode() -> bool:
+    return os.environ.get(OFFLINE_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def disabled_backends() -> set[str]:
+    """Return explicitly disabled live adapters for controlled ablations."""
+    return {
+        name.strip().lower()
+        for name in os.environ.get(DISABLED_BACKENDS_ENV, "").split(",")
+        if name.strip()
+    }
 
 
 def arxiv_id(url: str) -> str | None:
@@ -97,6 +115,7 @@ def new_manifest() -> dict[str, Any]:
         "lane_budgets": dict(LANE_BUDGETS),
         "retrieval_condition": None,
         "queries": [],
+        "candidates": [],
         "results": [],
         "selected_keys": [],
         "backend_calls": [],
@@ -169,6 +188,32 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     condition = manifest.get("retrieval_condition")
     if query_ids and condition not in {"frozen", "open_world", "mixed"}:
         errors.append("retrieval_condition must describe a populated search")
+
+    candidates = manifest.get("candidates", [])
+    if not isinstance(candidates, list):
+        errors.append("retrieval candidates must be a list")
+        candidates = []
+    query_text_by_id = {
+        query.get("id"): query.get("text")
+        for query in manifest.get("queries", [])
+        if isinstance(query, dict)
+    }
+    for index, candidate in enumerate(candidates):
+        where = f"retrieval candidates[{index}]"
+        if not isinstance(candidate, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        if not isinstance(candidate.get("url"), str) or not canonical_key(candidate["url"]):
+            errors.append(f"{where}.url must be a non-empty URL")
+        query_id = candidate.get("query_id")
+        if query_id not in query_ids:
+            errors.append(f"{where}.query_id is unknown")
+        elif candidate.get("query") != query_text_by_id.get(query_id):
+            errors.append(f"{where}.query does not match its query_id")
+        if not isinstance(candidate.get("backend"), str) or not candidate["backend"]:
+            errors.append(f"{where}.backend must be non-empty")
+        if not isinstance(candidate.get("rank"), int) or candidate["rank"] <= 0:
+            errors.append(f"{where}.rank must be a positive integer")
 
     result_keys: set[str] = set()
     for index, result in enumerate(manifest.get("results", [])):
@@ -252,8 +297,34 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
                 digest = hashlib.sha256(content.encode()).hexdigest()
                 if visit.get("content_sha256") != digest:
                     errors.append(f"{where}.content_sha256 does not match retained content")
+        has_original_size = "original_content_chars" in visit
+        has_truncated_flag = "content_truncated" in visit
+        if has_original_size != has_truncated_flag:
+            errors.append(
+                f"{where} must record original_content_chars and content_truncated together"
+            )
+        elif has_original_size:
+            original_size = visit.get("original_content_chars")
+            retained_size = visit.get("content_chars")
+            if not isinstance(original_size, int) or original_size < 0:
+                errors.append(f"{where}.original_content_chars must be non-negative")
+            elif isinstance(retained_size, int) and original_size < retained_size:
+                errors.append(
+                    f"{where}.original_content_chars cannot be smaller than content_chars"
+                )
+            if not isinstance(visit.get("content_truncated"), bool):
+                errors.append(f"{where}.content_truncated must be boolean")
+            elif isinstance(original_size, int) and isinstance(retained_size, int):
+                if visit["content_truncated"] != (original_size > retained_size):
+                    errors.append(
+                        f"{where}.content_truncated does not match retained content size"
+                    )
         if not isinstance(visit.get("retrieved_at"), str) or not visit["retrieved_at"]:
             errors.append(f"{where}.retrieved_at must be non-empty")
+        if visit.get("view") == "section" and not (
+            isinstance(visit.get("section"), str) and visit["section"].strip()
+        ):
+            errors.append(f"{where}.section must name the retained section")
     return errors
 
 
@@ -363,10 +434,13 @@ class DeepXivBackend(SearchBackend):
     name = "deepxiv"
 
     def __init__(self) -> None:
+        if self.name in disabled_backends():
+            raise RuntimeError(f"DeepXiv is disabled by {DISABLED_BACKENDS_ENV}")
         executable = shutil.which("deepxiv")
         if executable:
             self.command = [executable]
             self.env = None
+            self.source = "installed_cli"
             version = subprocess.run(
                 self.command + ["--version"], text=True, capture_output=True,
                 timeout=10, check=False,
@@ -378,6 +452,7 @@ class DeepXivBackend(SearchBackend):
             raise RuntimeError("DeepXiv CLI and sibling checkout are unavailable")
         self.command = [sys.executable, "-m", "deepxiv_sdk.deepxiv_sdk.cli"]
         self.env = dict(os.environ)
+        self.source = "sibling_checkout"
         old_path = self.env.get("PYTHONPATH")
         self.env["PYTHONPATH"] = str(ROOT.parent) + (os.pathsep + old_path if old_path else "")
         version_file = ROOT.parent / "deepxiv_sdk" / "deepxiv_sdk" / "__init__.py"
@@ -432,6 +507,10 @@ class JinaSearchBackend(SearchBackend):
     name = "jina"
     version = "hosted-api-unknown"
 
+    def __init__(self) -> None:
+        if self.name in disabled_backends():
+            raise RuntimeError(f"Jina is disabled by {DISABLED_BACKENDS_ENV}")
+
     async def search(self, query: str, max_results: int) -> dict[str, Any]:
         return await asyncio.to_thread(self._search_sync, query, max_results)
 
@@ -485,6 +564,29 @@ def build_backends(
         except Exception as exc:
             failures.append({"backend": name, "error": f"{type(exc).__name__}: {exc}"})
     return backends, failures
+
+
+def describe_backend(backend: SearchBackend) -> dict[str, Any]:
+    """Return a secret-free, network-free backend availability description."""
+    description: dict[str, Any] = {
+        "backend": backend.name,
+        "available": True,
+        "backend_version": backend.version,
+    }
+    source = getattr(backend, "source", None)
+    if source:
+        description["source"] = source
+    if isinstance(backend, FrozenCorpusBackend):
+        description.update(
+            {
+                "source": "frozen_corpus",
+                "corpus_path": str(backend.path),
+                "corpus_sha256": backend.corpus_sha256,
+            }
+        )
+    elif isinstance(backend, JinaSearchBackend):
+        description["source"] = "hosted_service"
+    return description
 
 
 def merge_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -573,6 +675,111 @@ def select_balanced(results: list[dict[str, Any]], query_ids: list[str]) -> list
     return selected
 
 
+def expand_merged_results(
+    results: list[dict[str, Any]], queries: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Expand merged rows enough to preserve support when appending a search receipt."""
+    candidates: list[dict[str, Any]] = []
+    for result in results:
+        if not isinstance(result, dict) or not result.get("url"):
+            continue
+        query_ids = [qid for qid in result.get("query_ids", []) if qid in queries]
+        backends = [str(name) for name in result.get("backends", []) if name]
+        if not query_ids:
+            continue
+        if not backends:
+            backends = ["unknown"]
+        common = {
+            "url": result["url"],
+            "title": result.get("title") or "No title",
+            "snippet": result.get("snippet") or "",
+            "external_id": result.get("external_id"),
+            "rank": result.get("best_rank", 9999),
+        }
+        for index, query_id in enumerate(query_ids):
+            candidates.append(
+                {
+                    **common,
+                    "query_id": query_id,
+                    "query": queries[query_id],
+                    "backend": backends[min(index, len(backends) - 1)],
+                }
+            )
+        for backend in backends[len(query_ids) :]:
+            candidates.append(
+                {
+                    **common,
+                    "query_id": query_ids[0],
+                    "query": queries[query_ids[0]],
+                    "backend": backend,
+                }
+            )
+    return candidates
+
+
+def retained_candidates(
+    manifest: dict[str, Any], queries: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Return exact retained hits, migrating older result-only manifests."""
+    candidates = manifest.get("candidates")
+    if isinstance(candidates, list) and candidates:
+        return [dict(item) for item in candidates if isinstance(item, dict)]
+    return expand_merged_results(manifest.get("results", []), queries)
+
+
+def resolve_queries(
+    manifest: dict[str, Any], texts: list[str], lane: str
+) -> list[dict[str, str]]:
+    """Append new query identities and reuse exact queries on later dispatches."""
+    queries = manifest.setdefault("queries", [])
+    if not isinstance(queries, list):
+        raise ValueError("retrieval manifest queries must be a list")
+    by_text = {
+        str(item.get("text", "")).strip().casefold(): item
+        for item in queries
+        if isinstance(item, dict) and str(item.get("text", "")).strip()
+    }
+    existing_numbers = [
+        int(match.group(1))
+        for item in queries
+        if isinstance(item, dict)
+        and (match := re.fullmatch(r"q-(\d{2,})", str(item.get("id", ""))))
+    ]
+    next_number = max(existing_numbers, default=0) + 1
+    resolved: list[dict[str, str]] = []
+    dispatched_ids: set[str] = set()
+    for raw_text in texts:
+        text = raw_text.strip()
+        if not text:
+            raise ValueError("retrieval queries must be non-empty")
+        folded = text.casefold()
+        query = by_text.get(folded)
+        if query is None:
+            query = {"id": f"q-{next_number:02d}", "text": text, "lane": lane}
+            next_number += 1
+            queries.append(query)
+            by_text[folded] = query
+        elif query.get("lane") != lane:
+            raise ValueError(
+                f"query {query.get('id')} already belongs to lane {query.get('lane')}"
+            )
+        query_id = str(query["id"])
+        if query_id not in dispatched_ids:
+            resolved.append(
+                {"id": query_id, "text": str(query["text"]), "lane": str(query["lane"])}
+            )
+            dispatched_ids.add(query_id)
+    return resolved
+
+
+def combined_condition(existing: Any, current: str) -> str:
+    if existing not in {"frozen", "open_world", "mixed"}:
+        return current
+    if existing == current:
+        return current
+    return "mixed"
+
+
 async def dispatch_search(
     queries: list[dict[str, str]], backends: list[SearchBackend], max_results: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
@@ -629,6 +836,8 @@ def _strip_html(raw: str) -> str:
 
 
 def _jina_visit(url: str) -> tuple[str, str]:
+    if "jina" in disabled_backends():
+        raise RuntimeError(f"Jina is disabled by {DISABLED_BACKENDS_ENV}")
     headers = {"Accept": "text/plain", "X-Return-Format": "markdown",
                "User-Agent": "HieraResearch/1"}
     if os.environ.get("JINA_API_KEY"):
@@ -645,6 +854,8 @@ def _jina_visit(url: str) -> tuple[str, str]:
 
 
 def _direct_visit(url: str) -> str:
+    if "direct" in disabled_backends():
+        raise RuntimeError(f"direct visiting is disabled by {DISABLED_BACKENDS_ENV}")
     request = urllib.request.Request(url, headers={"User-Agent": "HieraResearch/1"})
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
         content_type = response.headers.get("Content-Type", "").lower()
@@ -654,6 +865,20 @@ def _direct_visit(url: str) -> str:
             )
         raw = response.read().decode("utf-8", errors="replace")
     return _strip_html(raw)
+
+
+def _deepxiv_section_content(raw: str) -> str:
+    """Extract the section body before applying the visit retention budget."""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("DeepXiv returned invalid JSON for a section") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
+        raise RuntimeError("DeepXiv section response has no textual content")
+    content = payload["content"]
+    if not content.strip():
+        raise RuntimeError("DeepXiv returned an empty section")
+    return content
 
 
 def _deepxiv_read(url: str, view: str, section: str | None) -> tuple[str, str, str]:
@@ -683,15 +908,96 @@ def _deepxiv_read(url: str, view: str, section: str | None) -> tuple[str, str, s
     if process.returncode != 0:
         message = (process.stderr or process.stdout).strip().splitlines()
         raise RuntimeError(message[-1] if message else f"exit {process.returncode}")
-    return process.stdout, "deepxiv", backend.version
+    content = process.stdout
+    if view == "section":
+        content = _deepxiv_section_content(content)
+    return content, "deepxiv", backend.version
+
+
+def _deepxiv_head_state(
+    manifest: dict[str, Any], url: str, lane: str
+) -> tuple[int, list[str]] | None:
+    """Return the latest retained DeepXiv head and its exact section names."""
+    key = canonical_key(url)
+    visits = manifest.get("visits", [])
+    for index in range(len(visits) - 1, -1, -1):
+        visit = visits[index]
+        if not (
+            isinstance(visit, dict)
+            and visit.get("canonical_key") == key
+            and visit.get("lane") == lane
+            and visit.get("backend") == "deepxiv"
+            and visit.get("view") == "head"
+            and visit.get("status") == "success"
+        ):
+            continue
+        try:
+            payload = json.loads(visit.get("content", ""))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("retained DeepXiv head is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("retained DeepXiv head must be a JSON object")
+        raw_sections = payload.get("sections", [])
+        if not isinstance(raw_sections, list):
+            raise RuntimeError("retained DeepXiv head has an invalid section map")
+        names: list[str] = []
+        for section in raw_sections:
+            name = section.get("name") if isinstance(section, dict) else section
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+        return index, names
+    return None
+
+
+def _check_deepxiv_progression(
+    manifest: dict[str, Any], url: str, lane: str, view: str, section: str | None
+) -> None:
+    """Require auditable triage before expensive DeepXiv paper reads."""
+    if view not in {"section", "full_text"}:
+        return
+    state = _deepxiv_head_state(manifest, url, lane)
+    if state is None:
+        raise RuntimeError(
+            f"DeepXiv {view} requires a prior successful {lane}-lane head visit"
+        )
+    head_index, section_names = state
+    if view == "section":
+        requested = (section or "").strip()
+        if requested not in section_names:
+            available = ", ".join(section_names) or "none"
+            raise RuntimeError(
+                "--section must exactly match the retained DeepXiv head; "
+                f"available sections: {available}"
+            )
+        return
+    if not section_names:
+        return
+    key = canonical_key(url)
+    failed_section = any(
+        isinstance(visit, dict)
+        and visit.get("canonical_key") == key
+        and visit.get("lane") == lane
+        and visit.get("view") == "section"
+        and visit.get("status") == "failed"
+        and visit.get("section") in section_names
+        for visit in manifest.get("visits", [])[head_index + 1 :]
+    )
+    if not failed_section:
+        raise RuntimeError(
+            "DeepXiv full_text is a fallback: read a named section first, or use it "
+            "after a recorded section failure"
+        )
 
 
 def add_visit(
     manifest: dict[str, Any], *, url: str, lane: str, backend: str, view: str,
     status: str, content: str | None = None, error: str | None = None,
     backend_version: str = "unknown", section: str | None = None,
+    original_content_chars: int | None = None,
 ) -> None:
     budgets = manifest.setdefault("lane_budgets", dict(LANE_BUDGETS))
+    retained_chars = len(content or "")
+    original_chars = retained_chars if original_content_chars is None else original_content_chars
     manifest.setdefault("visits", []).append(
         {
             "url": canonical_url(url),
@@ -703,7 +1009,9 @@ def add_visit(
             "section": section,
             "status": status,
             "budget_tokens": budgets[lane],
-            "content_chars": len(content or ""),
+            "content_chars": retained_chars,
+            "original_content_chars": original_chars,
+            "content_truncated": original_chars > retained_chars,
             "content_sha256": hashlib.sha256((content or "").encode()).hexdigest()
             if content
             else None,
@@ -714,13 +1022,191 @@ def add_visit(
     )
 
 
+def cmd_probe(args: argparse.Namespace) -> int:
+    """Check adapter discovery without contacting a remote service."""
+    if offline_mode() and args.backend != "frozen":
+        payload = {
+            "ok": False,
+            "backend": args.backend,
+            "available": False,
+            "error": f"{OFFLINE_ENV}=1 permits only the frozen backend",
+        }
+        print(json.dumps(payload, indent=2))
+        return 1
+    backends, failures = build_backends([args.backend], args.frozen_corpus)
+    if not backends:
+        error = failures[0]["error"] if failures else "backend unavailable"
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "backend": args.backend,
+                    "available": False,
+                    "error": error,
+                },
+                indent=2,
+            )
+        )
+        return 1
+    print(json.dumps({"ok": True, **describe_backend(backends[0])}, indent=2))
+    return 0
+
+
+def _native_result_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get("results", payload.get("items", payload.get("data", [])))
+    else:
+        rows = []
+    normalized: list[dict[str, Any]] = []
+    for index, row in enumerate(rows if isinstance(rows, list) else [], start=1):
+        if not isinstance(row, dict) or not isinstance(row.get("url"), str):
+            continue
+        url = row["url"].strip()
+        if not url:
+            continue
+        rank = row.get("rank", index)
+        normalized.append(
+            {
+                "url": url,
+                "title": row.get("title") or row.get("name") or "No title",
+                "snippet": row.get("snippet")
+                or row.get("description")
+                or str(row.get("content") or "")[:500],
+                "external_id": row.get("external_id") or row.get("arxiv_id"),
+                "rank": rank if isinstance(rank, int) and rank > 0 else index,
+            }
+        )
+    return normalized
+
+
+def cmd_record_search(args: argparse.Namespace) -> int:
+    """Append a Claude-native search receipt and merge its result URLs."""
+    if offline_mode():
+        print(
+            json.dumps(
+                {"ok": False, "errors": [f"{OFFLINE_ENV}=1 rejects external search receipts"]},
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    manifest = load_manifest(args.manifest)
+    existing_errors = validate_manifest(manifest)
+    if existing_errors:
+        print(json.dumps({"ok": False, "errors": existing_errors}, indent=2), file=sys.stderr)
+        return 1
+    query = resolve_queries(manifest, [args.query], args.lane)[0]
+    queries = manifest["queries"]
+
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+    call: dict[str, Any] = {
+        "query_id": query["id"],
+        "backend": args.backend,
+        "backend_version": args.backend_version,
+        "status": args.status,
+        "retrieved_at": retrieved_at,
+    }
+    new_candidates: list[dict[str, Any]] = []
+    if args.status == "success":
+        if args.results_file is None:
+            print(
+                json.dumps(
+                    {"ok": False, "errors": ["successful search requires --results-file"]},
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        payload = json.loads(args.results_file.read_text())
+        call["raw_response"] = payload
+        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+        call["response_sha256"] = hashlib.sha256(serialized).hexdigest()
+        call["metadata"] = {
+            "invocation_surface": "Claude native WebSearch",
+            "receipt_file": args.results_file.name,
+        }
+        for row in _native_result_rows(payload):
+            new_candidates.append(
+                {
+                    **row,
+                    "query_id": query["id"],
+                    "query": query["text"],
+                    "backend": args.backend,
+                }
+            )
+    else:
+        call["error"] = args.error or "native search failed without a supplied reason"
+        manifest.setdefault("backend_failures", []).append(
+            {
+                "query_id": query["id"],
+                "backend": args.backend,
+                "error": call["error"],
+            }
+        )
+
+    manifest.setdefault("backend_calls", []).append(call)
+    query_text = {
+        item["id"]: item["text"]
+        for item in queries
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    old_candidates = retained_candidates(manifest, query_text)
+    candidates = old_candidates + new_candidates
+    results = merge_candidates(candidates)
+    manifest.update(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "lane_budgets": dict(LANE_BUDGETS),
+            "retrieval_condition": combined_condition(
+                manifest.get("retrieval_condition"), "open_world"
+            ),
+            "candidates": candidates,
+            "results": results,
+            "selected_keys": select_balanced(results, [item["id"] for item in queries]),
+        }
+    )
+    errors = validate_manifest(manifest)
+    if not errors:
+        save_manifest(args.manifest, manifest)
+    print(
+        json.dumps(
+            {
+                "ok": not errors,
+                "query_id": query["id"],
+                "recorded_results": len(new_candidates),
+                "selected": manifest["selected_keys"],
+                "errors": errors,
+            },
+            indent=2,
+        )
+    )
+    return 0 if args.status == "success" and new_candidates and not errors else 1
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    queries = [
-        {"id": f"q-{index:02d}", "text": text, "lane": args.lane}
-        for index, text in enumerate(args.query, start=1)
-    ]
+    existing_errors = validate_manifest(manifest)
+    if existing_errors:
+        print(json.dumps({"ok": False, "errors": existing_errors}, indent=2), file=sys.stderr)
+        return 1
     names = args.backend or (["frozen"] if args.frozen_corpus else [])
+    if offline_mode() and (set(names) != {"frozen"} or args.frozen_corpus is None):
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "errors": [
+                        f"{OFFLINE_ENV}=1 requires the frozen backend and --frozen-corpus"
+                    ],
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     if not names:
         print(
             json.dumps(
@@ -735,51 +1221,90 @@ def cmd_search(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    queries = resolve_queries(manifest, args.query, args.lane)
     backends, unavailable = build_backends(names, args.frozen_corpus)
     raw, failures, calls = asyncio.run(dispatch_search(queries, backends, args.max_results))
+    unavailable_events: list[dict[str, str]] = []
     for failure in unavailable:
         for query in queries:
+            event = {
+                "query_id": query["id"],
+                "backend": failure["backend"],
+                "error": failure["error"],
+            }
+            unavailable_events.append(event)
             calls.append(
                 {
-                    "query_id": query["id"],
-                    "backend": failure["backend"],
+                    **event,
                     "backend_version": "unavailable",
                     "status": "failed",
                     "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                    "error": failure["error"],
                 }
             )
-    results = merge_candidates(raw)
+    query_text = {
+        item["id"]: item["text"]
+        for item in manifest["queries"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    old_candidates = retained_candidates(manifest, query_text)
+    candidates = old_candidates + raw
+    results = merge_candidates(candidates)
+    current_condition = (
+        "frozen"
+        if set(names) == {"frozen"}
+        else "open_world"
+        if "frozen" not in names
+        else "mixed"
+    )
     manifest.update(
         {
             "schema_version": SCHEMA_VERSION,
             "lane_budgets": dict(LANE_BUDGETS),
-            "retrieval_condition": (
-                "frozen"
-                if set(names) == {"frozen"}
-                else "open_world"
-                if "frozen" not in names
-                else "mixed"
+            "retrieval_condition": combined_condition(
+                manifest.get("retrieval_condition"), current_condition
             ),
-            "queries": queries,
+            "candidates": candidates,
             "results": results,
-            "selected_keys": select_balanced(results, [q["id"] for q in queries]),
-            "backend_calls": calls,
-            "visits": [],
-            "backend_failures": unavailable + failures,
+            "selected_keys": select_balanced(
+                results, [item["id"] for item in manifest["queries"]]
+            ),
+            "backend_calls": manifest.get("backend_calls", []) + calls,
+            "backend_failures": manifest.get("backend_failures", [])
+            + unavailable_events
+            + failures,
         }
     )
-    save_manifest(args.manifest, manifest)
     errors = validate_manifest(manifest)
+    if not errors:
+        save_manifest(args.manifest, manifest)
     print(json.dumps({"ok": not errors, "selected": manifest["selected_keys"],
-                      "failures": manifest["backend_failures"], "errors": errors}, indent=2))
-    return 0 if results and not errors else 1
+                      "dispatch_results": len(raw),
+                      "failures": unavailable_events + failures,
+                      "errors": errors}, indent=2))
+    return 0 if raw and not errors else 1
 
 
 def cmd_visit(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
+    existing_errors = validate_manifest(manifest)
+    if existing_errors:
+        print(json.dumps({"ok": False, "errors": existing_errors}, indent=2), file=sys.stderr)
+        return 1
+    if offline_mode() and args.frozen_corpus is None:
+        print(
+            f"visit failed: {OFFLINE_ENV}=1 requires --frozen-corpus",
+            file=sys.stderr,
+        )
+        return 1
+    if args.view == "section" and not (args.section and args.section.strip()):
+        print("visit failed: --view section requires --section", file=sys.stderr)
+        return 1
+    if args.view != "section" and args.section:
+        print("visit failed: --section is valid only with --view section", file=sys.stderr)
+        return 1
     budget = manifest.get("lane_budgets", LANE_BUDGETS).get(args.lane, LANE_BUDGETS[args.lane])
     view = args.view
+    attempted_backend = "auto"
     try:
         if args.frozen_corpus:
             frozen = FrozenCorpusBackend(args.frozen_corpus)
@@ -800,23 +1325,35 @@ def cmd_visit(args: argparse.Namespace) -> int:
                 view = "full_text"
         elif arxiv_id(args.url) and view == "auto":
             view = "head"
+            attempted_backend = "deepxiv"
             content, backend, backend_version = _deepxiv_read(args.url, view, args.section)
         elif arxiv_id(args.url) and view in {"brief", "head", "preview", "section", "full_text"}:
+            attempted_backend = "deepxiv"
+            _check_deepxiv_progression(
+                manifest, args.url, args.lane, view, args.section
+            )
             content, backend, backend_version = _deepxiv_read(args.url, view, args.section)
         else:
             content, backend = _direct_visit(args.url), "direct"
             backend_version = "stdlib"
             if view == "auto":
                 view = "full_text"
+        if not content.strip():
+            raise RuntimeError("reader returned empty content")
+        original_content_chars = len(content)
         content = content[: budget * 4]
         add_visit(manifest, url=args.url, lane=args.lane, backend=backend, view=view,
                   status="success", content=content, backend_version=backend_version,
-                  section=args.section)
+                  section=args.section, original_content_chars=original_content_chars)
+        errors = validate_manifest(manifest)
+        if errors:
+            manifest["visits"].pop()
+            raise RuntimeError("invalid visit receipt: " + "; ".join(errors))
         save_manifest(args.manifest, manifest)
         print(content)
         return 0
     except Exception as exc:
-        add_visit(manifest, url=args.url, lane=args.lane, backend="auto", view=view,
+        add_visit(manifest, url=args.url, lane=args.lane, backend=attempted_backend, view=view,
                   status="failed", error=f"{type(exc).__name__}: {exc}",
                   backend_version="unknown", section=args.section)
         save_manifest(args.manifest, manifest)
@@ -825,7 +1362,23 @@ def cmd_visit(args: argparse.Namespace) -> int:
 
 
 def cmd_record_visit(args: argparse.Namespace) -> int:
+    if offline_mode():
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "errors": [f"{OFFLINE_ENV}=1 rejects externally recorded visits"],
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     manifest = load_manifest(args.manifest)
+    existing_errors = validate_manifest(manifest)
+    if existing_errors:
+        print(json.dumps({"ok": False, "errors": existing_errors}, indent=2), file=sys.stderr)
+        return 1
     content = args.content_file.read_text(errors="replace") if args.content_file else None
     if args.status == "success" and not content:
         print(
@@ -839,8 +1392,9 @@ def cmd_record_visit(args: argparse.Namespace) -> int:
     add_visit(manifest, url=args.url, lane=args.lane, backend=args.backend,
               view=args.view, status=args.status, content=content, error=args.error,
               backend_version=args.backend_version, section=args.section)
-    save_manifest(args.manifest, manifest)
     errors = validate_manifest(manifest)
+    if not errors:
+        save_manifest(args.manifest, manifest)
     print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
     return 0 if not errors else 1
 
@@ -856,6 +1410,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    probe = sub.add_parser(
+        "probe", help="check local adapter discovery without contacting a remote service"
+    )
+    probe.add_argument("--backend", required=True, choices=["frozen", "deepxiv", "jina"])
+    probe.add_argument("--frozen-corpus", type=Path)
+    probe.set_defaults(func=cmd_probe)
+
     search = sub.add_parser("search", help="fan queries across usable backends")
     search.add_argument("--manifest", type=Path, required=True)
     search.add_argument("--query", action="append", required=True)
@@ -868,6 +1429,19 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--lane", choices=sorted(LANE_BUDGETS), default="grounding")
     search.add_argument("--max-results", type=int, default=10)
     search.set_defaults(func=cmd_search)
+
+    record_search = sub.add_parser(
+        "record-search", help="record and merge results returned by Claude WebSearch"
+    )
+    record_search.add_argument("--manifest", type=Path, required=True)
+    record_search.add_argument("--query", required=True)
+    record_search.add_argument("--lane", choices=sorted(LANE_BUDGETS), default="grounding")
+    record_search.add_argument("--backend", default="claude-websearch")
+    record_search.add_argument("--backend-version", default="hosted-provider-unknown")
+    record_search.add_argument("--status", choices=["success", "failed"], default="success")
+    record_search.add_argument("--results-file", type=Path)
+    record_search.add_argument("--error")
+    record_search.set_defaults(func=cmd_record_search)
 
     visit = sub.add_parser("visit", help="read a source and append a visit receipt")
     visit.add_argument("--manifest", type=Path, required=True)

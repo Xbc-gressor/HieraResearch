@@ -95,7 +95,12 @@ would remove the independent contexts required by this project.
   literature-credibility stamp, required local comparisons, reopening
   conditions, and traceable sources; an arXiv upload is not validation. The
   registry is checked by `tools/background_contract.py` and steers every `fresh`
-  candidate.
+  candidate. `tools/search_backends.py` is the only DeepXiv interface; its
+  append-only manifest, progressive head→section contract, and offline/backend
+  switches are enforced mechanically. The background agent's scoped hook
+  auto-approves only that control plane and blocks direct probes, raw network
+  commands, arbitrary Python, and candidate execution. Use
+  `tools/run_background.py` for controlled retrieval-only conditions.
   See `docs/background-research.md` for the sibling-project audit, evidence
   semantics, fallback behavior, and validation contract.
 - `idea-generator` — produce the next generation in two steps: **SELECT** — run
@@ -168,6 +173,7 @@ python tools/validate_skills.py
 python tools/validate_tasks.py
 python tools/validate_background.py
 python tools/validate_search_backends.py
+python tools/validate_claude.py
 ```
 
 ## Adding A Task

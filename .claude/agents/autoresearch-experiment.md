@@ -252,10 +252,15 @@ When starting a new experiment:
    `ledger.json`; the `ledger.py` helpers create it on the first record. The
    first records will be the loop's bootstrap `fresh` candidates — there is no
    separate seed phase.
-8. **Background research — the only setup step before the loop.** Spawn
-   `Agent(background-researcher)` on the run dir to write `<run_dir>/background.md`
-   and `<run_dir>/background_retrieval.json`, whose visited, credibility-stamped
-   `tf-*` directions every `idea-generator` `fresh` candidate draws from.
+8. **Background research — the only setup step before the loop.** If neither
+   background artifact exists, spawn `Agent(background-researcher)` on the run
+   dir to write `<run_dir>/background.md` and
+   `<run_dir>/background_retrieval.json`, whose visited, credibility-stamped
+   `tf-*` directions every `idea-generator` `fresh` candidate draws from. If
+   both artifacts already exist (for example, because a controlled condition
+   was run through `tools/run_background.py`), validate and reuse them instead
+   of silently changing the retrieval condition. If only one exists, stop as
+   blocked: a background brief and its retrieval trace are one artifact pair.
 9. Verify both artifacts exist and validate the retrieval trace plus registry:
    ```bash
    python tools/search_backends.py validate \
