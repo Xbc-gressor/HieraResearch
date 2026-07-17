@@ -17,7 +17,9 @@ config rather than merging into it, so this launcher:
    with any remaining arguments forwarded verbatim.
 
 The kimi binary is located via `$KIMI_BIN`, then `PATH`, then the common
-VS Code extension install locations.
+VS Code extension install locations. Candidates are probed for `--agent-file`
+support (agent files were added after kimi-cli 0.x), so a stale `kimi` on
+PATH is skipped with a note instead of failing at launch.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import glob
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -37,8 +40,19 @@ HOOKS_TOML = ROOT / ".kimi" / "kimi-hooks.toml"
 USER_CONFIG = Path.home() / ".kimi" / "config.toml"
 
 
+def supports_agent_files(binary: str) -> bool:
+    """Probe whether a kimi candidate knows `--agent-file` (post-0.x feature)."""
+    try:
+        result = subprocess.run(
+            [binary, "--help"], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--agent-file" in result.stdout + result.stderr
+
+
 def find_kimi() -> str:
-    """Locate the kimi executable."""
+    """Locate a kimi executable that supports agent files."""
     candidates = [os.environ.get("KIMI_BIN"), shutil.which("kimi")]
     candidates += sorted(
         glob.glob(
@@ -47,11 +61,35 @@ def find_kimi() -> str:
             )
         )
     )
+    seen: set[str] = set()
+    rejected: list[str] = []
     for candidate in candidates:
-        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        if (
+            not candidate
+            or candidate in seen
+            or not os.path.isfile(candidate)
+            or not os.access(candidate, os.X_OK)
+        ):
+            continue
+        seen.add(candidate)
+        if supports_agent_files(candidate):
             return candidate
+        rejected.append(candidate)
+        print(
+            f"kimi_run.py: skipping {candidate} (no --agent-file support; "
+            "outdated kimi-cli)",
+            file=sys.stderr,
+        )
+    detail = ""
+    if rejected:
+        detail = (
+            "\nskipped outdated kimi binaries without --agent-file support:\n"
+            + "\n".join(f"  - {path}" for path in rejected)
+            + "\nupgrade kimi-cli or point KIMI_BIN at a newer binary"
+        )
     sys.exit(
-        "kimi_run.py: cannot find the kimi binary; set KIMI_BIN or put `kimi` on PATH"
+        "kimi_run.py: cannot find a kimi binary with --agent-file support; "
+        "set KIMI_BIN or put a current `kimi` on PATH" + detail
     )
 
 
