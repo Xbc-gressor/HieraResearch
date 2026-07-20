@@ -50,6 +50,6 @@ agent:
     experience-extractor:
       path: ./experience-extractor.yaml
       description: >
-        Every 5 rounds: regenerate the ledger's global experience block
-        (levers, lessons, per-direction run-local evidence) from the DAG.
+        Every 5 rounds: revise the ledger's bounded global experience snapshot
+        (levers, lessons, per-direction run-local evidence) from the DAG delta.
         Never edits records or background.md.

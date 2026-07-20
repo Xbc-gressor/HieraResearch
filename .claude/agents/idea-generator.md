@@ -125,7 +125,9 @@ Read what you need to make each action concrete (not to re-select):
    framework minimizes). Read the parent's `train.py` when you need to name a
    concrete component to borrow or perturb.
 3. **Experience**: `python tools/ledger.py show --ledger <run_dir>/ledger.json
-   --experience`. Steer idea content toward `promising` regions and
+   --experience`. This is a bounded snapshot incrementally revised from DAG
+   deltas plus Top/Bottom anchors; do not replace it with a full-ledger or
+   full-DAG read. Steer idea content toward `promising` regions and
    `bottlenecks`; do not repeat a `deadend` inside its tested scope unless its
    reopening condition is met. Use **`levers`** (change→Δ
    attribution across the whole run) to favor kinds of change with large typical
@@ -134,7 +136,9 @@ Read what you need to make each action concrete (not to re-select):
    Read `direction_evidence` as a separate run-local axis: `supported_here` and
    `contradicted_here` describe this task/run, while the copied
    `literature_credibility` describes external support. Do not collapse them into
-   one truth score. Apply a negative lesson only to the mechanism and scope it
+   one truth score. The lineage run arrays are bounded traceability receipts,
+   not a request to fetch every historical record. Apply a negative lesson only
+   to the mechanism and scope it
    actually tested. A `deadend` applies only inside its `scope` and is reopened
    by its `reopen_when`. `claim_coverage: partial` and non-empty
    `missing_comparisons` cannot block an adjacent method family.

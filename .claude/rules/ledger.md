@@ -43,8 +43,9 @@ Mutate it only through the helper:
   "task": "<task-name>",
   "tag": "<tag>",
   "metric": "<result.metric>",
+  "dag_revision": 0,
   "records": [ { "<record>" }, ... ],
-  "experience": { "<regenerated global interpretation>" }
+  "experience": { "<bounded derived snapshot + dag_revision cursor>" }
 }
 ```
 
@@ -73,6 +74,7 @@ unavailable fields are `null`, never omitted.
 | `trials_completed` | total warm-start + Phase C trials |
 | `elapsed_seconds` | tuner wall-clock |
 | `applied` | whether tuned params were applied to `BASE_PARAMS` |
+| `dag_revision` | helper-owned revision when this node became graph-visible or its score/status changed |
 
 `keep` means `final_best_score` is strictly **smaller** than the best previous
 `keep` (scores are always lower-is-better; a crash scores `+inf`). The helper is
@@ -94,6 +96,15 @@ tag stored on each fresh root. It keeps two axes separate:
   `comparison_runs`, and `missing_comparisons`. A decisive run status requires
   direct coverage of the direction's named comparisons by at least two scored
   non-crash runs; otherwise the status remains `inconclusive`.
+- `direct_runs`, `descendant_runs`, and `combination_runs` are bounded
+  representative receipts (at most five each), not copies of every historical
+  run id. Exhaustive ancestry stays in the immutable records.
+
+`ledger.dag_revision` advances only when a node first receives a result or an
+existing node's score/status changes. `ledger.py set-experience` copies the
+current revision into `experience.dag_revision` after a validated snapshot is
+stored. `got_graph.py render --incremental` uses that cursor to emit only changed
+nodes and affected edges plus fixed-size Top/Bottom anchors.
 
 Registry v2 external guidance and direction scopes use the same typed axes.
 Selection status is derived by `background_contract.py directions`; a prose
@@ -101,7 +112,7 @@ Pitfall cannot block a direction, and scope-mismatched guidance cannot change it
 priority. Direct `supported_here` or `mixed` evidence may reopen an external
 exclusion without rewriting the external credibility stamp.
 
-Before storing a regenerated experience block, validate it with
+Before storing a revised experience snapshot, validate it with
 `tools/background_contract.py validate-experience`. This checks that every
 direction appears once, the external stamp was not rewritten, and the recorded
 direct, descendant, combination, and comparison run ids match scored DAG

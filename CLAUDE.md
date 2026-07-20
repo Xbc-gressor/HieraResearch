@@ -105,15 +105,16 @@ would remove the independent contexts required by this project.
   by fitness (the graph search does); it reads records + the `experience` block +
   `background.md` to decide *what* each selected action becomes. Replaces the old
   `idea-proposer` skill.
-- `experience-extractor` — periodically (every N generations) distill global
-  experience from the ledger into the `experience` block. Besides levers,
+- `experience-extractor` — periodically (every N generations) incrementally
+  revise a bounded global `experience` snapshot from the ledger's DAG revision
+  delta plus fixed Top/Bottom anchors. Besides levers,
   dead-ends, and bottlenecks, it joins candidate ancestry to `background.md` by
   stable `tf-*` id and assigns each direction a separate run-local status:
   `untested`, `inconclusive`, `supported_here`, `contradicted_here`, or `mixed`.
   Decisive statuses require direct coverage of the direction's named comparators;
   missing arms remain `inconclusive`. It never rewrites the external literature
   stamp; the direction evidence is validated against the actual DAG before
-  `tools/ledger.py set-experience`.
+  `tools/ledger.py set-experience`; stored lineage receipts stay bounded.
 - `candidate-writer` — implement one candidate's `train.py`. Receives **just
   the target candidate dir**; reads its own ledger record (added by
   `idea-generator`) for the full `idea` + `source_run_ids`, derives

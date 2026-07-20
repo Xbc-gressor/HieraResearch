@@ -19,6 +19,7 @@ Shape:
       "task": "tabular-model-search",
       "tag": "agent-main-smoke",
       "metric": "mean_test_accuracy",
+      "dag_revision": 12,              # monotone graph-change cursor
       "records": [ {record}, ... ]   # ordered by run_id
     }
 
@@ -63,6 +64,7 @@ RECORD_FIELDS = (
     "trials_completed",
     "elapsed_seconds",
     "applied",           # bool | null: tuned params applied to BASE_PARAMS
+    "dag_revision",      # last score/status revision visible to the development DAG
 )
 
 TUNING_FIELDS = (
@@ -163,6 +165,18 @@ def _new_record(run_id: str) -> dict:
         "tune": False,
         "status": "pending",
     }
+
+
+def _current_dag_revision(data: dict) -> int:
+    return int(data.get("dag_revision", 0))
+
+
+def _touch_dag_record(data: dict, record: dict) -> int:
+    """Mark one new or score-updated DAG node with the next revision."""
+    current = _current_dag_revision(data) + 1
+    data["dag_revision"] = current
+    record["dag_revision"] = current
+    return current
 
 
 # ---------- derived computations ----------
@@ -414,6 +428,8 @@ def record_run(
         record = _new_record(run_id)
         data["records"].append(record)
 
+    before_graph_value = (record.get("status"), record.get("final_best_score"))
+
     # A non-finite score (+inf from a timeout / all-failed HPO, or nan) is NOT a
     # real result — it means the candidate could not be evaluated → crash, not
     # discard. Only a finite score is keep/discard.
@@ -431,6 +447,9 @@ def record_run(
         record["candidate_name"] = candidate_name
     if description:
         record["description"] = description
+    after_graph_value = (record.get("status"), record.get("final_best_score"))
+    if after_graph_value != before_graph_value:
+        _touch_dag_record(data, record)
     _save_ledger(ledger_path, data)
     _write_loop_state(ledger_path, data, config)
     return record
@@ -555,6 +574,8 @@ def cmd_brief(args) -> int:
         "reached": None if budget is None else attempted >= budget,
         "experience_updated_at_run": experience.get("updated_at_run"),
         "experience_generation": experience.get("generation"),
+        "dag_revision": data.get("dag_revision", 0),
+        "experience_dag_revision": experience.get("dag_revision"),
     }
     print(json.dumps(result, separators=(",", ":")))
     return 0
@@ -600,11 +621,16 @@ def cmd_loop_state(args) -> int:
     return 0
 
 
-def _set_experience(ledger_path: Path, experience: Any) -> None:
-    """Overwrite the ledger's top-level `experience` block (regenerate, not
-    append — so stale/wrong lessons drop on the next extraction). This is the
-    only way to write experience; the records array is untouched."""
+def _set_experience(ledger_path: Path, experience: dict) -> None:
+    """Overwrite the derived experience snapshot and advance its DAG cursor.
+
+    The cursor is helper-owned rather than model-authored.  It is written only
+    after the caller has validated the complete replacement snapshot, so a
+    failed extraction cannot acknowledge graph changes it did not process.
+    """
     data = _load_ledger(ledger_path)
+    experience = dict(experience)
+    experience["dag_revision"] = _current_dag_revision(data)
     data["experience"] = experience
     _save_ledger(ledger_path, data)
 

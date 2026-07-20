@@ -102,8 +102,9 @@ The role agents (prompts are runtime-adapted copies of `.claude/agents/`):
   crash diagnosis (the `crash-diagnosis` skill), records `best_warm_score`.
 - `tuner-orchestrator` — once per round on the run dir: the promotion gate
   selects at most one candidate and deep-tunes it in place.
-- `experience-extractor` — every 5 rounds: regenerate the ledger's `experience`
-  block (levers, lessons, per-`tf-*` run-local direction evidence).
+- `experience-extractor` — every 5 rounds: incrementally revise the ledger's
+  bounded `experience` snapshot from new/changed DAG edges, fixed Top/Bottom
+  anchors, and compact per-`tf-*` lineage receipts.
 
 The PreToolUse hook on `Agent` (`tools/harness_guard.py`) deterministically
 rejects delegation-boundary violations (e.g. assigning step-0+1/eval work to

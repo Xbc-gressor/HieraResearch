@@ -630,9 +630,9 @@ def main() -> int:
     assert any("does not match background.md" in error for error in errors), errors
 
     wrong_lineage = copy.deepcopy(experience)
-    wrong_lineage["direction_evidence"][0]["combination_runs"] = []
+    wrong_lineage["direction_evidence"][0]["combination_runs"] = ["002"]
     errors = validate_experience(wrong_lineage, REGISTRY, ledger)
-    assert any("must match DAG lineage" in error for error in errors), errors
+    assert any("is not a DAG-lineage subset" in error for error in errors), errors
 
     bad_ledger = copy.deepcopy(ledger)
     bad_ledger["records"][0]["source_run_ids"] = ["tf-99"]

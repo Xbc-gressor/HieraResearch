@@ -76,6 +76,7 @@ RUN_STATUS = {
 }
 CONFIDENCE = {"low", "med", "high"}
 CLAIM_COVERAGE = {"none", "partial", "direct"}
+LINEAGE_SAMPLE_LIMIT = 5
 
 
 class ContractError(ValueError):
@@ -707,6 +708,92 @@ def derive_lineage(registry: dict[str, Any], ledger: dict[str, Any]) -> dict[str
     }
 
 
+def _lineage_sample(items: list[dict[str, Any]], changed: set[str], limit: int) -> list[dict[str, Any]]:
+    """Choose bounded, deterministic receipts: changed, best, worst, newest."""
+    if limit <= 0:
+        return []
+    by_newest = sorted(items, key=lambda item: str(item["run_id"]), reverse=True)
+    finite = [item for item in items if isinstance(item.get("score"), (int, float))]
+    best = sorted(finite, key=lambda item: (item["score"], str(item["run_id"])))
+    worst = sorted(
+        items,
+        key=lambda item: (
+            item.get("status") == "crash",
+            item.get("score") if isinstance(item.get("score"), (int, float)) else float("inf"),
+            str(item["run_id"]),
+        ),
+        reverse=True,
+    )
+    ordered = [item for item in by_newest if item["run_id"] in changed] + best + worst + by_newest
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in ordered:
+        if item["run_id"] in seen:
+            continue
+        selected.append(item)
+        seen.add(item["run_id"])
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def derive_compact_lineage(
+    registry: dict[str, Any], ledger: dict[str, Any], *, limit: int = LINEAGE_SAMPLE_LIMIT
+) -> dict[str, Any]:
+    """Bounded lineage view for incremental experience extraction.
+
+    Exhaustive lineage remains mechanically derivable and is still used by the
+    validator. The model receives only runs changed since the committed
+    experience cursor and fixed-size representative receipts. This avoids
+    re-injecting every historical run id on each refresh.
+    """
+    lineage = derive_lineage(registry, ledger)
+    experience = ledger.get("experience") if isinstance(ledger.get("experience"), dict) else {}
+    cursor = int(experience.get("dag_revision", 0))
+    current = int(ledger["dag_revision"])
+    records = {
+        str(record.get("run_id")): record
+        for record in ledger.get("records", [])
+        if record.get("run_id") is not None
+        and (
+            record.get("status") == "crash"
+            or isinstance(record.get("final_best_score"), (int, float))
+        )
+    }
+    changed = {
+        run_id for run_id, record in records.items()
+        if int(record["dag_revision"]) > cursor
+    }
+
+    categories = {
+        "direct_runs": "direct_runs",
+        "descendant_runs": "single_origin_descendants",
+        "combination_runs": "combination_runs",
+    }
+    directions: dict[str, Any] = {}
+    for direction_id, evidence in lineage["directions"].items():
+        directions[direction_id] = {
+            "literature_credibility": evidence["literature_credibility"],
+            "delta_runs": {
+                output: [item for item in evidence[source] if item["run_id"] in changed]
+                for output, source in categories.items()
+            },
+            "representative_runs": {
+                output: _lineage_sample(evidence[source], changed, limit)
+                for output, source in categories.items()
+            },
+        }
+    return {
+        "schema_version": lineage["schema_version"],
+        "cursor": {
+            "from_revision": cursor,
+            "to_revision": current,
+        },
+        "directions": directions,
+        "warnings": lineage["warnings"],
+    }
+
+
 def validate_experience(
     experience: dict[str, Any], registry: dict[str, Any], ledger: dict[str, Any]
 ) -> list[str]:
@@ -715,7 +802,6 @@ def validate_experience(
     entries = experience.get("direction_evidence")
     if not isinstance(entries, list):
         return ["experience.direction_evidence must be a list"]
-
     lineage = derive_lineage(registry, ledger)
     errors.extend(f"lineage: {warning}" for warning in lineage["warnings"])
     expected = lineage["directions"]
@@ -871,10 +957,10 @@ def validate_experience(
                 errors.append(f"{where}.{output_field} must be a list of run-id strings")
                 continue
             expected_ids = [item["run_id"] for item in expected_direction[lineage_field]]
-            if sorted(actual_ids) != sorted(expected_ids):
+            unknown_lineage = sorted(set(actual_ids) - set(expected_ids))
+            if unknown_lineage:
                 errors.append(
-                    f"{where}.{output_field} must match DAG lineage; "
-                    f"expected {expected_ids}, got {actual_ids}"
+                    f"{where}.{output_field} is not a DAG-lineage subset: {unknown_lineage}"
                 )
 
         evidence_edges = entry.get("evidence_edges")
@@ -958,7 +1044,13 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     if errors:
         print(json.dumps({"ok": False, "errors": errors}, indent=2))
         return 1
-    print(json.dumps(derive_lineage(registry, ledger), indent=2))
+    if args.compact:
+        print(json.dumps(
+            derive_compact_lineage(registry, ledger, limit=args.limit),
+            separators=(",", ":"),
+        ))
+    else:
+        print(json.dumps(derive_lineage(registry, ledger), indent=2))
     return 0
 
 
@@ -1115,6 +1207,10 @@ def build_parser() -> argparse.ArgumentParser:
     lineage = sub.add_parser("lineage", help="join tf-* directions to candidate lineage")
     lineage.add_argument("--background", type=Path, required=True)
     lineage.add_argument("--ledger", type=Path, required=True)
+    lineage.add_argument("--compact", action="store_true",
+                         help="emit delta runs and bounded representative receipts")
+    lineage.add_argument("--limit", type=int, default=LINEAGE_SAMPLE_LIMIT, metavar="N",
+                         help=f"representative receipts per lineage category (default {LINEAGE_SAMPLE_LIMIT})")
     lineage.set_defaults(func=cmd_lineage)
 
     directions = sub.add_parser(

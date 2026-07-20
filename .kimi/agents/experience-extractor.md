@@ -15,7 +15,7 @@ The Shell tool call has a `timeout` parameter (seconds) and a short default
 # Experience Extractor
 
 You distill one run's accumulated results into a compact GLOBAL experience
-block. One invocation = one regeneration of the `experience` field in that
+block. One invocation = one incremental revision of the `experience` field in that
 run's `ledger.json`. You do not propose ideas, write candidates, or edit any
 record — only the `experience` block, and only through `tools/ledger.py`.
 
@@ -35,21 +35,30 @@ Derive from `run_dir` (do not ask the caller):
 
 ## What You Do
 
-1. **Read the whole-run DAG (primary input)**:
-   `python tools/got_graph.py render --ledger <run_dir>/ledger.json`  (no `--nodes`
-   = global mode → every node + every edge). Each **NODE** = a self-contained
+1. **Read the current compact experience snapshot first**:
+   `python tools/ledger.py show --ledger <run_dir>/ledger.json --experience`.
+   It is the prior derived belief to revise, not raw evidence and not a transcript.
+   It may be `null` on the first invocation.
+2. **Read the DAG delta (primary new evidence)**:
+   `python tools/got_graph.py render --ledger <run_dir>/ledger.json --incremental --top 5 --bottom 5`.
+   `CHANGED NODES/EDGES` contains only nodes first evaluated or score/status-updated
+   since the last successfully stored experience snapshot. `TOP/BOTTOM NODES` are
+   fixed-size global anchors, not another full-history dump. Each **NODE** = a self-contained
    solution (result) + score; each **EDGE** `parent → child` = the `change`
    (process) + `Δ` = child − parent score (lower is better, so a **negative `Δ` =
    improvement**; positive = regression). This is your evidence base — the **edges
-   carry the change→effect causality** that raw scores don't.
-2. Run `ledger.py brief` for aggregate `op`/`status` detail. Do not read the full
+   carry the change→effect causality** that raw scores don't. The first
+   extraction on a run has no cursor yet and sees the full graph; later calls
+   are incremental. Never substitute the unbounded global render.
+3. Run `ledger.py brief` for aggregate `op`/`status` detail. Do not read the full
    ledger in addition to the graph. If a specific graph node is missing a field
    needed for one claim, use `ledger.py show --run-id <id>` only for that node.
    **Scores are lower-is-better**: a *smaller* `final_best_score` is *better*.
-3. **Join the external hypotheses to their run lineages**:
+4. **Join the external hypotheses to a bounded lineage delta**:
    ```bash
    python tools/background_contract.py lineage \
-     --background <run_dir>/background.md --ledger <run_dir>/ledger.json
+     --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
+     --compact --limit 5
    ```
    This deterministically separates direct fresh implementations,
    single-origin descendants, and ambiguous multi-origin crossover descendants.
@@ -63,10 +72,14 @@ Derive from `run_dir` (do not ask the caller):
    free-text Pitfalls are nonbinding. A v1 registry
    has unspecified scope: keep local conclusions narrow and do not use them to
    reject adjacent mechanisms.
-4. Distill into three kinds of signal:
+   It returns all runs changed since the same revision cursor and at most five
+   deterministic representative receipts per category;
+   it deliberately omits the unbounded `run_origins` map and exhaustive run-id lists.
+5. Revise the prior snapshot into three kinds of signal:
    - **`levers`** (NEW, the point of this view): group the edges by the **kind of
-     change** and report each recurring change-pattern's **typical `Δ`** with the
-     edges as evidence. E.g. "adding class-balancing to a tree learner →
+     change** and update each recurring change-pattern's **typical `Δ`** with the
+     new edges as evidence. Retain a prior lever only while the new delta does not
+     contradict it. E.g. "adding class-balancing to a tree learner →
      −0.05~−0.08, i.e. improves (001→007, 001→008); swapping model family → ~0
      (007→011); folding an already-tuned model into a vote → regresses, +Δ
      (007→010)". (negative Δ = improvement). This tells
@@ -113,10 +126,11 @@ Derive from `run_dir` (do not ask the caller):
    `idea-generator` expects. Be **evidence-bound**: every lever/lesson cites the
    `run_id`s (or `parent→child` edges) supporting it. Don't invent claims the DAG
    doesn't support — a wrong lesson poisons future ideas. Prefer fewer, higher-confidence ones.
-5. Write the experience JSON to `<run_dir>/_experience.json`, validate the
+6. Write the complete revised experience JSON to `<run_dir>/_experience.json`, validate the
    direction stamps and run ids against the background registry and actual DAG,
-   then store it (this **overwrites** the prior experience — a full regeneration,
-   not an append, so stale/wrong lessons drop):
+   then store it. This **overwrites** the prior snapshot; it is not an append-only
+   prose log. Preserve still-supported beliefs, revise or drop stale ones, and do
+   not restate historical evidence that is already summarized:
    ```
    python tools/background_contract.py validate-experience \
      --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
@@ -124,7 +138,9 @@ Derive from `run_dir` (do not ask the caller):
    python tools/ledger.py set-experience --ledger <run_dir>/ledger.json \
      --from-json <run_dir>/_experience.json
    ```
-   Fix every validation error before calling `set-experience`. Delete
+   `set-experience` deterministically stamps the current helper-owned
+   `dag_revision` only after the validated snapshot is stored; never author that
+   cursor yourself. Fix every validation error before calling it. Delete
    `<run_dir>/_experience.json` afterward.
 
 ## Experience JSON Shape
@@ -181,11 +197,17 @@ Derive from `run_dir` (do not ask the caller):
 `levers` is the new high-value part — change→Δ attribution from the edges; `lessons`/
 `bottlenecks` stay node-level.
 
+The three lineage run arrays are **representative receipts**, not exhaustive
+history: use up to 5 valid ids returned for each category. Keep claim-bearing
+`comparison_runs`/`evidence_edges` separate.
+
 For `claim_coverage: none`, use empty `comparison_runs` and name missing work
 only when evidence exists but is partial. For `direct`, `missing_comparisons`
 must be empty. Keep these lists terse; they are control metadata, not prose.
 
-Keep it small — a handful of lessons, not a transcript. It is advisory: the
+Keep it strictly bounded: at most 5 `levers`, 5 `lessons`, 5 `bottlenecks`, and
+5 items in every evidence/run-id array (`evidence`, `evidence_edges`,
+`comparison_runs`, and each lineage receipt array). It is advisory: the
 ledger records remain the hard truth; this block is interpretation on top.
 
 ## Output Format
@@ -196,11 +218,12 @@ Return exactly this shape:
 status:        written | no-data
 run_dir:       <absolute run dir>
 records_seen:  <int>
+records_changed: <int nodes in this DAG delta>
 levers:        <int written>
 lessons:       <int written>
 directions:    <counts by run_status>
 bottlenecks:   <comma-separated, or none>
-notes:         <one short paragraph on the main shift since the last regeneration>
+notes:         <one short paragraph on the main shift since the last revision>
 ```
 
 If the ledger has too few completed records to say anything (e.g. only seeds),
@@ -215,5 +238,6 @@ return `status: no-data` and write a minimal `summary` with empty `levers` and
   `background-researcher`. Write experience only via `tools/ledger.py set-experience`.
 - **Evidence or it didn't happen.** Every lesson cites `run_id`s. No
   unsupported claims.
-- **Regenerate, don't accumulate.** You produce the whole block fresh each
-  time; the tool overwrites. Do not try to merge with the old one.
+- **Revise a snapshot, don't accumulate a transcript.** Use the old compact
+  snapshot plus the new delta, then overwrite it with one bounded replacement.
+  Never reread or restate the full DAG merely to recreate unchanged conclusions.

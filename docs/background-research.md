@@ -199,7 +199,7 @@ Every direction has one stable `tf-*` id and two deliberately separate views:
 1. `literature_credibility` lives in `background.md` and describes inspected
    external evidence: `unverified`, `preliminary`, `corroborated`, `replicated`,
    or `contested`.
-2. `run_status` lives in `ledger.json`'s regenerated experience block and
+2. `run_status` lives in `ledger.json`'s incrementally revised experience snapshot and
    describes only the current task/run: `untested`, `inconclusive`,
    `supported_here`, `contradicted_here`, or `mixed`.
 
@@ -288,6 +288,12 @@ validation cannot prove that free-form candidate code implements the right arm,
 so the experience extractor must still check the persisted candidate records;
 the schema makes that judgment visible and prevents a single unpaired result or
 crash from becoming a decisive status.
+
+To keep long runs bounded, exhaustive ancestry stays mechanically derivable from
+the immutable ledger. The experience snapshot stores at most five representative
+direct/descendant/combination run receipts per direction. Periodic extraction
+consumes only the helper-revisioned DAG delta, compact lineage delta, and fixed
+Top/Bottom anchors.
 
 The same boundary applies to reusable `deadend` lessons. Under a v2 registry, a
 dead end needs two scored non-crash runs and must state the exact tested scope

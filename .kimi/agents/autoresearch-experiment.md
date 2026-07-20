@@ -340,8 +340,9 @@ files every round. Candidate `train.py` files likewise stay in child contexts.
 
 When `ledger.json` exists and has at least one completed record, refresh before
 the next generation and then **every 5 rounds**: spawn `experience-extractor`
-with the run dir. It regenerates the top-level `experience` block from the DAG,
-including `tf-*` direction evidence joined to `background.md`. On an empty-run
+with the run dir. It incrementally revises the bounded top-level `experience`
+snapshot from the helper-owned DAG revision delta, fixed Top/Bottom anchors, and
+compact `tf-*` lineage receipts. It does not re-inject the whole DAG. On an empty-run
 bootstrap there is no ledger evidence, so skip extraction and let
 `idea-generator` use the validated external registry alone. **Skip this step on
 non-refresh rounds** (it is not per-round).
@@ -482,8 +483,8 @@ Use child agents for bounded work:
 - `background-researcher`: (required at setup) survey external knowledge
   for the task → `<run_dir>/background.md` plus
   `<run_dir>/background_retrieval.json` (the visited `tf-*` evidence).
-- `experience-extractor`: (periodic, every 5 rounds) distill the global
-  `experience` block into `ledger.json` from the records.
+- `experience-extractor`: (periodic, every 5 rounds) revise the bounded global
+  `experience` snapshot from the DAG delta and compact lineage receipts.
 - `idea-generator`: (once per round) SELECT via `got_select decide` then IDEATE
   this round's ≤ `B` actions and record each (`--op`, `--source-run-ids`).
 - `candidate-writer`: implement one candidate's `train.py` from its ledger record.

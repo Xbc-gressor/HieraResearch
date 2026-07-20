@@ -1,7 +1,8 @@
 """got_graph.py — S-GoT 计算层:发展 DAG + MCTS 统计(设计稿 §3 / §4 / §14.2)。
 
-节点身份 = `run_id`(str)。`r / V_max / V_med / N / cap` 每代从 DAG 重算(规模小,
-重算最简单,§14.1);`ec` 在 add 时增量维护(创建子代时每个真父代 +1,含产出 crash 的那次)。
+节点身份 = `run_id`(str)。`r / V_max / V_med / N / cap` 从 DAG 派生；ledger
+加载用一次批量拓扑 pass 重建结构统计，避免逐节点重复回溯祖先。`ec` 在 add 时
+增量维护(创建子代时每个真父代 +1,含产出 crash 的那次)。
 
 `source_run_ids` 是通用"来源"列表(§9):improve/crossover 放父代 run_id;
 fresh 放方向 tag `tf-*`。`parents()` 只取能解析成现有节点的项 → fresh 自动是根、tf-* 不连边。
@@ -60,10 +61,18 @@ class Graph:
 
     # ---------- ledger 适配器 ----------
     @classmethod
-    def from_ledger(cls, ledger: dict, *, C: float = 1.5, alpha: float = 0.5) -> "Graph":
+    def from_ledger(
+        cls, ledger: dict, *, C: float = 1.5, alpha: float = 0.5,
+        structural_stats: bool = True,
+    ) -> "Graph":
         """从 ledger.json dict 建图。按 run_id 升序(= 创建序 = 拓扑序:父先于子)插入,
         故 `_infer_op` 时父代已在图中。只纳入已跑过的 record(有数值 score 或 status=crash);
-        pending / 未跑(无 score)跳过。record 带 `op` 时为准,否则按可解析父代数推断。"""
+        pending / 未跑(无 score)跳过。record 带 `op` 时为准,否则按可解析父代数推断。
+
+        ledger 是完整快照，故不走 ``_add`` 的在线 ancestor backprop（长链上会
+        O(V²)）。节点/边先批量装载，再用 Python-int bitset 的反向拓扑 pass 精确
+        计算每个节点的 unique non-crash subtree ``N``。只做渲染时可关闭该统计。
+        """
         g = cls(C=C, alpha=alpha)
         for r in sorted(ledger.get("records", []), key=lambda r: _rid_key(r.get("run_id"))):
             status = r.get("status")
@@ -74,8 +83,31 @@ class Graph:
                 continue                                  # pending / 未跑 → 跳过
             src = [str(s) for s in (r.get("source_run_ids") or [])]
             op = r.get("op") or g._infer_op(src)
-            g._add(r["run_id"], op, src, None, float(score), status or "kept")
+            rid = str(r["run_id"])
+            g.nodes[rid] = Node(rid, op, src, float(score), status or "kept")
+            g._N[rid] = 0 if status == "crash" else 1
+        numeric_ids = [int(nid) for nid in g.nodes if nid.isdigit()]
+        g._next = max(numeric_ids, default=-1) + 1
+        if structural_stats:
+            g._rebuild_structural_stats()
         return g
+
+    def _rebuild_structural_stats(self) -> None:
+        """Rebuild ``ec`` and exact unique-subtree ``N`` from a loaded snapshot."""
+        for node in self.nodes.values():
+            node.ec = 0
+        for nid in self.nodes:
+            for parent in self.parents(nid):
+                self.nodes[parent].ec += 1
+
+        masks: dict[str, int] = {}
+        bit_for = {nid: 1 << index for index, nid in enumerate(self.topo())}
+        for nid in reversed(self.topo()):
+            mask = 0 if self.nodes[nid].status == "crash" else bit_for[nid]
+            for child in self.children(nid):
+                mask |= masks[child]
+            masks[nid] = mask
+            self._N[nid] = mask.bit_count()
 
     def _infer_op(self, source_run_ids) -> str:
         """缺 `op` 字段时的回退:按"能解析成现有节点的父代数"判 0/1/≥2。"""
@@ -222,7 +254,8 @@ def _rid_key(rid):
 
 # ---------- render:带注释的祖先轨迹视图(只读投影,设计 dev_plan/plan_change_effect)----------
 # 给定本轮要用的父代,摘出它们的祖先发展轨迹:节点=结果(ledger 的 idea,自包含),
-# 边=过程(ledger 的 change)+ 效果 Δ(现算)。纯读 ledger,不写、不调模型、仅 stdlib。
+# 边=过程(ledger 的 change)+ 效果 Δ(现算)。增量模式按 helper-owned
+# ``dag_revision`` 游标只输出变化，加固定大小 Top/Bottom 锚点。纯读 ledger。
 
 def _clean(s):
     """折叠空白/换行成单行,但**不截断**(完整保留 idea/change 内容)。"""
@@ -255,12 +288,48 @@ def _within(step, nid, depth):
     return seen
 
 
+def _best_id(g: Graph):
+    candidates = [
+        (n.score, _rid_key(nid), nid)
+        for nid, n in g.nodes.items()
+        if n.status != "crash"
+    ]
+    return min(candidates)[2] if candidates else None
+
+
+def _node_view(g: Graph, recs: dict, nid: str, *, best_id=None, **marks) -> dict:
+    n = g.nodes[nid]
+    root_tag = n.source_run_ids[0] if (n.op == "fresh" and n.source_run_ids) else n.op
+    return {
+        "id": nid,
+        "op": n.op,
+        "status": n.status,
+        "score": None if n.score == CRASH else round(n.score, 4),
+        "result": recs.get(nid, {}).get("idea"),
+        "root": root_tag,
+        "is_query": bool(marks.get("is_query")),
+        "is_child": bool(marks.get("is_child")),
+        "is_best": nid == best_id,
+    }
+
+
+def _edge_view(g: Graph, recs: dict, parent: str, child: str) -> dict:
+    cs, ps = g.nodes[child].score, g.nodes[parent].score
+    delta = None if (cs == CRASH or ps == CRASH) else round(cs - ps, 4)
+    return {
+        "child": child,
+        "parent": parent,
+        "delta": delta,
+        "change": _change_for_parent(recs.get(child, {}).get("change"), parent),
+    }
+
+
 def render_trajectory(ledger: dict, query_ids: list, depth=3) -> dict:
     """围绕 query 父代抠一张局部 DAG,从新到旧展示:
     - 往新方向 1 代:query 父代的**直接子代**(clone/improve 检查——这俩父代已被组合/改进过没有)。
     - 往旧方向 depth 层:query 父代的**祖先**(最多 depth 跳的发展轨迹)。
     节点=结果(idea)+分数,边=过程(change)+Δ;run_id 降序(新→旧)。纯读。"""
-    g = Graph.from_ledger(ledger)
+    g = Graph.from_ledger(ledger, structural_stats=False)
     recs = {str(r.get("run_id")): r for r in ledger.get("records", [])}
     query = [str(q) for q in query_ids]
     qset = {q for q in query if q in g.nodes}
@@ -271,82 +340,143 @@ def render_trajectory(ledger: dict, query_ids: list, depth=3) -> dict:
         ancestors |= _within(g.parents, q, depth)     # 往旧:depth 层祖先
     focus = qset | children | ancestors
 
-    best_id, best_score = None, float("inf")          # 全局最优(最低 non-crash 分)
-    for nid, n in g.nodes.items():
-        if n.status != "crash" and n.score < best_score:
-            best_id, best_score = nid, n.score
+    best_id = _best_id(g)
 
     nodes = []
     for nid in sorted(focus, key=_rid_key, reverse=True):   # 新 → 旧
-        n = g.nodes[nid]
-        root_tag = n.source_run_ids[0] if (n.op == "fresh" and n.source_run_ids) else n.op
-        nodes.append({"id": nid, "op": n.op, "status": n.status,
-                      "score": None if n.score == CRASH else round(n.score, 4),
-                      "result": recs.get(nid, {}).get("idea"), "root": root_tag,
-                      "is_query": nid in qset, "is_best": nid == best_id,
-                      "is_child": nid in children and nid not in qset})
+        nodes.append(_node_view(
+            g, recs, nid, best_id=best_id, is_query=nid in qset,
+            is_child=nid in children and nid not in qset,
+        ))
 
     edges = []
     for child in sorted(focus, key=_rid_key, reverse=True):
         for parent in sorted(g.parents(child), key=_rid_key):
             if parent not in focus:
                 continue
-            cs, ps = g.nodes[child].score, g.nodes[parent].score
-            delta = None if (cs == CRASH or ps == CRASH) else round(cs - ps, 4)
-            edges.append({"child": child, "parent": parent, "delta": delta,
-                          "change": _change_for_parent(recs.get(child, {}).get("change"), parent)})
+            edges.append(_edge_view(g, recs, parent, child))
     return {"query": query, "best": best_id, "nodes": nodes, "edges": edges}
 
 
 def render_global(ledger: dict) -> dict:
     """全局副模式(无 --nodes):投影**整个 run** 的全部节点 + 全部边(change+Δ),新→旧。
-    不设 cap——给 experience-extractor 当全样本找「change→Δ」规律。纯读。"""
-    g = Graph.from_ledger(ledger)
+    不设 cap，仅保留给手工诊断；agent 热路必须用 ``render_incremental``。纯读。"""
+    g = Graph.from_ledger(ledger, structural_stats=False)
     recs = {str(r.get("run_id")): r for r in ledger.get("records", [])}
 
-    best_id, best_score = None, float("inf")
-    for nid, n in g.nodes.items():
-        if n.status != "crash" and n.score < best_score:
-            best_id, best_score = nid, n.score
+    best_id = _best_id(g)
 
     order = sorted(g.nodes, key=_rid_key, reverse=True)   # 新 → 旧
     nodes = []
     for nid in order:
-        n = g.nodes[nid]
-        root_tag = n.source_run_ids[0] if (n.op == "fresh" and n.source_run_ids) else n.op
-        nodes.append({"id": nid, "op": n.op, "status": n.status,
-                      "score": None if n.score == CRASH else round(n.score, 4),
-                      "result": recs.get(nid, {}).get("idea"), "root": root_tag,
-                      "is_query": False, "is_child": False, "is_best": nid == best_id})
+        nodes.append(_node_view(g, recs, nid, best_id=best_id))
     edges = []
     for child in order:
         for parent in sorted(g.parents(child), key=_rid_key):
-            cs, ps = g.nodes[child].score, g.nodes[parent].score
-            delta = None if (cs == CRASH or ps == CRASH) else round(cs - ps, 4)
-            edges.append({"child": child, "parent": parent, "delta": delta,
-                          "change": _change_for_parent(recs.get(child, {}).get("change"), parent)})
+            edges.append(_edge_view(g, recs, parent, child))
     return {"query": None, "best": best_id, "nodes": nodes, "edges": edges}
 
 
+def render_incremental(ledger: dict, *, top=5, bottom=5) -> dict:
+    """Render graph changes since the last committed experience snapshot.
+
+    ``ledger.py set-experience`` owns ``experience.dag_revision``.  A record is
+    selected when its node score/status was first recorded or later updated
+    after that cursor.  Edges incident to a changed node are emitted because a
+    parent score update also changes every outgoing child-parent delta.
+
+    Global Top/Bottom node anchors are fixed-size and disjoint, so context no
+    longer grows with the run.
+    """
+    g = Graph.from_ledger(ledger, structural_stats=False)
+    recs = {str(r.get("run_id")): r for r in ledger.get("records", [])}
+    experience = ledger.get("experience") if isinstance(ledger.get("experience"), dict) else {}
+    cursor = int(experience.get("dag_revision", 0))
+    current = int(ledger["dag_revision"])
+    changed = {
+        nid for nid in g.nodes if int(recs[nid]["dag_revision"]) > cursor
+    }
+
+    best_id = _best_id(g)
+    changed_order = sorted(changed, key=_rid_key, reverse=True)
+    delta_nodes = [_node_view(g, recs, nid, best_id=best_id) for nid in changed_order]
+    delta_edges = []
+    for child in sorted(g.nodes, key=_rid_key, reverse=True):
+        for parent in sorted(g.parents(child), key=_rid_key):
+            if child in changed or parent in changed:
+                delta_edges.append(_edge_view(g, recs, parent, child))
+
+    noncrash = sorted(
+        (nid for nid, node in g.nodes.items() if node.status != "crash" and nid not in changed),
+        key=lambda nid: (g.nodes[nid].score, _rid_key(nid)),
+    )
+    top_ids = noncrash[:max(0, top)]
+    top_set = set(top_ids)
+    worst = sorted(
+        (nid for nid in g.nodes if nid not in changed and nid not in top_set),
+        key=lambda nid: (
+            g.nodes[nid].status == "crash",
+            g.nodes[nid].score,
+            _rid_key(nid),
+        ),
+        reverse=True,
+    )
+    bottom_ids = worst[:max(0, bottom)]
+    return {
+        "mode": "incremental",
+        "cursor": {
+            "from_revision": cursor,
+            "to_revision": current,
+        },
+        "best": best_id,
+        "delta_nodes": delta_nodes,
+        "delta_edges": delta_edges,
+        "top_nodes": [_node_view(g, recs, nid, best_id=best_id) for nid in top_ids],
+        "bottom_nodes": [_node_view(g, recs, nid, best_id=best_id) for nid in bottom_ids],
+    }
+
+
+def _format_nodes(lines: list[str], nodes: list[dict]) -> None:
+    for n in nodes:
+        marks = " ".join((["◀parent"] if n["is_query"] else [])
+                         + (["↳child"] if n.get("is_child") else [])
+                         + (["★best"] if n["is_best"] else []))
+        score = "crash" if n["score"] is None else f"{n['score']:.4f}"
+        st = "" if n["status"] in (None, "kept", "keep") else f" {n['status']}"
+        lines.append(f"  {n['id']:>4}  {score:>9}  [{n['root']}]{st} {marks}  {_clean(n['result'])}".rstrip())
+
+
+def _format_edges(lines: list[str], edges: list[dict]) -> None:
+    for e in edges:
+        d = "  n/a " if e["delta"] is None else f"Δ {e['delta']:+.3f}"
+        lines.append(f"  {e['parent']:>4} → {e['child']:<4}  {d:>9}  {_clean(e['change'])}".rstrip())
+
+
 def format_text(view: dict) -> str:
+    if view.get("mode") == "incremental":
+        cursor = view["cursor"]
+        lines = [
+            f"DAG DELTA (revision {cursor['from_revision']} → {cursor['to_revision']})",
+            "",
+            "CHANGED NODES (new nodes or score/status revisions; new → old)",
+        ]
+        _format_nodes(lines, view["delta_nodes"])
+        lines += ["", "CHANGED EDGES (incident to changed nodes; negative Δ = improvement)"]
+        _format_edges(lines, view["delta_edges"])
+        lines += ["", "TOP NODES (bounded global anchors not repeated in Delta; lower is better)"]
+        _format_nodes(lines, view["top_nodes"])
+        lines += ["", "BOTTOM NODES (bounded, disjoint from Delta/Top; crashes are worst)"]
+        _format_nodes(lines, view["bottom_nodes"])
+        return "\n".join(lines)
+
     title = (f"TRAJECTORY for ◀ {', '.join(view['query'])}" if view.get("query")
              else "FULL RUN DAG — all candidates (new → old)")
     lines = [title, "",
              "NODES (new → old; ◀parent = this round's parents, ↳child = their direct children",
              "       (clone/improve check), ★best = global best; result has no parent refs)"]
-    for n in view["nodes"]:
-        marks = " ".join(([" ◀parent"] if n["is_query"] else [])
-                         + (["↳child"] if n.get("is_child") else [])
-                         + (["★best"] if n["is_best"] else []))
-        score = "crash" if n["score"] is None else f"{n['score']:.4f}"
-        st = "" if n["status"] in (None, "kept", "keep") else f" {n['status']}"
-        # 定宽字段在前对齐(id/分数/root/标记),完整 result 拖尾不截断
-        lines.append(f"  {n['id']:>4}  {score:>9}  [{n['root']}]{st}{marks}  {_clean(n['result'])}".rstrip())
+    _format_nodes(lines, view["nodes"])
     lines += ["", "EDGES (process → effect; Δ = child − parent score, so negative Δ = improvement / lower is better)"]
-    for e in view["edges"]:
-        d = "  n/a " if e["delta"] is None else f"Δ {e['delta']:+.3f}"
-        # parent→child + Δ 在前对齐,完整 change 拖尾不截断
-        lines.append(f"  {e['parent']:>4} → {e['child']:<4}  {d:>9}  {_clean(e['change'])}".rstrip())
+    _format_edges(lines, view["edges"])
     return "\n".join(lines)
 
 
@@ -360,14 +490,26 @@ def _main(argv=None):
     r.add_argument("--ledger", required=True)
     r.add_argument("--nodes", help="comma-separated parent run_ids to trace (this round's decide "
                                     "parents). OMIT for global mode = the whole run's DAG.")
+    r.add_argument("--incremental", action="store_true",
+                   help="emit only graph revisions after experience.dag_revision plus bounded anchors")
+    r.add_argument("--top", type=int, default=5,
+                   help="number of best global anchor nodes in incremental mode (default 5)")
+    r.add_argument("--bottom", type=int, default=5,
+                   help="number of worst global anchor nodes in incremental mode (default 5)")
     r.add_argument("--depth", type=int, default=3,
                    help="how many layers of ANCESTORS to walk back (default 3); descendants are "
                         "always just 1 generation (direct children, for the clone/improve check).")
     r.add_argument("--format", choices=["text", "json"], default="text")
     args = p.parse_args(argv)
     if args.cmd == "render":
+        if args.nodes and args.incremental:
+            p.error("--nodes and --incremental are mutually exclusive")
+        if args.top < 0 or args.bottom < 0:
+            p.error("--top/--bottom must be non-negative")
         ledger = json.loads(Path(args.ledger).read_text())
-        if args.nodes:                                   # 主模式:围绕指定父代
+        if args.incremental:
+            view = render_incremental(ledger, top=args.top, bottom=args.bottom)
+        elif args.nodes:                                 # 主模式:围绕指定父代
             view = render_trajectory(ledger, [x.strip() for x in args.nodes.split(",") if x.strip()],
                                      depth=args.depth)
         else:                                            # 全局副模式:整个 run
