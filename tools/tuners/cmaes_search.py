@@ -25,6 +25,7 @@ import argparse
 import math
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,7 @@ from _common import (  # noqa: E402
     set_stage_meta,
     write_json,
 )
+from failure_artifacts import record_failure  # noqa: E402
 
 
 def build_codec(search_space: dict, base_params: dict):
@@ -193,6 +195,7 @@ def main() -> int:
     any_success = False
     early_stopped = False
     early_stop_reason = "none"
+    failure_refs = []
 
     monitor = PatienceMonitor(
         patience=args.patience,
@@ -208,8 +211,19 @@ def main() -> int:
         try:
             score = timed_eval(evaluate, make_model, params, args.candidate_path)
         except Exception as exc:
+            failure = record_failure(
+                report_path=args.tune_report_json,
+                candidate_path=args.candidate_path,
+                phase="phase_c",
+                method="cmaes",
+                params=params,
+                error=exc,
+                traceback_text=traceback.format_exc(),
+            )
             append_trial(args.tune_report_json, "cmaes",
-                         {"params": params, "score": None, "error": repr(exc)})
+                         {"params": params, "score": None, "status": "failed", **failure})
+            if failure["failure_ref"] not in failure_refs:
+                failure_refs.append(failure["failure_ref"])
             continue
         append_trial(args.tune_report_json, "cmaes", {"params": params, "score": score})
         any_success = True
@@ -234,8 +248,19 @@ def main() -> int:
             except Exception as exc:
                 # One bad param region must not kill the whole search: record the
                 # failure for audit and carry it as a penalty placeholder below.
+                failure = record_failure(
+                    report_path=args.tune_report_json,
+                    candidate_path=args.candidate_path,
+                    phase="phase_c",
+                    method="cmaes",
+                    params=params,
+                    error=exc,
+                    traceback_text=traceback.format_exc(),
+                )
                 append_trial(args.tune_report_json, "cmaes",
-                             {"params": params, "score": None, "error": repr(exc)})
+                             {"params": params, "score": None, "status": "failed", **failure})
+                if failure["failure_ref"] not in failure_refs:
+                    failure_refs.append(failure["failure_ref"])
                 results.append((x, None))
                 evals += 1
                 continue
@@ -281,6 +306,7 @@ def main() -> int:
             "popsize": args.popsize,
             "early_stopped": early_stopped,
             "early_stop_reason": early_stop_reason,
+            "failure_refs": failure_refs[-3:],
             "elapsed_seconds": round(elapsed, 1),
             "search_space": search_space_for_json(search_space),
         })

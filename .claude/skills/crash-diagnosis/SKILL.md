@@ -12,8 +12,7 @@ You follow this in your CURRENT context (you are not a separate agent) — the
 caller is the context that just ran the candidate and will apply the fix:
 
 - **`tunable-contract-extractor`, segment ③ (eval-K)** — a warm config raised;
-  you have the config + its full traceback (from `tune_report.json`'s failed
-  entry, `error_traceback`).
+  you have the config + its frozen `failure_receipt` from evaluator stdout.
 - **the main thread / `autoresearch-experiment` (official run)** — the candidate
   crashed; you have the run log.
 
@@ -21,14 +20,33 @@ One invocation = one crash = one verdict + action.
 
 ## What You Read
 
-- The **traceback** (the failed config's `error_traceback`, or the last ~80
-  lines of the run log — the traceback sits near the bottom).
+- The failed config's **`failure_receipt`**, or the last ~80 lines of an official
+  run log. Start from the receipt; do not read the full `tune_report.json`.
 - The candidate's **`train.py`** in full.
 - The **offending config** (the param dict), when diagnosing an eval-K crash.
 - `prepare.py` only if the traceback points into it or you need its exports.
 - `TASK.md`'s `## Evaluation Contract` + `task.toml` `[constraints]` — whether a
   fix is allowed (readonly files, dependencies) depends on the contract, not
   guesswork.
+
+If the receipt is ambiguous or would force `confidence: low`, retrieve only the
+missing evidence using:
+
+```bash
+python tools/tuners/tune_tools.py render-failure \
+  --tune-report-json <candidate_dir>/tune_report.json \
+  --failure-id <failure_id> --view lines --line-range <start:end>
+```
+
+Each receipt frame's `traceback_line` is the 1-based line used by
+`--line-range`. **Hard gate:** before returning `config_invalid` or `abandon`,
+if `failure_receipt.omitted_traceback_lines > 0`, you MUST retrieve the complete
+traceback with `--view full` and reconsider the verdict from that evidence.
+
+Outside that hard gate, use `--view full` only when no bounded range can answer
+the question. A legacy failed entry with inline `error_traceback` remains
+readable, but never regenerate or rewrite a receipt for a failure that already
+has `failure_ref`.
 
 ## The Verdict (classify into exactly one)
 

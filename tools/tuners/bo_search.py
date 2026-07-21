@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -35,6 +36,7 @@ from _common import (  # noqa: E402
     set_stage_meta,
     write_json,
 )
+from failure_artifacts import record_failure  # noqa: E402
 
 
 def suggest(trial, key: str, entry) -> object:
@@ -164,6 +166,7 @@ def main() -> int:
         start_best=prior_best_score(prior_trials),
     )
     early_stopped = {"flag": False, "reason": "none"}
+    failure_refs = []
 
     started = time.time()
 
@@ -175,10 +178,21 @@ def main() -> int:
         except Exception as exc:
             # Record the failure so it is auditable in tune_report, then re-raise
             # so Optuna (catch= below) marks this trial FAILED and moves on.
+            failure = record_failure(
+                report_path=args.tune_report_json,
+                candidate_path=args.candidate_path,
+                phase="phase_c",
+                method="bo",
+                params=params,
+                error=exc,
+                traceback_text=traceback.format_exc(),
+            )
             append_trial(
                 args.tune_report_json, "bo",
-                {"params": params, "score": None, "error": repr(exc)},
+                {"params": params, "score": None, "status": "failed", **failure},
             )
+            if failure["failure_ref"] not in failure_refs:
+                failure_refs.append(failure["failure_ref"])
             raise
         append_trial(
             args.tune_report_json, "bo", {"params": params, "score": score}
@@ -219,6 +233,7 @@ def main() -> int:
             "reason": "all BO trials errored; no completed trial",
             "early_stopped": early_stopped["flag"],
             "early_stop_reason": early_stopped["reason"],
+            "failure_refs": failure_refs[-3:],
             "elapsed_seconds": round(elapsed, 1),
             "search_space": search_space_for_json(search_space),
         })

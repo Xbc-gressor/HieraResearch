@@ -45,6 +45,7 @@ from _common import (  # noqa: E402
     write_json,
     write_tune_report,
 )
+from failure_artifacts import record_failure  # noqa: E402
 
 CRASHED = 3  # a not-yet-scored config raised; the caller diagnoses + fixes + resumes
 
@@ -120,15 +121,23 @@ def main() -> int:
             except Exception as exc:
                 tb = traceback.format_exc()
                 sys.stderr.write(tb)
+                failure = record_failure(
+                    report_path=args.tune_report_json,
+                    candidate_path=args.candidate_path,
+                    phase="phase_a",
+                    method="warmstart",
+                    params=params,
+                    error=exc,
+                    traceback_text=tb,
+                )
                 wsc.append({"params": params, "score": None, "status": "failed",
-                            "error": f"{type(exc).__name__}: {exc}"[:300],
-                            "error_traceback": tb})
+                            **failure})
                 report["phase_a"]["warm_start_configs"] = wsc
                 report["phase_a"]["status"] = "crashed"
                 write_tune_report(args.tune_report_json, report)
                 write_json({"phase": "a", "status": "crashed", "crash_index": i,
                             "crash_params": params,
-                            "error": f"{type(exc).__name__}: {exc}"[:300]})
+                            **failure})
                 return CRASHED
             wsc.append({"params": params, "score": score})
             cache[key] = score

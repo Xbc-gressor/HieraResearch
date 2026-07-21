@@ -30,6 +30,8 @@ Subcommands:
                     idea, best config+score, searched space, explored ranges, and
                     a few whole trials (top-by-score + farthest-point diverse, so
                     hyperparameter interactions survive). Feeds proposer/inducer.
+- render-failure  : frozen receipt by default; exact full/ranged traceback only
+                    when explicitly requested.
 
 Pure stdlib (ast/argparse/json), so it needs **no uv environment**: SEARCH_SPACE
 is read by AST literal_eval rather than importing the candidate. Scores are
@@ -44,6 +46,9 @@ import ast
 import json
 import math
 from pathlib import Path
+import sys
+
+from failure_artifacts import render_failure
 
 
 # ---------- SEARCH_SPACE via AST (no candidate import) ----------
@@ -717,6 +722,32 @@ def cmd_summarize(args) -> int:
     return 0
 
 
+def cmd_render_failure(args) -> int:
+    line_range = None
+    if args.view == "lines":
+        if args.line_range is None:
+            raise SystemExit("--line-range START:END is required for --view lines")
+        try:
+            start, end = (int(value) for value in args.line_range.split(":", 1))
+        except (TypeError, ValueError):
+            raise SystemExit("--line-range must be START:END") from None
+        line_range = (start, end)
+    elif args.line_range is not None:
+        raise SystemExit("--line-range is only valid with --view lines")
+
+    result = render_failure(
+        args.tune_report_json,
+        args.failure_id,
+        view=args.view,
+        line_range=line_range,
+    )
+    if isinstance(result, dict):
+        print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    else:
+        sys.stdout.write(result)
+    return 0
+
+
 def cmd_lint_schema(args) -> int:
     result = lint_schema(args.candidate_path)
     print(json.dumps(result, indent=2))
@@ -805,6 +836,13 @@ def build_parser() -> argparse.ArgumentParser:
     sz = sub.add_parser("summarize", help="Reduce one tune_report.json to its tuning summary.")
     sz.add_argument("--tune-report-json", required=True, type=Path)
     sz.set_defaults(func=cmd_summarize)
+
+    rf = sub.add_parser("render-failure", help="Read a frozen failure receipt or retrieve its traceback.")
+    rf.add_argument("--tune-report-json", required=True, type=Path)
+    rf.add_argument("--failure-id", required=True)
+    rf.add_argument("--view", choices=("receipt", "full", "lines"), default="receipt")
+    rf.add_argument("--line-range", help="1-based inclusive START:END; only for --view lines")
+    rf.set_defaults(func=cmd_render_failure)
 
     cs = sub.add_parser("check-search-space",
                         help="Validate + expand a proposed SEARCH_SPACE against the schema and survived configs; on ok, overwrite --space-json in place with the finalized space.")

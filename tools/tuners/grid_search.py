@@ -25,6 +25,7 @@ import math
 import random
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,7 @@ from _common import (  # noqa: E402
     set_stage_meta,
     write_json,
 )
+from failure_artifacts import record_failure  # noqa: E402
 
 
 def expand_entry(entry, resolution: int) -> list:
@@ -122,14 +124,26 @@ def main() -> int:
     trials_done = 0
     early_stopped = False
     early_stop_reason = "none"
+    failure_refs = []
 
     for params in param_dicts:
         try:
             score = timed_eval(evaluate, make_model, params, args.candidate_path)
         except Exception as exc:
             # A bad param combo must not kill the sweep: record it and skip.
+            failure = record_failure(
+                report_path=args.tune_report_json,
+                candidate_path=args.candidate_path,
+                phase="phase_c",
+                method="grid",
+                params=params,
+                error=exc,
+                traceback_text=traceback.format_exc(),
+            )
             append_trial(args.tune_report_json, "grid",
-                         {"params": params, "score": None, "error": repr(exc)})
+                         {"params": params, "score": None, "status": "failed", **failure})
+            if failure["failure_ref"] not in failure_refs:
+                failure_refs.append(failure["failure_ref"])
             continue
         append_trial(args.tune_report_json, "grid", {"params": params, "score": score})
         trials_done += 1
@@ -156,6 +170,7 @@ def main() -> int:
             "trials_planned": total,
             "early_stopped": early_stopped,
             "early_stop_reason": early_stop_reason,
+            "failure_refs": failure_refs[-3:],
             "elapsed_seconds": round(elapsed, 1),
             "search_space": search_space_for_json(search_space),
         })
