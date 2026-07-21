@@ -3,7 +3,7 @@
     "Per-run framework-hyperparameter OVERRIDES for one autoresearch run (e.g. a Phase-3 OFAT trial).",
     "USAGE: copy this to  runs/<task>/<tag>/framework_cfg.json  and keep ONLY the keys you want to override",
     "       (delete the rest — any omitted key uses the code default). Copying it verbatim = all defaults = no-op.",
-    "READ BY (tracked code):  got_select.py decide -> the 'got' section  ·  tune_tools.py select-candidate -> tuner.n_min/top_percentile  ·  bo_search.py -> tuner.bo_n_trials + bo_patience_cap/bo_patience_floor (adaptive) or bo_patience (fixed override).",
+    "READ BY (tracked code):  got_select.py decide -> the 'got' section  ·  semantic_search.py select -> the 'semantic_search' section  ·  tune_tools.py select-candidate -> tuner.n_min/top_percentile  ·  bo_search.py -> tuner.bo_n_trials + bo_patience_cap/bo_patience_floor (adaptive) or bo_patience (fixed override).",
     "PRIORITY: explicit CLI flag (--cfg / --n-min / --top-percentile / --n-trials / --patience) > this file > module default. NOTE: BO patience is adaptive by default = min(bo_patience_cap, max(bo_patience_floor, round(1.5*n_dims))); set tuner.bo_patience to force a fixed value.",
     "NOTE: 'got'/'tuner' below hold the CURRENT DEFAULTS so this doubles as a reference; '_keys' documents each. 'tuner.K' (warm-config count) is read by the tunable-contract-extractor AGENT (not a deterministic tool), but is injectable here too.",
     "runs/ is gitignored, so the copied file is local-only (not committed)."
@@ -18,6 +18,12 @@
     "c_pucb": 0.4,
     "c_leaf": 0.4,
     "tau": 0.3
+  },
+  "semantic_search": {
+    "policy": "coverage",
+    "coverage_weight": 0.1,
+    "cost_weight": 0.2,
+    "uncertainty_weight": 0.5
   },
   "tuner": {
     "K": 5,
@@ -39,6 +45,10 @@
     "got.c_pucb": "outer: PUCB exploration constant over the action pool (default 0.4; flat in [0.1,0.8], base-dependent → kept default). OFAT {0.2,0.4,0.8}.",
     "got.c_leaf": "outer: select_leaf UCB exploration constant during descent (default 0.4). OFAT {0.2,0.4,0.8}.",
     "got.tau": "outer: op-prior softmax temperature (default 0.3). OFAT {0.1,0.3,0.6}.",
+    "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage (fully deterministic, no LLM scores), gain, or gain_uncertainty. The last two require per-proposal rubric inputs and preserve predicted_gain, uncertainty, cost, and coverage separately in each record's policy_receipt.",
+    "semantic_search.coverage_weight": "semantic acquisition: additive deterministic under-coverage contribution for gain policies (default 0.1).",
+    "semantic_search.cost_weight": "semantic acquisition: subtractive predicted implementation/evaluation cost contribution (default 0.2).",
+    "semantic_search.uncertainty_weight": "semantic acquisition: exploration bonus used only by gain_uncertainty (default 0.5); uncertainty is a rubric score, not a calibrated posterior.",
     "tuner.K": "inner: number of warm-start configs the tunable-contract-extractor PROPOSES per candidate (default 5; read by the AGENT). OFAT {3,5,8} — highest-impact inner knob.",
     "tuner.K_eval": "inner: how many of the K proposed warm configs are EVALUATED at step 0+1 (default 3; best-of-K_eval = screening score). The remaining K−K_eval are DEFERRED — stored params-only in tune_report.phase_a.deferred_configs and evaluated by the deep-tuner FIRST (bo enqueue / grid prepend) ONLY if the candidate is promoted. Saves (K−K_eval) evals on every un-promoted candidate; budget-neutral for promoted ones (deferred are extra initial trials). K_eval>=K disables deferral (evaluate all).",
     "tuner.n_min": "inner: min population before deep-tune fires. NOW DERIVED from top_percentile = ceil(100/(100-P)) (P=80→5); this key is only an explicit OVERRIDE.",

@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "catalog_id": "semantic-dimensions/v1",
+  "provenance": "p1-semantic-search-space-plan.md#pre-defined-dimension-catalog",
+  "dimensions": [
+    {
+      "id": "dim-task-formulation",
+      "definition": "How the metric-bearing task is decomposed into learned subproblems and what each prediction means.",
+      "boundary": "Does not own input encoding, model topology, loss implementation, or the fixed evaluator."
+    },
+    {
+      "id": "dim-data-curation",
+      "definition": "How allowed raw examples are acquired and which examples or external sources belong to the training or auxiliary pools.",
+      "boundary": "Does not own within-example transforms, derived synthetic variants, exposure frequency/order, or validation folds."
+    },
+    {
+      "id": "dim-input-representation",
+      "definition": "How one raw example becomes the canonical model input.",
+      "boundary": "Does not own stochastic training-only views, the learnable predictor, or inference-time search."
+    },
+    {
+      "id": "dim-data-augmentation",
+      "definition": "How extra training examples or views are derived or synthesized from allowed information.",
+      "boundary": "Does not choose external source membership, reusable supervisory signals, or test-time augmentation."
+    },
+    {
+      "id": "dim-supervision",
+      "definition": "How learning signals are produced and attached to examples.",
+      "boundary": "Does not define target semantics, scalar loss aggregation, or the optimizer."
+    },
+    {
+      "id": "dim-model-architecture",
+      "definition": "The learnable function class and its structural organization.",
+      "boundary": "Does not own pretrained weights, the trainable subset, or aggregation of separately trained predictors."
+    },
+    {
+      "id": "dim-initialization-adaptation",
+      "definition": "Where parameters start and which parameters or added adaptation mechanism are trainable.",
+      "boundary": "Does not own the base function topology or time-varying freeze/unfreeze phases. A task-fixed base model is represented as baseline-only."
+    },
+    {
+      "id": "dim-learning-objective",
+      "definition": "Which scalar criteria define a good update.",
+      "boundary": "Does not own the fixed task metric, the origin of labels/rewards, or the update algorithm."
+    },
+    {
+      "id": "dim-optimization",
+      "definition": "How gradients or other learning signals produce one parameter update.",
+      "boundary": "Exact numeric settings belong to inner HPO; phase ordering, stopping, and low-level execution do not."
+    },
+    {
+      "id": "dim-training-protocol",
+      "definition": "How data, objectives, and trainable regimes are sequenced under the budget.",
+      "boundary": "Does not own pool membership, the update equation, validation estimators, or semantics-preserving acceleration."
+    },
+    {
+      "id": "dim-validation-selection",
+      "definition": "Which training-only evidence selects configurations or checkpoints and decides when to stop.",
+      "boundary": "Does not include the immutable official evaluation or HieraResearch's outer point-selection policy."
+    },
+    {
+      "id": "dim-ensemble",
+      "definition": "How multiple independently usable trained predictors are combined.",
+      "boundary": "Jointly trained branches belong to architecture; repeated views or decoding from one predictor belong to inference."
+    },
+    {
+      "id": "dim-inference",
+      "definition": "How fixed predictor(s) are invoked to produce raw predictions.",
+      "boundary": "Does not own multi-model combination or conversion of raw predictions into final task outputs."
+    },
+    {
+      "id": "dim-output-postprocessing",
+      "definition": "How raw predictions become the metric-facing decision, submission, or model artifact.",
+      "boundary": "Does not alter predictor execution or the official scoring rule."
+    },
+    {
+      "id": "dim-resource-execution",
+      "definition": "How the same intended method is realized within time, memory, hardware, and dependency constraints.",
+      "boundary": "If a change intentionally alters examples, updates, or predictions, it belongs to the corresponding statistical dimension instead."
+    }
+  ]
+}

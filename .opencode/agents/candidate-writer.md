@@ -60,21 +60,26 @@ From that record take (`idea` + `change` together are your **entire** brief):
   build (what it IS; it has no parent references). This is the target.
 - **`change`** — the **PROCESS**: how it differs from the parent(s) — for a
   `crossover` written per-parent (`vs <p1>: …; vs <p2>: …`), for an `improve` the
-  one perturbation, for a `fresh` `from scratch: <tf-NN>`. Use it to know exactly
+  implementation process, for a `fresh` `from scratch at <point-id>`. Use it to know exactly
   what to take from / change in each parent's `train.py`.
 - **`source_run_ids`** — the genealogy. For an `improve`/`crossover` candidate
   these are parent run ids (improve → one, crossover → two, e.g.
-  `["003","005"]`); for a `fresh` candidate it is a single **direction tag**
-  `tf-NN` (a try-first direction from `background.md`), **not** a parent. Derive
-  **`source_train_paths` = `[<run_dir>/candidates/<sid>/train.py` for each `sid`
-  that is a numeric run id]`** — **skip any `tf-*` tag** (a fresh candidate has
-  no parents; its idea is self-contained).
+  `["003","005"]`); for a `fresh` candidate it is empty. Derive
+  **`source_train_paths` = `[<run_dir>/candidates/<sid>/train.py` for each parent]`**.
+- **`semantic_point`** — the complete revisioned attribution chosen before the
+  idea was written. Keep the implementation consistent with its selected and
+  explicitly inactive dimensions, but remember that the point is not a full
+  program specification.
+- **`policy_receipt`** — why the semantic selector chose this point. It is context,
+  not an instruction to rewrite ancestry or optimize a different point.
 - **`candidate_name`** — the name hint to prefer for `CANDIDATE_NAME`.
 
-If the brief is missing, has the wrong `run_id`, or lacks `idea`, stop and report
-that the upstream pipeline did not materialize the record — do not guess. If the
-candidate dir or `prepare.py` does not resolve, stop and report which input is
-missing. Do not invent paths.
+If the brief is missing, has the wrong `run_id`, lacks `idea`, or has no complete
+`semantic_point` / `policy_receipt`, stop and report that the upstream pipeline
+did not materialize the required semantic record—do not guess. If ancestry is
+nonnumeric, or the
+candidate dir or `prepare.py` does not resolve, stop and report the invalid or
+missing input. Do not invent paths.
 
 The task contract you must honor lives in `TASK.md`'s `## Evaluation Contract`
 and `task.toml` `[evaluation]`/`[constraints]` — read them (step 1 below); they
@@ -88,11 +93,10 @@ Decide what to do from the file system, in this order:
    existing file IS the candidate (a provided-baseline seed copied from the task
    root). Read it, run the sanity checks below, and return the verdict with
    `wrote: false`. Never "improve" it.
-2. **No resolvable parents (empty, or only a `tf-*` direction tag) → write from
-   scratch.** This is a `fresh` candidate: implement the idea (a try-first
-   direction from `background.md`) directly against the APIs exposed by
-   `prepare.py`. Keep it simple, low-risk, and runnable: no heavy ensembles, no
-   long training loops, no new dependencies.
+2. **No parents → write from scratch.** This is a `fresh` candidate: implement
+   the complete idea at its selected semantic point directly against the APIs
+   exposed by `prepare.py`. Keep it runnable and within constraints; do not
+   silently replace a selected mechanism with a simpler point.
 3. **Otherwise → write with references.** Read every derived
    `source_train_paths`. Use the first (the primary parent) as the structural
    reference and implement the idea on top of it; borrow from the others only

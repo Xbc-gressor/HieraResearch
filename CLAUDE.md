@@ -85,42 +85,42 @@ would remove the independent contexts required by this project.
   tolerates backend failure, deduplicates and balances candidates across queries, progressively
   reads them in explicit grounding/novelty budget lanes, and looks for
   counterevidence. It writes `<run_dir>/background.md` plus the visited-source
-  trace `<run_dir>/background_retrieval.json`. Sources, structured `g-*` negative
-  guidance, and stable `tf-*` hypotheses use the same typed scope axes. The
+  trace `<run_dir>/background_retrieval.json`. The background freezes a
+  task-relevant subset of `semantic-dimensions/v1`, an explicit baseline in
+  every selected dimension, task-specific stable `hyp-*` values, and scoped
+  activation/exclusion relations. Sources, structured `g-*` guidance, and
+  hypotheses use the same typed scope axes. The
   contract derives containment mechanically: only directly matched guidance may
-  change a direction's priority or eligibility, while free-text Pitfalls are
+  change a hypothesis's priority or eligibility, while free-text Pitfalls are
   nonbinding. Weak or contested negatives can only caution; binding guidance
   needs directly scoped primary empirical evidence and retains an out-of-scope
-  `scope_probe` instead of erasing adjacent mechanisms. Each direction also carries a separate
+  `scope_probe` instead of erasing adjacent mechanisms. Each hypothesis also carries a separate
   literature-credibility stamp, required local comparisons, reopening
   conditions, and traceable sources; an arXiv upload is not validation. The
-  registry is checked by `tools/background_contract.py` and steers every `fresh`
-  candidate.
-  See `docs/background-research.md` for the sibling-project audit, evidence
-  semantics, fallback behavior, and validation contract.
-- `idea-generator` — produce the next generation in two steps: **SELECT** — run
-  `got_select decide` (deterministic graph search) for this round's actions (a
-  bootstrap/stall `fresh`, or ≤B `improve`/`crossover`); **IDEATE** — turn each
-  into a concrete idea and `ledger.py add-record --op …`. It does not pick parents
-  by fitness (the graph search does); it reads records + the `experience` block +
-  `background.md` to decide *what* each selected action becomes. Replaces the old
-  `idea-proposer` skill.
+  registry is checked by `tools/background_contract.py`; legacy flat registries
+  are rejected rather than migrated.
+  See `docs/background-research.md` for the hierarchical search-space contract,
+  evidence and scope semantics, fallback behavior, and validation commands.
+- `idea-generator` — run structural **SELECT** with `got_select decide`, then use
+  `semantic_search.py` to enumerate valid complete points and apply the
+  replaceable coverage/gain/gain-plus-uncertainty acquisition policy before
+  **IDEATE**. It persists numeric ancestry, the complete revisioned point, and a
+  policy receipt with gain, uncertainty, cost, and coverage kept separate. The
+  graph search still owns actions/parents; semantic policy owns only point choice.
 - `experience-extractor` — periodically (every N generations) incrementally
   revise a bounded global `experience` snapshot from the ledger's DAG revision
-  delta plus fixed Top/Bottom anchors. Besides levers,
-  dead-ends, and bottlenecks, it joins candidate ancestry to `background.md` by
-  stable `tf-*` id and assigns each direction a separate run-local status:
-  `untested`, `inconclusive`, `supported_here`, `contradicted_here`, or `mixed`.
-  Decisive statuses require direct coverage of the direction's named comparators;
-  missing arms remain `inconclusive`. It never rewrites the external literature
-  stamp; the direction evidence is validated against the actual DAG before
-  `tools/ledger.py set-experience`; stored lineage receipts stay bounded.
+  delta plus fixed Top/Bottom anchors and compact mechanical point diffs. It
+  keeps generic levers, dead ends, and high-level bottlenecks traceable to run
+  ids, but P1 deliberately does not create dimension/hypothesis statuses or
+  semantic DAG receipts; those are P2. It never rewrites background, mappings,
+  policy receipts, or raw observations.
 - `candidate-writer` — implement one candidate's `train.py`. Receives **just
   the target candidate dir**; reads its own ledger record (added by
   `idea-generator`) for the full `idea` + `source_run_ids`, derives
   `source_train_paths` from the **numeric** parent ids and `prepare.py` / task
-  contract from the dir. A `tf-*` source tag (fresh) or empty `source_run_ids` →
-  write from scratch; numeric parents → write informed by their `train.py`; target
+  contract from the dir, and keeps the implementation consistent with the
+  record's `semantic_point`. Empty `source_run_ids` → write from scratch;
+  numeric parents → write informed by their `train.py`; target
   `train.py` already exists (provided baseline) → leave untouched. Returns the new
   `train.py`, a unified diff, the chosen `CANDIDATE_NAME`, and risk flags. Does not
   own the tuner contract. Spawned by the experiment loop.

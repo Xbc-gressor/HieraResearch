@@ -48,7 +48,7 @@ def load_records(run_dir: Path) -> tuple[dict, list[dict]]:
 
 
 def _numeric_parents(rec: dict) -> list[str]:
-    """source_run_ids entries that name a real parent node (digits), not tf-* tags."""
+    """Return numeric DAG parents (P1 source_run_ids contains only these)."""
     return [s for s in (rec.get("source_run_ids") or []) if str(s).isdigit()]
 
 
@@ -149,11 +149,15 @@ def summarize(data: dict, records: list[dict], threshold: Optional[float] = None
             "run_id": best.get("run_id"), "candidate_name": best.get("candidate_name"),
             "final_best_score": best.get("final_best_score"),
             "op": best.get("op"), "tuned": bool(best.get("tune")),
+            "point_id": (best.get("semantic_point") or {}).get("point_id"),
+            "semantic_policy": ((best.get("policy_receipt") or {}).get("policy") or {}).get("name"),
         },
         "tuned_detail": tuned_detail,
         "records": [{
             "run_id": r.get("run_id"), "op": r.get("op"),
             "source_run_ids": r.get("source_run_ids"),
+            "point_id": (r.get("semantic_point") or {}).get("point_id"),
+            "semantic_policy": ((r.get("policy_receipt") or {}).get("policy") or {}).get("name"),
             "candidate_name": r.get("candidate_name"),
             "final_best_score": r.get("final_best_score"),
             "status": r.get("status"), "tune": bool(r.get("tune")),

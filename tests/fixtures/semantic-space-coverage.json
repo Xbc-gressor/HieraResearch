@@ -1,0 +1,36 @@
+{
+  "mle_bench_shaped": {
+    "target decomposition": "dim-task-formulation",
+    "corpus filtering": "dim-data-curation",
+    "feature engineering": "dim-input-representation",
+    "training perturbations": "dim-data-augmentation",
+    "pseudo labels": "dim-supervision",
+    "learner family": "dim-model-architecture",
+    "pretrained initialization": "dim-initialization-adaptation",
+    "metric aligned loss": "dim-learning-objective",
+    "update rule": "dim-optimization",
+    "curriculum": "dim-training-protocol",
+    "fold and checkpoint choice": "dim-validation-selection",
+    "blending": "dim-ensemble",
+    "test time augmentation": "dim-inference",
+    "threshold and submission repair": "dim-output-postprocessing",
+    "mixed precision and caching": "dim-resource-execution"
+  },
+  "posttrain_bench_shaped": {
+    "response task decomposition": "dim-task-formulation",
+    "dataset choice": "dim-data-curation",
+    "chat serialization": "dim-input-representation",
+    "synthetic instructions": "dim-data-augmentation",
+    "response masks and preferences": "dim-supervision",
+    "fixed base network": "dim-model-architecture",
+    "parameter efficient tuning": "dim-initialization-adaptation",
+    "preference objective": "dim-learning-objective",
+    "optimizer family": "dim-optimization",
+    "staged curriculum": "dim-training-protocol",
+    "proxy checkpoint choice": "dim-validation-selection",
+    "checkpoint soup": "dim-ensemble",
+    "decoding and retrieval": "dim-inference",
+    "answer extraction": "dim-output-postprocessing",
+    "packing precision and kernels": "dim-resource-execution"
+  }
+}

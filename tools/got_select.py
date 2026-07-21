@@ -120,12 +120,11 @@ def _replay_stall(graph) -> int:
 
 def derive_state(graph) -> dict:
     """从 records(经 from_ledger)重算全局派生量,无持久状态(§14.1 决策 B)。
-    ḡ_op 用当前 r 重算(stateless);best/consumed/Nop/n_roots 同理。"""
+    ḡ_op 用当前 r 重算(stateless);best/Nop/n_roots 同理。语义覆盖由
+    semantic_search 独立计算。"""
     r = graph.r_map()
     scored = [n.score for n in graph.nodes.values() if n.status != "crash"]
     best = min(scored) if scored else float("inf")
-    consumed = sorted({s for nid in graph.nodes for s in graph.nodes[nid].source_run_ids
-                       if not graph._is_ref(s)})
     Nop = {"improve": 0, "crossover": 0}
     for n in graph.nodes.values():
         if n.op in Nop:
@@ -141,7 +140,7 @@ def derive_state(graph) -> dict:
                 cnt[n.op] += 1
                 gbar[n.op] += (gval - gbar[n.op]) / cnt[n.op]   # running mean ≡ 均值
     n_roots = sum(1 for rt in graph.roots() if graph.nodes[rt].status != "crash")
-    return dict(best=best, consumed=consumed, Nop=Nop, gbar=gbar,
+    return dict(best=best, Nop=Nop, gbar=gbar,
                 stall=_replay_stall(graph), n_alive=len(graph.alive_roots()), n_roots=n_roots)
 
 
@@ -165,7 +164,7 @@ def decide(graph, cfg) -> dict:
             actions = [{"op": op, "parents": list(args)}
                        for op, args in pick_pucb(graph, L, st["gbar"], st["Nop"], cfg)]
     if kind == "fresh":
-        actions = [{"op": "fresh"} for _ in range(k)]   # 方向由 IDEATE 从 background 优先级 − consumed 选
+        actions = [{"op": "fresh"} for _ in range(k)]   # 语义选点由独立 semantic_search 层完成
     diag = dict(st)
     if diag["best"] == float("inf"):
         diag["best"] = None                      # 合法 JSON(无 non-crash 节点时)

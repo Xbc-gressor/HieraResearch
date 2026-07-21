@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Validate and join HieraResearch background directions with run evidence.
+"""Validate and render the P1 hierarchical ``background.md`` contract.
 
-``background.md`` remains a readable Markdown brief, but its ``Direction
-registry`` JSON fence is the machine-readable contract shared by the
-orchestrator, background researcher, experience extractor, and idea generator.
+The Markdown document is the human view.  Its fenced ``Search space
+registry`` JSON object is the machine contract shared by both runtimes.  This
+module validates literature receipts and typed guidance around the structural
+contract owned by :mod:`semantic_space`.
+
+Pre-P1 flat ``tf-*`` registries are intentionally rejected.  Runs are local
+and disposable, so there is no implicit migration or mixed-mode behavior.
 """
 
 from __future__ import annotations
@@ -17,11 +21,23 @@ from pathlib import Path
 from typing import Any
 
 from search_backends import canonical_key, validate_manifest
+from semantic_space import (
+    SemanticSpaceError,
+    catalog_receipt,
+    complete_point,
+    coverage_from_records,
+    derive_semantic_lineage,
+    hypothesis_map,
+    load_catalog,
+    point_id,
+    selected_assignments,
+    space_receipt,
+    space_revision,
+    validate_point,
+    validate_space_core,
+)
 
 
-SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
-TF_RE = re.compile(r"^tf-(\d{2,})$")
 SOURCE_RE = re.compile(r"^src-(\d{2,})$")
 GUIDANCE_RE = re.compile(r"^g-(\d{2,})$")
 SCOPE_TAG_RE = re.compile(r"^(?:\*|[a-z0-9][a-z0-9._-]*)$")
@@ -57,7 +73,6 @@ VALIDATION_STATUS = {
     "not_assessed",
 }
 EVIDENCE_ROLES = {"supports", "contradicts", "context"}
-DIRECTION_KINDS = {"evidence_prior", "scope_probe"}
 SCOPE_AXES = (
     "model_families",
     "data_regimes",
@@ -67,116 +82,52 @@ SCOPE_AXES = (
 )
 GUIDANCE_SECTIONS = {"pitfall", "deprioritize"}
 GUIDANCE_EFFECTS = {"caution", "deprioritize", "exclude"}
-RUN_STATUS = {
-    "untested",
-    "inconclusive",
-    "supported_here",
-    "contradicted_here",
-    "mixed",
-}
-CONFIDENCE = {"low", "med", "high"}
-CLAIM_COVERAGE = {"none", "partial", "direct"}
-LINEAGE_SAMPLE_LIMIT = 5
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+POLICY_CONFIG_KEYS = {"coverage_weight", "cost_weight", "uncertainty_weight"}
 
 
 class ContractError(ValueError):
     """A malformed or incompatible background contract."""
 
 
-def load_registry(path: Path) -> dict[str, Any]:
-    """Extract the canonical JSON registry from a Markdown background brief."""
-    text = path.read_text(errors="replace")
-    marker = re.search(r"^## Direction registry\s*$", text, flags=re.MULTILINE)
-    if marker is None:
-        raise ContractError(f"{path}: missing '## Direction registry'")
-    fence = re.search(
-        r"```json\s*(\{.*?\})\s*```",
-        text[marker.end() :],
-        flags=re.DOTALL,
-    )
-    if fence is None:
-        raise ContractError(f"{path}: direction registry must be a fenced JSON object")
-    try:
-        registry = json.loads(fence.group(1))
-    except json.JSONDecodeError as exc:
-        raise ContractError(f"{path}: invalid direction registry JSON: {exc}") from exc
-    if not isinstance(registry, dict):
-        raise ContractError(f"{path}: direction registry must be an object")
-    return registry
-
-
-def validate_background_markdown(
-    path: Path, registry: dict[str, Any]
-) -> list[str]:
-    """Keep human negative guidance aligned with the machine contract."""
-    if registry.get("schema_version") != SCHEMA_VERSION:
-        return []
-    text = path.read_text(errors="replace")
-    guidance = {
-        item.get("id"): item
-        for item in registry.get("guidance", [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
-    errors: list[str] = []
-    referenced: set[str] = set()
-    section_names = {"Pitfalls": "pitfall", "Deprioritize": "deprioritize"}
-
-    for heading, expected_section in section_names.items():
-        match = re.search(rf"^## {re.escape(heading)}\s*$", text, flags=re.MULTILINE)
-        if match is None:
-            if heading == "Pitfalls" or any(
-                item.get("section") == expected_section for item in guidance.values()
-            ):
-                errors.append(f"background.md is missing required '## {heading}' section")
-            continue
-        next_heading = re.search(r"^##\s+", text[match.end() :], flags=re.MULTILINE)
-        end = match.end() + next_heading.start() if next_heading else len(text)
-        body = text[match.end() : end]
-        has_marked_bullet = False
-        for line_number, raw_line in enumerate(body.splitlines(), start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            if raw_line[:1].isspace() and has_marked_bullet:
-                continue
-            marker = re.match(
-                r"^-\s+`(?P<id>g-\d{2,}|task-constraint|operational)`(?:\s|$)",
-                line,
-            )
-            if marker is None:
-                has_marked_bullet = False
-                errors.append(
-                    f"{heading} line {line_number} must start with a registered `g-NN`, "
-                    "`task-constraint`, or `operational` marker"
-                )
-                continue
-            has_marked_bullet = True
-            marker_id = marker.group("id")
-            if not GUIDANCE_RE.fullmatch(marker_id):
-                continue
-            item = guidance.get(marker_id)
-            if item is None:
-                errors.append(f"{heading} references unknown guidance id {marker_id}")
-                continue
-            referenced.add(marker_id)
-            if item.get("section") != expected_section:
-                errors.append(
-                    f"{heading} references {marker_id}, but registry section is "
-                    f"{item.get('section')!r}"
-                )
-
-    missing = sorted(set(guidance) - referenced)
-    if missing:
-        errors.append(f"structured guidance is not referenced in its Markdown section: {missing}")
-    return errors
-
-
-def _nonempty_string(value: Any) -> bool:
+def _nonempty(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ContractError(f"cannot read JSON object {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContractError(f"{path}: expected a JSON object")
+    return value
+
+
+def load_registry(path: Path) -> dict[str, Any]:
+    """Extract the canonical semantic-search-space registry from Markdown."""
+    text = path.read_text(errors="replace")
+    marker = re.search(r"^## Search space registry\s*$", text, flags=re.MULTILINE)
+    if marker is None:
+        if re.search(r"^## Direction registry\s*$", text, flags=re.MULTILINE):
+            raise ContractError(
+                f"{path}: legacy flat 'Direction registry' is unsupported; "
+                "regenerate a schema_version 3 hierarchical search space"
+            )
+        raise ContractError(f"{path}: missing '## Search space registry'")
+    fence = re.search(r"```json\s*(\{.*?\})\s*```", text[marker.end() :], flags=re.DOTALL)
+    if fence is None:
+        raise ContractError(f"{path}: search space registry must be a fenced JSON object")
+    try:
+        registry = json.loads(fence.group(1))
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"{path}: invalid search space registry JSON: {exc}") from exc
+    if not isinstance(registry, dict):
+        raise ContractError(f"{path}: search space registry must be an object")
+    return registry
+
+
 def _validate_scope(scope: Any, where: str) -> list[str]:
-    """Validate a conservative, exact-tag scope shared by claims and directions."""
     errors: list[str] = []
     if not isinstance(scope, dict):
         return [f"{where} must be an object"]
@@ -193,9 +144,7 @@ def _validate_scope(scope: Any, where: str) -> list[str]:
                 for value in values
             )
         ):
-            errors.append(
-                f"{where}.{axis} must be a non-empty list of lowercase scope tags"
-            )
+            errors.append(f"{where}.{axis} must be a non-empty list of lowercase scope tags")
         elif len(values) != len(set(values)):
             errors.append(f"{where}.{axis} must not contain duplicate tags")
         elif "*" in values and len(values) != 1:
@@ -204,12 +153,7 @@ def _validate_scope(scope: Any, where: str) -> list[str]:
 
 
 def scope_relation(claim_scope: Any, target_scope: Any) -> str:
-    """Return direct, partial, mismatch, or unknown for claim -> target scope.
-
-    A claim is direct only when every target tag is covered on every axis.
-    Any disjoint axis makes it a mismatch. Overlap without containment is only
-    partial and cannot drive deterministic deprioritization or exclusion.
-    """
+    """Return direct, partial, mismatch, or unknown for claim -> target scope."""
     if _validate_scope(claim_scope, "claim_scope") or _validate_scope(
         target_scope, "target_scope"
     ):
@@ -227,47 +171,57 @@ def scope_relation(claim_scope: Any, target_scope: Any) -> str:
     return "direct" if direct else "partial"
 
 
-def validate_registry(
-    registry: dict[str, Any],
+def _evidence_link_errors(
+    links: Any,
+    where: str,
+    source_ids: set[str],
     *,
-    ledger: dict[str, Any] | None = None,
-    retrieval_manifest: dict[str, Any] | None = None,
-) -> list[str]:
-    """Return contract errors; an empty list means the registry is valid."""
+    allow_empty: bool,
+) -> tuple[list[str], list[dict[str, Any]]]:
     errors: list[str] = []
-    schema_version = registry.get("schema_version")
-    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
-        errors.append(
-            f"schema_version must be one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
-        )
-    scoped_contract = schema_version == SCHEMA_VERSION
+    if not isinstance(links, list) or (not allow_empty and not links):
+        return [f"{where} must be {'a' if allow_empty else 'a non-empty'} list"], []
+    valid: list[dict[str, Any]] = []
+    for index, link in enumerate(links):
+        item_where = f"{where}[{index}]"
+        if not isinstance(link, dict):
+            errors.append(f"{item_where} must be an object")
+            continue
+        if link.get("source_id") not in source_ids:
+            errors.append(f"{item_where} references unknown source id {link.get('source_id')!r}")
+        if link.get("role") not in EVIDENCE_ROLES:
+            errors.append(f"{item_where}.role must be one of {sorted(EVIDENCE_ROLES)}")
+        unknown = sorted(set(link) - {"source_id", "role"})
+        if unknown:
+            errors.append(f"{item_where} has unknown fields {unknown}")
+        valid.append(link)
+    return errors, valid
 
-    directions = registry.get("directions")
+
+def _validate_sources(
+    registry: dict[str, Any], retrieval_manifest: dict[str, Any] | None
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    errors: list[str] = []
     sources = registry.get("sources")
-    if not isinstance(directions, list) or not directions:
-        errors.append("directions must be a non-empty list")
-        directions = []
-    if not isinstance(sources, list) or not sources:
-        errors.append("sources must be a non-empty list")
-        sources = []
-
-    source_ids: set[str] = set()
-    source_urls: dict[str, str] = {}
-    source_keys: dict[str, str] = {}
+    if not isinstance(sources, list):
+        return ["sources must be a list"], {}
     source_by_id: dict[str, dict[str, Any]] = {}
-    for index, source in enumerate(sources, start=1):
-        where = f"sources[{index - 1}]"
+    source_keys: dict[str, str] = {}
+    source_urls: dict[str, str] = {}
+    for index, source in enumerate(sources):
+        where = f"sources[{index}]"
         if not isinstance(source, dict):
             errors.append(f"{where} must be an object")
             continue
         source_id = source.get("id")
-        if not isinstance(source_id, str) or SOURCE_RE.fullmatch(source_id) is None:
-            errors.append(f"{where}.id must match src-NN")
-        elif source_id in source_ids:
-            errors.append(f"duplicate source id {source_id}")
-        else:
-            source_ids.add(source_id)
-            source_by_id[source_id] = source
+        expected_id = f"src-{index + 1:02d}"
+        if source_id != expected_id:
+            errors.append(f"{where}.id must be {expected_id} (order, no gaps)")
+        if isinstance(source_id, str):
+            if source_id in source_by_id:
+                errors.append(f"duplicate source id {source_id}")
+            else:
+                source_by_id[source_id] = source
         if source.get("type") not in SOURCE_TYPES:
             errors.append(f"{where}.type must be one of {sorted(SOURCE_TYPES)}")
         if source.get("publication_status") not in PUBLICATION_STATUS:
@@ -279,16 +233,15 @@ def validate_registry(
                 f"{where}.validation_status must be one of {sorted(VALIDATION_STATUS)}"
             )
         for field in ("title", "url"):
-            if not _nonempty_string(source.get(field)):
+            if not _nonempty(source.get(field)):
                 errors.append(f"{where}.{field} must be a non-empty string")
-        if scoped_contract:
-            errors.extend(_validate_scope(source.get("studied_scope"), f"{where}.studied_scope"))
+        errors.extend(_validate_scope(source.get("studied_scope"), f"{where}.studied_scope"))
         url = source.get("url")
-        if _nonempty_string(url) and not url.startswith(("https://", "http://")):
-            errors.append(f"{where}.url must be an HTTP(S) URL")
-        if isinstance(source_id, str) and _nonempty_string(url):
-            source_urls[source_id] = url
-            if scoped_contract:
+        if _nonempty(url):
+            if not url.startswith(("https://", "http://")):
+                errors.append(f"{where}.url must be an HTTP(S) URL")
+            else:
+                source_urls[str(source_id)] = url
                 key = canonical_key(url)
                 previous = source_keys.get(key)
                 if previous is not None:
@@ -296,14 +249,18 @@ def validate_registry(
                         f"sources {previous} and {source_id} duplicate canonical work {key}"
                     )
                 else:
-                    source_keys[key] = source_id
+                    source_keys[key] = str(source_id)
+        unknown = sorted(
+            set(source)
+            - {"id", "type", "title", "url", "publication_status", "validation_status", "studied_scope"}
+        )
+        if unknown:
+            errors.append(f"{where} has unknown fields {unknown}")
 
     if retrieval_manifest is not None:
         errors.extend(validate_manifest(retrieval_manifest))
         if retrieval_manifest.get("retrieval_condition") == "mixed":
-            errors.append(
-                "background evidence cannot mix frozen and live retrieval in one condition"
-            )
+            errors.append("background evidence cannot mix frozen and live retrieval in one condition")
         visited_grounding = {
             visit.get("canonical_key")
             for visit in retrieval_manifest.get("visits", [])
@@ -316,718 +273,982 @@ def validate_registry(
                 errors.append(
                     f"source {source_id} was not successfully visited in the grounding lane"
                 )
+    return errors, source_by_id
 
-    direction_ids: list[str] = []
-    direction_by_id: dict[str, dict[str, Any]] = {}
-    required_text = (
-        "title",
-        "claim",
-        "credibility_rationale",
-        "testable_expectation",
-    )
-    for index, direction in enumerate(directions, start=1):
-        where = f"directions[{index - 1}]"
-        if not isinstance(direction, dict):
-            errors.append(f"{where} must be an object")
-            continue
-        direction_id = direction.get("id")
-        expected_id = f"tf-{index:02d}"
-        if direction_id != expected_id:
-            errors.append(f"{where}.id must be {expected_id} (priority order, no gaps)")
-        if isinstance(direction_id, str):
-            if direction_id in direction_by_id:
-                errors.append(f"duplicate direction id {direction_id}")
-            else:
-                direction_ids.append(direction_id)
-                direction_by_id[direction_id] = direction
-        for field in required_text:
-            if not _nonempty_string(direction.get(field)):
-                errors.append(f"{where}.{field} must be a non-empty string")
-        if scoped_contract:
-            kind = direction.get("kind")
-            if kind not in DIRECTION_KINDS:
-                errors.append(f"{where}.kind must be one of {sorted(DIRECTION_KINDS)}")
-            if kind == "evidence_prior" and direction.get("probe_for"):
-                errors.append(f"{where}.probe_for is only valid for a scope_probe")
-            if not _nonempty_string(direction.get("claim_scope")):
-                errors.append(f"{where}.claim_scope must be a non-empty string")
-            errors.extend(_validate_scope(direction.get("scope"), f"{where}.scope"))
-            values = direction.get("required_comparisons")
-            if (
-                not isinstance(values, list)
-                or not values
-                or any(not _nonempty_string(value) for value in values)
-            ):
-                errors.append(
-                    f"{where}.required_comparisons must be a non-empty string list"
-                )
-            if not _nonempty_string(direction.get("reopen_when")):
-                errors.append(f"{where}.reopen_when must be a non-empty string")
-        credibility = direction.get("literature_credibility")
-        if credibility not in LITERATURE_CREDIBILITY:
+
+def _credibility_errors(
+    item: dict[str, Any],
+    links: list[dict[str, Any]],
+    source_by_id: dict[str, dict[str, Any]],
+    where: str,
+) -> list[str]:
+    errors: list[str] = []
+    credibility = item.get("literature_credibility")
+    if credibility not in LITERATURE_CREDIBILITY:
+        errors.append(
+            f"{where}.literature_credibility must be one of {sorted(LITERATURE_CREDIBILITY)}"
+        )
+    roles = [link.get("role") for link in links]
+    if credibility == "contested" and "contradicts" not in roles:
+        errors.append(f"{where} is contested but cites no contradicting evidence")
+    if credibility == "replicated":
+        replicated_support = any(
+            link.get("role") == "supports"
+            and source_by_id.get(link.get("source_id"), {}).get("validation_status")
+            == "independently_reproduced"
+            for link in links
+        )
+        if not replicated_support:
             errors.append(
-                f"{where}.literature_credibility must be one of "
-                f"{sorted(LITERATURE_CREDIBILITY)}"
+                f"{where} is replicated but has no independently reproduced supporting source"
             )
-        evidence_links = direction.get("evidence")
-        evidence_roles: list[str] = []
-        if not isinstance(evidence_links, list) or not evidence_links:
-            errors.append(f"{where}.evidence must be a non-empty list")
-        else:
-            for evidence_index, link in enumerate(evidence_links):
-                link_where = f"{where}.evidence[{evidence_index}]"
-                if not isinstance(link, dict):
-                    errors.append(f"{link_where} must be an object")
-                    continue
-                source_id = link.get("source_id")
-                role = link.get("role")
-                if source_id not in source_ids:
-                    errors.append(f"{link_where} references unknown source id {source_id!r}")
-                if role not in EVIDENCE_ROLES:
-                    errors.append(f"{link_where}.role must be one of {sorted(EVIDENCE_ROLES)}")
-                else:
-                    evidence_roles.append(role)
-        if credibility == "contested" and "contradicts" not in evidence_roles:
-            errors.append(f"{where} is contested but cites no contradicting evidence")
-        if credibility == "replicated":
-            replicated_support = any(
-                link.get("role") == "supports"
-                and source_by_id.get(link.get("source_id"), {}).get("validation_status")
-                == "independently_reproduced"
-                for link in (evidence_links if isinstance(evidence_links, list) else [])
-                if isinstance(link, dict)
-            )
-            if not replicated_support:
-                errors.append(
-                    f"{where} is replicated but has no independently reproduced supporting source"
-                )
-
-    if scoped_contract:
-        guidance = registry.get("guidance")
-        if not isinstance(guidance, list):
-            errors.append("guidance must be a list")
-            guidance = []
-        guidance_ids: list[str] = []
-        guidance_by_id: dict[str, dict[str, Any]] = {}
-        binding_guidance_ids: set[str] = set()
-        for index, item in enumerate(guidance, start=1):
-            where = f"guidance[{index - 1}]"
-            if not isinstance(item, dict):
-                errors.append(f"{where} must be an object")
-                continue
-            guidance_id = item.get("id")
-            expected_id = f"g-{index:02d}"
-            if guidance_id != expected_id:
-                errors.append(f"{where}.id must be {expected_id} (order, no gaps)")
-            if isinstance(guidance_id, str):
-                if guidance_id in guidance_by_id:
-                    errors.append(f"duplicate guidance id {guidance_id}")
-                else:
-                    guidance_ids.append(guidance_id)
-                    guidance_by_id[guidance_id] = item
-            if item.get("section") not in GUIDANCE_SECTIONS:
-                errors.append(
-                    f"{where}.section must be one of {sorted(GUIDANCE_SECTIONS)}"
-                )
-            effect = item.get("effect")
-            if effect not in GUIDANCE_EFFECTS:
-                errors.append(f"{where}.effect must be one of {sorted(GUIDANCE_EFFECTS)}")
-            for field in ("claim", "credibility_rationale", "reopen_when"):
-                if not _nonempty_string(item.get(field)):
-                    errors.append(f"{where}.{field} must be a non-empty string")
-            credibility = item.get("literature_credibility")
-            if credibility not in LITERATURE_CREDIBILITY:
-                errors.append(
-                    f"{where}.literature_credibility must be one of "
-                    f"{sorted(LITERATURE_CREDIBILITY)}"
-                )
-            errors.extend(_validate_scope(item.get("scope"), f"{where}.scope"))
-
-            evidence_links = item.get("evidence")
-            direct_support_ids: set[str] = set()
-            evidence_roles: list[str] = []
-            if not isinstance(evidence_links, list) or not evidence_links:
-                errors.append(f"{where}.evidence must be a non-empty list")
-                evidence_links = []
-            for evidence_index, link in enumerate(evidence_links):
-                link_where = f"{where}.evidence[{evidence_index}]"
-                if not isinstance(link, dict):
-                    errors.append(f"{link_where} must be an object")
-                    continue
-                source_id = link.get("source_id")
-                role = link.get("role")
-                if source_id not in source_ids:
-                    errors.append(f"{link_where} references unknown source id {source_id!r}")
-                if role not in EVIDENCE_ROLES:
-                    errors.append(
-                        f"{link_where}.role must be one of {sorted(EVIDENCE_ROLES)}"
-                    )
-                    continue
-                evidence_roles.append(role)
-                source = source_by_id.get(source_id, {})
-                relation = scope_relation(source.get("studied_scope"), item.get("scope"))
-                if (
-                    role == "supports"
-                    and relation == "direct"
-                    and source.get("type") in BINDING_SOURCE_TYPES
-                    and source.get("publication_status") != "withdrawn_or_retracted"
-                ):
-                    direct_support_ids.add(str(source_id))
-            if credibility == "contested" and "contradicts" not in evidence_roles:
-                errors.append(f"{where} is contested but cites no contradicting evidence")
-            if effect in {"deprioritize", "exclude"}:
-                if credibility not in {"preliminary", "corroborated", "replicated"}:
-                    errors.append(
-                        f"{where}.{effect} requires preliminary, corroborated, or "
-                        f"replicated evidence; {credibility!r} may only caution"
-                    )
-                if not direct_support_ids:
-                    errors.append(
-                        f"{where}.{effect} requires a non-withdrawn primary empirical source "
-                        "whose studied scope directly contains the guidance scope"
-                    )
-                elif isinstance(guidance_id, str):
-                    binding_guidance_ids.add(guidance_id)
-            if effect == "exclude":
-                if credibility not in {"corroborated", "replicated"}:
-                    errors.append(
-                        f"{where}.exclude requires corroborated or replicated evidence"
-                    )
-                if len(direct_support_ids) < 2:
-                    errors.append(
-                        f"{where}.exclude requires two directly scoped supporting sources"
-                    )
-                reproduced_support = any(
-                    source_by_id.get(source_id, {}).get("validation_status")
-                    == "independently_reproduced"
-                    for source_id in direct_support_ids
-                )
-                if not reproduced_support:
-                    errors.append(
-                        f"{where}.exclude requires directly scoped independent reproduction"
-                    )
-
-        probed_guidance_ids: set[str] = set()
-        for direction in directions:
-            if not isinstance(direction, dict) or direction.get("kind") != "scope_probe":
-                continue
-            where = f"direction {direction.get('id')}"
-            probe_for = direction.get("probe_for")
-            if (
-                not isinstance(probe_for, list)
-                or not probe_for
-                or any(not isinstance(item, str) for item in probe_for)
-            ):
-                errors.append(f"{where}.probe_for must be a non-empty guidance-id list")
-                continue
-            unknown_targets = sorted(set(probe_for) - set(guidance_ids))
-            if unknown_targets:
-                errors.append(f"{where}.probe_for references unknown ids {unknown_targets}")
-            for guidance_id in set(probe_for) & set(guidance_ids):
-                relation = scope_relation(
-                    guidance_by_id[guidance_id].get("scope"), direction.get("scope")
-                )
-                if relation == "direct":
-                    errors.append(
-                        f"{where} is not a boundary probe for {guidance_id}; scopes match directly"
-                    )
-                else:
-                    probed_guidance_ids.add(guidance_id)
-        unprobed_guidance = sorted(binding_guidance_ids - probed_guidance_ids)
-        if unprobed_guidance:
-            errors.append(
-                "binding external guidance requires an out-of-scope scope_probe direction; "
-                f"unprobed guidance: {unprobed_guidance}"
-            )
-
-    if ledger is not None:
-        for record in ledger.get("records", []):
-            run_id = str(record.get("run_id"))
-            for source in record.get("source_run_ids") or []:
-                source = str(source)
-                if source.startswith("tf-") and source not in direction_by_id:
-                    errors.append(f"ledger run {run_id} references unknown direction {source}")
-
     return errors
 
 
-def derive_direction_selection(
-    registry: dict[str, Any], ledger: dict[str, Any] | None = None
-) -> dict[str, dict[str, Any]]:
-    """Derive eligibility from typed scope; prose pitfalls have no blocking power."""
-    experience_entries = (
-        (ledger or {}).get("experience", {}).get("direction_evidence", [])
-        if isinstance((ledger or {}).get("experience"), dict)
-        else []
-    )
-    experience_by_id = {
-        entry.get("direction_id"): entry
-        for entry in experience_entries
-        if isinstance(entry, dict) and isinstance(entry.get("direction_id"), str)
-    }
-    guidance = [
-        item for item in registry.get("guidance", []) if isinstance(item, dict)
-    ]
-    result: dict[str, dict[str, Any]] = {}
-    effect_rank = {"caution": 0, "deprioritize": 1, "exclude": 2}
-    for direction in registry.get("directions", []):
-        if not isinstance(direction, dict) or not isinstance(direction.get("id"), str):
+def _validate_hypotheses(
+    registry: dict[str, Any], source_by_id: dict[str, dict[str, Any]]
+) -> list[str]:
+    errors: list[str] = []
+    source_ids = set(source_by_id)
+    dimensions = registry.get("dimensions")
+    if not isinstance(dimensions, list):
+        return errors
+    for dimension_index, dimension in enumerate(dimensions):
+        if not isinstance(dimension, dict):
             continue
-        matched = []
-        binding = []
-        strongest = "caution"
-        for item in guidance:
-            relation = scope_relation(item.get("scope"), direction.get("scope"))
-            if relation != "direct":
+        for hypothesis_index, hypothesis in enumerate(dimension.get("hypotheses", [])):
+            if not isinstance(hypothesis, dict):
                 continue
-            effect = item.get("effect")
-            if effect not in GUIDANCE_EFFECTS:
-                continue
-            receipt = {"id": item.get("id"), "effect": effect}
-            matched.append(receipt)
-            if effect in {"deprioritize", "exclude"}:
-                binding.append(receipt)
-            if effect_rank[effect] > effect_rank[strongest]:
-                strongest = effect
+            where = f"dimensions[{dimension_index}].hypotheses[{hypothesis_index}]"
+            errors.extend(_validate_scope(hypothesis.get("scope"), f"{where}.scope"))
+            allow_empty = hypothesis.get("kind") == "baseline"
+            link_errors, links = _evidence_link_errors(
+                hypothesis.get("evidence"),
+                f"{where}.evidence",
+                source_ids,
+                allow_empty=allow_empty,
+            )
+            errors.extend(link_errors)
+            errors.extend(_credibility_errors(hypothesis, links, source_by_id, where))
+    return errors
 
-        selection_status = {
-            "caution": "active",
-            "deprioritize": "deprioritized",
-            "exclude": "excluded",
-        }[strongest]
-        local = experience_by_id.get(direction["id"], {})
-        reopened = (
-            local.get("claim_coverage") == "direct"
-            and local.get("run_status") in {"supported_here", "mixed"}
+
+def _validate_relations_evidence(
+    registry: dict[str, Any], source_by_id: dict[str, dict[str, Any]]
+) -> list[str]:
+    errors: list[str] = []
+    source_ids = set(source_by_id)
+    relations = registry.get("relations")
+    if not isinstance(relations, list):
+        return errors
+    for index, relation in enumerate(relations):
+        if not isinstance(relation, dict):
+            continue
+        link_errors, _ = _evidence_link_errors(
+            relation.get("evidence"),
+            f"relations[{index}].evidence",
+            source_ids,
+            allow_empty=True,
         )
-        if reopened:
-            selection_status = "active"
-        result[direction["id"]] = {
-            "selection_status": selection_status,
+        errors.extend(link_errors)
+    return errors
+
+
+def _validate_provenance_refs(
+    registry: dict[str, Any], source_by_id: dict[str, dict[str, Any]]
+) -> list[str]:
+    """Make literature provenance receipts resolve to inspected sources."""
+    errors: list[str] = []
+    source_ids = set(source_by_id)
+
+    def check(receipts: Any, where: str) -> None:
+        if not isinstance(receipts, list):
+            return
+        for index, receipt in enumerate(receipts):
+            if (
+                isinstance(receipt, dict)
+                and receipt.get("kind") == "literature"
+                and receipt.get("ref") not in source_ids
+            ):
+                errors.append(
+                    f"{where}[{index}].ref must name an inspected source id; "
+                    f"got {receipt.get('ref')!r}"
+                )
+
+    dimensions = registry.get("dimensions")
+    if isinstance(dimensions, list):
+        for dimension_index, dimension in enumerate(dimensions):
+            if not isinstance(dimension, dict):
+                continue
+            check(dimension.get("evidence"), f"dimensions[{dimension_index}].evidence")
+            for hypothesis_index, hypothesis in enumerate(dimension.get("hypotheses", [])):
+                if isinstance(hypothesis, dict):
+                    check(
+                        hypothesis.get("provenance"),
+                        f"dimensions[{dimension_index}].hypotheses[{hypothesis_index}].provenance",
+                    )
+    relations = registry.get("relations")
+    if isinstance(relations, list):
+        for relation_index, relation in enumerate(relations):
+            if isinstance(relation, dict):
+                check(relation.get("provenance"), f"relations[{relation_index}].provenance")
+    return errors
+
+
+def _validate_guidance(
+    registry: dict[str, Any], source_by_id: dict[str, dict[str, Any]]
+) -> list[str]:
+    errors: list[str] = []
+    guidance = registry.get("guidance")
+    if not isinstance(guidance, list):
+        return ["guidance must be a list"]
+    guidance_ids = {
+        item.get("id") for item in guidance if isinstance(item, dict)
+    }
+    for dimension_index, dimension in enumerate(registry.get("dimensions", [])):
+        if not isinstance(dimension, dict):
+            continue
+        for hypothesis_index, hypothesis in enumerate(dimension.get("hypotheses", [])):
+            if not isinstance(hypothesis, dict) or hypothesis.get("kind") != "scope_probe":
+                continue
+            where = f"dimensions[{dimension_index}].hypotheses[{hypothesis_index}]"
+            for guidance_id in hypothesis.get("probe_for") or []:
+                if guidance_id not in guidance_ids:
+                    errors.append(
+                        f"{where}.probe_for references unknown guidance id {guidance_id!r}"
+                    )
+    source_ids = set(source_by_id)
+    hypotheses = hypothesis_map(registry)
+    for index, item in enumerate(guidance):
+        where = f"guidance[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        guidance_id = item.get("id")
+        expected_id = f"g-{index + 1:02d}"
+        if guidance_id != expected_id:
+            errors.append(f"{where}.id must be {expected_id} (order, no gaps)")
+        if item.get("section") not in GUIDANCE_SECTIONS:
+            errors.append(f"{where}.section must be one of {sorted(GUIDANCE_SECTIONS)}")
+        effect = item.get("effect")
+        if effect not in GUIDANCE_EFFECTS:
+            errors.append(f"{where}.effect must be one of {sorted(GUIDANCE_EFFECTS)}")
+        for field in ("claim", "credibility_rationale", "reopen_when"):
+            if not _nonempty(item.get(field)):
+                errors.append(f"{where}.{field} must be a non-empty string")
+        errors.extend(_validate_scope(item.get("scope"), f"{where}.scope"))
+        link_errors, links = _evidence_link_errors(
+            item.get("evidence"), f"{where}.evidence", source_ids, allow_empty=False
+        )
+        errors.extend(link_errors)
+        errors.extend(_credibility_errors(item, links, source_by_id, where))
+        credibility = item.get("literature_credibility")
+        direct_support_ids = {
+            link.get("source_id")
+            for link in links
+            if link.get("role") == "supports"
+            and source_by_id.get(link.get("source_id"), {}).get("type") in BINDING_SOURCE_TYPES
+            and source_by_id.get(link.get("source_id"), {}).get("publication_status")
+            != "withdrawn_or_retracted"
+            and scope_relation(
+                source_by_id.get(link.get("source_id"), {}).get("studied_scope"),
+                item.get("scope"),
+            )
+            == "direct"
+        }
+        if effect in {"deprioritize", "exclude"}:
+            if credibility in {"unverified", "contested"}:
+                errors.append(
+                    f"{where} {credibility} negative guidance may only caution"
+                )
+            if not direct_support_ids:
+                errors.append(
+                    f"{where} binding guidance requires a directly scoped primary empirical source"
+                )
+            source_contains_guidance = any(
+                scope_relation(source.get("studied_scope"), item.get("scope")) == "direct"
+                for source in source_by_id.values()
+                if source.get("type") in BINDING_SOURCE_TYPES
+                and source.get("publication_status") != "withdrawn_or_retracted"
+            )
+            if not source_contains_guidance:
+                errors.append(
+                    f"{where} no eligible source directly contains the guidance scope"
+                )
+            probes = [
+                hypothesis
+                for _, hypothesis in hypotheses.values()
+                if hypothesis.get("kind") == "scope_probe"
+                and guidance_id in (hypothesis.get("probe_for") or [])
+                and scope_relation(item.get("scope"), hypothesis.get("scope")) != "direct"
+            ]
+            if not probes:
+                errors.append(
+                    f"{where} binding guidance requires an out-of-scope scope_probe hypothesis"
+                )
+        if effect == "exclude":
+            if credibility not in {"corroborated", "replicated"}:
+                errors.append(f"{where} exclusion requires corroborated or replicated evidence")
+            if len(direct_support_ids) < 2:
+                errors.append(f"{where} exclusion requires two directly scoped supporting sources")
+            reproduced = any(
+                source_by_id.get(source_id, {}).get("validation_status")
+                == "independently_reproduced"
+                for source_id in direct_support_ids
+            )
+            if not reproduced:
+                errors.append(f"{where} exclusion requires directly scoped independent reproduction")
+        unknown = sorted(
+            set(item)
+            - {
+                "id",
+                "section",
+                "effect",
+                "claim",
+                "scope",
+                "literature_credibility",
+                "credibility_rationale",
+                "reopen_when",
+                "evidence",
+            }
+        )
+        if unknown:
+            errors.append(f"{where} has unknown fields {unknown}")
+    return errors
+
+
+def derive_hypothesis_selection(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Derive external-guidance eligibility without mutating the frozen space."""
+    guidance = [item for item in registry.get("guidance", []) if isinstance(item, dict)]
+    result: dict[str, dict[str, Any]] = {}
+    for hypothesis_id, (_, hypothesis) in hypothesis_map(registry).items():
+        matched: list[dict[str, str]] = []
+        binding: list[dict[str, str]] = []
+        for item in guidance:
+            if scope_relation(item.get("scope"), hypothesis.get("scope")) != "direct":
+                continue
+            receipt = {"id": item.get("id"), "effect": item.get("effect")}
+            matched.append(receipt)
+            if item.get("effect") in {"deprioritize", "exclude"}:
+                binding.append(receipt)
+        status = "active"
+        if any(item["effect"] == "exclude" for item in binding):
+            status = "excluded"
+        elif any(item["effect"] == "deprioritize" for item in binding):
+            status = "deprioritized"
+        result[hypothesis_id] = {
+            "selection_status": status,
             "matched_guidance": matched,
             "binding_guidance": binding,
-            "reopened_by_run_status": local.get("run_status") if reopened else None,
         }
     return result
 
 
-def _safe_score(value: Any) -> float | None:
-    try:
-        score = float(value)
-    except (TypeError, ValueError):
-        return None
-    return score if math.isfinite(score) else None
-
-
-def derive_lineage(registry: dict[str, Any], ledger: dict[str, Any]) -> dict[str, Any]:
-    """Map every candidate to its originating tf-* hypotheses.
-
-    A single-origin descendant is useful lineage evidence. Multi-origin
-    descendants are reported separately because crossover success cannot be
-    credited causally to every contributing direction.
-    """
-    directions = registry.get("directions", [])
-    direction_ids = [d["id"] for d in directions if isinstance(d, dict) and "id" in d]
-    records = {
-        str(record.get("run_id")): record
-        for record in ledger.get("records", [])
-        if record.get("run_id") is not None
-    }
-    memo: dict[str, set[str]] = {}
-    warnings: list[str] = []
-
-    def origins(run_id: str, visiting: set[str] | None = None) -> set[str]:
-        if run_id in memo:
-            return memo[run_id]
-        visiting = set() if visiting is None else visiting
-        if run_id in visiting:
-            warnings.append(f"cycle while resolving lineage at run {run_id}")
-            return set()
-        record = records.get(run_id)
-        if record is None:
-            warnings.append(f"missing parent record {run_id}")
-            return set()
-        visiting.add(run_id)
-        found: set[str] = set()
-        for source in record.get("source_run_ids") or []:
-            source = str(source)
-            if TF_RE.fullmatch(source):
-                found.add(source)
-            elif source in records:
-                found.update(origins(source, visiting))
-            elif source.isdigit():
-                warnings.append(f"run {run_id} references missing parent {source}")
-        visiting.remove(run_id)
-        memo[run_id] = found
-        return found
-
-    evidence = {
-        direction_id: {
-            "literature_credibility": next(
-                d.get("literature_credibility")
-                for d in directions
-                if isinstance(d, dict) and d.get("id") == direction_id
-            ),
-            "direct_runs": [],
-            "single_origin_descendants": [],
-            "combination_runs": [],
-        }
-        for direction_id in direction_ids
-    }
-    run_origins: dict[str, list[str]] = {}
-
-    for run_id, record in records.items():
-        origin_set = origins(run_id)
-        run_origins[run_id] = sorted(origin_set)
-        item = {
-            "run_id": run_id,
-            "op": record.get("op"),
-            "status": record.get("status"),
-            "score": _safe_score(record.get("final_best_score")),
-        }
-        direct_tags = {
-            str(source)
-            for source in record.get("source_run_ids") or []
-            if TF_RE.fullmatch(str(source))
-        }
-        for direction_id in origin_set:
-            if direction_id not in evidence:
-                continue
-            if record.get("op") == "fresh" and direction_id in direct_tags:
-                evidence[direction_id]["direct_runs"].append(item)
-            elif len(origin_set) == 1:
-                evidence[direction_id]["single_origin_descendants"].append(item)
-            else:
-                evidence[direction_id]["combination_runs"].append(item)
-
-    return {
-        "schema_version": registry.get("schema_version", SCHEMA_VERSION),
-        "directions": evidence,
-        "run_origins": run_origins,
-        "warnings": sorted(set(warnings)),
-    }
-
-
-def _lineage_sample(items: list[dict[str, Any]], changed: set[str], limit: int) -> list[dict[str, Any]]:
-    """Choose bounded, deterministic receipts: changed, best, worst, newest."""
-    if limit <= 0:
-        return []
-    by_newest = sorted(items, key=lambda item: str(item["run_id"]), reverse=True)
-    finite = [item for item in items if isinstance(item.get("score"), (int, float))]
-    best = sorted(finite, key=lambda item: (item["score"], str(item["run_id"])))
-    worst = sorted(
-        items,
-        key=lambda item: (
-            item.get("status") == "crash",
-            item.get("score") if isinstance(item.get("score"), (int, float)) else float("inf"),
-            str(item["run_id"]),
-        ),
-        reverse=True,
+def validate_candidate_point(point: Any, registry: dict[str, Any]) -> list[str]:
+    """Validate one structural point plus P1 guidance-derived eligibility."""
+    errors = validate_point(point, registry)
+    if errors or not isinstance(point, dict):
+        return errors
+    selection = derive_hypothesis_selection(registry)
+    excluded = sorted(
+        hypothesis_id
+        for hypothesis_id in selected_assignments(point).values()
+        if selection.get(hypothesis_id, {}).get("selection_status") == "excluded"
     )
-    ordered = [item for item in by_newest if item["run_id"] in changed] + best + worst + by_newest
-    selected: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in ordered:
-        if item["run_id"] in seen:
-            continue
-        selected.append(item)
-        seen.add(item["run_id"])
-        if len(selected) >= limit:
-            break
-    return selected
-
-
-def derive_compact_lineage(
-    registry: dict[str, Any], ledger: dict[str, Any], *, limit: int = LINEAGE_SAMPLE_LIMIT
-) -> dict[str, Any]:
-    """Bounded lineage view for incremental experience extraction.
-
-    Exhaustive lineage remains mechanically derivable and is still used by the
-    validator. The model receives only runs changed since the committed
-    experience cursor and fixed-size representative receipts. This avoids
-    re-injecting every historical run id on each refresh.
-    """
-    lineage = derive_lineage(registry, ledger)
-    experience = ledger.get("experience") if isinstance(ledger.get("experience"), dict) else {}
-    cursor = int(experience.get("dag_revision", 0))
-    current = int(ledger["dag_revision"])
-    records = {
-        str(record.get("run_id")): record
-        for record in ledger.get("records", [])
-        if record.get("run_id") is not None
-        and (
-            record.get("status") == "crash"
-            or isinstance(record.get("final_best_score"), (int, float))
-        )
-    }
-    changed = {
-        run_id for run_id, record in records.items()
-        if int(record["dag_revision"]) > cursor
-    }
-
-    categories = {
-        "direct_runs": "direct_runs",
-        "descendant_runs": "single_origin_descendants",
-        "combination_runs": "combination_runs",
-    }
-    directions: dict[str, Any] = {}
-    for direction_id, evidence in lineage["directions"].items():
-        directions[direction_id] = {
-            "literature_credibility": evidence["literature_credibility"],
-            "delta_runs": {
-                output: [item for item in evidence[source] if item["run_id"] in changed]
-                for output, source in categories.items()
-            },
-            "representative_runs": {
-                output: _lineage_sample(evidence[source], changed, limit)
-                for output, source in categories.items()
-            },
-        }
-    return {
-        "schema_version": lineage["schema_version"],
-        "cursor": {
-            "from_revision": cursor,
-            "to_revision": current,
-        },
-        "directions": directions,
-        "warnings": lineage["warnings"],
-    }
-
-
-def validate_experience(
-    experience: dict[str, Any], registry: dict[str, Any], ledger: dict[str, Any]
-) -> list[str]:
-    """Validate the structured tf-* run-status view against actual lineage."""
-    errors: list[str] = []
-    entries = experience.get("direction_evidence")
-    if not isinstance(entries, list):
-        return ["experience.direction_evidence must be a list"]
-    lineage = derive_lineage(registry, ledger)
-    errors.extend(f"lineage: {warning}" for warning in lineage["warnings"])
-    expected = lineage["directions"]
-    records = {
-        str(record.get("run_id")): record
-        for record in ledger.get("records", [])
-        if record.get("run_id") is not None
-    }
-    scoped_contract = registry.get("schema_version") == SCHEMA_VERSION
-    if scoped_contract and "lessons" in experience:
-        lessons = experience.get("lessons")
-        if not isinstance(lessons, list):
-            errors.append("experience.lessons must be a list")
-            lessons = []
-        for index, lesson in enumerate(lessons):
-            where = f"lessons[{index}]"
-            if not isinstance(lesson, dict):
-                errors.append(f"{where} must be an object")
-                continue
-            if lesson.get("kind") != "deadend":
-                continue
-            errors.extend(_validate_scope(lesson.get("scope"), f"{where}.scope"))
-            if not _nonempty_string(lesson.get("reopen_when")):
-                errors.append(
-                    f"{where}.reopen_when must be a non-empty string for a deadend"
-                )
-            evidence_runs = lesson.get("evidence")
-            if not isinstance(evidence_runs, list) or any(
-                not isinstance(run_id, str) for run_id in evidence_runs
-            ):
-                errors.append(f"{where}.evidence must be a list of run-id strings")
-                continue
-            evidence_runs = list(dict.fromkeys(evidence_runs))
-            unknown_runs = sorted(set(evidence_runs) - set(records))
-            if unknown_runs:
-                errors.append(f"{where}.evidence contains unknown runs {unknown_runs}")
-            scored_runs = [
-                run_id
-                for run_id in evidence_runs
-                if records.get(run_id, {}).get("status") in {"keep", "discard"}
-                and _safe_score(records.get(run_id, {}).get("final_best_score")) is not None
-            ]
-            if len(scored_runs) < 2:
-                errors.append(
-                    f"{where} deadend requires at least two scored non-crash runs; "
-                    f"got {scored_runs}"
-                )
-    ledger_edges = {
-        f"{source}->{run_id}"
-        for run_id, record in records.items()
-        for source in (record.get("source_run_ids") or [])
-        if str(source) in records
-    }
-    seen: set[str] = set()
-
-    relation_fields = {
-        "direct_runs": "direct_runs",
-        "descendant_runs": "single_origin_descendants",
-        "combination_runs": "combination_runs",
-    }
-    for index, entry in enumerate(entries):
-        where = f"direction_evidence[{index}]"
-        if not isinstance(entry, dict):
-            errors.append(f"{where} must be an object")
-            continue
-        direction_id = entry.get("direction_id")
-        if direction_id not in expected:
-            errors.append(f"{where}.direction_id is unknown: {direction_id!r}")
-            continue
-        if direction_id in seen:
-            errors.append(f"duplicate direction evidence for {direction_id}")
-            continue
-        seen.add(direction_id)
-
-        expected_direction = expected[direction_id]
-        if entry.get("literature_credibility") != expected_direction["literature_credibility"]:
-            errors.append(
-                f"{where}.literature_credibility does not match background.md for {direction_id}"
-            )
-        if entry.get("run_status") not in RUN_STATUS:
-            errors.append(f"{where}.run_status must be one of {sorted(RUN_STATUS)}")
-        if entry.get("confidence") not in CONFIDENCE:
-            errors.append(f"{where}.confidence must be one of {sorted(CONFIDENCE)}")
-        if not _nonempty_string(entry.get("rationale")):
-            errors.append(f"{where}.rationale must be a non-empty string")
-
-        if scoped_contract:
-            coverage = entry.get("claim_coverage")
-            comparison_runs = entry.get("comparison_runs")
-            missing_comparisons = entry.get("missing_comparisons")
-            if coverage not in CLAIM_COVERAGE:
-                errors.append(
-                    f"{where}.claim_coverage must be one of {sorted(CLAIM_COVERAGE)}"
-                )
-            if not isinstance(comparison_runs, list) or any(
-                not isinstance(run_id, str) for run_id in comparison_runs
-            ):
-                errors.append(f"{where}.comparison_runs must be a list of run-id strings")
-                comparison_runs = []
-            else:
-                comparison_runs = list(dict.fromkeys(comparison_runs))
-                unknown_runs = sorted(set(comparison_runs) - set(records))
-                if unknown_runs:
-                    errors.append(
-                        f"{where}.comparison_runs contains unknown runs {unknown_runs}"
-                    )
-            if not isinstance(missing_comparisons, list) or any(
-                not _nonempty_string(item) for item in missing_comparisons
-            ):
-                errors.append(f"{where}.missing_comparisons must be a string list")
-                missing_comparisons = []
-
-            run_status = entry.get("run_status")
-            decisive = run_status in {"supported_here", "contradicted_here", "mixed"}
-            if run_status == "untested" and coverage != "none":
-                errors.append(f"{where}.claim_coverage must be none while untested")
-            if coverage == "none" and comparison_runs:
-                errors.append(f"{where}.comparison_runs must be empty when coverage is none")
-            if coverage == "partial" and not missing_comparisons:
-                errors.append(
-                    f"{where}.missing_comparisons must name the uncovered comparator or scope"
-                )
-            if coverage == "direct" and missing_comparisons:
-                errors.append(
-                    f"{where}.missing_comparisons must be empty when coverage is direct"
-                )
-            if decisive and coverage != "direct":
-                errors.append(
-                    f"{where}.run_status {run_status} requires direct claim coverage"
-                )
-            if decisive and len(comparison_runs) < 2:
-                errors.append(
-                    f"{where}.run_status {run_status} requires at least two comparison runs"
-                )
-            if coverage == "direct":
-                invalid_runs = [
-                    run_id
-                    for run_id in comparison_runs
-                    if records.get(run_id, {}).get("status") not in {"keep", "discard"}
-                    or _safe_score(records.get(run_id, {}).get("final_best_score")) is None
-                ]
-                if invalid_runs:
-                    errors.append(
-                        f"{where}.direct comparison runs must be scored non-crashes; "
-                        f"invalid {invalid_runs}"
-                    )
-
-        for output_field, lineage_field in relation_fields.items():
-            actual_ids = entry.get(output_field)
-            if not isinstance(actual_ids, list) or any(
-                not isinstance(run_id, str) for run_id in actual_ids
-            ):
-                errors.append(f"{where}.{output_field} must be a list of run-id strings")
-                continue
-            expected_ids = [item["run_id"] for item in expected_direction[lineage_field]]
-            unknown_lineage = sorted(set(actual_ids) - set(expected_ids))
-            if unknown_lineage:
-                errors.append(
-                    f"{where}.{output_field} is not a DAG-lineage subset: {unknown_lineage}"
-                )
-
-        evidence_edges = entry.get("evidence_edges")
-        if not isinstance(evidence_edges, list) or any(
-            not isinstance(edge, str) for edge in evidence_edges
-        ):
-            errors.append(f"{where}.evidence_edges must be a list of parent->child strings")
-        else:
-            unknown_edges = sorted(set(evidence_edges) - ledger_edges)
-            if unknown_edges:
-                errors.append(f"{where}.evidence_edges contains unknown edges {unknown_edges}")
-
-        related_ids = {
-            item["run_id"]
-            for field in relation_fields.values()
-            for item in expected_direction[field]
-        }
-        terminal = {
-            run_id
-            for run_id in related_ids
-            if records.get(run_id, {}).get("status") in {"keep", "discard", "crash"}
-        }
-        noncrash = {
-            run_id
-            for run_id in terminal
-            if records.get(run_id, {}).get("status") != "crash"
-        }
-        run_status = entry.get("run_status")
-        if not terminal and run_status != "untested":
-            errors.append(f"{where}.run_status must be untested before any completed evidence")
-        if terminal and run_status == "untested":
-            errors.append(f"{where}.run_status cannot be untested after completed evidence")
-        if not noncrash and run_status in {"supported_here", "contradicted_here", "mixed"}:
-            errors.append(f"{where}.run_status {run_status} requires non-crash evidence")
-
-    missing = sorted(set(expected) - seen)
-    if missing:
-        errors.append(f"direction_evidence is missing {missing}")
+    if excluded:
+        errors.append(f"semantic_point selects guidance-excluded hypotheses {excluded}")
     return errors
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    data = json.loads(path.read_text())
-    if not isinstance(data, dict):
-        raise ContractError(f"{path}: expected a JSON object")
-    return data
+def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
+    receipt = record.get("policy_receipt")
+    point = record.get("semantic_point")
+    if not isinstance(receipt, dict):
+        return [f"{where}.policy_receipt must be an object distinct from observations"]
+    point_object = point if isinstance(point, dict) else {}
+    errors: list[str] = []
+    if receipt.get("schema_version") != 1:
+        errors.append(f"{where}.policy_receipt.schema_version must be 1")
+    if receipt.get("space_revision") != point_object.get("space_revision"):
+        errors.append(f"{where}.policy_receipt.space_revision must match semantic_point")
+    proposal_revision = receipt.get("proposal_set_revision")
+    if not isinstance(proposal_revision, str) or DIGEST_RE.fullmatch(proposal_revision) is None:
+        errors.append(f"{where}.policy_receipt.proposal_set_revision must be a sha256 digest")
+    if receipt.get("selected_point_id") != point_object.get("point_id"):
+        errors.append(f"{where}.policy_receipt.selected_point_id must match semantic_point")
+    action = receipt.get("action")
+    raw_parents = record.get("source_run_ids")
+    expected_parents = [str(item) for item in raw_parents] if isinstance(raw_parents, list) else []
+    if not isinstance(action, dict) or set(action) != {"op", "parents"}:
+        errors.append(f"{where}.policy_receipt.action must contain only op and parents")
+    elif action.get("op") != record.get("op"):
+        errors.append(f"{where}.policy_receipt.action.op must match record.op")
+    elif action.get("parents") != expected_parents:
+        errors.append(f"{where}.policy_receipt.action.parents must match numeric ancestry")
+    policy = receipt.get("policy")
+    policy_name = policy.get("name") if isinstance(policy, dict) else None
+    if not isinstance(policy, dict) or set(policy) != {"name", "config"}:
+        errors.append(f"{where}.policy_receipt.policy must contain only name and config")
+    elif policy_name not in {
+        "coverage",
+        "gain",
+        "gain_uncertainty",
+    }:
+        errors.append(
+            f"{where}.policy_receipt.policy.name must be coverage, gain, or gain_uncertainty"
+        )
+    config = policy.get("config") if isinstance(policy, dict) else None
+    config_valid = True
+    if not isinstance(config, dict) or set(config) != POLICY_CONFIG_KEYS:
+        errors.append(
+            f"{where}.policy_receipt.policy.config must keep exactly "
+            f"{sorted(POLICY_CONFIG_KEYS)}"
+        )
+        config = {}
+        config_valid = False
+    else:
+        for key, value in config.items():
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                config_valid = False
+                errors.append(
+                    f"{where}.policy_receipt.policy.config.{key} must be a finite "
+                    "non-negative number"
+                )
+    components = receipt.get("components")
+    coverage_valid = False
+    model_components_valid = False
+    required_components = {"coverage", "predicted_gain", "uncertainty", "cost"}
+    if not isinstance(components, dict) or set(components) != required_components:
+        errors.append(
+            f"{where}.policy_receipt.components must keep {sorted(required_components)} separate"
+        )
+        components = {}
+    else:
+        coverage = components["coverage"]
+        coverage_valid = (
+            isinstance(coverage, (int, float))
+            and not isinstance(coverage, bool)
+            and math.isfinite(float(coverage))
+            and 0.0 <= float(coverage) <= 1.0
+        )
+        if not coverage_valid:
+            errors.append(f"{where}.policy_receipt coverage must be a finite number in [0, 1]")
+        model_components = [
+            components["predicted_gain"], components["uncertainty"], components["cost"]
+        ]
+        if policy_name == "coverage":
+            model_components_valid = all(value is None for value in model_components)
+            if any(value is not None for value in model_components):
+                errors.append(
+                    f"{where}.policy_receipt coverage policy must not invent model components"
+                )
+        elif policy_name in {"gain", "gain_uncertainty"}:
+            model_components_valid = all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and 0.0 <= float(value) <= 1.0
+                for value in model_components
+            )
+            if not model_components_valid:
+                errors.append(
+                    f"{where}.policy_receipt gain policies require separate finite "
+                    "predicted_gain, uncertainty, and cost values in [0, 1]"
+                )
+    evidence = receipt.get("evidence")
+    if (
+        not isinstance(evidence, list)
+        or len(evidence) > 5
+        or any(not _nonempty(item) or len(item) > 240 for item in evidence)
+    ):
+        errors.append(
+            f"{where}.policy_receipt.evidence must contain at most five short strings"
+        )
+        evidence = []
+    if policy_name == "coverage" and evidence:
+        errors.append(f"{where}.policy_receipt coverage policy evidence must be empty")
+    if policy_name in {"gain", "gain_uncertainty"} and not evidence:
+        errors.append(f"{where}.policy_receipt gain policies require selection evidence")
+    acquisition_score = receipt.get("acquisition_score")
+    if (
+        not isinstance(acquisition_score, (int, float))
+        or isinstance(acquisition_score, bool)
+        or not math.isfinite(float(acquisition_score))
+    ):
+        errors.append(f"{where}.policy_receipt.acquisition_score must be finite numeric")
+    elif (
+        components
+        and config_valid
+        and coverage_valid
+        and model_components_valid
+        and policy_name in {"coverage", "gain", "gain_uncertainty"}
+    ):
+        coverage = float(components["coverage"])
+        if policy_name == "coverage":
+            expected_score = coverage
+        elif all(components[key] is not None for key in ("predicted_gain", "uncertainty", "cost")):
+            expected_score = (
+                float(components["predicted_gain"])
+                + float(config["coverage_weight"]) * coverage
+                - float(config["cost_weight"]) * float(components["cost"])
+            )
+            if policy_name == "gain_uncertainty":
+                expected_score += float(config["uncertainty_weight"]) * float(
+                    components["uncertainty"]
+                )
+        else:
+            expected_score = None
+        if expected_score is not None and not math.isclose(
+            float(acquisition_score), round(expected_score, 10), rel_tol=0.0, abs_tol=1e-9
+        ):
+            errors.append(
+                f"{where}.policy_receipt.acquisition_score does not match its separate components"
+            )
+    ranked = receipt.get("ranked_point_ids")
+    if (
+        not isinstance(ranked, list)
+        or not ranked
+        or len(ranked) > 128
+        or any(not isinstance(item, str) for item in ranked)
+        or len(ranked) != len(set(ranked))
+        or ranked[0] != receipt.get("selected_point_id")
+    ):
+        errors.append(
+            f"{where}.policy_receipt.ranked_point_ids must be unique and start with the selected point"
+        )
+    allowed = {
+        "schema_version",
+        "space_revision",
+        "proposal_set_revision",
+        "policy",
+        "action",
+        "selected_point_id",
+        "components",
+        "acquisition_score",
+        "evidence",
+        "ranked_point_ids",
+    }
+    unknown = sorted(set(receipt) - allowed)
+    if unknown:
+        errors.append(f"{where}.policy_receipt has unknown fields {unknown}")
+    return errors
+
+
+def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    records = ledger.get("records")
+    if not isinstance(records, list):
+        return ["ledger.records must be a list"]
+    expected_receipt = space_receipt(registry)
+    if (records or ledger.get("search_space") is not None) and ledger.get(
+        "search_space"
+    ) != expected_receipt:
+        errors.append(
+            "ledger.search_space must preserve the exact background and catalog revision receipt"
+        )
+    known: set[str] = set()
+    for index, record in enumerate(records):
+        where = f"ledger.records[{index}]"
+        if not isinstance(record, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        raw_run_id = record.get("run_id")
+        run_id = str(raw_run_id)
+        valid_run_id = isinstance(raw_run_id, str) and raw_run_id.isdigit()
+        if not valid_run_id:
+            errors.append(f"{where}.run_id must be a numeric string")
+        elif run_id in known:
+            errors.append(f"{where}.run_id duplicates an earlier record")
+        if record.get("kind") != "optimization":
+            errors.append(f"{where}.kind must be optimization")
+        for field in ("idea", "change", "candidate_name", "description"):
+            if not _nonempty(record.get(field)):
+                errors.append(f"{where}.{field} must be a non-empty candidate field")
+        op = record.get("op")
+        parents = record.get("source_run_ids")
+        if not isinstance(parents, list) or any(
+            not isinstance(parent, str) or not parent.isdigit() for parent in parents
+        ):
+            errors.append(
+                f"{where}.source_run_ids must contain only numeric parent ids; "
+                "hypothesis attribution belongs in semantic_point"
+            )
+            parents = []
+        if any(parent not in known for parent in parents):
+            errors.append(f"{where}.source_run_ids must reference earlier records")
+        expected_parent_count = {"fresh": 0, "improve": 1, "crossover": 2}.get(op)
+        if expected_parent_count is None:
+            errors.append(f"{where}.op must be fresh, improve, or crossover")
+        elif len(parents) != expected_parent_count or len(parents) != len(set(parents)):
+            errors.append(
+                f"{where} {op} requires {expected_parent_count} distinct numeric parents"
+            )
+        point_errors = validate_candidate_point(record.get("semantic_point"), registry)
+        errors.extend(f"{where}: {error}" for error in point_errors)
+        errors.extend(_validate_policy_receipt(record, where))
+        if valid_run_id:
+            known.add(run_id)
+    experience = ledger.get("experience")
+    if experience not in (None, {}):
+        errors.extend(validate_experience(experience, registry, ledger))
+    return errors
+
+
+def validate_registry(
+    registry: dict[str, Any],
+    *,
+    ledger: dict[str, Any] | None = None,
+    retrieval_manifest: dict[str, Any] | None = None,
+) -> list[str]:
+    errors = validate_space_core(registry)
+    source_errors, source_by_id = _validate_sources(registry, retrieval_manifest)
+    errors.extend(source_errors)
+    errors.extend(_validate_hypotheses(registry, source_by_id))
+    errors.extend(_validate_relations_evidence(registry, source_by_id))
+    errors.extend(_validate_provenance_refs(registry, source_by_id))
+    errors.extend(_validate_guidance(registry, source_by_id))
+    if not errors:
+        selection = derive_hypothesis_selection(registry)
+        for dimension in registry.get("dimensions", []):
+            if not isinstance(dimension, dict):
+                continue
+            baseline_id = dimension.get("baseline_hypothesis_id")
+            status = selection.get(baseline_id, {}).get("selection_status")
+            if status != "active":
+                errors.append(
+                    f"dimension {dimension.get('id')} baseline {baseline_id} is {status}; "
+                    "the frozen space would have no unconditional valid baseline"
+                )
+        if complete_point(registry) is None:
+            errors.append(
+                "the frozen registry has no valid explicit-baseline point under its relations"
+            )
+    if ledger is not None:
+        errors.extend(validate_ledger(registry, ledger))
+    return errors
+
+
+def validate_background_markdown(path: Path, registry: dict[str, Any]) -> list[str]:
+    """Keep the human hierarchy and structured guidance aligned with JSON."""
+    text = path.read_text(errors="replace")
+    marker = re.search(r"^## Search space registry\s*$", text, flags=re.MULTILINE)
+    human = text[: marker.start()] if marker else text
+    errors: list[str] = []
+    for heading in ("Dimension coverage", "Dimensions", "Relations", "Pitfalls"):
+        if re.search(rf"^## {re.escape(heading)}\s*$", human, flags=re.MULTILINE) is None:
+            errors.append(f"background.md is missing required '## {heading}' section")
+
+    def section_body(heading: str) -> str:
+        match = re.search(rf"^## {re.escape(heading)}\s*$", human, flags=re.MULTILINE)
+        if match is None:
+            return ""
+        next_heading = re.search(r"^##\s+", human[match.end() :], flags=re.MULTILINE)
+        end = match.end() + next_heading.start() if next_heading else len(human)
+        return human[match.end() : end]
+
+    coverage_body = section_body("Dimension coverage")
+    dimensions_body = section_body("Dimensions")
+    relations_body = section_body("Relations")
+    dimensions = registry.get("dimensions")
+    if not isinstance(dimensions, list):
+        dimensions = []
+    known_dimension_ids = {
+        str(dimension.get("id")) for dimension in dimensions if isinstance(dimension, dict)
+    }
+    known_hypothesis_ids = set(hypothesis_map(registry))
+    human_dimension_ids = set(re.findall(r"`(dim-[a-z0-9-]+)`", coverage_body + dimensions_body))
+    human_hypothesis_ids = set(re.findall(r"`(hyp-[a-z0-9-]+)`", coverage_body + dimensions_body))
+    unknown_human_dimensions = sorted(human_dimension_ids - known_dimension_ids)
+    unknown_human_hypotheses = sorted(human_hypothesis_ids - known_hypothesis_ids)
+    if unknown_human_dimensions:
+        errors.append(f"human hierarchy references unknown dimensions {unknown_human_dimensions}")
+    if unknown_human_hypotheses:
+        errors.append(f"human hierarchy references unknown hypotheses {unknown_human_hypotheses}")
+    for dimension in dimensions:
+        if not isinstance(dimension, dict):
+            continue
+        dimension_id = dimension.get("id")
+        if f"`{dimension_id}`" not in coverage_body:
+            errors.append(f"Dimension coverage does not reference dimension {dimension_id}")
+        if f"`{dimension.get('baseline_hypothesis_id')}`" not in coverage_body:
+            errors.append(
+                f"Dimension coverage does not show the baseline for {dimension_id}"
+            )
+        dimension_heading = re.search(
+            rf"^###\s+`{re.escape(str(dimension_id))}`\s*$",
+            dimensions_body,
+            flags=re.MULTILINE,
+        )
+        if dimension_heading is None:
+            errors.append(f"Dimensions section is missing hierarchy heading {dimension_id}")
+            dimension_section = ""
+        else:
+            next_dimension = re.search(
+                r"^###\s+", dimensions_body[dimension_heading.end() :], flags=re.MULTILINE
+            )
+            end = (
+                dimension_heading.end() + next_dimension.start()
+                if next_dimension
+                else len(dimensions_body)
+            )
+            dimension_section = dimensions_body[dimension_heading.end() : end]
+        for hypothesis in dimension.get("hypotheses", []):
+            if (
+                isinstance(hypothesis, dict)
+                and f"`{hypothesis.get('id')}`" not in dimension_section
+            ):
+                errors.append(
+                    f"Dimensions hierarchy {dimension_id} does not reference hypothesis "
+                    f"{hypothesis.get('id')}"
+                )
+    relations = registry.get("relations")
+    if not isinstance(relations, list):
+        relations = []
+    for relation in relations:
+        if isinstance(relation, dict) and f"`{relation.get('id')}`" not in relations_body:
+            errors.append(f"Relations section does not reference relation {relation.get('id')}")
+    known_relation_ids = {
+        str(relation.get("id")) for relation in relations if isinstance(relation, dict)
+    }
+    human_relation_ids = set(re.findall(r"`(rel-[a-z0-9-]+)`", relations_body))
+    unknown_human_relations = sorted(human_relation_ids - known_relation_ids)
+    if unknown_human_relations:
+        errors.append(f"Relations section references unknown relations {unknown_human_relations}")
+
+    guidance = {
+        item.get("id"): item
+        for item in registry.get("guidance", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    referenced: set[str] = set()
+    section_names = {"Pitfalls": "pitfall", "Deprioritize": "deprioritize"}
+    for heading, expected_section in section_names.items():
+        match = re.search(rf"^## {re.escape(heading)}\s*$", human, flags=re.MULTILINE)
+        if match is None:
+            if any(item.get("section") == expected_section for item in guidance.values()):
+                errors.append(f"background.md is missing required '## {heading}' section")
+            continue
+        next_heading = re.search(r"^##\s+", human[match.end() :], flags=re.MULTILINE)
+        end = match.end() + next_heading.start() if next_heading else len(human)
+        body = human[match.end() : end]
+        has_marked_bullet = False
+        for line_number, raw_line in enumerate(body.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if raw_line[:1].isspace() and has_marked_bullet:
+                continue
+            bullet = re.match(
+                r"^-\s+`(?P<id>g-\d{2,}|task-constraint|operational)`(?:\s|$)", line
+            )
+            if bullet is None:
+                has_marked_bullet = False
+                errors.append(
+                    f"{heading} line {line_number} must start with a registered `g-NN`, "
+                    "`task-constraint`, or `operational` marker"
+                )
+                continue
+            has_marked_bullet = True
+            marker_id = bullet.group("id")
+            if not GUIDANCE_RE.fullmatch(marker_id):
+                continue
+            item = guidance.get(marker_id)
+            if item is None:
+                errors.append(f"{heading} references unknown guidance id {marker_id}")
+                continue
+            referenced.add(marker_id)
+            if item.get("section") != expected_section:
+                errors.append(
+                    f"{heading} references {marker_id}, but registry section is "
+                    f"{item.get('section')!r}"
+                )
+    missing = sorted(set(guidance) - referenced)
+    if missing:
+        errors.append(f"structured guidance is not referenced in its Markdown section: {missing}")
+    return errors
+
+
+def render_space(
+    registry: dict[str, Any], ledger: dict[str, Any] | None, *, max_hypotheses: int
+) -> dict[str, Any]:
+    coverage = coverage_from_records(registry, (ledger or {}).get("records", []))
+    counts = {
+        item["hypothesis_id"]: item["count"]
+        for dimension in coverage["dimensions"]
+        for item in dimension["hypotheses"]
+    }
+    selection = derive_hypothesis_selection(registry)
+    dimensions = []
+    for dimension in registry.get("dimensions", []):
+        if not isinstance(dimension, dict):
+            continue
+        hypotheses = []
+        for hypothesis in dimension.get("hypotheses", []):
+            if not isinstance(hypothesis, dict):
+                continue
+            hypothesis_id = hypothesis.get("id")
+            hypotheses.append(
+                {
+                    "id": hypothesis_id,
+                    "title": hypothesis.get("title"),
+                    "kind": hypothesis.get("kind"),
+                    "claim": hypothesis.get("claim"),
+                    "literature_credibility": hypothesis.get("literature_credibility"),
+                    "selection": selection.get(hypothesis_id),
+                    "coverage_count": counts.get(hypothesis_id, 0),
+                }
+            )
+        hypotheses.sort(
+            key=lambda item: (
+                {"active": 0, "deprioritized": 1, "excluded": 2}.get(
+                    (item.get("selection") or {}).get("selection_status"), 3
+                ),
+                item["coverage_count"],
+                item["id"],
+            )
+        )
+        dimensions.append(
+            {
+                "id": dimension.get("id"),
+                "mode": dimension.get("mode"),
+                "baseline_hypothesis_id": dimension.get("baseline_hypothesis_id"),
+                "selection_reason": dimension.get("selection_reason"),
+                "hypotheses": hypotheses[:max_hypotheses],
+                "omitted_hypotheses": max(0, len(hypotheses) - max_hypotheses),
+            }
+        )
+    return {
+        "ok": True,
+        "space": space_receipt(registry),
+        "coverage": {
+            "n_valid_records": coverage["n_valid_records"],
+            "n_unique_points": coverage["n_unique_points"],
+        },
+        "dimensions": dimensions,
+        "relations": [
+            {
+                key: relation.get(key)
+                for key in ("id", "type", "when", "then", "target_dimension_id", "members")
+                if key in relation
+            }
+            for relation in registry.get("relations", [])
+            if isinstance(relation, dict)
+        ],
+    }
+
+
+def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
+    """Validate the bounded P1 belief view without implementing P2 semantics."""
+    if not isinstance(experience, dict):
+        return ["experience must be an object"]
+    errors: list[str] = []
+    deferred = {"direction_evidence", "dimension_evidence", "hypothesis_evidence"}
+    present = sorted(deferred & set(experience))
+    if present:
+        errors.append(
+            f"experience fields {present} are not a P1 contract; two-level belief extraction is P2"
+        )
+    allowed_top = {
+        "schema_version",
+        "updated_at_run",
+        "generation",
+        "summary",
+        "promising_regions",
+        "lessons",
+        "bottlenecks",
+        "dag_revision",
+    }
+    unknown_top = sorted(set(experience) - allowed_top - deferred)
+    if unknown_top:
+        errors.append(f"experience has unknown fields {unknown_top}")
+    if experience.get("schema_version") != 2:
+        errors.append("experience.schema_version must be 2")
+    generation = experience.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        errors.append("experience.generation must be a non-negative integer")
+    if not _nonempty(experience.get("summary")) or len(experience.get("summary", "")) > 2000:
+        errors.append(
+            "experience.summary must be a non-empty interpretation of at most 2000 characters"
+        )
+
+    terminal_records = [
+        record
+        for record in ledger.get("records", [])
+        if isinstance(record, dict) and record.get("status") in {"keep", "discard", "crash"}
+    ]
+    terminal_ids = {str(record.get("run_id")) for record in terminal_records}
+    updated_at_run = experience.get("updated_at_run")
+    if not isinstance(updated_at_run, str) or updated_at_run not in terminal_ids:
+        errors.append("experience.updated_at_run must reference a terminal ledger run")
+
+    ledger_dag_revision = ledger.get("dag_revision", 0)
+    valid_ledger_dag_revision = (
+        isinstance(ledger_dag_revision, int)
+        and not isinstance(ledger_dag_revision, bool)
+        and ledger_dag_revision >= 0
+    )
+    dag_revision = experience.get("dag_revision")
+    if dag_revision is not None and (
+        not isinstance(dag_revision, int)
+        or isinstance(dag_revision, bool)
+        or dag_revision < 0
+        or not valid_ledger_dag_revision
+        or dag_revision > ledger_dag_revision
+    ):
+        errors.append(
+            "experience.dag_revision must be a valid helper-owned cursor at or before the ledger revision"
+        )
+
+    def validate_items(
+        field: str,
+        *,
+        limit: int,
+        required: set[str],
+        optional: set[str] | None = None,
+    ) -> None:
+        items = experience.get(field)
+        if not isinstance(items, list):
+            errors.append(f"experience.{field} must be a list")
+            return
+        if len(items) > limit:
+            errors.append(f"experience.{field} may contain at most {limit} items")
+        optional_fields = optional or set()
+        for index, item in enumerate(items):
+            where = f"experience.{field}[{index}]"
+            if not isinstance(item, dict):
+                errors.append(f"{where} must be an object")
+                continue
+            missing = sorted(required - set(item))
+            unknown = sorted(set(item) - required - optional_fields)
+            if missing:
+                errors.append(f"{where} is missing fields {missing}")
+            if unknown:
+                errors.append(f"{where} has unknown fields {unknown}")
+            if not _nonempty(item.get("claim")) or len(item.get("claim", "")) > 600:
+                errors.append(f"{where}.claim must be non-empty and at most 600 characters")
+            evidence = item.get("evidence")
+            if (
+                not isinstance(evidence, list)
+                or not evidence
+                or len(evidence) > 5
+                or any(not isinstance(run_id, str) or run_id not in terminal_ids for run_id in evidence)
+                or len(evidence) != len(set(evidence))
+            ):
+                errors.append(
+                    f"{where}.evidence must contain 1–5 unique terminal ledger run ids"
+                )
+            if item.get("confidence") not in {"low", "med", "high"}:
+                errors.append(f"{where}.confidence must be low, med, or high")
+
+    validate_items(
+        "promising_regions",
+        limit=8,
+        required={"claim", "evidence", "confidence", "uncertainty"},
+    )
+    promising_regions = experience.get("promising_regions")
+    for index, item in enumerate(promising_regions if isinstance(promising_regions, list) else []):
+        if isinstance(item, dict) and (
+            not _nonempty(item.get("uncertainty"))
+            or len(item.get("uncertainty", "")) > 600
+        ):
+            errors.append(
+                f"experience.promising_regions[{index}].uncertainty must be non-empty "
+                "and at most 600 characters"
+            )
+
+    validate_items(
+        "lessons",
+        limit=12,
+        required={"kind", "claim", "evidence", "confidence"},
+        optional={"reopen_when"},
+    )
+    lessons = experience.get("lessons")
+    for index, item in enumerate(lessons if isinstance(lessons, list) else []):
+        if not isinstance(item, dict):
+            continue
+        where = f"experience.lessons[{index}]"
+        if item.get("kind") not in {"lever", "deadend", "feasibility"}:
+            errors.append(f"{where}.kind must be lever, deadend, or feasibility")
+        if item.get("kind") == "deadend" and not _nonempty(item.get("reopen_when")):
+            errors.append(f"{where}.reopen_when is required for a deadend")
+        if "reopen_when" in item and (
+            not _nonempty(item.get("reopen_when"))
+            or len(item.get("reopen_when", "")) > 600
+        ):
+            errors.append(
+                f"{where}.reopen_when must be non-empty and at most 600 characters when present"
+            )
+
+    validate_items(
+        "bottlenecks",
+        limit=6,
+        required={"claim", "evidence", "confidence"},
+    )
+    return errors
+
+
+def validate_experience_replacement(experience: Any, ledger: dict[str, Any]) -> list[str]:
+    """Additional freshness checks for a snapshot about to replace the old one."""
+    if not isinstance(experience, dict):
+        return []
+    errors: list[str] = []
+    if "dag_revision" in experience:
+        errors.append("replacement experience must omit helper-owned dag_revision")
+    terminal_ids = [
+        str(record.get("run_id"))
+        for record in ledger.get("records", [])
+        if isinstance(record, dict) and record.get("status") in {"keep", "discard", "crash"}
+    ]
+    if terminal_ids and experience.get("updated_at_run") != terminal_ids[-1]:
+        errors.append("replacement experience.updated_at_run must be the latest terminal ledger run")
+    prior = ledger.get("experience")
+    prior_generation = prior.get("generation") if isinstance(prior, dict) and prior else None
+    expected_generation = (
+        prior_generation + 1
+        if isinstance(prior_generation, int) and not isinstance(prior_generation, bool)
+        else 0
+    )
+    if experience.get("generation") != expected_generation:
+        errors.append(
+            f"replacement experience.generation must be {expected_generation}"
+        )
+    return errors
+
+
+def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any] | None, list[str]]:
+    registry = load_registry(args.background)
+    ledger = _load_json(args.ledger) if getattr(args, "ledger", None) else None
+    manifest = (
+        _load_json(args.retrieval_manifest)
+        if getattr(args, "retrieval_manifest", None)
+        else None
+    )
+    errors = validate_registry(registry, ledger=ledger, retrieval_manifest=manifest)
+    errors.extend(validate_background_markdown(args.background, registry))
+    return registry, ledger, errors
+
+
+def cmd_catalog(args: argparse.Namespace) -> int:
+    catalog = load_catalog()
+    value = {"catalog": catalog, "receipt": catalog_receipt(catalog)}
+    print(json.dumps(value, indent=None if args.compact else 2, separators=(",", ":") if args.compact else None))
+    return 0
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    registry = load_registry(args.background)
-    ledger = _load_json(args.ledger) if args.ledger else None
-    retrieval_manifest = _load_json(args.retrieval_manifest) if args.retrieval_manifest else None
-    errors = validate_registry(
-        registry,
-        ledger=ledger,
-        retrieval_manifest=retrieval_manifest,
-    )
-    errors.extend(validate_background_markdown(args.background, registry))
+    registry, _, errors = _validated_inputs(args)
     result = {
         "ok": not errors,
         "schema_version": registry.get("schema_version"),
-        "scope_contract": (
-            "explicit"
-            if registry.get("schema_version") == SCHEMA_VERSION
-            else "legacy_unspecified"
-        ),
-        "directions": len(registry.get("directions", [])),
+        "space": space_receipt(registry),
+        "dimensions": len(registry.get("dimensions", [])),
+        "hypotheses": len(hypothesis_map(registry)),
+        "relations": len(registry.get("relations", [])),
         "guidance": len(registry.get("guidance", [])),
         "sources": len(registry.get("sources", [])),
         "errors": errors,
@@ -1036,160 +1257,88 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0 if not errors else 1
 
 
-def cmd_lineage(args: argparse.Namespace) -> int:
-    registry = load_registry(args.background)
-    ledger = _load_json(args.ledger)
-    errors = validate_registry(registry, ledger=ledger)
-    errors.extend(validate_background_markdown(args.background, registry))
-    if errors:
-        print(json.dumps({"ok": False, "errors": errors}, indent=2))
+def cmd_render(args: argparse.Namespace) -> int:
+    if not 1 <= args.max_hypotheses <= 32:
+        print(
+            json.dumps(
+                {"ok": False, "errors": ["--max-hypotheses must be in [1, 32]"]},
+                separators=(",", ":"),
+            )
+        )
         return 1
-    if args.compact:
-        print(json.dumps(
-            derive_compact_lineage(registry, ledger, limit=args.limit),
+    registry, ledger, errors = _validated_inputs(args)
+    if errors:
+        print(json.dumps({"ok": False, "errors": errors}, separators=(",", ":")))
+        return 1
+    print(
+        json.dumps(
+            render_space(registry, ledger, max_hypotheses=args.max_hypotheses),
             separators=(",", ":"),
-        ))
-    else:
-        print(json.dumps(derive_lineage(registry, ledger), indent=2))
+        )
+    )
     return 0
-
-
-def _consumed_direction_ids(ledger: dict[str, Any] | None) -> set[str]:
-    return {
-        source
-        for record in (ledger or {}).get("records", [])
-        for source in (record.get("source_run_ids") or [])
-        if isinstance(source, str) and source.startswith("tf-")
-    }
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
-    """Return the small background-maintenance action owned by the orchestrator."""
-    registry = load_registry(args.background)
-    ledger = _load_json(args.ledger) if args.ledger else None
-    errors = validate_registry(registry, ledger=ledger)
-    errors.extend(validate_background_markdown(args.background, registry))
-    if errors:
-        print(json.dumps({"ok": False, "errors": errors}, separators=(",", ":")))
-        return 1
-    consumed = _consumed_direction_ids(ledger)
-    direction_ids = {
-        direction.get("id")
-        for direction in registry.get("directions", [])
-        if isinstance(direction, dict) and isinstance(direction.get("id"), str)
-    }
-    refresh_legacy = (
-        registry.get("schema_version") == 1
-        and bool(direction_ids)
-        and direction_ids.issubset(consumed)
-    )
-    print(json.dumps({
-        "ok": True,
+    registry, _, errors = _validated_inputs(args)
+    result = {
+        "ok": not errors,
         "schema_version": registry.get("schema_version"),
-        "action": "refresh_background" if refresh_legacy else "none",
-        "reason": "legacy_directions_exhausted" if refresh_legacy else None,
-    }, separators=(",", ":")))
-    return 0
+        "action": "none" if not errors else "reject",
+        "space": space_receipt(registry),
+        "errors": errors,
+    }
+    print(json.dumps(result, separators=(",", ":")))
+    return 0 if not errors else 1
 
 
-def cmd_directions(args: argparse.Namespace) -> int:
-    """Print the compact hypothesis view used for fresh-candidate ideation."""
-    registry = load_registry(args.background)
-    ledger = _load_json(args.ledger) if args.ledger else None
-    errors = validate_registry(registry, ledger=ledger)
-    errors.extend(validate_background_markdown(args.background, registry))
-    if errors:
-        print(json.dumps({"ok": False, "errors": errors}, separators=(",", ":")))
-        return 1
-    consumed = _consumed_direction_ids(ledger)
-    scoped_contract = registry.get("schema_version") == SCHEMA_VERSION
-    selection = derive_direction_selection(registry, ledger) if scoped_contract else {}
-    directions = []
-    excluded = []
-    eligible_count = 0
-    for priority, direction in enumerate(registry.get("directions", [])):
-        direction_id = direction.get("id")
-        decision = selection.get(direction_id, {
-            "selection_status": "active",
-            "matched_guidance": [],
-            "binding_guidance": [],
-            "reopened_by_run_status": None,
-        })
-        if decision["selection_status"] == "excluded":
-            excluded.append({
-                "id": direction_id,
-                "title": direction.get("title"),
-                "binding_guidance": decision["binding_guidance"],
-            })
-            continue
-        eligible_count += 1
-        if args.unconsumed and direction_id in consumed:
-            continue
-        item = {
-            "id": direction_id,
-            "title": direction.get("title"),
-            "claim": direction.get("claim"),
-            "literature_credibility": direction.get("literature_credibility"),
-            "testable_expectation": direction.get("testable_expectation"),
-            "selection_status": decision["selection_status"],
-            "matched_guidance": decision["matched_guidance"],
-            "binding_guidance": decision["binding_guidance"],
-            "reopened_by_run_status": decision["reopened_by_run_status"],
-            "_priority": priority,
-        }
-        if scoped_contract:
-            item.update({
-                "kind": direction.get("kind"),
-                "probe_for": direction.get("probe_for", []),
-                "claim_scope": direction.get("claim_scope"),
-                "scope": direction.get("scope"),
-                "required_comparisons": direction.get("required_comparisons"),
-                "reopen_when": direction.get("reopen_when"),
-            })
-        directions.append(item)
-    directions.sort(
-        key=lambda item: (
-            0 if item["selection_status"] == "active" else 1,
-            item["_priority"],
+def cmd_validate_point(args: argparse.Namespace) -> int:
+    registry, _, errors = _validated_inputs(args)
+    point = _load_json(args.point)
+    if not errors:
+        errors.extend(validate_candidate_point(point, registry))
+    print(
+        json.dumps(
+            {
+                "ok": not errors,
+                "point_id": point_id(point) if isinstance(point, dict) else None,
+                "space_revision": space_revision(registry),
+                "errors": errors,
+            },
+            indent=2,
         )
     )
-    for item in directions:
-        item.pop("_priority", None)
-    print(json.dumps({
-        "ok": True,
-        "schema_version": registry.get("schema_version"),
-        "scope_contract": (
-            "explicit"
-            if registry.get("schema_version") == SCHEMA_VERSION
-            else "legacy_unspecified"
-        ),
-        "consumed": sorted(consumed),
-        "all_consumed": bool(eligible_count) and not directions,
-        "excluded": excluded,
-        "directions": directions,
-    }, separators=(",", ":")))
+    return 0 if not errors else 1
+
+
+def cmd_lineage(args: argparse.Namespace) -> int:
+    if args.compact and not 1 <= args.limit <= 64:
+        print(
+            json.dumps(
+                {"ok": False, "errors": ["compact --limit must be in [1, 64]"]},
+                separators=(",", ":"),
+            )
+        )
+        return 1
+    registry, ledger, errors = _validated_inputs(args)
+    if errors:
+        print(json.dumps({"ok": False, "errors": errors}, separators=(",", ":")))
+        return 1
+    value = derive_semantic_lineage(registry, ledger or {}, limit=args.limit if args.compact else None)
+    print(json.dumps(value, separators=(",", ":") if args.compact else None, indent=None if args.compact else 2))
     return 0
 
 
 def cmd_validate_experience(args: argparse.Namespace) -> int:
-    registry = load_registry(args.background)
-    ledger = _load_json(args.ledger)
+    registry, ledger, errors = _validated_inputs(args)
     if args.experience:
         experience = _load_json(args.experience)
     else:
-        experience = ledger.get("experience")
-        if not isinstance(experience, dict):
-            print(
-                json.dumps(
-                    {"ok": False, "errors": ["ledger has no object-valued experience block"]},
-                    indent=2,
-                )
-            )
-            return 1
-    errors = validate_registry(registry, ledger=ledger)
-    errors.extend(validate_background_markdown(args.background, registry))
+        experience = (ledger or {}).get("experience")
     if not errors:
-        errors.extend(validate_experience(experience, registry, ledger))
+        errors.extend(validate_experience(experience, registry, ledger or {}))
+        if args.experience:
+            errors.extend(validate_experience_replacement(experience, ledger or {}))
     print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
     return 0 if not errors else 1
 
@@ -1198,47 +1347,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    validate = sub.add_parser("validate", help="validate a background registry")
+    catalog = sub.add_parser("catalog", help="print semantic-dimensions/v1 and its digest")
+    catalog.add_argument("--compact", action="store_true")
+    catalog.set_defaults(func=cmd_catalog)
+
+    validate = sub.add_parser("validate", help="validate a hierarchical background")
     validate.add_argument("--background", type=Path, required=True)
     validate.add_argument("--ledger", type=Path)
     validate.add_argument("--retrieval-manifest", type=Path)
     validate.set_defaults(func=cmd_validate)
 
-    lineage = sub.add_parser("lineage", help="join tf-* directions to candidate lineage")
-    lineage.add_argument("--background", type=Path, required=True)
-    lineage.add_argument("--ledger", type=Path, required=True)
-    lineage.add_argument("--compact", action="store_true",
-                         help="emit delta runs and bounded representative receipts")
-    lineage.add_argument("--limit", type=int, default=LINEAGE_SAMPLE_LIMIT, metavar="N",
-                         help=f"representative receipts per lineage category (default {LINEAGE_SAMPLE_LIMIT})")
-    lineage.set_defaults(func=cmd_lineage)
+    render = sub.add_parser("render", help="bounded dimension/hypothesis/coverage view")
+    render.add_argument("--background", type=Path, required=True)
+    render.add_argument("--ledger", type=Path)
+    render.add_argument("--max-hypotheses", type=int, default=6)
+    render.set_defaults(func=cmd_render)
 
-    directions = sub.add_parser(
-        "directions", help="print compact tf-* hypotheses without source metadata"
-    )
-    directions.add_argument("--background", type=Path, required=True)
-    directions.add_argument("--ledger", type=Path)
-    directions.add_argument("--unconsumed", action="store_true")
-    directions.set_defaults(func=cmd_directions)
-
-    preflight = sub.add_parser(
-        "preflight", help="print the orchestrator-owned background maintenance action"
-    )
+    preflight = sub.add_parser("preflight", help="reject incompatible or mixed-mode run state")
     preflight.add_argument("--background", type=Path, required=True)
     preflight.add_argument("--ledger", type=Path)
     preflight.set_defaults(func=cmd_preflight)
 
-    validate_experience_parser = sub.add_parser(
-        "validate-experience", help="validate tf-* run statuses against DAG lineage"
+    point = sub.add_parser("validate-point", help="validate a complete candidate semantic point")
+    point.add_argument("--background", type=Path, required=True)
+    point.add_argument("--point", type=Path, required=True)
+    point.set_defaults(func=cmd_validate_point)
+
+    lineage = sub.add_parser("lineage", help="render ancestry and mechanical point diffs separately")
+    lineage.add_argument("--background", type=Path, required=True)
+    lineage.add_argument("--ledger", type=Path, required=True)
+    lineage.add_argument("--compact", action="store_true")
+    lineage.add_argument("--limit", type=int, default=8)
+    lineage.set_defaults(func=cmd_lineage)
+
+    experience = sub.add_parser(
+        "validate-experience", help="validate P1 experience without inventing P2 belief fields"
     )
-    validate_experience_parser.add_argument("--background", type=Path, required=True)
-    validate_experience_parser.add_argument("--ledger", type=Path, required=True)
-    validate_experience_parser.add_argument(
-        "--experience",
-        type=Path,
-        help="experience JSON file; omit to validate ledger's top-level experience block",
-    )
-    validate_experience_parser.set_defaults(func=cmd_validate_experience)
+    experience.add_argument("--background", type=Path, required=True)
+    experience.add_argument("--ledger", type=Path, required=True)
+    experience.add_argument("--experience", type=Path)
+    experience.set_defaults(func=cmd_validate_experience)
     return parser
 
 
@@ -1246,7 +1394,7 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         return args.func(args)
-    except (ContractError, OSError, json.JSONDecodeError) as exc:
+    except (ContractError, SemanticSpaceError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "errors": [str(exc)]}, indent=2), file=sys.stderr)
         return 1
 

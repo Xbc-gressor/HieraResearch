@@ -19,6 +19,7 @@ Shape:
       "task": "tabular-model-search",
       "tag": "agent-main-smoke",
       "metric": "mean_test_accuracy",
+      "search_space": { ... },           # exact catalog + background revision
       "dag_revision": 12,              # monotone graph-change cursor
       "records": [ {record}, ... ]   # ordered by run_id
     }
@@ -46,9 +47,11 @@ RECORD_FIELDS = (
     "run_id",
     "kind",              # always optimization (seed species retired)
     "idea",              # RESULT: self-contained description of THIS solution — no parent references (DAG node label)
-    "change",            # PROCESS: how this candidate changes from its parent(s); fresh -> "from scratch: <direction>" (DAG edge label)
-    "source_run_ids",    # parent run_ids (improve/crossover); [] when none; fresh holds tf-* direction tags
+    "change",            # PROCESS: parent-relative implementation change; fresh -> from scratch at the selected point
+    "source_run_ids",    # numeric parent run_ids only; fresh=[]
     "op",                # S-GoT op: fresh | improve | crossover (derivable from resolvable-parent count; stored for clarity)
+    "semantic_point",    # complete revisioned attribution to the frozen background search space
+    "policy_receipt",    # derived point-selection inputs/config; separate from ancestry and observations
     "candidate_name",    # stable name: hint at add-record, log's best_model after run
     "description",
     "metric",
@@ -157,6 +160,18 @@ def _get_record(data: dict, run_id: str) -> Optional[dict]:
         if record.get("run_id") == run_id:
             return record
     return None
+
+
+def _require_p1_record(record: dict, run_id: str) -> None:
+    """Reject mixed/legacy records on every downstream mutation path."""
+    if not isinstance(record.get("semantic_point"), dict):
+        raise ValueError(
+            f"record {run_id} has no semantic_point; legacy or mixed-mode records are unsupported"
+        )
+    if not isinstance(record.get("policy_receipt"), dict):
+        raise ValueError(
+            f"record {run_id} has no policy_receipt; selection policy must remain traceable"
+        )
 
 
 def _new_record(run_id: str) -> dict:
@@ -331,6 +346,15 @@ def _coerce(value: Optional[str], kind: str):
 
 
 def cmd_add_record(args) -> int:
+    # Import lazily so read-only ledger commands do not pay background-contract
+    # setup cost and to keep the mutation boundary explicit.
+    from background_contract import (
+        load_registry,
+        validate_background_markdown,
+        validate_registry,
+    )
+    from semantic_space import space_receipt
+
     ledger_path = Path(args.ledger)
     task_name = args.task or infer_task_name([ledger_path])
     if not task_name:
@@ -339,21 +363,49 @@ def cmd_add_record(args) -> int:
     data = _load_ledger(ledger_path)
     _ensure_meta(data, ledger_path, task_name, config)
 
+    background_path = Path(args.background)
+    registry = load_registry(background_path)
+    background_errors = validate_registry(registry, ledger=data)
+    background_errors.extend(validate_background_markdown(background_path, registry))
+    if background_errors:
+        raise SystemExit("invalid P1 background/ledger: " + "; ".join(background_errors))
+
     if _get_record(data, args.run_id) is not None:
         raise SystemExit(f"record already exists for run_id {args.run_id}")
     record = _new_record(args.run_id)
     source_run_ids = [x.strip() for x in (args.source_run_ids or "").split(",") if x.strip()]
+    if any(not source.isdigit() for source in source_run_ids):
+        raise SystemExit(
+            "--source-run-ids accepts numeric parents only; hypothesis attribution "
+            "belongs in --semantic-point"
+        )
+    expected_parent_count = {"fresh": 0, "improve": 1, "crossover": 2}.get(args.op)
+    if expected_parent_count is None:
+        raise SystemExit("--op is required")
+    if len(source_run_ids) != expected_parent_count or len(set(source_run_ids)) != len(source_run_ids):
+        raise SystemExit(
+            f"{args.op} requires {expected_parent_count} distinct numeric parent ids"
+        )
+    semantic_point = json.loads(Path(args.semantic_point).read_text())
+    policy_receipt = json.loads(Path(args.policy_receipt).read_text())
     record.update(
         kind=args.kind,
         idea=args.idea,
         change=args.change,
         source_run_ids=source_run_ids,
         op=args.op,
+        semantic_point=semantic_point,
+        policy_receipt=policy_receipt,
         candidate_name=args.candidate_name_hint,
         description=args.description or args.idea,
         metric=data["metric"],
     )
+    data["search_space"] = data.get("search_space") or space_receipt(registry)
     data["records"].append(record)
+    contract_errors = validate_registry(registry, ledger=data)
+    if contract_errors:
+        data["records"].pop()
+        raise SystemExit("invalid candidate semantic contract: " + "; ".join(contract_errors))
     _save_ledger(ledger_path, data)
     _write_loop_state(ledger_path, data, config)
     print(json.dumps(record, indent=2))
@@ -379,6 +431,7 @@ def cmd_set_tuning(args) -> int:
     record = _get_record(data, args.run_id)
     if record is None:
         raise SystemExit(f"no record for run_id {args.run_id}; add-record first")
+    _require_p1_record(record, args.run_id)
 
     if args.from_report:
         updates = _tuning_record_from_report(Path(args.from_report))
@@ -417,16 +470,18 @@ def record_run(
 ) -> dict:
     """Fill one record's result score (the config-eval best — there is no separate
     official run) and the (auto) keep/discard/crash status. Owns `final_best_score`
-    and `status`; tuning metadata is written by `set-tuning`. Creates the record if
-    missing (recovery path). Returns the updated record.
+    and `status`; tuning metadata is written by `set-tuning`. P1 requires every
+    candidate to have a validated semantic mapping, so missing records are not
+    synthesized by the result path. Returns the updated record.
     """
     config = load_task_config(task_name)
     data = _load_ledger(ledger_path)
     record = _get_record(data, run_id)
     if record is None:
-        _ensure_meta(data, ledger_path, task_name, config)
-        record = _new_record(run_id)
-        data["records"].append(record)
+        raise ValueError(
+            f"no record for run_id {run_id}; add-record with a validated semantic point first"
+        )
+    _require_p1_record(record, run_id)
 
     before_graph_value = (record.get("status"), record.get("final_best_score"))
 
@@ -636,8 +691,27 @@ def _set_experience(ledger_path: Path, experience: dict) -> None:
 
 
 def cmd_set_experience(args) -> int:
+    from background_contract import (
+        load_registry,
+        validate_background_markdown,
+        validate_experience,
+        validate_experience_replacement,
+        validate_registry,
+    )
+
+    ledger_path = Path(args.ledger)
+    background_path = Path(args.background)
+    data = _load_ledger(ledger_path)
+    registry = load_registry(background_path)
     experience = json.loads(Path(args.from_json).read_text())
-    _set_experience(Path(args.ledger), experience)
+    errors = validate_registry(registry, ledger=data)
+    errors.extend(validate_background_markdown(background_path, registry))
+    if not errors:
+        errors.extend(validate_experience(experience, registry, data))
+        errors.extend(validate_experience_replacement(experience, data))
+    if errors:
+        raise SystemExit("invalid P1 experience replacement: " + "; ".join(errors))
+    _set_experience(ledger_path, experience)
     keys = list(experience.keys()) if isinstance(experience, dict) else None
     print(json.dumps({"ok": True, "experience_keys": keys}))
     return 0
@@ -668,14 +742,19 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--kind", default="optimization", choices=["optimization"])
     add.add_argument("--idea", required=True,
                      help="RESULT: self-contained description of this solution, NO parent references (DAG node label)")
-    add.add_argument("--change", default=None,
+    add.add_argument("--change", required=True,
                      help="PROCESS: how this candidate changes from its parent(s) (DAG edge label); "
-                          "fresh -> 'from scratch: <direction>'")
+                          "fresh -> 'from scratch at <point-id>'")
     add.add_argument("--source-run-ids", default="",
-                     help="comma-separated parent run_ids (improve/crossover); empty when none; "
-                          "fresh holds tf-* direction tags")
-    add.add_argument("--op", choices=["fresh", "improve", "crossover"],
+                     help="comma-separated numeric parent run_ids; fresh must be empty")
+    add.add_argument("--op", required=True, choices=["fresh", "improve", "crossover"],
                      help="S-GoT op; inferable from parent count but stored for clarity")
+    add.add_argument("--background", required=True,
+                     help="hierarchical background.md that freezes this run's search space")
+    add.add_argument("--semantic-point", required=True, type=Path,
+                     help="validated complete semantic-point JSON selected for this candidate")
+    add.add_argument("--policy-receipt", required=True, type=Path,
+                     help="semantic acquisition receipt JSON kept separate from observations")
     add.add_argument("--candidate-name-hint", required=True)
     add.add_argument("--description")
     add.set_defaults(func=cmd_add_record)
@@ -696,6 +775,8 @@ def build_parser() -> argparse.ArgumentParser:
     tune.set_defaults(func=cmd_set_tuning)
 
     exp = sub.add_parser("set-experience", parents=[common])
+    exp.add_argument("--background", required=True,
+                     help="hierarchical background.md used to validate the ledger and belief view")
     exp.add_argument("--from-json", required=True, type=Path,
                      help="JSON file with the experience block to store (overwrites).")
     exp.set_defaults(func=cmd_set_experience)

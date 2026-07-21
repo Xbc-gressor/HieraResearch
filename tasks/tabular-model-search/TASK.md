@@ -47,8 +47,8 @@ Rules:
 ## Files
 
 - `train.py`: no task-root baseline is provided; `candidate-writer` writes each
-  candidate's `train.py` (a `fresh` candidate from scratch from a `background.md`
-  try-first direction, or informed by parents for `improve`/`crossover`).
+  complete candidate at its validated `background.md` semantic point (`fresh`
+  from scratch, or informed by numeric parents for `improve`/`crossover`).
 - `prepare.py`: fixed synthetic datasets, train/test splits, and the single
   `evaluate_config` scoring function. Do not modify during normal experiments.
 - `pyproject.toml`: task-local uv environment. Dependency changes are allowed

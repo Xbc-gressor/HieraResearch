@@ -89,7 +89,7 @@ tag: <你的运行标签>
 
 **`tasks/<task-name>/prepare.py`**：固定评估表面。正常实验期间不修改。
 
-**`tasks/<task-name>/train.py`**：可选的用户提供的基线候选方案。大多数任务省略此文件——循环通过 `fresh` 候选方案自举，`candidate-writer` 在 `runs/` 下从头生成每个 `train.py`（使用 `background.md` 的 try-first 方向用于 fresh 候选方案）。
+**`tasks/<task-name>/train.py`**：可选的用户提供基线。多数任务省略它——循环通过 `fresh` 自举，`candidate-writer` 在 `runs/` 下按已验证的完整语义点从头生成 `train.py`。
 
 ### 4.2 实验流程
 
@@ -99,18 +99,19 @@ tag: <你的运行标签>
 读取主代理 prompt / task.toml / TASK.md
         ↓
 background-researcher: 多后端知识侦察 → background.md + background_retrieval.json
-    (设置阶段，必需一次；产生带研究范围、迁移边界和 scope-probe 的 tf-* 优先级列表)
+    (设置阶段，必需一次；冻结 semantic-dimensions/v1 子集、显式基线、hyp-* 与关系)
         ↓
 (每 N 轮) experience-extractor: 提炼全局经验 → ledger.json experience 块
         ↓
 idea-generator:
-    SELECT: 运行 got_select.py decide → 获取本轮的行动
+    SELECT-1: got_select.py decide → 获取图行动与数字父代
             (bootstrap/stall → fresh; 否则在前沿上 PUCB → ≤B improve/crossover)
-    IDEATE: 将每个行动转化为具体想法 → ledger.py add-record --op ...
+    SELECT-2: semantic_search.py → 合法点集 → coverage/gain/gain_uncertainty 选点
+    IDEATE: 将点落成完整方案 → ledger.py add-record（祖先、点、策略收据分开）
         ↓
 对每个行动: tools/new_candidate.py --skip-entrypoint → 创建候选目录(prepare.py + 精简 _candidate_brief.json)
         ↓
-candidate-writer: 读取候选简报 (idea + source_run_ids；无 shell 权限) → 写 candidate/train.py
+candidate-writer: 读取候选简报 (idea + 数字父代 + semantic_point) → 写 candidate/train.py
         ↓
 step 0+1: tunable-contract-extractor
     ① 制作 PARAM_SCHEMA + 重构 make_model
@@ -131,11 +132,11 @@ step 0+1: tunable-contract-extractor
 
 ### 4.3 两层搜索架构
 
-**外层搜索（S-GoT 图搜索）**：候选方案形成开发 DAG。`got_select.py decide` 使用 PUCB + 结构互补性 `c̃_dag` + bootstrap/stall fresh 规则确定性地决定本轮的行动：
-- 空图或停滞 → `fresh`（来自 `background.md` try-first 方向的新血统）
+**外层搜索（图行动 + 语义选点）**：候选方案形成开发 DAG。`got_select.py decide` 使用 PUCB + 结构互补性 `c̃_dag` + bootstrap/stall 规则，只决定行动与父代：
+- 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 将预期收益、不确定性、成本、覆盖分别保存并组合。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
@@ -192,47 +193,46 @@ LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
 
 证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置步骤）。读取 `TASK.md` / `task.toml`（优化目标、数据特征、`allow_dependencies` 约束），先分解多个研究问题。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend；DeepXiv 是显式选择的 open-world 学术条件，Jina 仅作为显式 live-web fallback/ablation。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序，再轮询补齐各 query 的覆盖。随后按 grounding lane（6000 tokens）渐进阅读，并同时寻找反证、复现和官方工件。它产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`。
 
-来源、结构化的负面指导 `g-*` 与每个 `tf-*` 方向使用同一组类型化范围轴：模型家族、数据情境、指标、干预机制、评估协议。`tools/background_contract.py` 根据这些轴机械地计算包含关系；智能体不再自行填写“适用/不适用”。只有范围直接覆盖方向的结构化指导才能改变优先级或资格；`unverified` / `contested` 负面证据只能提示，不能降级或排除。Markdown 中未注册的负面 Pitfall 会使合约校验失败，也永远不是选择输入。每条有约束力的负面指导必须由范围直接匹配、未撤回的主要实证来源支持，并保留一个范围外 `scope_probe`，因此一个学习器与全局干预上的结论不能消灭范围外的邻近集成机制。
+`background.md` 现在是 schema-3 的语义搜索空间：从唯一的 `semantic-dimensions/v1` 目录中选择并冻结相关维度；每个维度复制目录定义/边界/来源，登记显式任务基线与稳定 `hyp-*` 值；`activates` / `requires` / `excludes` 关系表示条件激活与不兼容组合。禁止 run-local/misc 维度；标量设置仍属于内层 HPO。人类可读的 Dimension coverage / Dimensions / Relations 与 JSON 层级必须一致。
 
-每个 `tf-*` 方向同时记录具体 claim、可检验预期、必要的本地比较、重开条件、来源及其 `supports` / `contradicts` / `context` 关系，以及独立的文献可信度标签：`unverified` / `preliminary` / `corroborated` / `replicated` / `contested`。标签是证据印章而非真值；单独上传到 arXiv 不视为验证。`tools/background_contract.py validate` 会检查 ID 连续性、来源引用、来源→指导范围包含关系及排除证据门槛，并要求 `replicated` 有独立复现证据、`contested` 有明确反证。
+来源、结构化负面指导 `g-*` 与每个假设继续使用同一组五轴范围：模型家族、数据情境、指标、干预机制、评估协议。只有直接覆盖假设的指导可影响资格；`unverified` / `contested` 负面只能提示。每个非基线假设保存 claim、比较项、重开条件、来源关系与独立文献可信度标签。绑定负面仍必须保留范围外 `scope_probe`，不会删除邻近机制。
 
-Direction registry 中的每个来源必须在 retrieval manifest 中存在成功的 grounding visit；只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 或 OpenCode 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
+Search space registry 中的每个来源必须在 retrieval manifest 中存在成功的 grounding visit；只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 或 OpenCode 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
 
 冻结语料的约定路径是 `tasks/<task>/background_corpus.json`；普通 open-world 开发可不提供，但 frozen / network-disabled 评测必须提供该文件或显式等价路径。
 
-设计来源、兄弟项目审计、fallback 和双轴语义详见 `docs/background-research.md`。
+层级语义空间、证据与作用域语义、fallback 和验证契约详见 `docs/background-research.md`。
 
-- 来自 `idea-generator` 的每个 `fresh` 候选方案从此列表消耗一个未消耗的方向（`source_run_ids` 持有 `tf-*` 标签），引导搜索超越账本自身的历史
-- `experience-extractor` 用同一 `tf-*` ID 把运行证据接回外部假设，但把运行内状态单独存放在 ledger experience 中，不改写 `background.md` 的文献可信度
+- 假设是可复用的空间取值，不会在首次使用后“消耗”；每个候选保存完整、带版本的 `semantic_point`
+- `source_run_ids` 只保存数字父代，假设归因、策略预测与分数观测分别存放
 - 证据为基础（每个声明可追溯；无虚构论文）；对任务/账本只读；不运行实验
-- 如果搜索停滞，可以重新运行以注入新的外部方向
+- P1 空间在 setup 后冻结；不在停滞时刷新、剪枝或扩展
 - `model: inherit`（继承调用会话的模型配置）
 
 ### 5.3 idea-generator
 
-外层 S-GoT 的 LLM 着陆点，通过两步产生下一代：
+外层搜索的 LLM 着陆点，通过三步产生下一代：
 
-- **SELECT**：运行 `python tools/got_select.py decide --ledger <ledger>` 获取确定性图搜索分配——bootstrap/stall `fresh`，或来自前沿叶子上 PUCB 的 ≤B `improve`/`crossover` 行动（具有 `c̃_dag` 结构互补性）。**不通过目测适应度选择父代；图搜索处理那个。**
-- **IDEATE**：对于每个行动，读取父记录（idea/score）+ 账本 `experience` + `background.md`，综合一个假设驱动的具体想法，用 `ledger.py add-record --op <fresh|improve|crossover>` 写记录（`source_run_ids` 持有父 run_ids，或 `fresh` 的 `tf-*` 方向标签）
+- **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集；根据配置应用 `coverage` / `gain` / `gain_uncertainty`。后两者用 `[0,1]` rubric 分别评估 predicted gain、uncertainty、cost，并与确定性 coverage 分栏写入 `policy_receipt`，不冒充校准后验。
+- **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。
 
 ### 5.4 experience-extractor
 
-每 N 轮运行一次（非每个候选方案），从 `ledger.json` 提炼**全局经验**——有前景的区域、死胡同、每数据集瓶颈和 change→Δ lever——并通过 `tools/background_contract.py lineage` 将候选血统连接到 `background.md` 的 `tf-*` 假设。它使用 `tools/ledger.py set-experience` 在账本顶层重新生成 `experience` 块；`idea-generator` 在下次 IDEATE 期间读取它。
-
-`direction_evidence` 为每个 `tf-*` 保存运行内状态 `untested` / `inconclusive` / `supported_here` / `contradicted_here` / `mixed`，并附直接运行、单源后代、组合后代和证据边。v2 还记录 `claim_coverage`、实际比较的 run ids 与缺失比较臂；没有直接覆盖 registry 指定的比较项时不能写支持/反驳结论。文献可信度与运行内状态是两个并行维度：前者描述外部证据，后者只描述当前任务/运行。写入前由 `background_contract.py validate-experience` 对照真实 DAG 校验，避免把 crossover 的成功错误归因给所有祖先方向；experience-extractor 不编辑 `background.md`。
+每 N 轮运行一次，从 DAG 增量、Top/Bottom 锚点、机械语义点差异中提炼有界全局经验。P1 只保留通用 promising regions / lessons / bottlenecks，并要求证据 run id 与不确定性；不生成 `dimension_evidence` / `hypothesis_evidence`，不把点成员关系当因果。双层信念与语义 DAG 收据留到 P2。
 
 ### 5.5 candidate-writer
 
 将账本记录的想法实现到候选目录的 `train.py` 中。**输入仅是候选目录**——它通过 `ledger.py show` 读取自己的账本记录以获取 `idea` + `source_run_ids`，派生父 `train.py` 引用，编写行为取决于文件系统状态，适应三种情况：
 
 - 目标目录已有 `train.py`（提供的基线）：不写；按原样保留；返回 `wrote: false`
-- `source_run_ids` 是 `tf-*` 方向标签或为空（`fresh`，无父代）：从头编写，引用 `prepare.py` 暴露的 API——简单、低风险、可运行的基线
-- `source_run_ids` 是数字父 run_ids（`improve`/`crossover`）：使用第一个父代作为结构脚手架实现想法，根据需要从剩余父代借用
+- `source_run_ids` 为空（`fresh`）：按记录的完整语义点从头编写，不得偷偷换成另一个更简单的点
+- `source_run_ids` 是数字父 run ids（`improve`/`crossover`）：使用父代代码实现想法，同时保持与 `semantic_point` 一致
 
 职责：
-- 通过 `ledger.py show` 读取自己的账本记录以获取 idea + source_run_ids
+- 通过 `ledger.py show` 读取 idea + 数字父代 + semantic_point + policy_receipt
 - 读取从 source_run_ids 派生的父 `train.py`
 - 读取只读 `prepare.py` 以理解评估 API
 - 仅写目标候选的 `train.py`
@@ -319,7 +319,7 @@ python tools/new_candidate.py <task-name> <tag> <run_id> --from-candidate <best_
 ```bash
 python tools/ledger.py add-record      ...   # idea-generator 创建记录 (带 --op)
 python tools/ledger.py set-tuning      ...   # 填充调优元数据 (extractor 无标记 / tuner --mark-tuned 设置 tune:true)
-python tools/ledger.py set-experience  ...   # experience-extractor 写全局 experience 块
+python tools/ledger.py set-experience --background <background.md> ...   # 校验后写全局 experience 块
 python tools/ledger.py record-run      ...   # extractor/tuner 用 config-eval 最佳调用: 写 final_best_score + 计算 keep/discard/crash
 python tools/ledger.py percentile      ...   # 按字段的跨记录百分位 (tuner 门控 / select-candidate 使用; 只读)
 python tools/ledger.py evaluations     ...   # 预算检查: 跨记录的 Σ trials_completed
@@ -327,7 +327,7 @@ python tools/ledger.py loop-state      ...   # 从 ledger.json 重新生成 loop
 python tools/ledger.py show            ...   # 读取单个记录或整个账本
 ```
 
-每个记录携带 `op`（`fresh`/`improve`/`crossover`）字段；`kind` 始终为 `optimization`（种子物种退役）；`fresh` 候选的 `source_run_ids` 持有一个 `tf-*` 方向标签而非父 ID。MCTS 统计（`r/V_max/V_med/N/ec`）和全局派生量不持久化；每代由 `got_graph.from_ledger` 从记录重新计算。
+每个记录携带 `op`；`kind` 始终为 `optimization`。`source_run_ids` 只含数字父代（fresh 为空）；`semantic_point` 保存对精确 background revision 的完整归因；`policy_receipt` 单独保存采集配置、证据与 gain/uncertainty/cost/coverage。首条记录还冻结顶层 `search_space` 收据。缺映射、旧平面记录或 revision 漂移都会被拒绝。MCTS 统计仍由 `got_graph.from_ledger` 重算。
 
 `loop_state.md` 是 `ledger.json` 的派生视图，由 `ledger.py` 重新生成；不单独手动编辑。
 
@@ -352,16 +352,23 @@ runs/<task-name>/<tag>/loop_state.md
 
 ### 7.5 background_contract.py
 
-`background.md` 与运行证据之间的确定性合约层：
+`background.md` 与候选语义归因之间的确定性合约层：
 
-- `validate`：检查 Direction registry JSON、连续稳定的 `tf-*` ID、来源引用、文献可信度、五轴研究范围、来源→负面指导的直接包含、排除证据门槛、每条有约束力指导的范围外 scope-probe、grounding visit，以及 ledger 中是否存在未知方向
-- `preflight`：只向 orchestrator 返回背景维护动作；耗尽的 legacy v1 registry 返回 `refresh_background`，该动作不会进入 idea-generator 的状态接口
-- `lineage`：沿 DAG 传播每个候选的起源 `tf-*` 集合，并区分直接 fresh、单源后代和多源组合后代
-- `validate-experience`：检查 experience 中每个方向的双轴标签、claim coverage、必需比较项和证据 run ids 是否与 background + DAG 一致；缺少比较臂时不能写 `supported_here`/`contradicted_here`
+- `catalog`：输出唯一的 `semantic-dimensions/v1` 及内容摘要
+- `validate`：检查 schema-3 层级、目录解析、显式基线、关系、五轴范围、来源/指导证据、人类视图以及所有 ledger 点/祖先/策略收据
+- `render`：输出有界的维度、假设、关系与覆盖视图
+- `preflight`：合法 P1 状态只返回 `none`；旧平面或 mixed-mode 直接拒绝，不迁移
+- `validate-point`：检查完整点、条件激活、requires 与 excludes
+- `lineage`：并列呈现数字祖先与机械 point diff，不生成因果边
+- `validate-experience`：校验通用 P1 belief 的 run-id 证据，并拒绝提前出现的 P2 双层信念字段
 
 `python tools/validate_background.py` 使用合成 DAG 回归这些合约。
 
-### 7.6 search_backends.py
+### 7.6 semantic_search.py
+
+图行动之后的语义选点层：`propose` 为 fresh/improve/crossover 生成有界合法点；`select` 可替换 `coverage`、`gain`、`gain_uncertainty` 策略并输出 point + policy receipt。策略可替换而不改变 registry、祖先或观测历史。
+
+### 7.7 search_backends.py
 
 受 Arbor 检索层启发的轻量适配器，但不导入 Arbor runtime：
 
@@ -521,7 +528,7 @@ python tools/validate_skills.py
 
 ## 12. 框架配置覆盖
 
-`framework_cfg.json` 为单次运行提供 S-GoT 图搜索和调优器超参数的覆盖配置。放置在运行目录中：
+`framework_cfg.json` 为单次运行提供图搜索、语义选点和调优器参数的覆盖配置。放置在运行目录中：
 
 ```text
 runs/<task>/<tag>/framework_cfg.json
@@ -534,8 +541,9 @@ runs/<task>/<tag>/framework_cfg.json
 
 **使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。
 
-文件包含两个主要部分：
+文件包含三个主要部分：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
+- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认是无需 LLM 打分的 `coverage`
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

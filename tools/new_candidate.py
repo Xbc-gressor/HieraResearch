@@ -49,13 +49,33 @@ def candidate_brief(ledger_path: Path, run_id: str) -> dict | None:
         return None
     for record in data.get("records", []):
         if record.get("run_id") == run_id:
+            parents = record.get("source_run_ids")
+            expected_parents = {"fresh": 0, "improve": 1, "crossover": 2}.get(
+                record.get("op")
+            )
+            if (
+                expected_parents is None
+                or not isinstance(parents, list)
+                or len(parents) != expected_parents
+                or len(parents) != len(set(parents))
+                or any(not isinstance(parent, str) or not parent.isdigit() for parent in parents)
+                or not isinstance(record.get("idea"), str)
+                or not record["idea"].strip()
+                or not isinstance(record.get("change"), str)
+                or not record["change"].strip()
+                or not isinstance(record.get("semantic_point"), dict)
+                or not isinstance(record.get("policy_receipt"), dict)
+            ):
+                return None
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "run_id": run_id,
                 "op": record.get("op"),
                 "idea": record.get("idea"),
                 "change": record.get("change"),
-                "source_run_ids": record.get("source_run_ids") or [],
+                "source_run_ids": parents,
+                "semantic_point": record.get("semantic_point"),
+                "policy_receipt": record.get("policy_receipt"),
                 "candidate_name": record.get("candidate_name"),
             }
     return None

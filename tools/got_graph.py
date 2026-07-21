@@ -4,8 +4,8 @@
 加载用一次批量拓扑 pass 重建结构统计，避免逐节点重复回溯祖先。`ec` 在 add 时
 增量维护(创建子代时每个真父代 +1,含产出 crash 的那次)。
 
-`source_run_ids` 是通用"来源"列表(§9):improve/crossover 放父代 run_id;
-fresh 放方向 tag `tf-*`。`parents()` 只取能解析成现有节点的项 → fresh 自动是根、tf-* 不连边。
+`source_run_ids` 只保存数字父代 run_id；fresh 使用空列表。候选的完整
+语义归因保存在 ledger record 的 `semantic_point`，不与 DAG 祖先混用。
 
 两种构造:
 - `add(op, source_run_ids, ...)`         自增 str id —— 离线 toy / 单测用。
@@ -24,7 +24,7 @@ CRASH = float("inf")  # crash 的原始 score 哨兵(越低越好,+inf = 最差)
 class Node:
     id: str                  # = run_id
     op: str                  # 'fresh' | 'improve' | 'crossover'
-    source_run_ids: list     # list[str]:父代 run_id 或 'tf-*'(fresh 的方向)
+    source_run_ids: list     # list[str]:仅父代 run_id；fresh=[]
     score: float             # 原始 score,越低越好;crash = +inf
     status: str              # 'kept' | 'discard' | 'crash'(ledger 的 keep/discard 等价 non-crash)
     genome: object = None    # 可选 payload(toy 是 list[float];生产为 None)
@@ -299,7 +299,7 @@ def _best_id(g: Graph):
 
 def _node_view(g: Graph, recs: dict, nid: str, *, best_id=None, **marks) -> dict:
     n = g.nodes[nid]
-    root_tag = n.source_run_ids[0] if (n.op == "fresh" and n.source_run_ids) else n.op
+    root_tag = n.op
     return {
         "id": nid,
         "op": n.op,

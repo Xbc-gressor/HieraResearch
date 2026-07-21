@@ -11,8 +11,8 @@ import sys
 
 RECEIPT_FIELDS = {
     "idea-generator": (
-        ("status", "generation_run_ids", "actions", "risk_flags"),
-        ("status", "generation_run_ids", "actions"),
+        ("run_id", "op", "parents", "point_id", "policy", "candidate", "ledger"),
+        ("run_id", "op", "parents", "point_id", "policy", "candidate", "ledger"),
     ),
     "candidate-writer": (
         ("status", "candidate_path", "candidate_name", "wrote", "risk_flags", "confidence"),
@@ -30,17 +30,14 @@ RECEIPT_FIELDS = {
         ("tuned_run_id", "ledger_updated"),
     ),
     "experience-extractor": (
-        ("status", "run_dir", "records_seen", "levers", "lessons", "directions",
-         "bottlenecks", "notes"),
-        ("status", "records_seen"),
+        ("updated_at_run", "generation", "evidence_runs", "ledger"),
+        ("updated_at_run", "generation", "evidence_runs", "ledger"),
     ),
 }
 
 RECEIPT_ENUMS = {
-    ("idea-generator", "status"): {"recorded"},
     ("candidate-writer", "status"): {"written", "existing", "blocked"},
     ("tunable-contract-extractor", "status"): {"ok", "crash"},
-    ("experience-extractor", "status"): {"written", "no-data"},
 }
 
 
@@ -69,8 +66,9 @@ def compact_task_result(agent: str, raw: str) -> str:
         if key not in allowed:
             continue
         value = match.group(2).strip()
-        if value and value not in values.setdefault(key, []):
-            values[key].append(value[:500])
+        bucket = values.setdefault(key, [])
+        if value and (agent == "idea-generator" or value not in bucket):
+            bucket.append(value[:500])
 
     child = re.search(r'<task\s+id="([^"]+)"', raw)
     missing = [key for key in required if not values.get(key)]
@@ -79,6 +77,11 @@ def compact_task_result(agent: str, raw: str) -> str:
         expected = RECEIPT_ENUMS.get((agent, key))
         if expected and values.get(key) and any(value.lower() not in expected for value in values[key]):
             invalid_values.append(key)
+    action_count_mismatch = None
+    if agent == "idea-generator" and not missing:
+        counts = {key: len(values[key]) for key in required}
+        if len(set(counts.values())) != 1:
+            action_count_mismatch = counts
     scope_violation = None
     if agent == "candidate-writer" and re.search(
         r"\b(?:warmstart_eval|best_warm|trials_completed|ledger_recorded|set-tuning)\b",
@@ -86,7 +89,7 @@ def compact_task_result(agent: str, raw: str) -> str:
         re.IGNORECASE,
     ):
         scope_violation = "candidate-writer returned evaluation/tuning evidence"
-    invalid = bool(missing or invalid_values or scope_violation)
+    invalid = bool(missing or invalid_values or scope_violation or action_count_mismatch)
     lines = [
         f"agent: {agent}",
         f"child_session_id: {child.group(1) if child else 'unknown'}",
@@ -103,6 +106,8 @@ def compact_task_result(agent: str, raw: str) -> str:
         lines.append(f"invalid_fields: {','.join(invalid_values)}")
     if scope_violation:
         lines.append(f"scope_violation: {scope_violation}")
+    if action_count_mismatch:
+        lines.append(f"action_count_mismatch: {json.dumps(action_count_mismatch, sort_keys=True)}")
     if invalid:
         diagnostic_lines = []
         for line in raw.splitlines():

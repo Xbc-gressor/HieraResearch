@@ -10,16 +10,17 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from background_contract import derive_compact_lineage  # noqa: E402
 from got_graph import CRASH, Graph, render_incremental  # noqa: E402
 from ledger import _set_experience, _touch_dag_record  # noqa: E402
+from semantic_space import complete_point, derive_semantic_lineage  # noqa: E402
+from validate_background import fixture_registry  # noqa: E402
 
 
 def _records() -> list[dict]:
     rows = [
-        ("000", ["tf-01"], "fresh", "keep", 0.5),
+        ("000", [], "fresh", "keep", 0.5),
         ("001", ["000"], "improve", "keep", 0.4),
-        ("002", ["tf-02"], "fresh", "discard", 0.8),
+        ("002", [], "fresh", "discard", 0.8),
         ("003", ["001", "002"], "crossover", "keep", 0.3),
         ("004", ["003"], "improve", "crash", None),
         ("005", ["002"], "improve", "discard", 0.9),
@@ -73,24 +74,21 @@ class IncrementalDagTests(unittest.TestCase):
             stored = json.loads(ledger_path.read_text())
         self.assertEqual(stored["experience"]["dag_revision"], 7)
 
-        registry = {
-            "schema_version": 2,
-            "directions": [
-                {"id": "tf-01", "literature_credibility": "preliminary"},
-                {"id": "tf-02", "literature_credibility": "preliminary"},
-            ],
-        }
-        stored["experience"]["dag_revision"] = 4
-        compact = derive_compact_lineage(registry, stored, limit=2)
-        self.assertEqual(compact["cursor"], {"from_revision": 4, "to_revision": 7})
-        self.assertEqual(
-            [item["run_id"] for item in compact["directions"]["tf-02"]["delta_runs"]["descendant_runs"]],
-            ["005"],
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        stacked = complete_point(
+            registry,
+            {
+                "dim-model-architecture": "hyp-model-multibranch",
+                "dim-ensemble": "hyp-ensemble-stacking",
+            },
         )
-        self.assertLessEqual(
-            len(compact["directions"]["tf-01"]["representative_runs"]["combination_runs"]),
-            2,
-        )
+        for record in stored["records"]:
+            record["semantic_point"] = stacked if record["run_id"] in {"002", "003", "004", "005"} else baseline
+        compact = derive_semantic_lineage(registry, stored, limit=2)
+        self.assertEqual([item["run_id"] for item in compact["runs"]], ["004", "005"])
+        self.assertEqual(compact["coverage"]["n_valid_records"], 6)
+        self.assertLessEqual(len(compact["hypothesis_runs"]["hyp-model-multibranch"]), 2)
 
     def test_bulk_graph_stats_match_incremental_construction(self) -> None:
         ledger = {"records": _records()}

@@ -55,8 +55,8 @@ Do them in order.
 
 - **`train_py`** (required) — absolute path to the candidate `train.py`.
 - **`source_run_ids`** (optional) — comma-separated parent run ids for lineage
-  (e.g. `003,005`). A `tf-*` direction tag (fresh) or empty/absent (explore)
-  means no lineage — propose from the schema + dataset alone.
+  (e.g. `003,005`). Empty/absent means a fresh root. Semantic hypothesis
+  attribution lives in the ledger record's `semantic_point`, not this field.
 
 Derive the rest from `train_py` (do not ask the caller):
 
@@ -136,7 +136,7 @@ Over the `PARAM_SCHEMA` keys, propose together:
 
 **K warm configs** — `[{key: value, ...}]`, each key present, kinds respected.
 **Diversity matters more than raw quality** (they seed the deep-tuner's percentile,
-BO's priors, CMA-ES's mean). Cover distinct directions — for K=5: ① baseline
+BO's priors, CMA-ES's mean). Cover distinct numeric regimes — for K=5: ① baseline
 (segment ①'s originals), ② capacity-up, ③ capacity-down, ④ rate/scale extreme,
 ⑤ categorical pivot. **Scale the count to K**: K<5 → keep baseline + the most
 informative spread; K>5 → add finer variations around the promising (low-score)
@@ -223,14 +223,16 @@ deep-tuner later evaluates the deferred configs FIRST (bo enqueue / grid prepend
 
 - **exit 0** — every config scored; `BASE_PARAMS` = best-of-K′; `phase_a`
   finalized. Go to 3c.
-- **exit 3 (CRASHED)** — the config at `crash_index` raised; its **full
-  traceback** is in `tune_report.json`'s failed entry (`error_traceback`). Go to 3b.
+- **exit 3 (CRASHED)** — the config at `crash_index` raised. Stdout contains its
+  frozen `failure_receipt` and `failure_ref`; the full traceback remains in the
+  referenced append-only artifact. Go to 3b.
 
 ### 3b. Diagnose + fix (the crash loop)
 
 **【crash-diagnosis skill】** Invoke `Skill(crash-diagnosis)` — or, if the Skill
 tool is unavailable, read `.opencode/skills/crash-diagnosis/SKILL.md` and follow it
-— on the crashing config + its `error_traceback`:
+— on the crashing config + its `failure_receipt`. Retrieve full or ranged source
+through `tune_tools.py render-failure` only when the receipt is insufficient:
 
 - **`config_invalid`** → Edit `<candidate_dir>/_warm_configs.json`, replacing that
   config's bad value with a valid one (config fixes are unbounded).
