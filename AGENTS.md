@@ -1,175 +1,108 @@
-# autoresearch-automl (kimi-cli runtime)
+# autoresearch-automl
 
-Multi-task autoresearch harness. The repo runs autonomous experimentation loops
-where an agent edits run-local candidate `train.py` files and tracks the
-configured metric. The harness has two side-by-side runtimes:
+Multi-task autonomous experimentation harness. The supported interactive
+runtimes are Claude Code (`.claude/`) and OpenCode (`.opencode/`); deterministic
+state, graph search, evaluation, and tuning live in `tools/` and are shared.
 
-- `.claude/` — the original Claude Code runtime (see `CLAUDE.md`).
-- `.kimi/` — the kimi-cli port documented here. The deterministic machinery in
-  `tools/` (~11k lines: ledger, background contract, graph search, tuners) is
-  shared and runtime-agnostic.
+## Start an experiment with OpenCode
 
-This file is the kimi-side conventions doc; kimi-cli auto-loads it as
-`${KIMI_AGENTS_MD}`.
+Run from this repository root:
 
-## Authoritative Documents
+```bash
+opencode --agent autoresearch-experiment \
+  --model moonshotai/kimi-k3 --auto
+```
 
-Always read these before doing experiment work:
+Then provide `task_name`, `tag`, and optionally `max_evaluations`. For a
+non-interactive session:
 
-1. `tasks/<task-name>/TASK.md` and `tasks/<task-name>/task.toml` — task brief
-   and machine-readable contract for whichever task is in scope.
-2. `.kimi/rules/ledger.md` — the ledger schema and the helper-only mutation
-   contract (never hand-edit `ledger.json`).
+```bash
+opencode run --agent autoresearch-experiment \
+  --model moonshotai/kimi-k3 --auto \
+  "task_name=<task> tag=<tag> max_evaluations=<n>"
+```
 
-The `autoresearch-experiment` agent is self-contained when started as the main
-thread (see below) and is the canonical experiment protocol.
+`autoresearch-hillclimb` is the deliberately simple comparison baseline and is
+started with the same commands using `--agent autoresearch-hillclimb`.
 
-## Project Layout
+OpenCode primary and subagents inherit `moonshotai/kimi-k3` from the launch
+command. `--auto` approves permission requests that are not explicitly denied;
+the project agents still enforce their hard role boundaries. Every experiment
+agent explicitly allows doom-loop recovery so an unattended run does not pause
+for that prompt.
+
+## Authoritative inputs
+
+Before experiment work, read:
+
+1. `tasks/<task-name>/TASK.md` and `tasks/<task-name>/task.toml`.
+2. `.opencode/rules/ledger.md` only when ledger schema detail is needed.
+
+OpenCode injects `AGENTS.md` and the selected agent prompt automatically. Do
+not read either one again from inside the agent session.
+
+The ledger contract is intentionally not injected globally through
+`opencode.json`; most role agents need only a narrow helper-rendered view.
+
+## Runtime layout
 
 ```text
-.kimi/agents/                  kimi-cli agent files (*.yaml + system-prompt *.md)
-.kimi/rules/                   referenced schemas (ledger.md)
-.kimi/skills/                  project-local kimi skills (crash-diagnosis)
-.kimi/kimi-hooks.toml          hook registrations merged at launch
-tools/kimi_run.py              launcher: merges hooks into the user config, execs kimi
-tools/                         validation and helper scripts (shared, runtime-agnostic)
-tasks/<task-name>/             independent uv task projects
-runs/<task-name>/<tag>/        local run artifacts (gitignored)
+.opencode/agents/                 project-local primary/subagents
+.opencode/skills/                 inline capability skills
+.opencode/rules/                  on-demand state contracts
+.opencode/plugins/hiera-guard.js  delegation and receipt guard
+tools/                            shared deterministic machinery
+tasks/<task-name>/                independent uv task projects
+runs/<task-name>/<tag>/           local experiment artifacts (gitignored)
 ```
 
-Each task is its own uv project. Do not treat `tasks/*` as a uv workspace.
+The experiment primary agent may invoke exactly these six subagents through
+OpenCode's `Task` tool:
 
-## Skills
+- `background-researcher`
+- `idea-generator`
+- `candidate-writer`
+- `tunable-contract-extractor`
+- `tuner-orchestrator`
+- `experience-extractor`
 
-Project-local skills under `.kimi/skills/` are auto-discovered by kimi-cli.
-Skills here are **capability skills** (`crash-diagnosis`): pure methodology
-followed **inline** in the caller's own context (no spawning, reusable at many
-sites). kimi-cli has no Skill tool — the caller reads the `SKILL.md` with
-ReadFile and follows it.
+The allow-list is encoded in the primary agent's native `permission.task` map.
+Every child has `task: deny`; `candidate-writer` also has `bash: deny`.
+`.opencode/plugins/hiera-guard.js` rejects the known writer/evaluation boundary
+collapse and replaces rich child output with compact receipts before it returns
+to the primary context.
 
-- `crash-diagnosis` — methodology for diagnosing one candidate crash and deciding
-  recovery: `config_invalid` (fix the config) / `code_incompatible` (minimally fix
-  the code, preferred) / `abandon`. Followed **inline** by whoever runs the
-  candidate — `tunable-contract-extractor` (an eval-K crash) or the main thread
-  (an official-run crash) — since sub-agents cannot spawn a diagnosis sub-agent.
+## Context and state discipline
 
-## Agents
+- Pass paths and compact identifiers to child agents. Durable artifacts are the
+  payload; child responses are receipts, not copies of code, logs, or ledgers.
+- Never hand-edit `runs/**/ledger.json`; use `tools/ledger.py`.
+- Experience refresh reads `got_graph.py render --incremental` with fixed
+  Top/Bottom anchors. Do not inject the unbounded full ledger or global DAG.
+- Retrieve a full record, source, or log only when a compact view identifies a
+  specific missing field or bottleneck.
+- Do not collapse role boundaries to save time. An evaluation budget does not
+  authorize combining writer, evaluation, or tuning contexts.
+- The outer loop searches semantic candidates; step 0+1 / step 2 tunes numeric
+  parameters inside one candidate. Keep those search levels distinct.
 
-Agents under `.kimi/agents/` are kimi-cli agent files: each `<name>.yaml`
-declares the tool policy (`allowed_tools` / `exclude_tools`) and points at its
-system prompt `<name>.md`. There are two supported execution modes:
+## Task and run boundaries
 
-1. A default main session (plain `kimi` in this repo) follows the loop
-   described in `AGENTS.md`/`CLAUDE.md` and spawns bounded child agents — but
-   the six role agents are registered only on `autoresearch-experiment`, so
-   prefer mode 2 for real runs.
-2. Dedicated experiment session:
+- `tasks/<task>/prepare.py` is the fixed evaluation surface.
+- Experiments modify candidate copies under `runs/`, never task-source
+  `train.py` in place.
+- Do not commit anything under `runs/`.
+- Add dependencies only when `constraints.allow_dependencies = true`.
+- Each task is its own uv project; use `uv --directory tasks/<task> ...`.
 
-   ```bash
-   python3 tools/kimi_run.py --agent autoresearch-experiment
-   ```
+## Narrow checks
 
-   The launcher merges `.kimi/kimi-hooks.toml` into the user config (this
-   registers the PreToolUse delegation guard) and execs kimi with
-   `--agent-file`. In that mode `autoresearch-experiment` is the main thread
-   and spawns the six bounded children itself via the `Agent` tool.
-
-Do not spawn `autoresearch-experiment` as a child agent: kimi-cli launches
-subagents without the `Agent` tool, so a nested orchestrator would lose the
-independent contexts this project requires.
-
-The role agents (prompts are runtime-adapted copies of `.claude/agents/`):
-
-- `autoresearch-experiment` — self-contained run-level orchestrator for one
-  `task_name + tag + run_dir`. Setup = `background-researcher` only; then the
-  loop runs in **rounds** (a generation of ≤B ideas at step 0+1, then one
-  **decoupled** deep-tuning step). Use one instance per concurrent experiment.
-- `autoresearch-hillclimb` — the deliberately simple comparison baseline
-  (single working copy, edit → run → keep/revert, `results.tsv`). Launched the
-  same way: `python3 tools/kimi_run.py --agent autoresearch-hillclimb`.
-- `background-researcher` — setup-time evidence researcher; writes
-  `<run_dir>/background.md` + `background_retrieval.json` with scoped,
-  credibility-stamped `tf-*` directions. The **only** agent with web tools
-  (`SearchWeb`/`FetchURL`); records native fetches via
-  `tools/search_backends.py record-visit --backend kimi-fetch`.
-- `idea-generator` — SELECT via `tools/got_select.py decide` (deterministic;
-  never override op/parents), then IDEATE each action into an idea and persist
-  it with `tools/ledger.py add-record`.
-- `candidate-writer` — implement one candidate's `train.py` from its ledger
-  record. Has **no Shell tool**; cannot run or evaluate anything.
-- `tunable-contract-extractor` — step 0+1 for one candidate: `PARAM_SCHEMA` /
-  `make_model` refactor, K warm configs + `SEARCH_SPACE`, eval-K with inline
-  crash diagnosis (the `crash-diagnosis` skill), records `best_warm_score`.
-- `tuner-orchestrator` — once per round on the run dir: the promotion gate
-  selects at most one candidate and deep-tunes it in place.
-- `experience-extractor` — every 5 rounds: incrementally revise the ledger's
-  bounded `experience` snapshot from new/changed DAG edges, fixed Top/Bottom
-  anchors, and compact per-`tf-*` lineage receipts.
-
-The PreToolUse hook on `Agent` (`tools/harness_guard.py`) deterministically
-rejects delegation-boundary violations (e.g. assigning step-0+1/eval work to
-`candidate-writer`) and, via `--allowed-subagents`, any `subagent_type` outside
-the six role agents — kimi-cli's Agent tool prose always advertises its
-built-in `coder`/`explore` types, so the spawn closure is enforced by the hook
-rather than by prompt text. kimi-cli's hook JSON uses the same field names as
-Claude Code's, so the guard is shared (the allow-list flag is kimi-only;
-without it the guard behaves exactly as before).
-
-## Running A Task
-
-From the repo root:
+For graph/context changes, start with:
 
 ```bash
-uv --directory tasks/<task-name> sync
-uv --directory tasks/<task-name> run python <entrypoint.py>
+python tools/validate_got.py
 ```
 
-Experiments use candidate directories by default. Create a candidate first
-with `tools/new_candidate.py` and run the copied entrypoint through the task
-environment.
-
-## Validation
-
-```bash
-python tools/validate_kimi.py        # the kimi runtime wiring (offline)
-python tools/validate_skills.py
-python tools/validate_tasks.py
-python tools/validate_background.py
-python tools/validate_search_backends.py
-```
-
-## Adding A Task
-
-1. Create `tasks/<task-name>/` mirroring an existing task. Minimum set:
-   `TASK.md`, `task.toml`, `pyproject.toml`, plus task code (typically
-   `prepare.py` and `train.py`).
-2. Add task dependencies to `pyproject.toml` and run
-   `uv --directory tasks/<task-name> sync` to produce `uv.lock`.
-3. Fill in `TASK.md` (human brief plus the `## Evaluation Contract` section)
-   and `task.toml` (machine config: the single `[evaluation].score_fn`,
-   metric, parser, required patterns, file constraints). **Scores are always
-   lower-is-better** — a higher-is-better metric must be negated/complemented
-   inside the task's own `score_fn`. A crash scores `+inf` (the worst).
-4. Run `python tools/validate_tasks.py`.
-
-## Shell Command Conventions
-
-- Do not prepend `cd <project-root> &&` to shell commands. The kimi-cli session
-  is already at the project root, so the `cd` is redundant.
-- Use relative paths from the project root, or quoted absolute paths.
-- kimi-cli's Shell tool supports a `timeout` parameter (seconds) — set it
-  generously for candidate evaluations instead of letting the default cut a
-  long run.
-
-## Boundaries
-
-- `tasks/<task-name>/prepare.py` is the fixed evaluation surface — do not
-  modify during normal experiments.
-- `tasks/<task-name>/train.py` is the experiment surface, but experiments copy
-  it into `runs/<task-name>/<tag>/candidates/<run_id>/` and only the copy gets
-  edited. `candidate-writer` generates each candidate's `train.py` under
-  `runs/`.
-- Do not commit anything under `runs/`. Run logs, `ledger.json`, and
-  `loop_state.md` are local-only state.
-- Add task dependencies only when `constraints.allow_dependencies = true` in
-  the task's `task.toml`.
+Add only the check implied by the touched contract. OpenCode runtime wiring is
+checked with the real CLI (`opencode debug agent <name>` and
+`opencode agent list`) rather than another repository-specific validator.

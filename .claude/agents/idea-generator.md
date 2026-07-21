@@ -56,19 +56,14 @@ python tools/background_contract.py validate \
 ```
 
 If `ledger.json` exists, append `--ledger <run_dir>/ledger.json` so consumed tags
-are checked too. If that ledger already has an `experience` object, also run:
+are checked too. Stop and report a contract error if this registry validation
+fails; do not invent or renumber a `tf-*` direction.
 
-```bash
-python tools/background_contract.py validate-experience \
-  --background <run_dir>/background.md --ledger <run_dir>/ledger.json
-```
-
-This catches a stale run-status view after a background refresh. Report that the
-orchestrator must re-run `experience-extractor` before ideation. On bootstrap the
-background-only validation is sufficient.
-
-Stop and report a contract error if this fails; do not invent or renumber a
-`tf-*` direction.
+Do not validate the committed `experience` snapshot against the latest ledger
+or request an experience refresh. It is intentionally periodic:
+`experience.dag_revision < ledger.dag_revision` means that a newer DAG delta is
+pending, not that the snapshot is invalid. The orchestrator alone owns the
+refresh schedule; the extractor validates each replacement before committing it.
 
 ```bash
 python tools/got_select.py decide --ledger <run_dir>/ledger.json
@@ -127,7 +122,10 @@ Read what you need to make each action concrete (not to re-select):
 3. **Experience**: `python tools/ledger.py show --ledger <run_dir>/ledger.json
    --experience`. This is a bounded snapshot incrementally revised from DAG
    deltas plus Top/Bottom anchors; do not replace it with a full-ledger or
-   full-DAG read. Steer idea content toward `promising` regions and
+   full-DAG read. It may intentionally lag the current DAG; treat its beliefs as
+   covering evidence only through its helper-stamped `dag_revision`. Current
+   deterministic actions, selected parent records, and action-local graph data
+   take precedence over the snapshot. Steer idea content toward `promising` regions and
    `bottlenecks`; do not repeat a `deadend` inside its tested scope unless its
    reopening condition is met. Use **`levers`** (change→Δ
    attribution across the whole run) to favor kinds of change with large typical

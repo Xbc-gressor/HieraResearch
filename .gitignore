@@ -13,9 +13,9 @@ worktrees/
 results/
 queue/
 
-# Codex per-session generated agent prompt
+# Repo-local runtime guide; ignore nested per-session prompt files only.
 AGENTS.md
-# ...except the repo root one, which documents the kimi-cli runtime (.kimi/)
+# Keep the repository root guide.
 !/AGENTS.md
 
 # Claude Code local-only settings

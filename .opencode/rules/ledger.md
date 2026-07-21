@@ -10,7 +10,7 @@ both halves, so there is no cross-file sync to drift.
 ## Never Hand-Edit
 
 Do **not** edit `ledger.json` by hand and do not write it from an agent with
-WriteFile/StrReplaceFile. It is written only by `tools/ledger.py`, which owns the schema,
+Write/Edit. It is written only by `tools/ledger.py`, which owns the schema,
 the keep/discard/crash decision, `next_run_id`, the Phase B percentile, and
 the derived `loop_state.md`. Hand-edits defeat the determinism that keeps a
 long autonomous run stable.

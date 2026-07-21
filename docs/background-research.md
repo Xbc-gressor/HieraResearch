@@ -177,10 +177,11 @@ registry claim: the source must be revisited in the grounding lane. This keeps
 sources that shaped a hypothesis separate from later overlap checking.
 
 The visited-source guarantee is strongest for visits made through
-`search_backends.py`, which writes receipts itself. Claude WebFetch fallback is
-recorded explicitly after a successful tool response; this provides deterministic
-artifact consistency, although it cannot independently inspect Claude's private
-tool transcript the way Arbor's integrated runtime can.
+`search_backends.py`, which writes receipts itself. Claude WebFetch or OpenCode
+webfetch fallback is recorded explicitly after a successful tool response; this
+provides deterministic artifact consistency, although it cannot independently
+inspect the runtime's private tool transcript the way Arbor's integrated runtime
+can.
 
 From the workspace layout used during development, the no-install smoke test is:
 

@@ -338,7 +338,10 @@ snapshot from the helper-owned DAG revision delta, fixed Top/Bottom anchors, and
 compact `tf-*` lineage receipts. It does not re-inject the whole DAG. On an empty-run
 bootstrap there is no ledger evidence, so skip extraction and let
 `idea-generator` use the validated external registry alone. **Skip this step on
-non-refresh rounds** (it is not per-round).
+non-refresh rounds** (it is not per-round). The orchestrator alone owns this
+schedule. A newer `ledger.dag_revision` than `experience.dag_revision` is the
+normal pending delta between refreshes; it does not invalidate the committed
+snapshot and must not trigger an ideation retry or an unscheduled extraction.
 
 ### 3. Generation — SELECT + IDEATE, then run each action
 

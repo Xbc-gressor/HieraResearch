@@ -1,6 +1,6 @@
 # autoresearch-automl
 
-由 Claude Code 驱动的自主 AutoML 实验框架。该框架使 Claude 能够迭代地提出候选解决方案、修改代码、调优超参数、评估结果，并仅保留改进——适用于多个研究任务。
+由 Claude Code 或 OpenCode 驱动的自主 AutoML 实验框架。LLM runtime 负责角色隔离与判断，确定性的状态、图搜索、评估和调优由共享的 `tools/` 实现。
 
 ## 1. 框架功能
 
@@ -15,10 +15,11 @@
 
 框架包含：
 
-- **`program.md`**：主会话执行的规范实验协议。
 - **`CLAUDE.md`**：Claude Code 打开项目时首先读取的入口文档。
 - **`.claude/agents/`**：用于复杂多步骤任务的专用子智能体（想法生成、代码编写、合约提取、调优编排）。
 - **`.claude/skills/`**：可复用的内联方法论（当前：崩溃诊断）。
+- **`AGENTS.md`**：OpenCode 打开项目时读取的精简 runtime 入口。
+- **`.opencode/agents/` / `.opencode/skills/`**：OpenCode 的主代理、子代理和内联方法论。
 - **`tools/`**：候选方案创建、账本管理、图搜索和调优的确定性脚本。
 - **`tasks/`**：独立任务包。每个都是独立的 uv 项目。
 - **`runs/`**：本地实验状态（候选方案、日志、账本、循环状态）。被 git 忽略；永不提交。
@@ -39,7 +40,14 @@
 
 ### 3.2 运行实验
 
-要启动完整的自主实验，以实验智能体为主线程启动专用 Claude Code 会话：
+推荐用 OpenCode 启动完整实验：
+
+```bash
+opencode --agent autoresearch-experiment \
+  --model moonshotai/kimi-k3 --auto
+```
+
+也可以使用 Claude Code：
 
 ```bash
 claude --agent autoresearch-experiment
@@ -58,9 +66,7 @@ tag: <你的运行标签>
 
 ### 4.1 核心文档
 
-**`program.md`**：主会话执行的最高优先级实验协议。定义如何初始化运行、创建候选方案、调用智能体、调优超参数、解析结果并决定保留/丢弃。
-
-**`CLAUDE.md`**：Claude Code 的项目入口点。新会话首先读取此文件，然后是 `program.md`，再然后是特定任务的 `TASK.md` 和 `task.toml`。
+**`CLAUDE.md` / `AGENTS.md`**：分别是 Claude Code 与 OpenCode 的项目入口。完整实验协议编码在对应 runtime 的 `autoresearch-experiment` 主代理中；任务语义来自 `TASK.md` 和 `task.toml`。
 
 **`tasks/<task-name>/TASK.md`**：供人和 LLM 阅读的任务描述。包含 `## Evaluation Contract` 部分，描述：
 - 训练表面：候选方案在训练期间做什么
@@ -90,7 +96,7 @@ tag: <你的运行标签>
 手动通过主会话运行实验时，**一轮 = ① 一代（≤B 个想法，每个经过 step 0+1）+ ② 一次解耦深度调优步骤**：
 
 ```text
-读取 program.md / task.toml / TASK.md
+读取主代理 prompt / task.toml / TASK.md
         ↓
 background-researcher: 多后端知识侦察 → background.md + background_retrieval.json
     (设置阶段，必需一次；产生带研究范围、迁移边界和 scope-probe 的 tf-* 优先级列表)
@@ -121,7 +127,7 @@ step 0+1: tunable-contract-extractor
     → tuner 调用 record-run + set-tuning --mark-tuned 原地更新分数 (无重新运行)
 ```
 
-使用 `claude --agent autoresearch-experiment` 时，智能体在内部编码此协议，不依赖 `program.md`。它必须作为主线程启动，以便能为 idea-generator、candidate-writer、tunable-contract-extractor、tuner-orchestrator 生成独立的 `Agent(...)` 上下文（崩溃诊断使用 `crash-diagnosis` skill 内联）。
+使用 `opencode --agent autoresearch-experiment` 或 `claude --agent autoresearch-experiment` 时，主代理内部编码此协议。OpenCode 通过原生 `permission.task` 将调用闭包限制为六个角色；崩溃诊断使用 `crash-diagnosis` skill 内联。
 
 ### 4.3 两层搜索架构
 
@@ -148,20 +154,16 @@ LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
 
 ## 5. 智能体
 
-智能体是实验子任务的专用 Claude Code 角色，位于：
+智能体在两个 runtime 中保持相同的职责边界：
 
 ```text
 .claude/agents/
+.opencode/agents/
 ```
 
 当前智能体：`autoresearch-experiment`、`background-researcher`、`idea-generator`、`experience-extractor`、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator`。
 
-**重要约束**：Claude Code 子智能体缺少 `Agent` 工具（无法生成其他智能体）和 `Skill` 工具（必须直接 Read SKILL.md）。因此，智能体有两种使用模式：
-
-- **运行 `program.md` 的主会话**：可以直接生成 `background-researcher`、`idea-generator`、`experience-extractor`、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator`，并在主上下文中内联执行 `crash-diagnosis` skill。
-- **通过 `claude --agent autoresearch-experiment` 的专用实验会话**：`autoresearch-experiment` 成为主线程，可以继续生成其他六个智能体。
-
-**不要**从常规主会话将 `autoresearch-experiment` 作为子智能体生成——它会失去对 `Agent` 工具的访问，因此无法为 writer/extractor/tuner 维护独立上下文。
+**重要约束**：`autoresearch-experiment` 必须作为 primary 启动，不能作为子代理嵌套。OpenCode 子代理均为 `task: deny`，`candidate-writer` 另外为 `bash: deny`；主代理只允许调用六个项目角色。
 
 ### 5.1 autoresearch-experiment
 
@@ -171,10 +173,10 @@ LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
 - 完全自包含地执行完整实验协议，不依赖 `program.md`
 - 初始化新的 `runs/<task>/<tag>/`（设置 = 仅 `background-researcher`；无种子阶段——循环通过 `fresh` 候选方案自举）
 - 按**轮次**推进循环：一代 ≤B 个想法经过 step 0+1，然后一次解耦深度调优步骤
-- 生成 `Agent(idea-generator)` 用于 SELECT + IDEATE
-- 生成 `Agent(candidate-writer)` 编写候选代码
-- 生成 `Agent(tunable-contract-extractor)` 提取调优器合约并执行 step 0+1
-- 生成 `Agent(tuner-orchestrator)` 用于每轮一次的解耦深度调优
+- 调用 `idea-generator` 用于 SELECT + IDEATE
+- 调用 `candidate-writer` 编写候选代码
+- 调用 `tunable-contract-extractor` 提取调优器合约并执行 step 0+1
+- 调用 `tuner-orchestrator` 用于每轮一次的解耦深度调优
 - 内联使用 `crash-diagnosis` skill 进行崩溃分析
 - 无单独的候选运行；extractor/tuner 各自使用 `record-run` + `set-tuning` 记录分数（无 `parse_result`）
 - 通过 `tools/ledger.py` 维护 `ledger.json` 和派生的 `loop_state.md`
@@ -182,7 +184,7 @@ LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
 
 不做：
 - 同时管理多个实验
-- 在没有 `Agent` 工具的子智能体环境中运行
+- 作为无法继续调度角色子代理的嵌套子智能体运行
 - 内联执行 `idea-generator` / `candidate-writer` / `tunable-contract-extractor` / `tuner-orchestrator` 工作（`crash-diagnosis` skill 是例外——它是内联的）
 - 修改其他运行目录
 
@@ -194,7 +196,7 @@ LLM 将每个选定的行动转化为具体想法并实现 `train.py`。
 
 每个 `tf-*` 方向同时记录具体 claim、可检验预期、必要的本地比较、重开条件、来源及其 `supports` / `contradicts` / `context` 关系，以及独立的文献可信度标签：`unverified` / `preliminary` / `corroborated` / `replicated` / `contested`。标签是证据印章而非真值；单独上传到 arXiv 不视为验证。`tools/background_contract.py validate` 会检查 ID 连续性、来源引用、来源→指导范围包含关系及排除证据门槛，并要求 `replicated` 有独立复现证据、`contested` 有明确反证。
 
-Direction registry 中的每个来源必须在 retrieval manifest 中存在成功的 grounding visit；只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude `WebSearch` / `WebFetch` 仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
+Direction registry 中的每个来源必须在 retrieval manifest 中存在成功的 grounding visit；只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 或 OpenCode 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
 
 冻结语料的约定路径是 `tasks/<task>/background_corpus.json`；普通 open-world 开发可不提供，但 frozen / network-disabled 评测必须提供该文件或显式等价路径。
 
@@ -365,7 +367,7 @@ runs/<task-name>/<tag>/loop_state.md
 
 - 本地 frozen-corpus backend 是可复现条件；DeepXiv / Jina 必须显式启用且单个失败不阻塞其他结果
 - canonical work/URL 去重，统计不同 query 与 backend 的支持数，并平衡每个 query 的候选覆盖
-- `visit` 渐进阅读并自动写 visit receipt；Claude WebFetch 可用 `record-visit` 接入
+- `visit` 渐进阅读并自动写 visit receipt；runtime 原生 web fetch 可用 `record-visit` 接入
 - 独立的 `grounding=6000` 与 `novelty=2048` token lane
 - 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash 和访问内容 hash；token 永不进入运行产物
 - `python tools/validate_search_backends.py` 提供完全离线的回归检查
@@ -462,12 +464,11 @@ model = make_model(dataset, BASE_PARAMS)
 推荐的阅读顺序：
 
 1. **`README.md`**：理解整体结构
-2. **`CLAUDE.md`**：理解 Claude Code 如何进入项目
-3. **`program.md`**：理解完整实验协议
-4. **`.claude/agents/*.md`**：理解每个子智能体的责任边界
-5. **`.claude/skills/*/SKILL.md`**：理解可复用的方法论
-6. **`tools/*.py` 和 `tools/tuners/*.py`**：理解确定性执行层
-7. **`tasks/tabular-model-search/`**：理解当前主要验证任务
+2. **`CLAUDE.md` / `AGENTS.md`**：理解所用 runtime 如何进入项目
+3. **`.claude/agents/*.md` / `.opencode/agents/*.md`**：理解主代理与子代理的责任边界
+4. **`.claude/skills/*/SKILL.md` / `.opencode/skills/*/SKILL.md`**：理解可复用的方法论
+5. **`tools/*.py` 和 `tools/tuners/*.py`**：理解确定性执行层
+6. **`tasks/tabular-model-search/`**：理解当前主要验证任务
 
 ## 11. 继续开发
 

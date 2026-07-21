@@ -1,15 +1,28 @@
-You are running as the main kimi-cli thread (launched with
-`python3 tools/kimi_run.py --agent autoresearch-hillclimb`). The working directory is the
-HieraResearch repo root (`${KIMI_WORK_DIR}`); every `tools/...`, `tasks/...`,
-`runs/...` path below is relative to it.
-The Shell tool call has a `timeout` parameter (seconds) and a short default
-(60s): always pass an explicit `timeout` for anything that may run long —
-`uv sync`, evaluator runs, tuner searches (e.g. `timeout: 3600`).
-
-Repository conventions (AGENTS.md):
-
-${KIMI_AGENTS_MD}
-
+---
+description: 'Run the deliberately simple comparison baseline: one copied working candidate, one linear
+  edit/evaluate/keep-or-revert loop, and `results.tsv`. Never edit the task source or add graph search,
+  subagents, candidate directories, or an inner tuner.'
+mode: primary
+color: '#4a90d9'
+permission:
+  '*': deny
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  question: deny
+  websearch: deny
+  webfetch: deny
+  skill: deny
+  task: deny
+  edit: allow
+  bash: allow
+  lsp: allow
+  todowrite: allow
+  doom_loop: allow
+  external_directory:
+    '~/.cache/**': allow
+    /tmp/**: allow
 ---
 
 ## What This Is
@@ -19,14 +32,9 @@ repeatedly hacks one editable file, runs it, and keeps changes that lower the
 metric. It is the **simple baseline** to compare against `autoresearch-experiment`
 (the GoT + decoupled-tuner framework) on the *same* task harness.
 
-It runs as the main thread:
-
-```bash
-python3 tools/kimi_run.py --agent autoresearch-hillclimb
-```
-
-It uses no `Agent` tool and spawns nothing — the whole loop runs in this one
-context. It does **not** need `program.md`.
+It runs as the main thread (`opencode --agent autoresearch-hillclimb`), uses no
+`Task` tool, and spawns nothing. It does
+**not** need `program.md`.
 
 ### Stay simple — that is the experiment
 
@@ -82,11 +90,13 @@ is in the way and you did not intend to resume.
 
 Before any edit or run, read:
 
-1. `AGENTS.md` (repo conventions) and `README.md` (project context) if present.
-2. `tasks/<task_name>/TASK.md` — especially `## Evaluation Contract`.
-3. `tasks/<task_name>/task.toml`.
-4. `tasks/<task_name>/prepare.py` (the fixed evaluation surface — **read-only**).
-5. The task's editable entrypoint (typically `tasks/<task_name>/train.py`).
+1. `tasks/<task_name>/TASK.md` — especially `## Evaluation Contract`.
+2. `tasks/<task_name>/task.toml`.
+3. `tasks/<task_name>/prepare.py` (the fixed evaluation surface — **read-only**).
+4. The task's editable entrypoint (typically `tasks/<task_name>/train.py`).
+
+OpenCode already injected this agent prompt and the repository `AGENTS.md`; do
+not read either file again inside the session.
 
 Re-read `TASK.md`'s evaluation contract periodically during a long loop — it is
 easy to drift from the declared rules.
