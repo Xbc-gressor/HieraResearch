@@ -100,8 +100,8 @@ program specification.
 
 ## Step 3 — Apply the configured semantic policy
 
-Read `framework_cfg.json.semantic_search`. If absent, use deterministic
-`coverage`. Supported policies are:
+Read `framework_cfg.json.semantic_search`. If absent, use `gain_uncertainty`.
+Supported policies are:
 
 - `coverage`: no LLM scores; select by under-covered hypotheses and point
   novelty;

@@ -215,16 +215,14 @@ set digest, action, ranking, and evidence. These values stay in
 `policy_receipt`; they do not become observations or beliefs.
 
 Run-local configuration lives under `framework_cfg.json.semantic_search`.
-`coverage` is the code and copied-template default; an exploitation/exploration
-policy is an explicit opt-in, for example:
+`gain_uncertainty` is the code and copied-template default; `coverage` (fully
+deterministic, no LLM scores) is an explicit opt-in for ablations, bootstrap
+runs, or prediction-failure fallback, for example:
 
 ```json
 {
   "semantic_search": {
-    "policy": "gain_uncertainty",
-    "coverage_weight": 0.1,
-    "cost_weight": 0.2,
-    "uncertainty_weight": 0.5
+    "policy": "coverage"
   }
 }
 ```

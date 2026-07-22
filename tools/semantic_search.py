@@ -761,7 +761,7 @@ def cmd_select(args: argparse.Namespace) -> int:
     proposals = _load_object(args.proposals)
     predictions = _load_object(args.predictions) if args.predictions else None
     configured_policy, configured_weights = _framework_policy_config(args.ledger)
-    policy = args.policy or configured_policy or "coverage"
+    policy = args.policy or configured_policy or "gain_uncertainty"
     config = dict(configured_weights)
     if args.cfg:
         override = json.loads(args.cfg)

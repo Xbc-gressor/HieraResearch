@@ -20,7 +20,7 @@
     "tau": 0.3
   },
   "semantic_search": {
-    "policy": "coverage",
+    "policy": "gain_uncertainty",
     "coverage_weight": 0.1,
     "cost_weight": 0.2,
     "uncertainty_weight": 0.5
