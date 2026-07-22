@@ -48,7 +48,7 @@ Derive the rest from `train_py` (do not ask the caller):
 | `candidate_dir` | the directory containing `train_py` (where the JSON artifacts live) |
 | `run_id` | `candidate_dir`'s name (e.g. `007`) |
 | `run_dir` | the `runs/<task>/<tag>/` ancestor (holds `ledger.json`) |
-| `prepare.py` (readonly) | `<candidate_dir>/prepare.py` — read for dataset shape, never edit |
+| `prepare.py` (readonly) | `<candidate_dir>/prepare.py` — read for the task's problem interface (what `make_model` receives and must return), never edit |
 | `task_dir` / `env.project` | `tasks/<task>` (`<task>` = the `runs/<task>/` segment); the uv dir for segment ③ is `task.toml`'s `env.project` (usually `tasks/<task>`) |
 
 Read the task contract — `TASK.md`'s `## Evaluation Contract` + `task.toml`
@@ -61,8 +61,13 @@ everything you propose aims *low*.
 ## Segment ① — `make_model` + `PARAM_SCHEMA` (behavior-preserving)
 
 Add **`PARAM_SCHEMA`** near the top of `train.py` and refactor construction into
-`make_model(dataset, params)` — the single place that builds the runnable
-candidate from tunable choices. Move inline construction (in `run_candidate` /
+**`make_model(<task-input>, params)`** — the single place that builds the runnable
+candidate from tunable choices. The first argument's name and shape, and the
+returned object's interface, are **task-defined**: use exactly what the task's
+`## Evaluation Contract` declares (`dataset` → sklearn-style estimator for the
+tabular tasks; `problem` → an optimizer object with `run() -> float` for
+`es-optimization-design`). The symbol name `make_model` and the `params` dict
+are the only framework-wide parts. Move inline construction (in `run_candidate` /
 `main` / loops / helpers) behind `make_model`, driven by `params`.
 
 **Do NOT write `SEARCH_SPACE` or `BASE_PARAMS` here.** `PARAM_SCHEMA` declares
@@ -78,7 +83,7 @@ per tunable key only its **kind** (+ categorical options):
    names) unless the task benefits.
 2. Refactor each tunable's hard-coded value to read from `params[key]`. **Record
    the original values** — in segment ② one of your K configs is exactly them
-   (the safe baseline), so `make_model(dataset, <originals>)` reproduces current
+   (the safe baseline), so `make_model(<task-input>, <originals>)` reproduces current
    behavior.
 
 **Gate (loop until ok):**
@@ -105,7 +110,7 @@ Returns `{per_parent: {pid: {idea, best_params, best_score, search_space,
 explored, trials}}}` — per parent its best whole config + score (lower better),
 the searched range, and a few whole trials (so hyperparameter *interactions* are
 visible). Steer toward parents' good regions, away from their plateaus. Empty for
-seeds → lean on `PARAM_SCHEMA` + dataset shape + same-family ledger records.
+seeds → lean on `PARAM_SCHEMA` + the task's problem interface + same-family ledger records.
 
 ### 2b. Propose K warm configs + a SEARCH_SPACE (one shot)
 

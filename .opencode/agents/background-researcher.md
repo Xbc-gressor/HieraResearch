@@ -111,14 +111,21 @@ validate.
 ### Step 3 — Plan the evidence search
 
 Before retrieving, decompose the task into 3–6 bounded research questions. Cover,
-as relevant:
+as relevant to the task's contract shape (estimator-search, optimizer design,
+pipeline construction, …):
 
-- Model families / architectures that perform well on this data type.
-- Preprocessing / feature-engineering choices.
-- Ensembling / stacking / calibration.
+- Method families that perform well on this problem type (model/architecture
+  families for estimator tasks; algorithm families and their mechanisms — e.g.
+  step-size adaptation, restarts — for optimizer-design tasks).
+- Problem-side choices: preprocessing / feature engineering for data-driven
+  tasks; initialization, budget allocation, constraint handling for
+  algorithm-design tasks.
+- Combination and post-processing: ensembling / stacking / calibration where
+  predictions are produced; hybrid or staged strategies where an algorithm runs.
 - Hyperparameter ranges practitioners actually use (useful priors for
   `SEARCH_SPACE`).
-- Failure modes: what overfits, what is slow, what needs lots of data.
+- Failure modes: what overfits, what is slow, what needs lots of data, what
+  breaks on which problem landscape.
 - Strong baselines, negative results, replications, and later work that might
   contradict an attractive claim.
 
@@ -221,19 +228,23 @@ For each promising claim, inspect enough of the actual source to assess:
 
 Record the **studied scope**, not just the conclusion sentence: data population
 and size, binary/multiclass target, metric, learner, intervention, comparator,
-budget, and validation protocol. A result about global random undersampling with
-logistic regression does not cover per-bootstrap sampling in a balanced forest,
-SMOTE, or multiclass boosting. Split mechanisms whenever those boundaries
-change. Never turn "worked across the paper's datasets" into "works for tabular
-data" or "one sampler hurt" into "resampling hurts."
+budget, and validation protocol (for non-estimator tasks: problem family,
+dimension/budget regime, baseline algorithms, and stopping criteria). A result
+about global random undersampling with logistic regression does not cover
+per-bootstrap sampling in a balanced forest, SMOTE, or multiclass boosting —
+just as a step-size rule tuned on unimodal functions does not cover multimodal
+or deceptive landscapes. Split mechanisms whenever those boundaries
+change. Never turn "worked across the paper's datasets" into "works for this
+whole problem class" or "one sampler hurt" into "resampling hurts."
 
 Encode source, guidance, and hypothesis scopes on the same five axes:
 `model_families`, `data_regimes`, `metrics`, `interventions`, and
 `evaluation_protocols`. Values are specific lowercase tags such as `xgboost`,
-`binary_risk_assessment`, `f1`, `global_sampling_to_balance`, and
-`cross_validation`. Do not use a broad tag when the paper only studied a narrow
-variant. `background_contract.py` derives scope match mechanically; you do not
-self-assign `applicability` or `scope_match`.
+`binary_risk_assessment`, `f1`, `global_sampling_to_balance`,
+`cross_validation`, `cma_es`, or `multimodal_benchmark`. Do not use a broad tag
+when the paper only studied a narrow variant. `background_contract.py` derives
+scope match mechanically; you do not self-assign `applicability` or
+`scope_match`.
 
 Matching is conservative. Guidance is direct only when its scope contains the
 hypothesis on every axis. Any disjoint axis is a mismatch; overlap without full

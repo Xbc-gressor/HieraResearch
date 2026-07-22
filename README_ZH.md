@@ -141,7 +141,7 @@ step 0+1: tunable-contract-extractor
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
 - **Step 0+1**（tunable-contract-extractor；一个子智能体完成；对每个候选方案运行）：
-  ① 行为保持地重构构造逻辑为 `make_model(dataset, params)` + 声明 `PARAM_SCHEMA`
+  ① 行为保持地重构构造逻辑为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）+ 声明 `PARAM_SCHEMA`
   ② 结合**血统证据**与数据提出 K=5 个热启动配置 + 数据驱动的 `SEARCH_SPACE`；一致性预检 + `check-search-space` + `apply_search_space`
   ③ **评估 K 个配置**（warmstart_eval；顺序/可恢复）；**对每次崩溃内联 crash-diagnosis skill**（config-invalid → 修复配置；code-incompatible → 最小化修复代码 ≤10 次）；全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
   深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
@@ -248,7 +248,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 
 Step 0+1：在候选 `train.py` 准备好后运行，在一个子智能体中完成所有事情：
 
-① 行为保持地将构造逻辑重构为 `make_model(dataset, params)` 并声明 `PARAM_SCHEMA`（仅列出可调参数 + 类型，无范围/默认值）
+① 行为保持地将构造逻辑重构为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）并声明 `PARAM_SCHEMA`（仅列出可调参数 + 类型，无范围/默认值）
 ② 结合**血统证据**（`lineage-evidence`）与数据一次性提出 K=5 个热启动配置 + 一个数据驱动的 `SEARCH_SPACE`，自运行 `check-search-space`（扩展边界以包含配置）+ `apply_search_space` 写回
 ③ 评估这 K 个配置（`warmstart_eval`；顺序/可恢复/崩溃时停止）；**对每次崩溃内联调用 `crash-diagnosis` skill**（config-invalid → 修复配置 / code-incompatible → 最小化修复代码 ≤10 次）直到全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
 
@@ -446,6 +446,16 @@ CPU 表格分类模型搜索任务。指标是 `neg_mean_balanced_accuracy`（�
 - 多模型路线比较
 - `keep` / `discard` 结果管理
 
+### 8.3 es-optimization-design
+
+```text
+tasks/es-optimization-design/
+```
+
+CPU 黑盒连续优化器设计任务，用于契约形状多样化：候选不是 estimator，而是在固定评估预算（`budget = 2000 × dim`）内通过 `problem.evaluate` 最小化未知函数（rastrigin/rosenbrock/ackley/schwefel × dim {2,10,30} × 3 种子）的迭代优化算法。指标为 `mean_log10_1p_best_fitness`（越小越好）。
+
+签名按任务自定义（底层 tuner 本就支持）：`make_model(problem, params)` 返回带 `run() -> float` 的优化器对象；`prepare.evaluate_config` 内部跑完全部 36 个问题并返回均值。
+
 ## 9. 候选方案合约
 
 当候选方案需要调优时，`train.py` 应暴露：
@@ -454,17 +464,19 @@ CPU 表格分类模型搜索任务。指标是 `neg_mean_balanced_accuracy`（�
 BASE_PARAMS = {...}
 SEARCH_SPACE = {...}
 
-def make_model(dataset, params):
+def make_model(<task-input>, params):
     ...
 ```
 
-官方运行应使用：
+`make_model` 这个符号名和 `params` 字典是框架级约定；**首个参数的名称/形状与返回对象的接口由任务的 Evaluation Contract 定义**——tabular 任务为 `make_model(dataset, params)` 返回 sklearn 风格 estimator，`es-optimization-design` 为 `make_model(problem, params)` 返回带 `run() -> float` 的优化器对象。
+
+官方运行应使用（以 tabular 任务为例）：
 
 ```python
 model = make_model(dataset, BASE_PARAMS)
 ```
 
-`prepare.py` 处理固定数据集和评估函数。候选的 `train.py` 仅通过 `prepare.py` 暴露的接口访问数据、训练模型、计算分数。
+`prepare.py` 处理固定的问题实例和评估函数。候选的 `train.py` 仅通过 `prepare.py` 暴露的接口访问问题、构造候选、计算分数。
 
 ## 10. 新开发者的交接阅读顺序
 

@@ -123,13 +123,18 @@ Decide what to do from the file system, in this order:
      scoring surface or fabricate scores.
    - The file is syntactically valid Python (no stray markers, balanced
      parentheses, all imports resolved).
-   - Cast hyperparameters used as sklearn **integer/count** arguments to `int`.
+   - **When the task's contract is sklearn-style** (`make_model(dataset, params)`
+     returning an estimator — e.g. the tabular tasks): cast hyperparameters used
+     as sklearn **integer/count** arguments to `int`.
      Several estimators reject a float there and will crash at fit time — most
      notably `SelectKBest(k=...)` (k is an int count or `"all"`, never a
      fraction), plus `n_estimators`, `max_depth`, `n_neighbors`, etc. If the idea
      is expressed as a fraction (e.g. "keep 70% of features"), convert it to a
      count from the data shape inside `make_model`
-     (`k = max(1, int(round(frac * dataset.x_train.shape[1])))`).
+     (`k = max(1, int(round(frac * dataset.x_train.shape[1])))`). The same
+     int/float discipline applies to non-sklearn contracts (e.g. a population
+     size or a restart count must be an `int`), but the types and semantics come
+     from that task's Evaluation Contract, not from sklearn.
    - If the parents use the tuner contract (`PARAM_SCHEMA`, `SEARCH_SPACE`,
      `BASE_PARAMS`, `make_model`), keep that structure intact rather than
      dismantling it — but do not design or redesign it yourself; the contract

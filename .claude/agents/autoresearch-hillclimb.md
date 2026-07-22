@@ -145,7 +145,9 @@ only for a genuine, already-diagnosed dead end.
 
 Fallback for tasks that expose only `evaluation.score_fn` and have no
 metric-emitting entrypoint: make the working copy a tiny driver that ALWAYS keeps
-both `make_model(dataset, params)` AND an `if __name__ == "__main__":` block that
+both `make_model(<task-input>, params)` — with the signature the task's
+Evaluation Contract declares (`dataset` for the tabular tasks, `problem` for
+`es-optimization-design`) — AND an `if __name__ == "__main__":` block that
 imports the task's `evaluate_config`/`score_fn`, calls `score_fn(make_model, PARAMS)`,
 and prints `<result.metric>: <value>` (plus a `best_model:` line if the parser wants
 it). Never delete the `__main__` driver when editing — without it the run prints

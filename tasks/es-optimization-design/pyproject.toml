@@ -1,0 +1,10 @@
+[project]
+name = "es-optimization-design"
+version = "0.1.0"
+description = "Black-box continuous optimizer design (ES/DE/CMA-style) on fixed benchmark functions under an evaluation budget."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0.0",
+    "optuna>=3.6.0",
+    "cma>=3.3.0",
+]
