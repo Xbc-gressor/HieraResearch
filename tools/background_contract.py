@@ -22,6 +22,7 @@ from typing import Any
 
 from search_backends import canonical_key, validate_manifest
 from semantic_space import (
+    DEFAULT_DIMENSION_STRATEGY,
     SemanticSpaceError,
     catalog_receipt,
     complete_point,
@@ -30,6 +31,8 @@ from semantic_space import (
     hypothesis_map,
     load_catalog,
     point_id,
+    resolve_dimension_catalog,
+    resolve_dimension_strategy,
     selected_assignments,
     space_receipt,
     space_revision,
@@ -804,8 +807,12 @@ def validate_registry(
     *,
     ledger: dict[str, Any] | None = None,
     retrieval_manifest: dict[str, Any] | None = None,
+    catalog: dict[str, Any] | None = None,
+    dimension_strategy: str = DEFAULT_DIMENSION_STRATEGY,
 ) -> list[str]:
-    errors = validate_space_core(registry)
+    errors = validate_space_core(
+        registry, catalog=catalog, dimension_strategy=dimension_strategy
+    )
     source_errors, source_by_id = _validate_sources(registry, retrieval_manifest)
     errors.extend(source_errors)
     errors.extend(_validate_hypotheses(registry, source_by_id))
@@ -1222,19 +1229,30 @@ def validate_experience_replacement(experience: Any, ledger: dict[str, Any]) -> 
 
 def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any] | None, list[str]]:
     registry = load_registry(args.background)
+    dimension_strategy = resolve_dimension_strategy(args.background)
+    catalog = resolve_dimension_catalog(
+        args.background, explicit_path=getattr(args, "catalog", None)
+    )
     ledger = _load_json(args.ledger) if getattr(args, "ledger", None) else None
     manifest = (
         _load_json(args.retrieval_manifest)
         if getattr(args, "retrieval_manifest", None)
         else None
     )
-    errors = validate_registry(registry, ledger=ledger, retrieval_manifest=manifest)
+    errors = validate_registry(
+        registry,
+        ledger=ledger,
+        retrieval_manifest=manifest,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
     errors.extend(validate_background_markdown(args.background, registry))
     return registry, ledger, errors
 
 
 def cmd_catalog(args: argparse.Namespace) -> int:
-    catalog = load_catalog()
+    path = getattr(args, "path", None)
+    catalog = load_catalog(path) if path else load_catalog()
     value = {"catalog": catalog, "receipt": catalog_receipt(catalog)}
     print(json.dumps(value, indent=None if args.compact else 2, separators=(",", ":") if args.compact else None))
     return 0
@@ -1347,34 +1365,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    catalog = sub.add_parser("catalog", help="print semantic-dimensions/v1 and its digest")
+    catalog = sub.add_parser("catalog", help="print a dimension catalog and its digest")
+    catalog.add_argument("--path", type=Path, help="catalog JSON; defaults to the built-in catalog")
     catalog.add_argument("--compact", action="store_true")
     catalog.set_defaults(func=cmd_catalog)
 
     validate = sub.add_parser("validate", help="validate a hierarchical background")
     validate.add_argument("--background", type=Path, required=True)
+    validate.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     validate.add_argument("--ledger", type=Path)
     validate.add_argument("--retrieval-manifest", type=Path)
     validate.set_defaults(func=cmd_validate)
 
     render = sub.add_parser("render", help="bounded dimension/hypothesis/coverage view")
     render.add_argument("--background", type=Path, required=True)
+    render.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     render.add_argument("--ledger", type=Path)
     render.add_argument("--max-hypotheses", type=int, default=6)
     render.set_defaults(func=cmd_render)
 
     preflight = sub.add_parser("preflight", help="reject incompatible or mixed-mode run state")
     preflight.add_argument("--background", type=Path, required=True)
+    preflight.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     preflight.add_argument("--ledger", type=Path)
     preflight.set_defaults(func=cmd_preflight)
 
     point = sub.add_parser("validate-point", help="validate a complete candidate semantic point")
     point.add_argument("--background", type=Path, required=True)
+    point.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     point.add_argument("--point", type=Path, required=True)
     point.set_defaults(func=cmd_validate_point)
 
     lineage = sub.add_parser("lineage", help="render ancestry and mechanical point diffs separately")
     lineage.add_argument("--background", type=Path, required=True)
+    lineage.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     lineage.add_argument("--ledger", type=Path, required=True)
     lineage.add_argument("--compact", action="store_true")
     lineage.add_argument("--limit", type=int, default=8)
@@ -1384,6 +1408,7 @@ def build_parser() -> argparse.ArgumentParser:
         "validate-experience", help="validate P1 experience without inventing P2 belief fields"
     )
     experience.add_argument("--background", type=Path, required=True)
+    experience.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     experience.add_argument("--ledger", type=Path, required=True)
     experience.add_argument("--experience", type=Path)
     experience.set_defaults(func=cmd_validate_experience)

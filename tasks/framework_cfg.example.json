@@ -3,9 +3,10 @@
     "Per-run framework-hyperparameter OVERRIDES for one autoresearch run (e.g. a Phase-3 OFAT trial).",
     "USAGE: copy this to  runs/<task>/<tag>/framework_cfg.json  and keep ONLY the keys you want to override",
     "       (delete the rest — any omitted key uses the code default). Copying it verbatim = all defaults = no-op.",
-    "READ BY (tracked code):  got_select.py decide -> the 'got' section  ·  semantic_search.py select -> the 'semantic_search' section  ·  tune_tools.py select-candidate -> tuner.n_min/top_percentile  ·  bo_search.py -> tuner.bo_n_trials + bo_patience_cap/bo_patience_floor (adaptive) or bo_patience (fixed override).",
-    "PRIORITY: explicit CLI flag (--cfg / --n-min / --top-percentile / --n-trials / --patience) > this file > module default. NOTE: BO patience is adaptive by default = min(bo_patience_cap, max(bo_patience_floor, round(1.5*n_dims))); set tuner.bo_patience to force a fixed value.",
-    "NOTE: 'got'/'tuner' below hold the CURRENT DEFAULTS so this doubles as a reference; '_keys' documents each. 'tuner.K' (warm-config count) is read by the tunable-contract-extractor AGENT (not a deterministic tool), but is injectable here too.",
+    "READ BY (tracked code):  semantic_space.py -> the 'space_initialization' section  ·  got_select.py decide -> the 'got' section  ·  semantic_search.py select -> the 'semantic_search' section  ·  tune_tools.py select-candidate -> tuner.n_min/top_percentile  ·  bo_search.py -> tuner.bo_n_trials + bo_patience_cap/bo_patience_floor (adaptive) or bo_patience (fixed override).",
+    "PRIORITY: explicit CLI flag (--catalog / --cfg / --n-min / --top-percentile / --n-trials / --patience) > this file > module default. NOTE: BO patience is adaptive by default = min(bo_patience_cap, max(bo_patience_floor, round(1.5*n_dims))); set tuner.bo_patience to force a fixed value.",
+    "SETUP: tools/init_run.py --dimension-strategy persists space_initialization.dimension_strategy here; it does not bypass this file and cannot change a run after semantic artifacts exist.",
+    "NOTE: the sections below hold the CURRENT DEFAULTS so this doubles as a reference; '_keys' documents each. 'tuner.K' (warm-config count) is read by the tunable-contract-extractor AGENT (not a deterministic tool), but is injectable here too.",
     "runs/ is gitignored, so the copied file is local-only (not committed)."
   ],
   "got": {
@@ -18,6 +19,9 @@
     "c_pucb": 0.4,
     "c_leaf": 0.4,
     "tau": 0.3
+  },
+  "space_initialization": {
+    "dimension_strategy": "catalog_subset"
   },
   "semantic_search": {
     "policy": "gain_uncertainty",
@@ -45,6 +49,7 @@
     "got.c_pucb": "outer: PUCB exploration constant over the action pool (default 0.4; flat in [0.1,0.8], base-dependent → kept default). OFAT {0.2,0.4,0.8}.",
     "got.c_leaf": "outer: select_leaf UCB exploration constant during descent (default 0.4). OFAT {0.2,0.4,0.8}.",
     "got.tau": "outer: op-prior softmax temperature (default 0.3). OFAT {0.1,0.3,0.6}.",
+    "space_initialization.dimension_strategy": "search-space setup: catalog_subset selects from contracts/semantic-dimensions-v1.json (default); llm_induced makes background-researcher create and fully use a validated run-local dimension_catalog.json before retrieval. Explicit --catalog overrides the source, not the configured full-vs-subset semantics.",
     "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage (fully deterministic, no LLM scores), gain, or gain_uncertainty. The last two require per-proposal rubric inputs and preserve predicted_gain, uncertainty, cost, and coverage separately in each record's policy_receipt.",
     "semantic_search.coverage_weight": "semantic acquisition: additive deterministic under-coverage contribution for gain policies (default 0.1).",
     "semantic_search.cost_weight": "semantic acquisition: subtractive predicted implementation/evaluation cost contribution (default 0.2).",

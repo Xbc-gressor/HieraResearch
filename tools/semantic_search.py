@@ -46,6 +46,8 @@ from semantic_space import (
     incoming_activation_relations,
     point_diff,
     point_id,
+    resolve_dimension_catalog,
+    resolve_dimension_strategy,
     selected_assignments,
     space_receipt,
     validate_point,
@@ -417,12 +419,13 @@ def validate_proposal_set(value: Any) -> list[str]:
         catalog = space.get("catalog")
         if (
             not isinstance(catalog, dict)
-            or catalog.get("id") != "semantic-dimensions/v1"
+            or not isinstance(catalog.get("id"), str)
+            or not catalog.get("id")
             or not isinstance(catalog.get("revision"), str)
             or DIGEST_RE.fullmatch(catalog["revision"]) is None
             or set(catalog) != {"id", "revision"}
         ):
-            errors.append("proposal set space.catalog must be a semantic-dimensions/v1 receipt")
+            errors.append("proposal set space.catalog must be a resolved-catalog receipt")
         dimension_ids = space.get("dimension_ids")
         if (
             not isinstance(dimension_ids, list)
@@ -727,8 +730,16 @@ def _framework_policy_config(ledger_path: Path | None) -> tuple[str | None, dict
 
 def cmd_propose(args: argparse.Namespace) -> int:
     registry = load_registry(args.background)
+    catalog_path = getattr(args, "catalog", None)
+    dimension_strategy = resolve_dimension_strategy(args.background)
+    catalog = resolve_dimension_catalog(args.background, explicit_path=catalog_path)
     ledger = _load_object(args.ledger) if args.ledger and args.ledger.exists() else {"records": []}
-    errors = validate_registry(registry, ledger=ledger)
+    errors = validate_registry(
+        registry,
+        ledger=ledger,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
     errors.extend(validate_background_markdown(args.background, registry))
     if errors:
         print(json.dumps({"ok": False, "errors": errors}, indent=2))
@@ -795,6 +806,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     propose = sub.add_parser("propose", help="build bounded valid points for one graph action")
     propose.add_argument("--background", type=Path, required=True)
+    propose.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     propose.add_argument("--ledger", type=Path)
     propose.add_argument("--op", choices=["fresh", "improve", "crossover"], required=True)
     propose.add_argument("--parents", default="", help="comma-separated numeric parents")

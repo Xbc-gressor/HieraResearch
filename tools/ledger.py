@@ -353,7 +353,12 @@ def cmd_add_record(args) -> int:
         validate_background_markdown,
         validate_registry,
     )
-    from semantic_space import space_receipt
+    from semantic_space import (
+        SemanticSpaceError,
+        resolve_dimension_catalog,
+        resolve_dimension_strategy,
+        space_receipt,
+    )
 
     ledger_path = Path(args.ledger)
     task_name = args.task or infer_task_name([ledger_path])
@@ -365,7 +370,20 @@ def cmd_add_record(args) -> int:
 
     background_path = Path(args.background)
     registry = load_registry(background_path)
-    background_errors = validate_registry(registry, ledger=data)
+    try:
+        dimension_strategy = resolve_dimension_strategy(background_path)
+        catalog = resolve_dimension_catalog(
+            background_path,
+            explicit_path=Path(args.catalog) if args.catalog else None,
+        )
+    except SemanticSpaceError as exc:
+        raise SystemExit(f"invalid dimension catalog: {exc}") from exc
+    background_errors = validate_registry(
+        registry,
+        ledger=data,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
     background_errors.extend(validate_background_markdown(background_path, registry))
     if background_errors:
         raise SystemExit("invalid P1 background/ledger: " + "; ".join(background_errors))
@@ -402,7 +420,12 @@ def cmd_add_record(args) -> int:
     )
     data["search_space"] = data.get("search_space") or space_receipt(registry)
     data["records"].append(record)
-    contract_errors = validate_registry(registry, ledger=data)
+    contract_errors = validate_registry(
+        registry,
+        ledger=data,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
     if contract_errors:
         data["records"].pop()
         raise SystemExit("invalid candidate semantic contract: " + "; ".join(contract_errors))
@@ -698,13 +721,31 @@ def cmd_set_experience(args) -> int:
         validate_experience_replacement,
         validate_registry,
     )
+    from semantic_space import (
+        SemanticSpaceError,
+        resolve_dimension_catalog,
+        resolve_dimension_strategy,
+    )
 
     ledger_path = Path(args.ledger)
     background_path = Path(args.background)
     data = _load_ledger(ledger_path)
     registry = load_registry(background_path)
+    try:
+        dimension_strategy = resolve_dimension_strategy(background_path)
+        catalog = resolve_dimension_catalog(
+            background_path,
+            explicit_path=Path(args.catalog) if args.catalog else None,
+        )
+    except SemanticSpaceError as exc:
+        raise SystemExit(f"invalid dimension catalog: {exc}") from exc
     experience = json.loads(Path(args.from_json).read_text())
-    errors = validate_registry(registry, ledger=data)
+    errors = validate_registry(
+        registry,
+        ledger=data,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
     errors.extend(validate_background_markdown(background_path, registry))
     if not errors:
         errors.extend(validate_experience(experience, registry, data))
@@ -751,6 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
                      help="S-GoT op; inferable from parent count but stored for clarity")
     add.add_argument("--background", required=True,
                      help="hierarchical background.md that freezes this run's search space")
+    add.add_argument("--catalog", help="explicit dimension catalog override")
     add.add_argument("--semantic-point", required=True, type=Path,
                      help="validated complete semantic-point JSON selected for this candidate")
     add.add_argument("--policy-receipt", required=True, type=Path,
@@ -777,6 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp = sub.add_parser("set-experience", parents=[common])
     exp.add_argument("--background", required=True,
                      help="hierarchical background.md used to validate the ledger and belief view")
+    exp.add_argument("--catalog", help="explicit dimension catalog override")
     exp.add_argument("--from-json", required=True, type=Path,
                      help="JSON file with the experience block to store (overwrites).")
     exp.set_defaults(func=cmd_set_experience)

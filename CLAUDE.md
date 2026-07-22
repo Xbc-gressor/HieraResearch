@@ -85,11 +85,13 @@ would remove the independent contexts required by this project.
   tolerates backend failure, deduplicates and balances candidates across queries, progressively
   reads them in explicit grounding/novelty budget lanes, and looks for
   counterevidence. It writes `<run_dir>/background.md` plus the visited-source
-  trace `<run_dir>/background_retrieval.json`. The background freezes a
-  task-relevant subset of `semantic-dimensions/v1`, an explicit baseline in
-  every selected dimension, task-specific stable `hyp-*` values, and scoped
-  activation/exclusion relations. Sources, structured `g-*` guidance, and
-  hypotheses use the same typed scope axes. The
+  trace `<run_dir>/background_retrieval.json`. The default strategy freezes a
+  task-relevant subset of `semantic-dimensions/v1`; the `llm_induced` strategy
+  first writes a final task-specific `<run_dir>/dimension_catalog.json` using
+  the on-demand guide in `docs/dimension-induction.md`. The background registers
+  an explicit baseline in every resolved dimension, task-specific stable
+  `hyp-*` values, and scoped activation/exclusion relations. Sources, structured
+  `g-*` guidance, and hypotheses use the same typed scope axes. The
   contract derives containment mechanically: only directly matched guidance may
   change a hypothesis's priority or eligibility, while free-text Pitfalls are
   nonbinding. Weak or contested negatives can only caution; binding guidance

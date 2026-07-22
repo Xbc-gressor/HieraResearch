@@ -11,11 +11,13 @@ requirement of its own. Terms in backticks name the exact contract fields.
   implementations for the task — a candidate's `train.py` together with its
   numeric configuration (`PARAM_SCHEMA`, `BASE_PARAMS`, everything inner HPO
   may change).
-- The catalog `contracts/semantic-dimensions-v1.json` fixes the dimension
-  index set `D` (fifteen `dim-*` ids, frozen order, content-addressed by a
-  catalog `revision`).
-- Background research freezes a run subset `A ⊆ D`: the registry of `kind:
-  "semantic_search_space"` selects dimensions, gives each a set of local
+- The resolved dimension catalog fixes the dimension index set `D` (ordered
+  `dim-*` ids, content-addressed by a catalog `revision`). By default it is
+  `contracts/semantic-dimensions-v1.json`; `llm_induced` resolves a validated
+  run-local catalog instead.
+- Background research freezes the run dimensions `A`: `catalog_subset` selects
+  `A ⊆ D`, while `llm_induced` defines a task-specific catalog and uses `A = D`.
+  The registry of `kind: "semantic_search_space"` gives each dimension local
   `hyp-*` hypotheses containing one distinguished `baseline_hypothesis_id`,
   and declares `rel-*` relations (`activates`, `requires`, `excludes`). The
   frozen space is content-addressed by `space_revision`.
@@ -57,11 +59,13 @@ belief about `F` (acquisition `predicted_gain`, `uncertainty`) is a derived,
 replaceable view over the ledger — never part of the registry or the
 observation history.
 
-## Subset selection is subspace selection
+## Dimension resolution is subspace selection
 
-Freezing `A` pins every dimension outside `A` — either inapplicable to the
-task or fixed by a task constraint. Formally the run searches the slice of
-the full space obtained by fixing the coordinates in `D \ A`, and the
+Under `catalog_subset`, freezing `A` pins every built-in dimension outside `A` —
+either inapplicable to the task or fixed by a task constraint. Under
+`llm_induced`, task-first decomposition defines `D` directly and the registry
+uses the whole catalog. In either case, the run searches a frozen slice of the
+larger space of possible candidate mechanisms, and the
 two-level decomposition
 
     min_{x} f(x) = min_{s ∈ S} F(s)
@@ -73,9 +77,8 @@ operational sufficient condition: select every dimension holding a legal
 material choice, and represent a constraint-fixed material choice as a
 visible `mode: "baseline_only"` dimension rather than dropping it. The
 residual risk — a material choice no catalog dimension owns — is a genuine
-coverage gap. It must be recorded as a non-mutating observation and left to
-P4's evidence-driven catalog process, because it means the frozen subspace
-may exclude the optimum and no within-run move can repair that.
+coverage gap: the frozen subspace may exclude the optimum and no within-run move
+can repair that run's catalog.
 
 ## Search moves in the quotient
 

@@ -356,7 +356,7 @@ def main() -> int:
     assert validate_registry(registry) == [], validate_registry(registry)
 
     # Static ownership audits for both requested benchmark shapes: every named
-    # material choice resolves to the fixed catalog and there is no catch-all.
+    # material choice resolves to the built-in catalog and there is no catch-all.
     catalog = load_catalog()
     catalog_ids = {item["id"] for item in catalog["dimensions"]}
     coverage_fixture = json.loads(
@@ -437,7 +437,7 @@ def main() -> int:
     unknown_dimension = copy.deepcopy(registry)
     unknown_dimension["dimensions"][0]["id"] = "dim-miscellaneous"
     errors = validate_registry(unknown_dimension)
-    assert any("run-local dimensions are forbidden" in error for error in errors), errors
+    assert any("is not in catalog" in error for error in errors), errors
 
     legacy_registry = {"schema_version": 2, "directions": [], "sources": []}
     errors = validate_registry(legacy_registry)

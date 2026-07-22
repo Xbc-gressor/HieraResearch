@@ -23,27 +23,11 @@ from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PATH = ROOT / "contracts" / "semantic-dimensions-v1.json"
+DEFAULT_DIMENSION_STRATEGY = "catalog_subset"
+DIMENSION_STRATEGIES = {DEFAULT_DIMENSION_STRATEGY, "llm_induced"}
+INDUCED_CATALOG_FILENAME = "dimension_catalog.json"
 SEARCH_SPACE_SCHEMA_VERSION = 3
 POINT_SCHEMA_VERSION = 1
-CATALOG_ID = "semantic-dimensions/v1"
-CATALOG_PROVENANCE = "p1-semantic-search-space-plan.md#pre-defined-dimension-catalog"
-CATALOG_DIMENSION_IDS = (
-    "dim-task-formulation",
-    "dim-data-curation",
-    "dim-input-representation",
-    "dim-data-augmentation",
-    "dim-supervision",
-    "dim-model-architecture",
-    "dim-initialization-adaptation",
-    "dim-learning-objective",
-    "dim-optimization",
-    "dim-training-protocol",
-    "dim-validation-selection",
-    "dim-ensemble",
-    "dim-inference",
-    "dim-output-postprocessing",
-    "dim-resource-execution",
-)
 
 DIMENSION_RE = re.compile(r"^dim-[a-z0-9][a-z0-9-]*$")
 HYPOTHESIS_RE = re.compile(r"^hyp-[a-z0-9][a-z0-9-]*$")
@@ -81,6 +65,60 @@ def load_catalog(path: Path = CATALOG_PATH) -> dict[str, Any]:
     return catalog
 
 
+def resolve_dimension_catalog(
+    background_path: Path,
+    *,
+    explicit_path: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve the catalog for one run, with an explicit CLI path taking priority."""
+    if explicit_path is not None:
+        return load_catalog(Path(explicit_path))
+
+    strategy = resolve_dimension_strategy(background_path)
+    if strategy == DEFAULT_DIMENSION_STRATEGY:
+        return load_catalog()
+
+    run_dir = Path(background_path).parent
+    config_path = run_dir / "framework_cfg.json"
+    catalog_path = run_dir / INDUCED_CATALOG_FILENAME
+    if not catalog_path.is_file():
+        raise SemanticSpaceError(
+            f"{config_path}: llm_induced requires {catalog_path}"
+        )
+    return load_catalog(catalog_path)
+
+
+def resolve_dimension_strategy(background_path: Path) -> str:
+    """Resolve one run's configured dimension strategy without loading its catalog."""
+    run_dir = Path(background_path).parent
+    config_path = run_dir / "framework_cfg.json"
+    if not config_path.is_file():
+        return DEFAULT_DIMENSION_STRATEGY
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SemanticSpaceError(
+            f"cannot read space initialization config {config_path}: {exc}"
+        ) from exc
+    if not isinstance(config, dict):
+        raise SemanticSpaceError(f"{config_path}: framework config must be an object")
+    section = config.get("space_initialization", {})
+    if not isinstance(section, dict):
+        raise SemanticSpaceError(f"{config_path}: space_initialization must be an object")
+    unknown = sorted(set(section) - {"dimension_strategy"})
+    if unknown:
+        raise SemanticSpaceError(
+            f"{config_path}: unknown space_initialization keys {unknown}"
+        )
+    strategy = section.get("dimension_strategy", DEFAULT_DIMENSION_STRATEGY)
+    if strategy not in DIMENSION_STRATEGIES:
+        raise SemanticSpaceError(
+            f"{config_path}: space_initialization.dimension_strategy must be one of "
+            f"{sorted(DIMENSION_STRATEGIES)}"
+        )
+    return strategy
+
+
 def validate_catalog(catalog: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     unknown_top = sorted(
@@ -90,22 +128,20 @@ def validate_catalog(catalog: dict[str, Any]) -> list[str]:
         errors.append(f"catalog has unknown fields {unknown_top}")
     if catalog.get("schema_version") != 1:
         errors.append("catalog.schema_version must be 1")
-    if catalog.get("catalog_id") != CATALOG_ID:
-        errors.append(f"catalog.catalog_id must be {CATALOG_ID!r}")
-    if catalog.get("provenance") != CATALOG_PROVENANCE:
-        errors.append(f"catalog.provenance must be {CATALOG_PROVENANCE!r}")
+    if not _nonempty(catalog.get("catalog_id")):
+        errors.append("catalog.catalog_id must be a non-empty stable id")
+    if not _nonempty(catalog.get("provenance")):
+        errors.append("catalog.provenance must be a non-empty string")
     dimensions = catalog.get("dimensions")
     if not isinstance(dimensions, list) or not dimensions:
         return errors + ["catalog.dimensions must be a non-empty list"]
     seen: set[str] = set()
-    actual_ids: list[Any] = []
     for index, dimension in enumerate(dimensions):
         where = f"catalog.dimensions[{index}]"
         if not isinstance(dimension, dict):
             errors.append(f"{where} must be an object")
             continue
         dimension_id = dimension.get("id")
-        actual_ids.append(dimension_id)
         if not isinstance(dimension_id, str) or not DIMENSION_RE.fullmatch(dimension_id):
             errors.append(f"{where}.id must match dim-<slug>")
         elif dimension_id in seen:
@@ -118,19 +154,15 @@ def validate_catalog(catalog: dict[str, Any]) -> list[str]:
         unknown = sorted(set(dimension) - {"id", "definition", "boundary"})
         if unknown:
             errors.append(f"{where} has unknown fields {unknown}")
-    if actual_ids != list(CATALOG_DIMENSION_IDS):
-        errors.append(
-            "catalog dimensions must exactly preserve semantic-dimensions/v1 ids and order"
-        )
     return errors
 
 
 def catalog_revision(catalog: dict[str, Any] | None = None) -> str:
-    return digest(catalog or load_catalog())
+    return digest(load_catalog() if catalog is None else catalog)
 
 
 def catalog_receipt(catalog: dict[str, Any] | None = None) -> dict[str, str]:
-    value = catalog or load_catalog()
+    value = load_catalog() if catalog is None else catalog
     return {"id": value["catalog_id"], "revision": catalog_revision(value)}
 
 
@@ -253,11 +285,21 @@ def _cycle(edges: list[tuple[str, str]]) -> list[str] | None:
 
 
 def validate_space_core(
-    registry: dict[str, Any], catalog: dict[str, Any] | None = None
+    registry: dict[str, Any],
+    catalog: dict[str, Any] | None = None,
+    *,
+    dimension_strategy: str = DEFAULT_DIMENSION_STRATEGY,
 ) -> list[str]:
     """Validate hierarchy and relations, excluding source/guidance semantics."""
     errors: list[str] = []
-    catalog = catalog or load_catalog()
+    if dimension_strategy not in DIMENSION_STRATEGIES:
+        errors.append(
+            f"dimension_strategy must be one of {sorted(DIMENSION_STRATEGIES)}"
+        )
+    catalog = load_catalog() if catalog is None else catalog
+    catalog_errors = validate_catalog(catalog)
+    if catalog_errors:
+        return [f"catalog: {error}" for error in catalog_errors]
     expected_catalog = catalog_receipt(catalog)
     if registry.get("schema_version") != SEARCH_SPACE_SCHEMA_VERSION:
         if "directions" in registry or registry.get("schema_version") in {1, 2}:
@@ -273,13 +315,24 @@ def validate_space_core(
         errors.append("space_id must be a non-empty stable run-local id")
     if registry.get("catalog") != expected_catalog:
         errors.append(
-            "catalog must exactly match the installed semantic-dimensions/v1 receipt "
+            "catalog must exactly match the supplied dimension catalog receipt "
             f"{expected_catalog}"
         )
 
     dimensions = registry.get("dimensions")
     if not isinstance(dimensions, list) or not dimensions:
         return errors + ["dimensions must be a non-empty list"]
+    if dimension_strategy == "llm_induced":
+        selected_ids = [
+            dimension.get("id") if isinstance(dimension, dict) else None
+            for dimension in dimensions
+        ]
+        catalog_ids = [dimension["id"] for dimension in catalog["dimensions"]]
+        if selected_ids != catalog_ids:
+            errors.append(
+                "llm_induced registry dimensions must exactly match the run-local "
+                "catalog ids and order"
+            )
     catalog_by_id = {item["id"]: item for item in catalog["dimensions"]}
     dimension_ids: set[str] = set()
     hypothesis_ids: set[str] = set()
@@ -325,7 +378,7 @@ def validate_space_core(
         catalog_entry = catalog_by_id.get(dimension_id)
         if catalog_entry is None:
             errors.append(
-                f"{where}.id is not in {CATALOG_ID}: {dimension_id!r}; run-local dimensions are forbidden"
+                f"{where}.id is not in catalog {catalog.get('catalog_id')!r}: {dimension_id!r}"
             )
         elif dimension_id in dimension_ids:
             errors.append(f"duplicate selected dimension {dimension_id}")

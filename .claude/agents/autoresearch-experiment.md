@@ -25,7 +25,8 @@ Do not spawn it as a child. Claude Code subagents cannot use the `Agent` tool,
 and running inline would collapse the independent contexts required for
 research, implementation, evaluation, and tuning.
 
-The caller provides `task_name`, `tag`, or `run_dir`. Infer
+The caller provides `task_name`, `tag`, or `run_dir`, and may provide
+`dimension_strategy=catalog_subset|llm_induced`. Infer
 `runs/<task_name>/<tag>` when unambiguous. If `task_name` is known but `tag` is
 missing, choose a concise date/purpose tag. Existing run artifacts mean resume;
 never overwrite them. If the run identity cannot be resolved safely, record a
@@ -49,8 +50,9 @@ Continue rounds until the evaluation budget is exhausted or a hard stop occurs.
   is attribution to the frozen search space. `policy_receipt` records separate
   gain, uncertainty, cost, and coverage inputs; none of these is an observation
   or causal conclusion.
-- After setup, `background.md` is immutable for the run and only
-  `background-researcher` writes it. Preflight rejects revision drift.
+- After setup, `background.md` and the resolved dimension catalog are immutable
+  for the run and only `background-researcher` writes them. Preflight rejects
+  revision drift.
 - Only deterministic helpers mutate `ledger.json`. Never hand-edit it.
 - Scores are lower-is-better. Missing or non-finite results are crashes and are
   worse than every finite score.
@@ -82,16 +84,24 @@ Use progressive disclosure after setup:
 
 ## Setup
 
+If the caller supplied `dimension_strategy` for an existing run, first invoke
+`init_run.py` with that strategy to persist it before semantic artifacts exist
+or verify that it matches the frozen run. Treat a conflict as a setup blocker.
+
 For a new run:
 
 1. Initialize it:
 
    ```bash
-   python tools/init_run.py <task_name> <tag>
+   python tools/init_run.py <task_name> <tag> \
+     [--dimension-strategy <catalog_subset|llm_induced>]
    ```
 
    This creates the run directory and copies
    `tasks/framework_cfg.example.json` to `<run_dir>/framework_cfg.json`.
+   Pass the optional flag when the caller supplied `dimension_strategy`; the
+   config is the persistent authority. On a resumed run, the helper permits the
+   same strategy but rejects a conflicting one after semantic artifacts exist.
 2. Read the required task files and verify the task environment:
 
    ```bash
@@ -100,12 +110,16 @@ For a new run:
 
    Run `run.prepare_command` through that environment only when required assets
    are absent.
-3. Spawn `Agent(background-researcher)` with the run directory. It writes the
-   evidence trace and the schema-3 hierarchical background over the fixed
-   `semantic-dimensions/v1` catalog.
-4. Validate both artifacts:
+3. Spawn `Agent(background-researcher)` with the run directory. It reads the
+   configured strategy and writes the evidence trace plus schema-3 hierarchical
+   background. Under `llm_induced`, it also writes the final task-specific
+   `<run_dir>/dimension_catalog.json` before retrieval.
+4. Validate the strategy-scoped artifacts:
 
    ```bash
+   # llm_induced only
+   python tools/background_contract.py catalog \
+     --path <run_dir>/dimension_catalog.json
    python tools/search_backends.py validate \
      --manifest <run_dir>/background_retrieval.json
    python tools/background_contract.py validate \
@@ -113,7 +127,8 @@ For a new run:
      --retrieval-manifest <run_dir>/background_retrieval.json
    ```
 
-   Fix or rerun background research if validation fails.
+   Fix or rerun background research if validation fails. A missing or malformed
+   induced catalog blocks setup; never switch strategies as recovery.
 
 Do not pre-create the ledger, loop state, candidate entrypoints, or generic
 result files. The first generated record and deterministic helpers create the

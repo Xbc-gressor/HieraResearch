@@ -20,29 +20,40 @@ same point.
 
 `docs/search-space.md` states this mechanism formally: a point is an
 equivalence class (fiber) of implementations under the attribution map, and
-freezing the run's dimension subset is selecting a subspace that must still
+freezing the run's resolved dimensions is selecting a subspace that must still
 contain the optimum.
 
-## Fixed dimension catalog
+## Dimension strategies
 
-`contracts/semantic-dimensions-v1.json` is the only source of dimension
-identities for P1. Its content-addressed receipt is printed by:
+`contracts/semantic-dimensions-v1.json` is the default source of dimension
+identities. Its content-addressed receipt is printed by:
 
 ```bash
 python tools/background_contract.py catalog
 ```
 
-The catalog is broader than a task. Background research selects and freezes a
-task-relevant subset. Every serialized run dimension repeats the catalog's
-stable id, definition, ownership boundary, and provenance exactly, then adds a
-task-specific selection reason, evidence receipts, mode, status, baseline, and
-hypotheses.
+Deterministic tools resolve the source through
+`framework_cfg.json.space_initialization.dimension_strategy`. The default
+`catalog_subset` strategy loads the built-in catalog. `llm_induced` instead
+has the background researcher create a validated
+`<run_dir>/dimension_catalog.json` from the task contract before literature
+retrieval. Its instructions live in `docs/dimension-induction.md` and are loaded
+only for that strategy. An explicit `--catalog` path overrides the catalog
+source, not the configured selection semantics.
 
-Agents may not invent a run-local dimension or route an idea into a catch-all.
-A genuine coverage gap is recorded as non-mutating prose; P4, not P1 setup,
-owns catalog expansion.
+With `catalog_subset`, the catalog is broader than a task and background
+research selects a task-relevant subset. With `llm_induced`, the run-local
+catalog is already the final task-specific dimension set, so the registry must
+use every catalog dimension exactly once and in catalog order. Under either
+strategy, every serialized run dimension must come from the resolved catalog
+and repeat its stable id, definition, ownership boundary, and provenance
+exactly, then add a task-specific selection reason, evidence receipts, mode,
+status, baseline, and hypotheses. A gap in the resolved catalog is recorded
+explicitly rather than routed into a catch-all dimension.
 
-The partition rule is the interface whose output changes directly:
+For `catalog_subset`, the built-in catalog applies the following ownership
+table. The induced strategy follows the task-first procedure in its on-demand
+guide without using this table as a candidate catalog:
 
 | interface changed | owner |
 |---|---|
@@ -73,7 +84,7 @@ The fenced `## Search space registry` JSON object has `schema_version: 3` and
 `kind: semantic_search_space`. Its top-level fields are:
 
 - stable run-local `space_id`;
-- exact `semantic-dimensions/v1` catalog receipt;
+- exact resolved catalog receipt;
 - non-empty selected `dimensions`;
 - explicit scoped `relations`;
 - structured negative `guidance`;
@@ -307,6 +318,9 @@ python tools/background_contract.py render \
 ```bash
 python tools/search_backends.py validate \
   --manifest <run_dir>/background_retrieval.json
+
+python tools/background_contract.py catalog \
+  --path <run_dir>/dimension_catalog.json  # llm_induced only
 
 python tools/background_contract.py validate \
   --background <run_dir>/background.md \

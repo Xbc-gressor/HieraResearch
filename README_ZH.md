@@ -98,8 +98,8 @@ tag: <你的运行标签>
 ```text
 读取主代理 prompt / task.toml / TASK.md
         ↓
-background-researcher: 多后端知识侦察 → background.md + background_retrieval.json
-    (设置阶段，必需一次；冻结 semantic-dimensions/v1 子集、显式基线、hyp-* 与关系)
+background-researcher: 解析维度策略 → 多后端知识侦察 → background.md + background_retrieval.json
+    (llm_induced 额外先生成 dimension_catalog.json；随后冻结显式基线、hyp-* 与关系)
         ↓
 (每 N 轮) experience-extractor: 提炼全局经验 → ledger.json experience 块
         ↓
@@ -191,9 +191,9 @@ step 0+1: tunable-contract-extractor
 
 ### 5.2 background-researcher
 
-证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置步骤）。读取 `TASK.md` / `task.toml`（优化目标、数据特征、`allow_dependencies` 约束），先分解多个研究问题。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend；DeepXiv 是显式选择的 open-world 学术条件，Jina 仅作为显式 live-web fallback/ablation。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序，再轮询补齐各 query 的覆盖。随后按 grounding lane（6000 tokens）渐进阅读，并同时寻找反证、复现和官方工件。它产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`。
+证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置步骤）。读取 `TASK.md` / `task.toml` / `prepare.py` 的候选可见接口，并先解析 `space_initialization.dimension_strategy`。默认 `catalog_subset` 从内置目录选取任务相关维度；`llm_induced` 则在检索文献前按需读取 `docs/dimension-induction.md`，直接生成最终的任务维度集 `<run_dir>/dimension_catalog.json`。随后才分解研究问题并检索证据。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend；DeepXiv 是显式选择的 open-world 学术条件，Jina 仅作为显式 live-web fallback/ablation。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序，再轮询补齐各 query 的覆盖。随后按 grounding lane（6000 tokens）渐进阅读，并同时寻找反证、复现和官方工件。它总是产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`，在 `llm_induced` 下另加维度目录。
 
-`background.md` 现在是 schema-3 的语义搜索空间：从唯一的 `semantic-dimensions/v1` 目录中选择并冻结相关维度；每个维度复制目录定义/边界/来源，登记显式任务基线与稳定 `hyp-*` 值；`activates` / `requires` / `excludes` 关系表示条件激活与不兼容组合。禁止 run-local/misc 维度；标量设置仍属于内层 HPO。人类可读的 Dimension coverage / Dimensions / Relations 与 JSON 层级必须一致。
+`background.md` 现在是 schema-3 的语义搜索空间：每个维度复制已解析目录的定义/边界/来源，登记显式任务基线与稳定 `hyp-*` 值；`catalog_subset` 可使用内置目录的子集，`llm_induced` 必须完整、按序使用 run-local 目录。`activates` / `requires` / `excludes` 关系表示条件激活与不兼容组合。标量设置仍属于内层 HPO。人类可读的 Dimension coverage / Dimensions / Relations 与 JSON 层级必须一致。
 
 来源、结构化负面指导 `g-*` 与每个假设继续使用同一组五轴范围：模型家族、数据情境、指标、干预机制、评估协议。只有直接覆盖假设的指导可影响资格；`unverified` / `contested` 负面只能提示。每个非基线假设保存 claim、比较项、重开条件、来源关系与独立文献可信度标签。绑定负面仍必须保留范围外 `scope_probe`，不会删除邻近机制。
 
@@ -354,7 +354,7 @@ runs/<task-name>/<tag>/loop_state.md
 
 `background.md` 与候选语义归因之间的确定性合约层：
 
-- `catalog`：输出唯一的 `semantic-dimensions/v1` 及内容摘要
+- `catalog`：校验并输出内置目录或显式 `--path` 目录及内容摘要
 - `validate`：检查 schema-3 层级、目录解析、显式基线、关系、五轴范围、来源/指导证据、人类视图以及所有 ledger 点/祖先/策略收据
 - `render`：输出有界的维度、假设、关系与覆盖视图
 - `preflight`：合法 P1 状态只返回 `none`；旧平面或 mixed-mode 直接拒绝，不迁移
@@ -539,11 +539,12 @@ runs/<task>/<tag>/framework_cfg.json
 - 任务特定的预算约束（例如，最大评估次数、单次评估时间限制）
 - 调整探索与利用的权衡
 
-**使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。
+**使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced` 直接持久化维度策略。
 
-文件包含三个主要部分：
+主要配置包括：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
-- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认是无需 LLM 打分的 `coverage`
+- **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
+- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认使用 `gain_uncertainty`，`coverage` 保留为确定性消融或失败回退策略
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

@@ -56,7 +56,7 @@ Other mutations remain:
     "space_id": "<run-local stable id>",
     "space_revision": "sha256:<exact background digest>",
     "catalog": {
-      "id": "semantic-dimensions/v1",
+      "id": "<resolved catalog id>",
       "revision": "sha256:<catalog digest>"
     },
     "dimension_ids": ["dim-..."]

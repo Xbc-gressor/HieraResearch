@@ -87,6 +87,47 @@ class DelegationGuardTests(unittest.TestCase):
             self.assertNotIn("--top-k", prompt)
             self.assertNotIn("--bottom-k", prompt)
 
+    def test_dimension_strategy_protocol_is_mirrored_and_loaded_on_demand(self) -> None:
+        guide = (ROOT / "docs" / "dimension-induction.md").read_text()
+        normalized_guide = " ".join(guide.split())
+        for required in (
+            "Prefer 4–10 dimensions",
+            "final dimension set for the run",
+            "no second subset-selection pass",
+            "do not fall back to the built-in catalog",
+        ):
+            self.assertIn(required, normalized_guide)
+
+        for relative_path in (
+            ".claude/agents/background-researcher.md",
+            ".opencode/agents/background-researcher.md",
+        ):
+            prompt = (ROOT / relative_path).read_text()
+            normalized_prompt = " ".join(prompt.split())
+            for required in (
+                "space_initialization.dimension_strategy",
+                "docs/dimension-induction.md",
+                "do not load it for `catalog_subset`",
+                "Use every induced dimension exactly once",
+                "dimension_catalog.json",
+            ):
+                self.assertIn(required, normalized_prompt, (relative_path, required))
+            self.assertNotIn("subset of the fixed", prompt)
+
+        for relative_path in (
+            ".claude/agents/autoresearch-experiment.md",
+            ".opencode/agents/autoresearch-experiment.md",
+        ):
+            prompt = (ROOT / relative_path).read_text()
+            normalized_prompt = " ".join(prompt.split())
+            for required in (
+                "dimension_strategy=catalog_subset|llm_induced",
+                "--dimension-strategy <catalog_subset|llm_induced>",
+                "background_contract.py catalog",
+                "missing or malformed",
+            ):
+                self.assertIn(required, normalized_prompt, (relative_path, required))
+
     def test_blocks_observed_role_collapse(self) -> None:
         prompt = "After writing train.py, also perform step 0+1 since budget is tight."
         self.assertIsNotNone(harness_guard.delegation_violation("candidate-writer", prompt))
