@@ -14,6 +14,7 @@ from search_backends import (
     LANE_BUDGETS,
     FrozenCorpusBackend,
     SearchBackend,
+    _validate_query_plan,
     add_visit,
     canonical_key,
     dispatch_search,
@@ -80,8 +81,14 @@ def main() -> int:
                 str(manifest_path),
                 "--frozen-corpus",
                 str(corpus_path),
-                "--query",
-                "regularized trees",
+                "--query-spec",
+                json.dumps(
+                    {
+                        "text": "regularized trees",
+                        "target_dimension_ids": ["dim-method-choice"],
+                        "evidence_roles": ["hypothesis"],
+                    }
+                ),
             ],
             text=True,
             capture_output=True,
@@ -118,8 +125,14 @@ def main() -> int:
                 "search",
                 "--manifest",
                 str(Path(tmp) / "must-not-run.json"),
-                "--query",
-                "regularized trees",
+                "--query-spec",
+                json.dumps(
+                    {
+                        "text": "regularized trees",
+                        "target_dimension_ids": ["dim-method-choice"],
+                        "evidence_roles": ["hypothesis"],
+                    }
+                ),
             ],
             text=True,
             capture_output=True,
@@ -129,8 +142,20 @@ def main() -> int:
         assert "select --backend explicitly" in implicit_external.stderr
 
     queries = [
-        {"id": "q-01", "text": "regularized trees", "lane": "grounding"},
-        {"id": "q-02", "text": "tree baseline failures", "lane": "grounding"},
+        {
+            "id": "q-01",
+            "text": "regularized trees",
+            "lane": "grounding",
+            "target_dimension_ids": ["dim-method-choice"],
+            "evidence_roles": ["hypothesis"],
+        },
+        {
+            "id": "q-02",
+            "text": "tree baseline failures",
+            "lane": "grounding",
+            "target_dimension_ids": ["dim-method-choice"],
+            "evidence_roles": ["baseline", "failure_mode"],
+        },
     ]
     deepxiv = FakeBackend(
         "deepxiv",
@@ -218,6 +243,27 @@ def main() -> int:
     assert any("content_chars must be positive" in error for error in errors), errors
 
     assert LANE_BUDGETS["grounding"] > LANE_BUDGETS["novelty"]
+
+    def plan_query(roles, targets=()):
+        return {
+            "id": "q-01",
+            "text": "planned",
+            "lane": "grounding",
+            "target_dimension_ids": list(targets),
+            "evidence_roles": list(roles),
+        }
+
+    for roles in (["hypothesis"], ["relation"], ["baseline", "hypothesis"]):
+        errors, _ = _validate_query_plan([plan_query(roles)], [])
+        assert any("must target at least one dimension" in e for e in errors), (roles, errors)
+    errors, _ = _validate_query_plan(
+        [plan_query(["baseline", "failure_mode", "counterevidence"])], []
+    )
+    assert errors == [], errors
+    errors, _ = _validate_query_plan(
+        [plan_query(["relation"], targets=("dim-method-choice",))], []
+    )
+    assert errors == [], errors
     print("Search backend, ranking, and visit-integrity checks passed.")
     return 0
 

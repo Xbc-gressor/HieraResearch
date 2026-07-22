@@ -97,12 +97,8 @@ to the primary context.
 
 ## Narrow checks
 
-For graph/context changes, start with:
-
-```bash
-python tools/validate_got.py
-```
-
 Add only the check implied by the touched contract. OpenCode runtime wiring is
 checked with the real CLI (`opencode debug agent <name>` and
 `opencode agent list`) rather than another repository-specific validator.
+
+Tests should be minimum. No new validators or tests unless every evidence points to its necessity.

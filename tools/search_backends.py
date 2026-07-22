@@ -30,8 +30,18 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LANE_BUDGETS = {"novelty": 2048, "grounding": 6000}
+EVIDENCE_ROLES = {
+    "hypothesis",
+    "baseline",
+    "failure_mode",
+    "counterevidence",
+    "relation",
+    "inner_hpo_prior",
+}
+INNER_HPO_ROLE = "inner_hpo_prior"
+DIMENSION_BOUND_ROLES = {"hypothesis", "relation"}
 MAX_SHARED = 6
 MAX_SELECTED = 18
 HTTP_TIMEOUT = 45
@@ -43,6 +53,7 @@ _ARXIV_RE = re.compile(
 _VERSION_RE = re.compile(r"v\d+$", re.IGNORECASE)
 _TAG_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _HTML_RE = re.compile(r"<[^>]+>")
+_DIMENSION_RE = re.compile(r"^dim-[a-z0-9][a-z0-9-]*$")
 
 
 def arxiv_id(url: str) -> str | None:
@@ -97,6 +108,7 @@ def new_manifest() -> dict[str, Any]:
         "lane_budgets": dict(LANE_BUDGETS),
         "retrieval_condition": None,
         "queries": [],
+        "coverage_exemptions": [],
         "results": [],
         "selected_keys": [],
         "backend_calls": [],
@@ -125,6 +137,107 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _validate_query_plan(
+    queries: Any, coverage_exemptions: Any
+) -> tuple[list[str], set[str]]:
+    errors: list[str] = []
+    query_ids: set[str] = set()
+    query_texts: set[str] = set()
+    targeted_dimensions: set[str] = set()
+
+    if not isinstance(queries, list):
+        return ["retrieval manifest queries must be a list"], query_ids
+    for index, query in enumerate(queries):
+        where = f"retrieval queries[{index}]"
+        if not isinstance(query, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        unknown = sorted(
+            set(query) - {"id", "text", "lane", "target_dimension_ids", "evidence_roles"}
+        )
+        if unknown:
+            errors.append(f"{where} has unknown fields {unknown}")
+        query_id = query.get("id")
+        if not isinstance(query_id, str) or not re.fullmatch(r"q-\d{2,}", query_id):
+            errors.append(f"{where}.id must match q-NN")
+        elif query_id in query_ids:
+            errors.append(f"duplicate retrieval query id {query_id}")
+        else:
+            query_ids.add(query_id)
+        if query.get("lane") not in LANE_BUDGETS:
+            errors.append(f"{where}.lane must be one of {sorted(LANE_BUDGETS)}")
+        if not isinstance(query.get("text"), str) or not query["text"].strip():
+            errors.append(f"{where}.text must be non-empty")
+        elif query["text"].strip().casefold() in query_texts:
+            errors.append(f"{where}.text duplicates another query")
+        else:
+            query_texts.add(query["text"].strip().casefold())
+
+        targets = query.get("target_dimension_ids")
+        valid_targets = isinstance(targets, list) and all(
+            isinstance(item, str) and _DIMENSION_RE.fullmatch(item) for item in targets
+        )
+        if not valid_targets:
+            errors.append(f"{where}.target_dimension_ids must be a list of dim-* ids")
+            targets = []
+        elif len(targets) != len(set(targets)):
+            errors.append(f"{where}.target_dimension_ids must not contain duplicates")
+        else:
+            targeted_dimensions.update(targets)
+
+        roles = query.get("evidence_roles")
+        valid_roles = (
+            isinstance(roles, list)
+            and bool(roles)
+            and all(isinstance(role, str) and role in EVIDENCE_ROLES for role in roles)
+        )
+        if not valid_roles:
+            errors.append(
+                f"{where}.evidence_roles must be a non-empty list drawn from "
+                f"{sorted(EVIDENCE_ROLES)}"
+            )
+            continue
+        if len(roles) != len(set(roles)):
+            errors.append(f"{where}.evidence_roles must not contain duplicates")
+        if INNER_HPO_ROLE in roles:
+            if roles != [INNER_HPO_ROLE]:
+                errors.append(
+                    f"{where} inner_hpo_prior must be the query's only evidence role"
+                )
+            if targets:
+                errors.append(f"{where} inner_hpo_prior must not target semantic dimensions")
+        elif not targets and set(roles) & DIMENSION_BOUND_ROLES:
+            errors.append(
+                f"{where} hypothesis/relation queries must target at least one dimension"
+            )
+
+    if not isinstance(coverage_exemptions, list):
+        errors.append("retrieval manifest coverage_exemptions must be a list")
+        return errors, query_ids
+    exempted_dimensions: set[str] = set()
+    for index, exemption in enumerate(coverage_exemptions):
+        where = f"retrieval coverage_exemptions[{index}]"
+        if not isinstance(exemption, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        unknown = sorted(set(exemption) - {"dimension_id", "rationale"})
+        if unknown:
+            errors.append(f"{where} has unknown fields {unknown}")
+        dimension_id = exemption.get("dimension_id")
+        if not isinstance(dimension_id, str) or not _DIMENSION_RE.fullmatch(dimension_id):
+            errors.append(f"{where}.dimension_id must be a dim-* id")
+        elif dimension_id in exempted_dimensions:
+            errors.append(f"duplicate retrieval coverage exemption {dimension_id}")
+        else:
+            exempted_dimensions.add(dimension_id)
+        if not isinstance(exemption.get("rationale"), str) or not exemption["rationale"].strip():
+            errors.append(f"{where}.rationale must be non-empty")
+    overlap = sorted(targeted_dimensions & exempted_dimensions)
+    if overlap:
+        errors.append(f"retrieval coverage exemptions duplicate query targets: {overlap}")
+    return errors, query_ids
+
+
 def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if manifest.get("schema_version") != SCHEMA_VERSION:
@@ -144,28 +257,10 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
             ):
                 errors.append("grounding token budget must exceed novelty token budget")
 
-    query_ids: set[str] = set()
-    query_texts: set[str] = set()
-    for index, query in enumerate(manifest.get("queries", [])):
-        where = f"retrieval queries[{index}]"
-        if not isinstance(query, dict):
-            errors.append(f"{where} must be an object")
-            continue
-        query_id = query.get("id")
-        if not isinstance(query_id, str) or not re.fullmatch(r"q-\d{2,}", query_id):
-            errors.append(f"{where}.id must match q-NN")
-        elif query_id in query_ids:
-            errors.append(f"duplicate retrieval query id {query_id}")
-        else:
-            query_ids.add(query_id)
-        if query.get("lane") not in LANE_BUDGETS:
-            errors.append(f"{where}.lane must be one of {sorted(LANE_BUDGETS)}")
-        if not isinstance(query.get("text"), str) or not query["text"].strip():
-            errors.append(f"{where}.text must be non-empty")
-        elif query["text"].strip().casefold() in query_texts:
-            errors.append(f"{where}.text duplicates another query")
-        else:
-            query_texts.add(query["text"].strip().casefold())
+    plan_errors, query_ids = _validate_query_plan(
+        manifest.get("queries"), manifest.get("coverage_exemptions")
+    )
+    errors.extend(plan_errors)
     condition = manifest.get("retrieval_condition")
     if query_ids and condition not in {"frozen", "open_world", "mixed"}:
         errors.append("retrieval_condition must describe a populated search")
@@ -364,25 +459,15 @@ class DeepXivBackend(SearchBackend):
 
     def __init__(self) -> None:
         executable = shutil.which("deepxiv")
-        if executable:
-            self.command = [executable]
-            self.env = None
-            version = subprocess.run(
-                self.command + ["--version"], text=True, capture_output=True,
-                timeout=10, check=False,
-            )
-            self.version = (version.stdout or version.stderr).strip() or "installed-cli-unknown"
-            return
-        sibling = ROOT.parent / "deepxiv_sdk" / "deepxiv_sdk" / "cli.py"
-        if not sibling.exists():
-            raise RuntimeError("DeepXiv CLI and sibling checkout are unavailable")
-        self.command = [sys.executable, "-m", "deepxiv_sdk.deepxiv_sdk.cli"]
-        self.env = dict(os.environ)
-        old_path = self.env.get("PYTHONPATH")
-        self.env["PYTHONPATH"] = str(ROOT.parent) + (os.pathsep + old_path if old_path else "")
-        version_file = ROOT.parent / "deepxiv_sdk" / "deepxiv_sdk" / "__init__.py"
-        match = re.search(r'__version__\s*=\s*["\']([^"\']+)', version_file.read_text())
-        self.version = match.group(1) if match else "sibling-unknown"
+        if not executable:
+            raise RuntimeError("deepxiv executable not found on PATH")
+        self.command = [executable]
+        self.env = None
+        version = subprocess.run(
+            self.command + ["--version"], text=True, capture_output=True,
+            timeout=10, check=False,
+        )
+        self.version = (version.stdout or version.stderr).strip() or "installed-cli-unknown"
 
     async def search(self, query: str, max_results: int) -> dict[str, Any]:
         return await asyncio.to_thread(self._search_sync, query, max_results)
@@ -574,9 +659,9 @@ def select_balanced(results: list[dict[str, Any]], query_ids: list[str]) -> list
 
 
 async def dispatch_search(
-    queries: list[dict[str, str]], backends: list[SearchBackend], max_results: int
+    queries: list[dict[str, Any]], backends: list[SearchBackend], max_results: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
-    tasks: list[tuple[dict[str, str], SearchBackend, asyncio.Task]] = []
+    tasks: list[tuple[dict[str, Any], SearchBackend, asyncio.Task]] = []
     for query in queries:
         for backend in backends:
             tasks.append(
@@ -714,12 +799,62 @@ def add_visit(
     )
 
 
+def _parse_cli_objects(
+    values: list[str], *, label: str, fields: set[str]
+) -> list[dict[str, Any]]:
+    parsed: list[dict[str, Any]] = []
+    for index, raw in enumerate(values, start=1):
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label} {index} is not valid JSON: {exc.msg}") from exc
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} {index} must be a JSON object")
+        unknown = sorted(set(item) - fields)
+        if unknown:
+            raise ValueError(f"{label} {index} has unknown fields {unknown}")
+        parsed.append(item)
+    return parsed
+
+
+def _reject_legacy_manifest(manifest: dict[str, Any]) -> None:
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"retrieval manifest schema_version must be {SCHEMA_VERSION}; "
+            "regenerate this disposable run artifact"
+        )
+
+
 def cmd_search(args: argparse.Namespace) -> int:
-    manifest = load_manifest(args.manifest)
+    specs = _parse_cli_objects(
+        args.query_spec,
+        label="--query-spec",
+        fields={"text", "target_dimension_ids", "evidence_roles"},
+    )
+    exemptions = _parse_cli_objects(
+        args.coverage_exemption or [],
+        label="--coverage-exemption",
+        fields={"dimension_id", "rationale"},
+    )
     queries = [
-        {"id": f"q-{index:02d}", "text": text, "lane": args.lane}
-        for index, text in enumerate(args.query, start=1)
+        {
+            "id": f"q-{index:02d}",
+            "text": spec.get("text"),
+            "lane": args.lane,
+            "target_dimension_ids": spec.get("target_dimension_ids"),
+            "evidence_roles": spec.get("evidence_roles"),
+        }
+        for index, spec in enumerate(specs, start=1)
     ]
+    plan_errors, _ = _validate_query_plan(queries, exemptions)
+    if plan_errors:
+        print(json.dumps({"ok": False, "errors": plan_errors}, indent=2), file=sys.stderr)
+        return 1
+
+    if args.manifest.exists():
+        existing = load_manifest(args.manifest)
+        _reject_legacy_manifest(existing)
+    manifest = new_manifest()
     names = args.backend or (["frozen"] if args.frozen_corpus else [])
     if not names:
         print(
@@ -762,6 +897,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 else "mixed"
             ),
             "queries": queries,
+            "coverage_exemptions": exemptions,
             "results": results,
             "selected_keys": select_balanced(results, [q["id"] for q in queries]),
             "backend_calls": calls,
@@ -778,6 +914,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_visit(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
+    _reject_legacy_manifest(manifest)
     budget = manifest.get("lane_budgets", LANE_BUDGETS).get(args.lane, LANE_BUDGETS[args.lane])
     view = args.view
     try:
@@ -826,6 +963,7 @@ def cmd_visit(args: argparse.Namespace) -> int:
 
 def cmd_record_visit(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
+    _reject_legacy_manifest(manifest)
     content = args.content_file.read_text(errors="replace") if args.content_file else None
     if args.status == "success" and not content:
         print(
@@ -858,7 +996,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = sub.add_parser("search", help="fan queries across usable backends")
     search.add_argument("--manifest", type=Path, required=True)
-    search.add_argument("--query", action="append", required=True)
+    search.add_argument(
+        "--query-spec",
+        action="append",
+        required=True,
+        help="JSON object with text, target_dimension_ids, and evidence_roles",
+    )
+    search.add_argument(
+        "--coverage-exemption",
+        action="append",
+        help="JSON object with dimension_id and rationale",
+    )
     search.add_argument("--backend", action="append", choices=["frozen", "deepxiv", "jina"])
     search.add_argument(
         "--frozen-corpus",

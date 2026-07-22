@@ -393,6 +393,14 @@ def main() -> int:
 
     # Retrieval provenance still gates every literature source.
     manifest = new_manifest()
+    manifest["coverage_exemptions"] = [
+        {
+            "dimension_id": dimension["id"],
+            "rationale": "Synthetic contract fixture does not run literature search.",
+        }
+        for dimension in registry["dimensions"]
+        if dimension["mode"] == "searchable"
+    ]
     add_visit(
         manifest,
         url=registry["sources"][0]["url"],

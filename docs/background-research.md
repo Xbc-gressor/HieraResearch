@@ -106,7 +106,7 @@ Each hypothesis preserves:
 
 - stable id, title, claim, `status: active`, and provenance receipts;
 - `kind: baseline`, `evidence_prior`, or `scope_probe`;
-- claim boundary and exact five-axis scope;
+- claim boundary and exact five-facet scope;
 - required local comparisons and reopening condition;
 - literature credibility and rationale;
 - testable lower-is-better expectation;
@@ -244,8 +244,20 @@ still tunes numeric parameters inside the chosen semantic point.
 
 ## Evidence-aware background research
 
-The retrieval path remains evidence-aware. Research first decomposes the task
-into independent questions, then uses an explicitly selected condition:
+The background-researcher runtime prompts keep only the mission, boundaries,
+and phase order always loaded; they load the operational details on demand
+from `docs/agent-resources/background-researcher/` (`retrieval.md` before the
+first retrieval action, `evidence-registry.md` before registry distillation,
+and `background-template.md` before writing the artifact).
+
+The retrieval path starts from the task contract and resolved registry. For each
+searchable dimension, research asks what evidence is needed to propose or
+compare hypotheses and to establish relevant relations, consolidating shared
+needs into many-to-many queries. It may add cross-cutting evidence **angles**—
+such as problem-class baselines, failure modes, or counterevidence—that are not
+claims about a particular search-space dimension. Those angles remain retrieval
+intent rather than becoming new dimensions. The resulting plan is run under an
+explicitly selected condition:
 
 - `frozen`: a pinned local JSON corpus for reproducible, network-disabled work;
 - `deepxiv`: optional open-world scholarly retrieval;
@@ -253,18 +265,49 @@ into independent questions, then uses an explicitly selected condition:
 - runtime-native web tools: fallback only, with successful content recorded
   through `search_backends.py record-visit`.
 
-The run-local `background_retrieval.json` records queries, backend failures,
-canonical deduplication, balanced selections, visits, content depth, budgets,
-versions, and hashes. Grounding has a 6000-token reading lane; novelty is a
-separate 2048-token lane. A novelty-only visit cannot support a registry claim.
+The run-local `background_retrieval.json` uses retrieval schema 2. In addition
+to backend failures, canonical deduplication, balanced selections, visits,
+content depth, budgets, versions, and hashes, each query records
+`target_dimension_ids` and `evidence_roles`. Queries are not dimensions: the
+alignment is many-to-many, and any target ids come from the resolved registry.
+Semantic roles are `hypothesis`, `baseline`, `failure_mode`, `counterevidence`,
+and `relation`. `hypothesis` and `relation` queries make claims inside the
+search space and must name at least one target; `baseline`, `failure_mode`,
+and `counterevidence` questions about the problem class as a whole may name
+none. A separate `inner_hpo_prior` query has no dimension targets and cannot
+be mixed with semantic roles.
 
-All registry sources must have a successful grounding visit. Search snippets,
-generated summaries, and unvisited URLs are insufficient. Frozen and live
-conditions cannot be mixed in one main evidence condition.
+Every `searchable` dimension needs at least one grounding query or a unique
+`coverage_exemption` with a rationale. `baseline_only` dimensions need no query
+coverage, and novelty-only queries do not satisfy grounding coverage. The query
+count is governed by evidence need and context budget, not a fixed number.
+
+Structured planning is passed to the adapter before any backend call:
+
+```bash
+python tools/search_backends.py search \
+  --manifest <run_dir>/background_retrieval.json --lane grounding \
+  --query-spec '{"text":"<bounded evidence question>","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","counterevidence"]}' \
+  --query-spec '{"text":"<problem-class comparator question>","target_dimension_ids":[],"evidence_roles":["baseline"]}' \
+  --query-spec '{"text":"<numeric prior question>","target_dimension_ids":[],"evidence_roles":["inner_hpo_prior"]}' \
+  --coverage-exemption '{"dimension_id":"<exact-uncovered-dim-id>","rationale":"<why applicable evidence is unavailable>"}' \
+  --frozen-corpus <pinned-corpus.json>
+```
+
+The exemption argument is omitted when queries cover every searchable
+dimension. Grounding has a 6000-token reading lane; novelty is a separate
+2048-token lane. A novelty-only visit cannot support a registry claim.
+
+All registry sources must have a successful grounding visit. Final background
+validation also joins query targets and exemptions to the registry, rejecting
+unknown ids and uncovered searchable dimensions. Search snippets, generated
+summaries, and unvisited URLs are insufficient. Frozen and live conditions
+cannot be mixed in one main evidence condition. Schema-1 retrieval manifests
+are rejected rather than migrated silently.
 
 ## Credibility, scope, and negative guidance
 
-Hypotheses keep the existing literature credibility axis:
+Hypotheses keep the existing literature credibility label:
 
 - `unverified`, `preliminary`, `corroborated`, `replicated`, or `contested`.
 
@@ -272,7 +315,7 @@ This is an external evidence stamp, not a truth score. A replicated method can
 fail locally; a preliminary hypothesis can work. P1 does not create the P2
 dimension/hypothesis run-status belief layer.
 
-Sources, hypotheses, and guidance share five exact-tag axes:
+Sources, hypotheses, and guidance share five exact-tag scope facets:
 
 - `model_families`, `data_regimes`, `metrics`, `interventions`, and
   `evaluation_protocols`.

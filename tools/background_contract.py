@@ -76,7 +76,7 @@ VALIDATION_STATUS = {
     "not_assessed",
 }
 EVIDENCE_ROLES = {"supports", "contradicts", "context"}
-SCOPE_AXES = (
+SCOPE_FACETS = (
     "model_families",
     "data_regimes",
     "metrics",
@@ -134,11 +134,11 @@ def _validate_scope(scope: Any, where: str) -> list[str]:
     errors: list[str] = []
     if not isinstance(scope, dict):
         return [f"{where} must be an object"]
-    unknown_axes = sorted(set(scope) - set(SCOPE_AXES))
-    if unknown_axes:
-        errors.append(f"{where} has unknown axes {unknown_axes}")
-    for axis in SCOPE_AXES:
-        values = scope.get(axis)
+    unknown_facets = sorted(set(scope) - set(SCOPE_FACETS))
+    if unknown_facets:
+        errors.append(f"{where} has unknown scope facets {unknown_facets}")
+    for facet in SCOPE_FACETS:
+        values = scope.get(facet)
         if (
             not isinstance(values, list)
             or not values
@@ -147,11 +147,11 @@ def _validate_scope(scope: Any, where: str) -> list[str]:
                 for value in values
             )
         ):
-            errors.append(f"{where}.{axis} must be a non-empty list of lowercase scope tags")
+            errors.append(f"{where}.{facet} must be a non-empty list of lowercase scope tags")
         elif len(values) != len(set(values)):
-            errors.append(f"{where}.{axis} must not contain duplicate tags")
+            errors.append(f"{where}.{facet} must not contain duplicate tags")
         elif "*" in values and len(values) != 1:
-            errors.append(f"{where}.{axis} wildcard must be the only tag")
+            errors.append(f"{where}.{facet} wildcard must be the only tag")
     return errors
 
 
@@ -162,9 +162,9 @@ def scope_relation(claim_scope: Any, target_scope: Any) -> str:
     ):
         return "unknown"
     direct = True
-    for axis in SCOPE_AXES:
-        claim_values = set(claim_scope[axis])
-        target_values = set(target_scope[axis])
+    for facet in SCOPE_FACETS:
+        claim_values = set(claim_scope[facet])
+        target_values = set(target_scope[facet])
         if "*" in claim_values:
             continue
         if claim_values.isdisjoint(target_values):
@@ -277,6 +277,73 @@ def _validate_sources(
                     f"source {source_id} was not successfully visited in the grounding lane"
                 )
     return errors, source_by_id
+
+
+def _validate_query_dimension_coverage(
+    registry: dict[str, Any], retrieval_manifest: dict[str, Any] | None
+) -> list[str]:
+    if retrieval_manifest is None:
+        return []
+    dimensions = registry.get("dimensions")
+    if not isinstance(dimensions, list):
+        return []
+    dimension_by_id = {
+        dimension.get("id"): dimension
+        for dimension in dimensions
+        if isinstance(dimension, dict) and isinstance(dimension.get("id"), str)
+    }
+    known_dimension_ids = set(dimension_by_id)
+    grounding_coverage: set[str] = set()
+    errors: list[str] = []
+
+    queries = retrieval_manifest.get("queries")
+    if isinstance(queries, list):
+        for index, query in enumerate(queries):
+            if not isinstance(query, dict):
+                continue
+            targets = query.get("target_dimension_ids")
+            if not isinstance(targets, list):
+                continue
+            valid_targets = {item for item in targets if isinstance(item, str)}
+            unknown = sorted(valid_targets - known_dimension_ids)
+            if unknown:
+                errors.append(
+                    f"retrieval query {query.get('id', index)!r} targets unknown registry "
+                    f"dimensions {unknown}"
+                )
+            if query.get("lane") == "grounding":
+                grounding_coverage.update(valid_targets & known_dimension_ids)
+
+    exempted: set[str] = set()
+    exemptions = retrieval_manifest.get("coverage_exemptions")
+    if isinstance(exemptions, list):
+        for index, exemption in enumerate(exemptions):
+            if not isinstance(exemption, dict):
+                continue
+            dimension_id = exemption.get("dimension_id")
+            if not isinstance(dimension_id, str):
+                continue
+            if dimension_id not in known_dimension_ids:
+                errors.append(
+                    f"retrieval coverage exemption {index} names unknown registry dimension "
+                    f"{dimension_id!r}"
+                )
+            else:
+                exempted.add(dimension_id)
+
+    uncovered = sorted(
+        dimension_id
+        for dimension_id, dimension in dimension_by_id.items()
+        if dimension.get("mode") == "searchable"
+        and dimension_id not in grounding_coverage
+        and dimension_id not in exempted
+    )
+    if uncovered:
+        errors.append(
+            "searchable registry dimensions lack a grounding query or coverage exemption: "
+            f"{uncovered}"
+        )
+    return errors
 
 
 def _credibility_errors(
@@ -815,6 +882,7 @@ def validate_registry(
     )
     source_errors, source_by_id = _validate_sources(registry, retrieval_manifest)
     errors.extend(source_errors)
+    errors.extend(_validate_query_dimension_coverage(registry, retrieval_manifest))
     errors.extend(_validate_hypotheses(registry, source_by_id))
     errors.extend(_validate_relations_evidence(registry, source_by_id))
     errors.extend(_validate_provenance_refs(registry, source_by_id))
