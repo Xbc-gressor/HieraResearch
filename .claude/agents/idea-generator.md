@@ -88,7 +88,12 @@ python tools/semantic_search.py propose \
 ```
 
 The helper deterministically completes baselines, explicit conditional
-inactivity, requirements, and exclusions. It emits bounded valid local choices:
+inactivity, requirements, and exclusions. It also owns effective eligibility:
+it composes the frozen space with the current `search_space_state` overlay,
+excludes runtime-pruned hypotheses from new proposals, pins runtime-pruned
+dimensions to their explicit baselines, orders deprioritized points last, and
+stamps the proposal set with `search_space_state_revision`. It emits bounded
+valid local choices:
 
 - `fresh`: under-covered baseline/intervention points, including bounded pairs;
 - `improve`: same-point reimplementation plus one-hop semantic neighbors;
@@ -158,10 +163,14 @@ python tools/semantic_search.py select \
   --point-output <...>/point.json --receipt-output <...>/policy.json
 ```
 
-The run-local config supplies the policy and weights. Correct a rejected
-prediction file at most once. If it still fails, use `--policy coverage` and let
-the receipt truthfully record the policy actually used; do not loop, preserve a
-failed model score, or invent missing scores.
+`select` also checks that the proposal set's `search_space_state_revision`
+equals the ledger's current overlay revision. A stale set is a protocol
+violation: re-run `propose` against the current overlay before selecting; never
+re-stamp or hand-edit a proposal set or receipt. The run-local config supplies
+the policy and weights. Correct a rejected prediction file at most once. If it
+still fails, use `--policy coverage` and let the receipt truthfully record the
+policy actually used; do not loop, preserve a failed model score, or invent
+missing scores.
 
 ## Step 4 — IDEATE a complete candidate at the selected point
 
@@ -197,10 +206,15 @@ python tools/ledger.py add-record \
   --candidate-name-hint '<name>' --description '<short summary>'
 ```
 
-Run `add-record` once per structural action, in action order. Re-read the brief
-for the next id after each write. The helper rejects stale revisions, incomplete
-points, invalid conditions/exclusions, nonnumeric ancestry, and mismatched
-receipts. Never hand-edit the ledger.
+Run `add-record` once per structural action, in action order, and complete
+propose → select → `add-record` for one action before starting the next; an
+intervening experience extractor is prohibited, so the stamped state revision
+cannot go stale mid-action. The admitted record must exist in the ledger before
+the coordinator creates a candidate directory or spawns candidate
+implementation. Re-read the brief for the next id after each write. The helper
+rejects stale space or state revisions, incomplete points, invalid
+conditions/exclusions, nonnumeric ancestry, and mismatched receipts. Never
+hand-edit the ledger.
 
 ## Output receipt
 
@@ -223,5 +237,9 @@ The ledger, semantic point, and policy receipt are the durable payload.
 - Do not write candidate code, run evaluations, tune parameters, or alter task
   files.
 - Do not write or refresh `background.md`.
+- Do not override a pruning decision: never reintroduce a pruned hypothesis or
+  a non-baseline value for a pruned dimension by hand-editing a point.
+- Do not hand-author, re-stamp, or alter a proposal set, semantic point, or
+  policy receipt.
 - Keep ancestry, semantic attribution, policy predictions, derived belief, and
   score observations distinct.

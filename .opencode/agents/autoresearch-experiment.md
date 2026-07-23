@@ -74,6 +74,11 @@ Continue rounds until the evaluation budget is exhausted or a hard stop occurs.
 - After setup, `background.md` and the resolved dimension catalog are immutable
   for the run and only `background-researcher` writes them. Preflight rejects
   revision drift.
+- Admission is round-serial. A belief refresh (experience storage plus
+  `apply-space-state`) completes before the next `idea-generator` spawn, and
+  propose → select → `add-record` for each action completes before any
+  candidate implementation starts. A stale `search_space_state_revision`
+  receipt is a protocol violation, never something to re-stamp.
 - Only deterministic helpers mutate `ledger.json`. Never hand-edit it.
 - Scores are lower-is-better. Missing or non-finite results are crashes and are
   worse than every finite score.
@@ -188,14 +193,27 @@ python tools/ledger.py set-phase --ledger <run_dir>/ledger.json \
 Before continuing, regenerate derived loop state with `ledger.py loop-state` if
 it disagrees with the brief.
 
-### 1. Refresh bounded belief when scheduled
+### 1. Refresh bounded belief at a refresh boundary
 
-After the first completed record and then every five rounds, spawn
-`experience-extractor` with the run directory. It revises only the bounded
-experience snapshot from the DAG delta, fixed Top/Bottom anchors, and compact
-semantic lineage. Skip it on empty or non-refresh rounds. A newer
+After the first completed record and then every five rounds, a scheduled
+refresh may run only at a refresh boundary: every record from the prior
+generation is terminal, the decoupled tuning step for that round has returned
+or no-op'd, and no idea-generator, candidate-writer, experience-extractor, or
+tuner child is active. Skip it on empty or non-refresh rounds. A newer
 `ledger.dag_revision` than `experience.dag_revision` is a normal pending delta,
 not a reason for an unscheduled refresh.
+
+Only at that boundary, spawn `experience-extractor` with the run directory. It
+regenerates the bounded two-level belief snapshot from the DAG delta, fixed
+Top/Bottom anchors, the deterministic per-target evidence view, and compact
+semantic lineage, then invokes `apply-space-state` once. Wait for belief
+storage plus `apply-space-state` to return before spawning the next
+`idea-generator`. The compact receipt carries `search_space_state_revision`
+and `decision_ids`; accept it as the refresh authority, but do not interpret
+belief or apply state transitions yourself. Parallelizing this refresh with
+candidate generation, evaluation, or tuning requires a future
+admission-revision contract and is prohibited by the current strict-equality
+protocol.
 
 ### 2. Generate and evaluate candidates
 
@@ -209,12 +227,15 @@ python tools/background_contract.py preflight \
 Only `action: none` proceeds. A rejection is a setup blocker; do not migrate or
 rewrite the frozen space.
 
-Spawn `idea-generator` once with the run directory. It obtains structural
-actions from `got_select`, selects valid semantic points under the configured
+Spawn `idea-generator` once with the run directory, only after any scheduled
+refresh has fully returned. It obtains structural actions from `got_select`,
+selects valid semantic points under the configured
 coverage/gain/gain-plus-uncertainty policy, creates complete ideas, and records
-pending candidates. Treat its receipt as the authority for each `run_id`, op,
-numeric parents, point id, and policy name. Do not override or silently drop an
-action.
+pending candidates; its propose → select → `add-record` completes per action
+without an intervening extractor. Treat its receipt as the authority for each
+`run_id`, op, numeric parents, point id, and policy name. Do not override or
+silently drop an action. Never create a candidate directory or spawn candidate
+implementation for a `run_id` whose record is not yet admitted to the ledger.
 
 For each returned action, in order:
 

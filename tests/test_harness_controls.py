@@ -87,10 +87,36 @@ ledger: /tmp/run/ledger.json
         experience = """updated_at_run: 005
 generation: 2
 evidence_runs: 5
+search_space_state_revision: 3
+decision_ids: sdec-000003
 ledger: /tmp/run/ledger.json
 """
         result = harness_guard.compact_task_result("experience-extractor", experience)
         self.assertIn("receipt_contract: ok", result)
+
+    def test_compacts_experience_state_decision_receipt(self) -> None:
+        decided = """updated_at_run: 007
+generation: 2
+evidence_runs: 5
+search_space_state_revision: 3
+decision_ids: sdec-000003
+ledger: /tmp/run/ledger.json
+"""
+        result = harness_guard.compact_task_result("experience-extractor", decided)
+        self.assertIn("receipt_contract: ok", result)
+        self.assertIn("search_space_state_revision: 3", result)
+        self.assertIn("decision_ids: sdec-000003", result)
+
+        noop = """updated_at_run: 007
+generation: 2
+evidence_runs: 5
+search_space_state_revision: 3
+decision_ids: none
+ledger: /tmp/run/ledger.json
+"""
+        result = harness_guard.compact_task_result("experience-extractor", noop)
+        self.assertIn("receipt_contract: ok", result)
+        self.assertIn("decision_ids: none", result)
 
 
 class UsageAndLifecycleTests(unittest.TestCase):

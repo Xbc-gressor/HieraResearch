@@ -30,8 +30,10 @@ RECEIPT_FIELDS = {
         ("tuned_run_id", "ledger_updated"),
     ),
     "experience-extractor": (
-        ("updated_at_run", "generation", "evidence_runs", "ledger"),
-        ("updated_at_run", "generation", "evidence_runs", "ledger"),
+        ("updated_at_run", "generation", "evidence_runs", "search_space_state_revision",
+         "decision_ids", "ledger"),
+        ("updated_at_run", "generation", "evidence_runs", "search_space_state_revision",
+         "decision_ids", "ledger"),
     ),
 }
 
