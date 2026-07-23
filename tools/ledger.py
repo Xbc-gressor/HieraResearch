@@ -39,7 +39,11 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-from search_space_state import empty_search_space_state, runtime_status_counts
+from search_space_state import (
+    append_experience_transitions,
+    empty_search_space_state,
+    runtime_status_counts,
+)
 from validate_tasks import ROOT, parse_task_toml
 
 
@@ -776,6 +780,79 @@ def cmd_set_experience(args) -> int:
     return 0
 
 
+def cmd_apply_space_state(args) -> int:
+    """Atomically apply the current experience's deterministic pruning transitions.
+
+    Loads and validates the background, ledger, stored experience, and current
+    overlay; derives and appends the transitions; re-validates the resulting
+    ledger; and saves once.  An empty transition set is a successful no-op.
+    Kept separate from ``set-experience`` so a failed policy transition never
+    corrupts or hides the replaceable belief snapshot.
+    """
+    from background_contract import (
+        load_registry,
+        validate_background_markdown,
+        validate_experience,
+        validate_registry,
+    )
+    from semantic_space import (
+        SemanticSpaceError,
+        resolve_dimension_catalog,
+        resolve_dimension_strategy,
+    )
+
+    ledger_path = Path(args.ledger)
+    background_path = Path(args.background)
+    data = _load_ledger(ledger_path)
+    registry = load_registry(background_path)
+    try:
+        dimension_strategy = resolve_dimension_strategy(background_path)
+        catalog = resolve_dimension_catalog(
+            background_path,
+            explicit_path=Path(args.catalog) if args.catalog else None,
+        )
+    except SemanticSpaceError as exc:
+        raise SystemExit(f"invalid dimension catalog: {exc}") from exc
+    errors = validate_registry(
+        registry,
+        ledger=data,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
+    errors.extend(validate_background_markdown(background_path, registry))
+    experience = data.get("experience")
+    if isinstance(experience, dict):
+        errors.extend(validate_experience(experience, registry, data))
+    if errors:
+        raise SystemExit("invalid P2 background/ledger/experience: " + "; ".join(errors))
+
+    state = data.get("search_space_state")
+    prior_revision = state.get("revision", 0) if isinstance(state, dict) else 0
+    decisions = append_experience_transitions(registry, data)
+    errors = validate_registry(
+        registry,
+        ledger=data,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
+    if errors:
+        raise SystemExit("invalid search-space transition: " + "; ".join(errors))
+    _save_ledger(ledger_path, data)
+    state = data.get("search_space_state")
+    revision = state.get("revision", prior_revision) if isinstance(state, dict) else prior_revision
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "prior_revision": prior_revision,
+                "revision": revision,
+                "decision_ids": [decision["decision_id"] for decision in decisions],
+            }
+        )
+    )
+    return 0
+
+
 def cmd_show(args) -> int:
     data = _load_ledger(Path(args.ledger))
     if args.experience:
@@ -841,6 +918,12 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--from-json", required=True, type=Path,
                      help="JSON file with the experience block to store (overwrites).")
     exp.set_defaults(func=cmd_set_experience)
+
+    apply_state = sub.add_parser("apply-space-state", parents=[common])
+    apply_state.add_argument("--background", required=True,
+                             help="hierarchical background.md that freezes this run's search space")
+    apply_state.add_argument("--catalog", help="explicit dimension catalog override")
+    apply_state.set_defaults(func=cmd_apply_space_state)
 
     run = sub.add_parser("record-run", parents=[common])
     run.add_argument("--run-id", required=True)

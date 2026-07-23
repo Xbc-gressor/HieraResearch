@@ -13,6 +13,14 @@ Reopening appends a new decision; pruning never deletes an id, a record, a
 point, an observation, or a prior decision.  Automated pruning is two-stage:
 ``active -> deprioritized`` in one experience generation, then
 ``deprioritized -> pruned`` in a later one; ``active -> pruned`` is forbidden.
+
+:func:`derive_experience_transitions` deterministically turns the current
+validated experience snapshot into the next decision receipts, and
+:func:`append_experience_transitions` appends them, advancing only
+``search_space_state.revision`` (never ``dag_revision``).  Recommendation
+gates recompute comparator coverage and evaluation state from the cited
+receipts rather than trusting belief prose; baseline and externally excluded
+targets never receive a runtime transition.
 """
 
 from __future__ import annotations
@@ -20,6 +28,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from semantic_evidence import (
+    comparator_coverage,
+    edge_observation,
+    target_evaluation_state,
+)
 from semantic_space import dimension_map, hypothesis_map, selected_assignments
 
 
@@ -441,3 +454,339 @@ def validate_point_eligibility(
                 "pruning bars new proposals but never erases the id"
             )
     return errors
+
+
+# ---------- deterministic experience-to-pruning transitions ----------
+
+
+def _effective_recommendation(
+    belief: dict[str, Any], evaluation_state: str, coverage: dict[str, int]
+) -> str | None:
+    """Gate the authored recommendation on mechanically recomputed evidence.
+
+    A ``pruned`` recommendation that only meets the deprioritize gate is
+    carried out as a deprioritization; a recommendation whose gates fail
+    yields no transition at all (``None``), never a reopening.
+    """
+    recommended = belief.get("recommended_status")
+    if recommended == "active":
+        return "active"
+    if recommended not in {"deprioritized", "pruned"}:
+        return None
+    deprioritize_ok = (
+        belief.get("assessment") == "unpromising"
+        and belief.get("confidence") in {"med", "high"}
+        and evaluation_state in {"observed", "comparator_covered"}
+        and coverage["direct_noncrash_edges"] >= 1
+        and _nonempty(belief.get("reopen_when"))
+    )
+    if not deprioritize_ok:
+        return None
+    if recommended == "deprioritized":
+        return "deprioritized"
+    prune_ok = (
+        belief.get("confidence") == "high"
+        and evaluation_state == "comparator_covered"
+        and coverage["direct_noncrash_edges"] >= 2
+    )
+    return "pruned" if prune_ok else "deprioritized"
+
+
+def _normalized_beliefs(
+    ledger: dict[str, Any],
+    experience: dict[str, Any],
+    generation: int,
+    dag_revision: int,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Re-derive each target belief's coverage/state and gate its recommendation.
+
+    The normalized belief carries ``experience_generation`` and
+    ``experience_dag_revision`` from the snapshot so downstream comparisons
+    never read the raw experience again.
+    """
+    beliefs: dict[tuple[str, str], dict[str, Any]] = {}
+    for field, target_kind in (
+        ("dimension_evidence", "dimension"),
+        ("hypothesis_evidence", "hypothesis"),
+    ):
+        items = experience.get(field)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            target_id = item.get("target_id")
+            if not _nonempty(target_id):
+                continue
+            edge_ids = [
+                str(edge_id)
+                for edge_id in item.get("evidence_edge_ids") or []
+                if isinstance(edge_id, str)
+            ]
+            run_ids = [
+                str(run_id)
+                for run_id in item.get("evidence_run_ids") or []
+                if isinstance(run_id, str)
+            ]
+            coverage = comparator_coverage(
+                ledger, edge_ids, target_kind=target_kind, target_id=target_id
+            )
+            evaluation_state = target_evaluation_state(
+                ledger,
+                target_kind=target_kind,
+                target_id=target_id,
+                evidence_run_ids=run_ids,
+                evidence_edge_ids=edge_ids,
+            )
+            beliefs[(target_kind, target_id)] = {
+                "assessment": item.get("assessment"),
+                "confidence": item.get("confidence"),
+                "claim": item.get("claim"),
+                "uncertainty": item.get("uncertainty"),
+                "reopen_when": item.get("reopen_when"),
+                "evidence_edge_ids": edge_ids,
+                "comparator_coverage": coverage,
+                "evaluation_state": evaluation_state,
+                "recommended_status": _effective_recommendation(
+                    item, evaluation_state, coverage
+                ),
+                "experience_generation": generation,
+                "experience_dag_revision": dag_revision,
+            }
+    return beliefs
+
+
+def _has_reopening_evidence(belief: dict[str, Any], last: dict | None) -> bool:
+    """True only for a later generation with a newer cursor or a new edge."""
+    if last is None:
+        return False
+    if belief["experience_generation"] <= last["experience_generation"]:
+        return False
+    if belief["experience_dag_revision"] > last["experience_dag_revision"]:
+        return True
+    prior_edge_ids = last.get("evidence_edge_ids")
+    if not isinstance(prior_edge_ids, list):
+        return False
+    return any(
+        edge_id not in prior_edge_ids for edge_id in belief["evidence_edge_ids"]
+    )
+
+
+def _recommended_transition(current: str, belief: dict[str, Any], last: dict | None) -> str | None:
+    recommendation = belief["recommended_status"]
+    if current == "active" and recommendation in {"deprioritized", "pruned"}:
+        return "deprioritized"
+    if current == "deprioritized" and recommendation == "pruned":
+        if last is not None and belief["experience_generation"] > last["experience_generation"]:
+            return "pruned"
+        return None
+    if current in {"deprioritized", "pruned"} and recommendation == "active":
+        if _has_reopening_evidence(belief, last):
+            return "active"
+    return None
+
+
+def _dimension_prune_ready(
+    dimension: dict[str, Any],
+    generation: int,
+    runtime: dict[str, Any],
+    guidance: dict[str, Any],
+    beliefs: dict[tuple[str, str], dict[str, Any]],
+) -> bool:
+    """Scoped guard: pruning a dimension never bans adjacent mechanisms.
+
+    Every non-baseline hypothesis must be externally excluded, already
+    runtime-pruned, or covered by its own same-generation belief that
+    independently satisfies the high-confidence comparator-covered prune gate.
+    """
+    for hypothesis in dimension.get("hypotheses", []):
+        if not isinstance(hypothesis, dict):
+            continue
+        if hypothesis.get("kind") == "baseline":
+            continue
+        hypothesis_id = hypothesis.get("id")
+        entry = guidance.get(hypothesis_id) if isinstance(guidance, dict) else None
+        if isinstance(entry, dict) and entry.get("selection_status") == "excluded":
+            continue
+        if runtime["hypotheses"].get(hypothesis_id) == "pruned":
+            continue
+        belief = beliefs.get(("hypothesis", hypothesis_id))
+        if belief is None:
+            return False
+        if belief["experience_generation"] != generation:
+            return False
+        if belief["recommended_status"] != "pruned":
+            return False
+    return True
+
+
+def _decision_receipt(
+    ledger: dict[str, Any],
+    revision: int,
+    kind: str,
+    dimension_id: str,
+    target_id: str,
+    from_status: str,
+    to_status: str,
+    belief: dict[str, Any],
+    last: dict | None,
+) -> dict[str, Any]:
+    """Copy the belief and the current edge observations into an immutable receipt."""
+    reopen_when = belief.get("reopen_when")
+    if not _nonempty(reopen_when) and isinstance(last, dict):
+        reopen_when = last.get("reopen_when")
+    observations = []
+    for edge_id in belief["evidence_edge_ids"]:
+        observation = edge_observation(ledger, edge_id)
+        observations.append(
+            {
+                "edge_id": observation.get("edge_id") or edge_id,
+                "parent_status": observation.get("parent_status"),
+                "child_status": observation.get("child_status"),
+                "parent_score": observation.get("parent_score"),
+                "child_score": observation.get("child_score"),
+                "delta": observation.get("delta"),
+            }
+        )
+    return {
+        "schema_version": DECISION_SCHEMA_VERSION,
+        "decision_id": f"sdec-{revision:06d}",
+        "revision": revision,
+        "target": {"kind": kind, "dimension_id": dimension_id, "id": target_id},
+        "from_status": from_status,
+        "to_status": to_status,
+        "experience_generation": belief["experience_generation"],
+        "experience_dag_revision": belief["experience_dag_revision"],
+        "assessment": belief["assessment"],
+        "confidence": belief["confidence"],
+        "claim": belief["claim"],
+        "uncertainty": belief["uncertainty"],
+        "reopen_when": reopen_when,
+        "evidence_edge_ids": list(belief["evidence_edge_ids"]),
+        "comparator_coverage": dict(belief["comparator_coverage"]),
+        "evidence_observations": observations,
+    }
+
+
+def derive_experience_transitions(
+    registry: dict[str, Any], ledger: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Derive the next append-only decisions from the current experience.
+
+    Pure: returns the receipts that would be appended without mutating the
+    ledger.  Decisions follow registry dimension order, a dimension before
+    its hypotheses; baseline hypotheses, ``baseline_only`` dimensions, and
+    externally excluded hypotheses never receive a runtime transition.
+    """
+    experience = ledger.get("experience") if isinstance(ledger, dict) else None
+    if not isinstance(experience, dict):
+        return []
+    generation = experience.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        return []
+    dag_revision = experience.get("dag_revision")
+    if not isinstance(dag_revision, int) or isinstance(dag_revision, bool) or dag_revision < 0:
+        dag_revision = 0
+    state = ledger.get("search_space_state")
+    if not isinstance(state, dict):
+        state = empty_search_space_state()
+    decisions = [
+        decision
+        for decision in state.get("decisions") or []
+        if isinstance(decision, dict)
+    ]
+    runtime = replay_search_space_state(registry, state)
+    beliefs = _normalized_beliefs(ledger, experience, generation, dag_revision)
+    if not beliefs:
+        return []
+    # Lazy import: background_contract already imports this module.
+    from background_contract import derive_hypothesis_selection
+
+    guidance = derive_hypothesis_selection(registry)
+    last_decisions: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for decision in decisions:
+        target = decision.get("target")
+        if isinstance(target, dict):
+            last_decisions[(target.get("kind"), target.get("id"))] = decision
+    base_revision = state.get("revision")
+    if not isinstance(base_revision, int) or isinstance(base_revision, bool):
+        base_revision = len(decisions)
+
+    transitions: list[dict[str, Any]] = []
+    for dimension_id, dimension in dimension_map(registry).items():
+        belief = beliefs.get(("dimension", dimension_id))
+        if belief is not None and dimension.get("mode") != "baseline_only":
+            current = runtime["dimensions"].get(dimension_id, "active")
+            last = last_decisions.get(("dimension", dimension_id))
+            to_status = _recommended_transition(current, belief, last)
+            if to_status == "pruned" and not _dimension_prune_ready(
+                dimension, generation, runtime, guidance, beliefs
+            ):
+                to_status = None
+            if to_status is not None:
+                base_revision += 1
+                transitions.append(
+                    _decision_receipt(
+                        ledger,
+                        base_revision,
+                        "dimension",
+                        dimension_id,
+                        dimension_id,
+                        current,
+                        to_status,
+                        belief,
+                        last,
+                    )
+                )
+        for hypothesis in dimension.get("hypotheses", []):
+            if not isinstance(hypothesis, dict):
+                continue
+            hypothesis_id = hypothesis.get("id")
+            belief = beliefs.get(("hypothesis", hypothesis_id))
+            if belief is None:
+                continue
+            if hypothesis.get("kind") == "baseline":
+                continue  # the frozen space keeps an unconditional valid baseline
+            entry = guidance.get(hypothesis_id)
+            if isinstance(entry, dict) and entry.get("selection_status") == "excluded":
+                continue  # runtime decisions never override external exclusion
+            current = runtime["hypotheses"].get(hypothesis_id, "active")
+            last = last_decisions.get(("hypothesis", hypothesis_id))
+            to_status = _recommended_transition(current, belief, last)
+            if to_status is not None:
+                base_revision += 1
+                transitions.append(
+                    _decision_receipt(
+                        ledger,
+                        base_revision,
+                        "hypothesis",
+                        dimension_id,
+                        hypothesis_id,
+                        current,
+                        to_status,
+                        belief,
+                        last,
+                    )
+                )
+    return transitions
+
+
+def append_experience_transitions(
+    registry: dict[str, Any], ledger: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Append the derived decisions and advance only the overlay revision.
+
+    An empty transition set is a successful no-op.  ``dag_revision`` is never
+    touched: it tracks graph-visible score/status changes only.
+    """
+    transitions = derive_experience_transitions(registry, ledger)
+    if not transitions:
+        return []
+    state = ledger.get("search_space_state")
+    if not isinstance(state, dict):
+        state = empty_search_space_state()
+        ledger["search_space_state"] = state
+    decisions = state.setdefault("decisions", [])
+    decisions.extend(transitions)
+    state["revision"] = len(decisions)
+    return transitions

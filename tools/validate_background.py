@@ -762,6 +762,33 @@ def main() -> int:
         assert math.isinf(stored["records"][1]["final_best_score"])
         assert stored["experience"]["dag_revision"] == stored["dag_revision"]
 
+        # The append-only pruning pass follows set-experience; without target
+        # beliefs it is a successful no-op that saves once and moves nothing.
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "ledger.py"),
+                "apply-space-state",
+                "--ledger",
+                str(ledger_path),
+                "--background",
+                str(background_path),
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        applied = json.loads(completed.stdout)
+        assert applied == {
+            "ok": True,
+            "prior_revision": 0,
+            "revision": 0,
+            "decision_ids": [],
+        }, applied
+        stored = json.loads(ledger_path.read_text())
+        assert stored["search_space_state"] == empty_search_space_state()
+
     proposals = fresh_proposals["proposals"]
     assert len(proposals) >= 2
     predictions = {
