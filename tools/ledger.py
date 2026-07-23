@@ -20,6 +20,7 @@ Shape:
       "tag": "agent-main-smoke",
       "metric": "mean_test_accuracy",
       "search_space": { ... },           # exact catalog + background revision
+      "search_space_state": { ... },     # append-only P2 runtime eligibility overlay
       "dag_revision": 12,              # monotone graph-change cursor
       "records": [ {record}, ... ]   # ordered by run_id
     }
@@ -396,7 +397,7 @@ def cmd_add_record(args) -> int:
     )
     background_errors.extend(validate_background_markdown(background_path, registry))
     if background_errors:
-        raise SystemExit("invalid P1 background/ledger: " + "; ".join(background_errors))
+        raise SystemExit("invalid P2 background/ledger: " + "; ".join(background_errors))
 
     if _get_record(data, args.run_id) is not None:
         raise SystemExit(f"record already exists for run_id {args.run_id}")
@@ -514,8 +515,8 @@ def record_run(
 ) -> dict:
     """Fill one record's result score (the config-eval best — there is no separate
     official run) and the (auto) keep/discard/crash status. Owns `final_best_score`
-    and `status`; tuning metadata is written by `set-tuning`. P1 requires every
-    candidate to have a validated semantic mapping, so missing records are not
+    and `status`; tuning metadata is written by `set-tuning`. Every candidate
+    requires a validated semantic mapping, so missing records are not
     synthesized by the result path. Returns the updated record.
     """
     config = load_task_config(task_name)
@@ -781,7 +782,7 @@ def cmd_set_experience(args) -> int:
         errors.extend(validate_experience(experience, registry, data))
         errors.extend(validate_experience_replacement(experience, data))
     if errors:
-        raise SystemExit("invalid P1 experience replacement: " + "; ".join(errors))
+        raise SystemExit("invalid P2 experience replacement: " + "; ".join(errors))
     _set_experience(ledger_path, experience)
     keys = list(experience.keys()) if isinstance(experience, dict) else None
     print(json.dumps({"ok": True, "experience_keys": keys}))

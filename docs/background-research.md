@@ -1,4 +1,4 @@
-# Background as a semantic search space (P1)
+# Background as a semantic search space (P2)
 
 HieraResearch uses `background.md` to define the frozen outer semantic search
 space for one run. It is no longer a flat list of end-to-end directions.
@@ -7,11 +7,15 @@ The contract deliberately separates:
 
 - **space definition** — catalog dimensions, task hypotheses, conditions, and
   exclusions in `background.md`;
-- **candidate attribution** — a complete `semantic_point` in each ledger record;
+- **candidate attribution** — a complete `semantic_point` in each ledger
+  record, plus helper-derived per-parent `semantic_edges` receipts;
 - **ancestry** — numeric parent ids in `source_run_ids`;
 - **observations** — scores, crashes, tuning metadata, and logs in raw records;
 - **derived belief** — the bounded regenerated `ledger.experience` snapshot;
-- **selection policy** — a replaceable `policy_receipt` for each chosen point.
+- **selection policy** — a replaceable `policy_receipt` for each chosen point;
+- **runtime eligibility** — the append-only `ledger.search_space_state`
+  decision overlay that filters future proposals without touching the frozen
+  registry.
 
 A candidate remains a complete concrete solution. Its point says which
 hypotheses it instantiates; it does not claim that those hypotheses fully
@@ -90,7 +94,7 @@ The fenced `## Search space registry` JSON object has `schema_version: 3` and
 - structured negative `guidance`;
 - inspected evidence `sources`.
 
-Every selected dimension is `active` in P1 and has:
+Every registered dimension keeps `status: active` in the frozen registry and has:
 
 - `mode: searchable` or `baseline_only`;
 - one explicit `kind: baseline` hypothesis;
@@ -112,10 +116,11 @@ Each hypothesis preserves:
 - testable lower-is-better expectation;
 - typed source evidence links.
 
-P1 does not author pruned hypotheses or dimensions. `active`, directly
+The frozen registry never authors pruning state. `active`, directly
 `deprioritized`, and directly `excluded` eligibility are derived from typed
 external guidance without deleting the registered element. Evidence-preserving
-run-time pruning is P2.
+run-time pruning is implemented in the append-only `search_space_state`
+overlay described below; it never appears inside the registry.
 
 ## Conditions and exclusions
 
@@ -173,9 +178,15 @@ field cannot mean inactive.
 
 `source_run_ids` now contains only numeric parents: zero for `fresh`, one for
 `improve`, and two distinct parents for `crossover`. Hypothesis ids never appear
-there. `background_contract.py lineage` can reconstruct point differences from
-parents mechanically while warning that they are attribution, not causal edges.
-Persistent semantic DAG receipts are P2.
+there. Every non-fresh record also persists one mechanical receipt per numeric
+parent in `semantic_edges` (schema 1): the helper derives the exact point
+difference between the persisted parent and child points — `hypothesis_changed`,
+`dimension_activated`, or `dimension_deactivated` per changed assignment, with a
+`change_class` of `same_point`, `single_dimension`, or `multi_dimension` that is
+an attribution-strength category, not a causal claim. Models never author these
+receipts, and validation rebuilds them and requires exact persisted equality.
+`background_contract.py lineage` can reconstruct the same point differences
+from parents while warning that they are attribution, not causal edges.
 
 The first ledger write preserves a top-level `search_space` receipt. Later
 candidate additions, experience replacements, and preflight checks fail if the
@@ -241,6 +252,76 @@ runs, or prediction-failure fallback, for example:
 Changing the acquisition policy does not change registry or history semantics.
 `got_select` still owns outer graph exploration and parent selection; inner HPO
 still tunes numeric parameters inside the chosen semantic point.
+
+## Evidence, belief, and pruning
+
+The implemented P2 loop closes over the frozen registry without mutating it:
+
+```text
+background schema 3 (immutable S)
+  -> semantic point selection at search_space_state revision r
+  -> candidate + persistent semantic edge receipts
+  -> score/crash observations
+  -> bounded experience schema 3 (replaceable belief)
+  -> deterministic validated decision transition
+  -> append-only search_space_state revision r+1
+  -> next proposal set filters/orders against r+1
+```
+
+Every proposal set and policy receipt carries the
+`search_space_state_revision` it was built against; `select` and `add-record`
+reject stale revisions. Historical points remain valid at the revision where
+they were selected: later pruning never rewrites a record, a point, an
+observation, or a prior decision, and reopening appends a new transition.
+
+Three state families stay distinct. External guidance is `active`,
+`deprioritized`, or `excluded`. Runtime control is `active`, `deprioritized`,
+or `pruned`. Belief coverage is `unevaluated`, `failed`, `observed`, or
+`comparator_covered`. A crash is `+inf`, distinct from an unevaluated target,
+and cannot by itself contradict or prune a semantic element. Automated pruning
+is two-stage (`active -> deprioritized`, then `deprioritized -> pruned` in a
+later experience generation), and every recommendation is gated on
+mechanically recomputed evidence: deprioritization needs an unpromising
+med/high-confidence belief with at least one direct non-crash edge, pruning a
+high-confidence comparator-covered belief with at least two. Transitions never
+touch baselines, `baseline_only` dimensions, or externally `excluded`
+hypotheses. A dimension may be pruned only when every selectable non-baseline
+hypothesis in it is externally excluded, already runtime-pruned, or
+independently prune-recommended in the same generation, so evidence against
+one hypothesis cannot ban adjacent mechanisms. A runtime-pruned dimension keeps its explicit baseline eligible:
+new proposals pin the dimension to `baseline_hypothesis_id` instead of
+changing point arity or the frozen `space_revision`, because the overlay
+restricts which points may be proposed next — it does not redefine the space
+their receipts are attributed to. `ledger.dag_revision` tracks graph-visible
+score/status changes only; `search_space_state.revision` independently counts
+append-only decisions.
+
+A “dimension added/removed” edge in the roadmap is represented inside a fixed
+run as the conditional receipt operations `dimension_activated` /
+`dimension_deactivated`: the dimension was always registered, and the edge
+records a change in its point-level activity. Changing registry membership
+itself is P4 expansion and remains deferred.
+
+The experience extractor never reconstructs comparator coverage from the
+Top/Bottom graph window. Its authoritative bounded source is:
+
+```bash
+python tools/background_contract.py target-evidence \
+  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
+  --max-dimensions 16 --max-hypotheses 32 --max-edges-per-target 5
+```
+
+For each target it returns the exact cited `evidence_edge_ids`, per-edge
+score/status observations, the mechanical `evaluation_state`, and the cited
+`comparator_coverage`, disclosing bounded-view loss through
+`available_comparator_coverage` and `omitted_edge_counts`. Repeated
+`--target-id` selects exact known targets for a smaller follow-up view.
+
+Admission is strictly round-serial: experience extraction and
+`apply-space-state` run only at quiescent round boundaries, and
+propose -> select -> `add-record` completes before any candidate
+implementation starts. No extractor overlaps an in-flight candidate action;
+concurrent admission is deferred until it has an explicit revision contract.
 
 ## Evidence-aware background research
 
@@ -312,8 +393,9 @@ Hypotheses keep the existing literature credibility label:
 - `unverified`, `preliminary`, `corroborated`, `replicated`, or `contested`.
 
 This is an external evidence stamp, not a truth score. A replicated method can
-fail locally; a preliminary hypothesis can work. P1 does not create the P2
-dimension/hypothesis run-status belief layer.
+fail locally; a preliminary hypothesis can work. Run-status belief about
+dimensions and hypotheses lives in the schema-3 experience snapshot and the
+`search_space_state` overlay, never in this registry stamp.
 
 Sources, hypotheses, and guidance share five exact-tag scope facets:
 
@@ -379,6 +461,14 @@ python tools/background_contract.py lineage \
   --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
   --compact --limit 8
 
+python tools/background_contract.py target-evidence \
+  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
+  [--target-id <exact-id> ...]
+
+python tools/background_contract.py validate-experience \
+  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
+  --experience <experience.json>
+
 python tools/semantic_search.py propose \
   --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
   --op <op> --parents <ids> --output <proposals.json>
@@ -388,15 +478,24 @@ python tools/semantic_search.py select \
   --ledger <run_dir>/ledger.json \
   --point-output <point.json> --receipt-output <policy.json>
 
+python tools/ledger.py set-experience \
+  --ledger <run_dir>/ledger.json --background <run_dir>/background.md \
+  --from-json <experience.json>
+
+python tools/ledger.py apply-space-state \
+  --ledger <run_dir>/ledger.json --background <run_dir>/background.md
+
 python tools/validate_background.py
 ```
 
 Legacy `## Direction registry` files and schema 1/2 data fail with an explicit
-error. P1 intentionally provides no migration path for local disposable runs.
+error. The contract intentionally provides no migration path for local
+disposable runs.
 
-## P1 boundary
+## Deferred boundary
 
-This implementation does not add evidence-preserving pruning, two-level
-dimension/hypothesis belief extraction, persistent semantic DAG edge receipts,
-intermediate-log bottleneck retrieval, dynamic space expansion, or convergence
-claims. Those remain ordered P2–P4 work.
+Evidence-preserving pruning, two-level dimension/hypothesis belief extraction,
+and persistent semantic DAG edge receipts are implemented above. Still
+deferred: intermediate-log bottleneck retrieval (P3), dynamic space expansion
+including registry membership changes (P4), and convergence/regret claims.
+Concurrent admission is deferred until it has an explicit revision contract.

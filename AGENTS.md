@@ -79,6 +79,10 @@ to the primary context.
 - Never hand-edit `runs/**/ledger.json`; use `tools/ledger.py`.
 - Experience refresh reads `got_graph.py render --incremental` with fixed
   Top/Bottom anchors. Do not inject the unbounded full ledger or global DAG.
+- Dimension/hypothesis beliefs cite `background_contract.py target-evidence`
+  only; `ledger.py apply-space-state` owns every append-only
+  `search_space_state` transition. The frozen registry never carries runtime
+  pruning state.
 - Retrieve a full record, source, or log only when a compact view identifies a
   specific missing field or bottleneck.
 - Do not collapse role boundaries to save time. An evaluation budget does not
@@ -100,5 +104,3 @@ to the primary context.
 Add only the check implied by the touched contract. OpenCode runtime wiring is
 checked with the real CLI (`opencode debug agent <name>` and
 `opencode agent list`) rather than another repository-specific validator.
-
-Tests should be minimum. No new validators or tests unless every evidence points to its necessity.

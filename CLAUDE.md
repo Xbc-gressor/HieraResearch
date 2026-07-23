@@ -104,18 +104,25 @@ would remove the independent contexts required by this project.
   See `docs/background-research.md` for the hierarchical search-space contract,
   evidence and scope semantics, fallback behavior, and validation commands.
 - `idea-generator` — run structural **SELECT** with `got_select decide`, then use
-  `semantic_search.py` to enumerate valid complete points and apply the
+  `semantic_search.py` to enumerate valid complete points at the ledger's
+  current `search_space_state` revision (runtime-pruned hypotheses drop out, a
+  pruned dimension pins its explicit baseline) and apply the
   replaceable coverage/gain/gain-plus-uncertainty acquisition policy before
   **IDEATE**. It persists numeric ancestry, the complete revisioned point, and a
   policy receipt with gain, uncertainty, cost, and coverage kept separate. The
   graph search still owns actions/parents; semantic policy owns only point choice.
 - `experience-extractor` — periodically (every N generations) incrementally
-  revise a bounded global `experience` snapshot from the ledger's DAG revision
-  delta plus fixed Top/Bottom anchors and compact mechanical point diffs. It
-  keeps generic levers, dead ends, and high-level bottlenecks traceable to run
-  ids, but P1 deliberately does not create dimension/hypothesis statuses or
-  semantic DAG receipts; those are P2. It never rewrites background, mappings,
-  policy receipts, or raw observations.
+  revise a bounded global `experience` snapshot (schema 3) from the ledger's
+  DAG revision delta plus fixed Top/Bottom anchors and compact mechanical
+  point diffs. Beyond generic levers, dead ends, and bottlenecks, it authors
+  two-level `dimension_evidence`/`hypothesis_evidence` beliefs whose cited
+  edge ids, observations, evaluation states, and comparator counts come only
+  from `background_contract.py target-evidence` — never reconstructed from the
+  Top/Bottom window. A belief only recommends a runtime status: after a
+  successful `set-experience` it invokes `ledger.py apply-space-state` once,
+  and the deterministic helper owns every append-only `search_space_state`
+  transition (two-stage pruning, baseline protection, reopen-by-append). It
+  never rewrites background, mappings, policy receipts, or raw observations.
 - `candidate-writer` — implement one candidate's `train.py`. Receives **just
   the target candidate dir**; reads its own ledger record (added by
   `idea-generator`) for the full `idea` + `source_run_ids`, derives

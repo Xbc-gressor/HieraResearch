@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Deterministic contract helpers for the P1 semantic search space.
+"""Deterministic contract helpers for the P2 semantic search space.
 
 This module owns only search-space structure, candidate point validity, stable
 revision receipts, and mechanically derived coverage/diffs.  Literature
-evidence validation stays in :mod:`background_contract`; graph action selection
-stays in :mod:`got_select`; acquisition policy stays in
-:mod:`semantic_search`.
+evidence validation stays in :mod:`background_contract`; runtime eligibility
+decisions stay in :mod:`search_space_state`; graph action selection stays in
+:mod:`got_select`; acquisition policy stays in :mod:`semantic_search`.
 
 Formally (see ``docs/search-space.md``): a point is an equivalence class of
 concrete implementations under the attribution map, and the frozen registry is
-a subspace of the full catalog product restricted by validity relations.
+a subspace of the full catalog product restricted by validity relations.  The
+frozen registry never authors runtime pruning state: every element keeps
+``status: active`` here, while evidence-preserving pruning lives only in the
+append-only ``ledger.search_space_state`` overlay.
 """
 
 from __future__ import annotations
@@ -408,7 +411,8 @@ def validate_space_core(
             dimension_mode[dimension_id] = mode
         if dimension.get("status") not in ELEMENT_STATUSES:
             errors.append(
-                f"{where}.status must be active in P1; evidence-preserving pruning is P2"
+                f"{where}.status must be active; the frozen registry never "
+                "authors runtime pruning state"
             )
         hypotheses = dimension.get("hypotheses")
         if not isinstance(hypotheses, list) or not hypotheses:
@@ -444,7 +448,8 @@ def validate_space_core(
                 )
             if hypothesis.get("status") not in ELEMENT_STATUSES:
                 errors.append(
-                    f"{hyp_where}.status must be active in P1; pruning state is not authored here"
+                    f"{hyp_where}.status must be active; runtime pruning state "
+                    "lives only in ledger.search_space_state"
                 )
             hypothesis_provenance = hypothesis.get("provenance")
             errors.extend(
@@ -521,7 +526,7 @@ def validate_space_core(
         if relation_type not in RELATION_TYPES:
             errors.append(f"{where}.type must be one of {sorted(RELATION_TYPES)}")
         if relation.get("status") not in ELEMENT_STATUSES:
-            errors.append(f"{where}.status must be active in P1")
+            errors.append(f"{where}.status must be active")
         errors.extend(_validate_provenance(relation.get("provenance"), f"{where}.provenance"))
         if not isinstance(relation.get("evidence"), list):
             errors.append(f"{where}.evidence must be a list")

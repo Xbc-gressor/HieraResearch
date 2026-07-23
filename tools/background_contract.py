@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Validate and render the P1 hierarchical ``background.md`` contract.
+"""Validate and render the P2 hierarchical ``background.md`` contract.
 
 The Markdown document is the human view.  Its fenced ``Search space
 registry`` JSON object is the machine contract shared by both runtimes.  This
 module validates literature receipts and typed guidance around the structural
-contract owned by :mod:`semantic_space`.
+contract owned by :mod:`semantic_space`, checks the schema-3 experience
+snapshot and the append-only ``search_space_state`` overlay against persisted
+receipts, and renders the bounded per-target evidence view consumed by the
+experience extractor.
 
 Pre-P1 flat ``tf-*`` registries are intentionally rejected.  Runs are local
 and disposable, so there is no implicit migration or mixed-mode behavior.
@@ -637,7 +640,7 @@ def derive_hypothesis_selection(registry: dict[str, Any]) -> dict[str, dict[str,
 
 
 def validate_candidate_point(point: Any, registry: dict[str, Any]) -> list[str]:
-    """Validate one structural point plus P1 guidance-derived eligibility."""
+    """Validate one structural point plus guidance-derived eligibility."""
     errors = validate_point(point, registry)
     if errors or not isinstance(point, dict):
         return errors
@@ -1859,7 +1862,8 @@ def build_parser() -> argparse.ArgumentParser:
     lineage.set_defaults(func=cmd_lineage)
 
     experience = sub.add_parser(
-        "validate-experience", help="validate P1 experience without inventing P2 belief fields"
+        "validate-experience",
+        help="validate a schema-3 experience snapshot against cited receipts",
     )
     experience.add_argument("--background", type=Path, required=True)
     experience.add_argument("--catalog", type=Path, help="explicit dimension catalog override")

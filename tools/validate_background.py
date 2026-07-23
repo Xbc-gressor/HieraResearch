@@ -22,7 +22,12 @@ from background_contract import (
     validate_registry,
 )
 from search_backends import add_visit, new_manifest
-from search_space_state import empty_search_space_state
+from search_space_state import (
+    compose_effective_selection,
+    derive_experience_transitions,
+    empty_search_space_state,
+    replay_search_space_state,
+)
 from semantic_evidence import build_semantic_edges, comparator_coverage
 from semantic_search import build_proposal_set, select_proposal, validate_proposal_set
 from semantic_space import (
@@ -260,9 +265,74 @@ def fixture_registry() -> dict:
     }
 
 
+def shape_registry(catalog: dict, mapping: dict, space_id: str) -> dict:
+    """One toy registry per benchmark shape, built only from its ownership map.
+
+    Dimensions follow catalog order so the two shapes differ only in display
+    names and ``space_id``; any behavioral divergence then proves an
+    estimator-specific branch in the shared helpers.
+    """
+    catalog_by_id = {item["id"]: item for item in catalog["dimensions"]}
+    mapped = set(mapping.values())
+    dimensions = []
+    for catalog_entry in catalog["dimensions"]:
+        dimension_id = catalog_entry["id"]
+        if dimension_id not in mapped:
+            continue
+        slug = dimension_id[4:]
+        dimensions.append(
+            _dimension(
+                catalog_by_id,
+                catalog["provenance"],
+                dimension_id,
+                _hypothesis(
+                    f"hyp-{slug}-base",
+                    f"{slug} baseline choice",
+                    kind="baseline",
+                    intervention=f"{slug}-base",
+                ),
+                _hypothesis(
+                    f"hyp-{slug}-variant",
+                    f"{slug} variant choice",
+                    kind="evidence_prior",
+                    intervention=f"{slug}-variant",
+                ),
+            )
+        )
+    return {
+        "schema_version": 3,
+        "kind": "semantic_search_space",
+        "space_id": space_id,
+        "catalog": catalog_receipt(catalog),
+        "dimensions": dimensions,
+        "relations": [],
+        "guidance": [],
+        "sources": [
+            {
+                "id": "src-01",
+                "type": "paper",
+                "title": "Toy mechanism study",
+                "url": "https://example.test/toy-mechanism-study",
+                "publication_status": "preprint_only",
+                "validation_status": "artifact_available",
+                "studied_scope": {
+                    axis: ["*"]
+                    for axis in (
+                        "model_families",
+                        "data_regimes",
+                        "metrics",
+                        "interventions",
+                        "evaluation_protocols",
+                    )
+                },
+            }
+        ],
+    }
+
+
 def background_text(registry: dict) -> str:
     lines = [
-        "# Background — P1 fixture",
+        "# Background — P2 fixture",
         "",
         "## Dimension coverage",
         "",
@@ -372,6 +442,42 @@ def main() -> int:
         assert set(mapping.values()) == catalog_ids, (task_shape, mapping)
         assert len(mapping) == len(catalog_ids), (task_shape, mapping)
         assert all("misc" not in dimension_id for dimension_id in mapping.values())
+
+    # Cross-shape acceptance: the same state/proposal helpers drive both the
+    # MLE-bench-shaped and the PostTrainBench-shaped ownership maps.  Any
+    # estimator-specific branch would surface as a divergent signature.
+    shape_signatures: dict[str, dict] = {}
+    for task_shape, mapping in coverage_fixture.items():
+        shape = shape_registry(catalog, mapping, f"toy-{task_shape}")
+        assert validate_registry(shape) == [], validate_registry(shape)
+        shape_state = empty_search_space_state()
+        shape_runtime = replay_search_space_state(shape, shape_state)
+        shape_effective = compose_effective_selection(
+            shape, derive_hypothesis_selection(shape), shape_runtime
+        )
+        shape_ledger = {"records": [], "search_space_state": shape_state}
+        shape_proposals = build_proposal_set(
+            shape, shape_ledger, op="fresh", parents=[], max_points=16
+        )
+        assert validate_proposal_set(shape_proposals) == []
+        assert shape_proposals["proposals"]
+        shape_point, shape_receipt = select_proposal(shape_proposals, policy="coverage")
+        assert validate_point(shape_point, shape) == []
+        shape_transitions = derive_experience_transitions(shape, shape_ledger)
+        assert shape_transitions == []
+        shape_signatures[task_shape] = {
+            "dimension_statuses": list(shape_runtime["dimensions"].values()),
+            "hypothesis_statuses": list(shape_runtime["hypotheses"].values()),
+            "effective_statuses": [
+                entry["effective_status"] for entry in shape_effective.values()
+            ],
+            "n_proposals": len(shape_proposals["proposals"]),
+            "proposal_state_revision": shape_proposals["search_space_state_revision"],
+            "receipt_state_revision": shape_receipt["search_space_state_revision"],
+        }
+    assert set(shape_signatures) == {"mle_bench_shaped", "posttrain_bench_shaped"}
+    (shape_signature, *other_signatures) = shape_signatures.values()
+    assert all(other == shape_signature for other in other_signatures), shape_signatures
 
     with tempfile.TemporaryDirectory() as tmp:
         background_path = Path(tmp) / "background.md"
@@ -823,24 +929,31 @@ def main() -> int:
                 text=True,
             )
 
-        def cli_record_run(run_id: str, score: float) -> None:
+        def cli_record_run(run_id: str, score: float | None = None) -> None:
+            command = [
+                sys.executable,
+                str(ROOT / "tools" / "ledger.py"),
+                "record-run",
+                "--ledger", str(ledger_path),
+                "--task", "hard-interactions",
+                "--run-id", run_id,
+            ]
+            if score is not None:
+                command += ["--final-best-score", str(score)]
             subprocess.run(
-                [
-                    sys.executable,
-                    str(ROOT / "tools" / "ledger.py"),
-                    "record-run",
-                    "--ledger", str(ledger_path),
-                    "--task", "hard-interactions",
-                    "--run-id", run_id,
-                    "--final-best-score", str(score),
-                ],
+                command,
                 cwd=ROOT,
                 check=True,
                 capture_output=True,
                 text=True,
             )
 
-        def cli_set_experience(generation: int, updated_at_run: str, beliefs: list[dict]) -> None:
+        def cli_set_experience(
+            generation: int,
+            updated_at_run: str,
+            beliefs: list[dict],
+            dimension_beliefs: list[dict] | None = None,
+        ) -> None:
             experience_path.write_text(
                 json.dumps(
                     {
@@ -851,7 +964,7 @@ def main() -> int:
                         "promising_regions": [],
                         "lessons": [],
                         "bottlenecks": [],
-                        "dimension_evidence": [],
+                        "dimension_evidence": dimension_beliefs or [],
                         "hypothesis_evidence": beliefs,
                     }
                 )
@@ -1093,6 +1206,227 @@ def main() -> int:
         assert validate_registry(registry, ledger=stored) == [], validate_registry(
             registry, ledger=stored
         )
+
+        # The overlay revision is exactly the number of append-only decisions.
+        state = stored["search_space_state"]
+        assert state["revision"] == len(state["decisions"]) > 0
+
+        # Later decisions never invalidate records admitted at earlier state
+        # revisions: the pre-pruning records at the once-pruned point still
+        # validate against the frozen registry.
+        pre_pruning = [
+            item for item in stored["records"] if item["run_id"] in {"003", "004"}
+        ]
+        assert len(pre_pruning) == 2
+        for item in pre_pruning:
+            assert validate_point(item["semantic_point"], registry) == []
+
+        # `target-evidence` is the extractor's authoritative bounded source: an
+        # old direct comparator whose child run fell out of a one-node graph
+        # window is still returned, with selected counts equal to validator
+        # recomputation.  The experience cursor is current, so the incremental
+        # delta is empty and --top 1 --bottom 0 leaves only the best node.
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "got_graph.py"),
+                "render",
+                "--ledger", str(ledger_path),
+                "--incremental",
+                "--top", "1",
+                "--bottom", "0",
+                "--format", "json",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        window = json.loads(completed.stdout)
+        window_ids = {
+            node["id"]
+            for key in ("delta_nodes", "top_nodes", "bottom_nodes")
+            for node in window[key]
+        }
+        assert window_ids == {"002"}, window_ids
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "background_contract.py"),
+                "target-evidence",
+                "--background", str(background_path),
+                "--ledger", str(ledger_path),
+                "--target-id", "hyp-data-filtered",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        view = json.loads(completed.stdout)
+        (block,) = view["hypothesis_targets"]
+        assert {"sedge-002-003", "sedge-002-004"} <= set(block["evidence_edge_ids"])
+        assert {"003", "004"}.isdisjoint(window_ids)
+        assert block["comparator_coverage"] == comparator_coverage(
+            stored,
+            block["evidence_edge_ids"],
+            target_kind="hypothesis",
+            target_id="hyp-data-filtered",
+        )
+
+        # A crash-only belief informs feasibility but never becomes
+        # contradiction evidence: applying it appends no decisions and moves
+        # neither the overlay revision nor the DAG cursor.  The CLI helpers
+        # close over ledger_path, so rebinding redirects them to a fresh ledger.
+        ledger_path = tmp_path / "ledger-crash.json"
+        cli_add_record(
+            "000", "fresh", [], baseline_point, policy_receipt("fresh", [], baseline_point)
+        )
+        cli_record_run("000", 0.45)
+        cli_add_record(
+            "001", "improve", ["000"], prune_target,
+            policy_receipt("improve", ["000"], prune_target),
+        )
+        cli_record_run("001")  # no score: the run crashes
+        crash_belief = {
+            "target_id": "hyp-data-filtered",
+            "evaluation_state": "failed",
+            "assessment": "unknown",
+            "recommended_status": "active",
+            "claim": "The only comparator attempt crashed; a crash informs feasibility, not contradiction.",
+            "evidence_run_ids": ["001"],
+            "evidence_edge_ids": ["sedge-000-001"],
+            "comparator_coverage": {
+                "direct_noncrash_edges": 0,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 1,
+            },
+            "confidence": "low",
+            "uncertainty": "No non-crash observation exists for this target.",
+        }
+        dag_before = json.loads(ledger_path.read_text())["dag_revision"]
+        cli_set_experience(0, "001", [crash_belief])
+        applied = cli_apply_space_state()
+        assert applied == {
+            "ok": True,
+            "prior_revision": 0,
+            "revision": 0,
+            "decision_ids": [],
+        }, applied
+        stored = json.loads(ledger_path.read_text())
+        assert stored["dag_revision"] == dag_before
+        assert stored["search_space_state"] == empty_search_space_state()
+
+        # A runtime-pruned dimension is pinned to its explicit baseline in new
+        # proposals; point arity and the frozen space_revision never change.
+        ledger_path = tmp_path / "ledger-dimension.json"
+        cli_add_record(
+            "000", "fresh", [], baseline_point, policy_receipt("fresh", [], baseline_point)
+        )
+        cli_record_run("000", 0.45)
+        cli_add_record(
+            "001", "improve", ["000"], prune_target,
+            policy_receipt("improve", ["000"], prune_target),
+        )
+        cli_record_run("001", 0.6)
+        cli_add_record(
+            "002", "improve", ["000"], prune_target,
+            policy_receipt("improve", ["000"], prune_target),
+        )
+        cli_record_run("002", 0.62)
+
+        def cli_apply_preserving_dag() -> dict:
+            dag_before = json.loads(ledger_path.read_text())["dag_revision"]
+            result = cli_apply_space_state()
+            dag_after = json.loads(ledger_path.read_text())["dag_revision"]
+            assert dag_after == dag_before, (dag_before, dag_after)
+            return result
+
+        hypothesis_prune = {
+            "target_id": "hyp-data-filtered",
+            "evaluation_state": "comparator_covered",
+            "assessment": "unpromising",
+            "recommended_status": "pruned",
+            "claim": "Both direct comparisons were worse than their matched baseline parent.",
+            "evidence_run_ids": ["000", "001", "002"],
+            "evidence_edge_ids": ["sedge-000-001", "sedge-000-002"],
+            "comparator_coverage": {
+                "direct_noncrash_edges": 2,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+            "confidence": "high",
+            "uncertainty": "Implementation differences remain confounded with each semantic change.",
+            "reopen_when": "A later direct comparison improves over its parent.",
+        }
+        dimension_prune = {
+            "target_id": "dim-data-curation",
+            "evaluation_state": "comparator_covered",
+            "assessment": "unpromising",
+            "recommended_status": "pruned",
+            "claim": "Every selectable non-baseline hypothesis in the dimension is already pruned.",
+            "evidence_run_ids": ["000", "001", "002"],
+            "evidence_edge_ids": ["sedge-000-001", "sedge-000-002"],
+            "comparator_coverage": {
+                "direct_noncrash_edges": 2,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+            "confidence": "high",
+            "uncertainty": "Dimension-level attribution stays weaker than its single-dimension edges.",
+            "reopen_when": "A non-baseline hypothesis in the dimension is reopened.",
+        }
+        cli_set_experience(0, "002", [hypothesis_prune])
+        assert cli_apply_preserving_dag() == {
+            "ok": True, "prior_revision": 0, "revision": 1,
+            "decision_ids": ["sdec-000001"],
+        }
+        cli_set_experience(1, "002", [hypothesis_prune])
+        assert cli_apply_preserving_dag() == {
+            "ok": True, "prior_revision": 1, "revision": 2,
+            "decision_ids": ["sdec-000002"],
+        }
+        cli_set_experience(2, "002", [], dimension_beliefs=[dimension_prune])
+        assert cli_apply_preserving_dag() == {
+            "ok": True, "prior_revision": 2, "revision": 3,
+            "decision_ids": ["sdec-000003"],
+        }
+        cli_set_experience(3, "002", [], dimension_beliefs=[dimension_prune])
+        assert cli_apply_preserving_dag() == {
+            "ok": True, "prior_revision": 3, "revision": 4,
+            "decision_ids": ["sdec-000004"],
+        }
+
+        stored = json.loads(ledger_path.read_text())
+        state = stored["search_space_state"]
+        assert state["revision"] == len(state["decisions"]) == 4
+        assert validate_registry(registry, ledger=stored) == [], validate_registry(
+            registry, ledger=stored
+        )
+        replayed = replay_search_space_state(registry, state)
+        assert replayed["dimensions"]["dim-data-curation"] == "pruned"
+        assert replayed["hypotheses"]["hyp-data-filtered"] == "pruned"
+
+        dimension_proposals = cli_propose(proposals_path)
+        assert dimension_proposals["search_space_state_revision"] == 4
+        assert dimension_proposals["proposals"]
+        dimension_baseline = next(
+            item["baseline_hypothesis_id"]
+            for item in registry["dimensions"]
+            if item["id"] == "dim-data-curation"
+        )
+        for proposal in dimension_proposals["proposals"]:
+            point = proposal["point"]
+            assert validate_point(point, registry) == []
+            assert point["space_revision"] == space_revision(registry)
+            assert len(point["assignments"]) == len(registry["dimensions"])
+            assert not selects_target(proposal)
+            for assignment in point["assignments"]:
+                if (
+                    assignment["dimension_id"] == "dim-data-curation"
+                    and assignment["state"] == "selected"
+                ):
+                    assert assignment["hypothesis_id"] == dimension_baseline
 
     proposals = fresh_proposals["proposals"]
     assert len(proposals) >= 2

@@ -206,7 +206,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 - 假设是可复用的空间取值，不会在首次使用后“消耗”；每个候选保存完整、带版本的 `semantic_point`
 - `source_run_ids` 只保存数字父代，假设归因、策略预测与分数观测分别存放
 - 证据为基础（每个声明可追溯；无虚构论文）；对任务/账本只读；不运行实验
-- P1 空间在 setup 后冻结；不在停滞时刷新、剪枝或扩展
+- schema-3 空间在 setup 后冻结；运行时剪枝只发生在账本 `search_space_state` 覆盖层，不修改冻结 registry；空间扩展留到 P4
 - `model: inherit`（继承调用会话的模型配置）
 
 ### 5.3 idea-generator
@@ -214,14 +214,14 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 外层搜索的 LLM 着陆点，通过三步产生下一代：
 
 - **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
-- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集；根据配置应用 `coverage` / `gain` / `gain_uncertainty`。后两者用 `[0,1]` rubric 分别评估 predicted gain、uncertainty、cost，并与确定性 coverage 分栏写入 `policy_receipt`，不冒充校准后验。
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty`。后两者用 `[0,1]` rubric 分别评估 predicted gain、uncertainty、cost，并与确定性 coverage 分栏写入 `policy_receipt`，不冒充校准后验。
 - **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。
 
 ### 5.4 experience-extractor
 
-每 N 轮运行一次，从 DAG 增量、Top/Bottom 锚点、机械语义点差异中提炼有界全局经验。P1 只保留通用 promising regions / lessons / bottlenecks，并要求证据 run id 与不确定性；不生成 `dimension_evidence` / `hypothesis_evidence`，不把点成员关系当因果。双层信念与语义 DAG 收据留到 P2。
+每 N 轮运行一次，从 DAG 增量、Top/Bottom 锚点、机械语义点差异中提炼有界全局经验（schema 3）。除通用 promising regions / lessons / bottlenecks 外，还生成双层 `dimension_evidence` / `hypothesis_evidence` 信念；其引用边 id、逐边观测、评估状态与比较计数只取自 `background_contract.py target-evidence`，绝不从 Top/Bottom 窗口重建。信念只"建议"运行时状态：`set-experience` 成功后调用一次 `ledger.py apply-space-state`，由确定性 helper 拥有所有 append-only `search_space_state` 转移（两阶段剪枝、基线保护、重开即追加）。不把点成员关系当因果，永不改写 background、映射、策略收据或原始观测。
 
 ### 5.5 candidate-writer
 
@@ -355,18 +355,19 @@ runs/<task-name>/<tag>/loop_state.md
 `background.md` 与候选语义归因之间的确定性合约层：
 
 - `catalog`：校验并输出内置目录或显式 `--path` 目录及内容摘要
-- `validate`：检查 schema-3 层级、目录解析、显式基线、关系、五轴范围、来源/指导证据、人类视图以及所有 ledger 点/祖先/策略收据
+- `validate`：检查 schema-3 层级、目录解析、显式基线、关系、五轴范围、来源/指导证据、人类视图以及所有 ledger 点/祖先/策略收据/语义边收据与 `search_space_state` 覆盖层
 - `render`：输出有界的维度、假设、关系与覆盖视图
-- `preflight`：合法 P1 状态只返回 `none`；旧平面或 mixed-mode 直接拒绝，不迁移
+- `preflight`：合法 P2 状态只返回 `none`；旧平面或 mixed-mode 直接拒绝，不迁移
 - `validate-point`：检查完整点、条件激活、requires 与 excludes
 - `lineage`：并列呈现数字祖先与机械 point diff，不生成因果边
-- `validate-experience`：校验通用 P1 belief 的 run-id 证据，并拒绝提前出现的 P2 双层信念字段
+- `validate-experience`：校验 schema-3 快照——通用 belief 的 run-id 证据，以及双层 dimension/hypothesis 信念的引用边、评估状态与比较计数（按持久化收据机械重算，必须一致）
+- `target-evidence`：从持久化语义边收据为每个 target 输出有界比较证据（引用边 id、逐边观测、评估状态、引用计数），是 experience-extractor 的权威有界来源
 
 `python tools/validate_background.py` 使用合成 DAG 回归这些合约。
 
 ### 7.6 semantic_search.py
 
-图行动之后的语义选点层：`propose` 为 fresh/improve/crossover 生成有界合法点；`select` 可替换 `coverage`、`gain`、`gain_uncertainty` 策略并输出 point + policy receipt。策略可替换而不改变 registry、祖先或观测历史。
+图行动之后的语义选点层：`propose` 为 fresh/improve/crossover 生成有界合法点（按账本当前 `search_space_state` revision 过滤/排序：运行时剪枝的假设出局，被剪维度钉在显式基线）；`select` 可替换 `coverage`、`gain`、`gain_uncertainty` 策略并输出 point + policy receipt，提案集与收据都带 revision 戳，过期即拒。策略可替换而不改变 registry、祖先或观测历史。
 
 ### 7.7 search_backends.py
 
