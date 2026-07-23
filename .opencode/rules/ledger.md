@@ -103,11 +103,49 @@ discard.
 
 ## Experience boundary
 
-Raw records are the durable history. `experience` is a bounded regenerated
-belief snapshot whose claim-bearing collections are `promising_regions`,
-`lessons`, and `bottlenecks`. The experience extractor may use mechanically
-rendered point coverage and parent diffs as context, but it must not rewrite the
-space or present membership as causal support.
+Raw records are the durable history. `experience` (schema 3) is a bounded
+regenerated belief snapshot: `summary`, `promising_regions`, `lessons`,
+`bottlenecks`, plus two bounded target collections, `dimension_evidence`
+(at most 16 entries) and `hypothesis_evidence` (at most 32 entries), each
+target appearing at most once per collection. Target evidence is replaceable
+derived belief, never durable evidence: the validator recomputes its
+comparator counts and evaluation state from the cited ids, and it never
+mutates the frozen registry. Cited `evidence_edge_ids` name persisted
+semantic receipts; they are attribution evidence, and comparator coverage
+does not prove causality.
+
+Each target entry carries `target_id`, `evaluation_state`, `assessment`,
+`recommended_status`, `claim`, `evidence_run_ids` (0–5 unique terminal
+target-related runs), `evidence_edge_ids` (0–5 unique persisted
+target-touching edges), `comparator_coverage`, `confidence`, `uncertainty`,
+and optional `reopen_when`. `evaluation_state` is mechanical: `unevaluated`
+(no cited terminal runs or edges), `failed` (cited evidence is crash-only),
+`observed` (a non-crash observation but fewer than two direct non-crash
+edges), or `comparator_covered` (at least two direct non-crash edges).
+`assessment` is `unknown`, `promising`, `mixed`, or `unpromising`;
+`recommended_status` is `active`, `deprioritized`, or `pruned`; `confidence`
+is `low`, `med`, or `high`.
+
+Recommendation gates are exact and identical for both levels:
+
+- `unevaluated`/`failed` targets keep `assessment: unknown`,
+  `confidence: low`, and `recommended_status: active`; a crash alone never
+  contradicts a semantic element.
+- `deprioritized` requires `assessment: unpromising`, `confidence: med` or
+  `high`, `evaluation_state: observed` or `comparator_covered`, at least one
+  direct non-crash edge, and a non-empty `reopen_when`.
+- `pruned` requires `assessment: unpromising`, `confidence: high`,
+  `evaluation_state: comparator_covered`, at least two direct non-crash
+  edges, and a non-empty `reopen_when`.
+- High-confidence `promising` or `unpromising` claims require
+  `comparator_covered`.
+
+Belief recommendations stay separate from runtime eligibility: an entry only
+recommends. Actual `deprioritized`/`pruned` transitions are append-only
+`search_space_state` decisions with their own two-stage, baseline, and
+provenance rules. The experience extractor may use mechanically rendered
+point coverage, parent diffs, and bounded target evidence as context, but it
+must not rewrite the space or present membership as causal support.
 
 Validate before storing a snapshot:
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused deterministic checks for the P1 semantic-search-space contract."""
+"""Focused deterministic checks for the P2 semantic-search-space contract."""
 
 from __future__ import annotations
 
@@ -717,7 +717,7 @@ def main() -> int:
         experience_path.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "updated_at_run": "001",
                     "generation": 0,
                     "summary": "A same-point implementation completed and a later attempt crashed.",
@@ -731,6 +731,8 @@ def main() -> int:
                         }
                     ],
                     "bottlenecks": [],
+                    "dimension_evidence": [],
+                    "hypothesis_evidence": [],
                 }
             )
         )
@@ -803,15 +805,25 @@ def main() -> int:
     assert rendered["coverage"]["n_valid_records"] == 4
     assert len(rendered["dimensions"]) == len(registry["dimensions"])
 
-    # P1 does not smuggle P2 dimension/hypothesis belief extraction into the
-    # experience snapshot.
+    # P2 experience snapshots are schema 3: the two-level target evidence
+    # collections are required and the P1 schema is rejected without migration.
     errors = validate_experience(
-        {"dimension_evidence": []}, registry, ledger
-    )
-    assert any("P2" in error for error in errors), errors
-    assert validate_experience(
         {
             "schema_version": 2,
+            "updated_at_run": "003",
+            "generation": 0,
+            "summary": "A P1 snapshot has no place in a P2 ledger.",
+            "promising_regions": [],
+            "lessons": [],
+            "bottlenecks": [],
+        },
+        registry,
+        ledger,
+    )
+    assert any("schema_version must be 3" in error for error in errors), errors
+    assert validate_experience(
+        {
+            "schema_version": 3,
             "updated_at_run": "003",
             "generation": 0,
             "summary": "One same-point implementation change improved the observed score.",
@@ -825,6 +837,8 @@ def main() -> int:
                 }
             ],
             "bottlenecks": [],
+            "dimension_evidence": [],
+            "hypothesis_evidence": [],
         },
         registry,
         ledger,
@@ -833,7 +847,7 @@ def main() -> int:
     stale_view_ledger["dag_revision"] = 5
     assert validate_experience(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "updated_at_run": "001",
             "generation": 0,
             "summary": "A valid bounded snapshot may lag a newer DAG delta.",
@@ -847,6 +861,8 @@ def main() -> int:
                 }
             ],
             "bottlenecks": [],
+            "dimension_evidence": [],
+            "hypothesis_evidence": [],
             "dag_revision": 2,
         },
         registry,
@@ -915,7 +931,61 @@ def main() -> int:
         "crash_edges": 0,
     }
 
-    print("P1 semantic background, point, lineage, and policy checks passed.")
+    # A schema-3 belief snapshot cites the same persisted receipts: the
+    # recomputed comparator counts and evaluation state must match exactly,
+    # and the conservative pruning gates are enforced on both levels.
+    covered_belief = {
+        "target_id": "hyp-data-filtered",
+        "evaluation_state": "comparator_covered",
+        "assessment": "unpromising",
+        "recommended_status": "pruned",
+        "claim": "Both direct comparisons were worse than their matched baseline parents.",
+        "evidence_run_ids": ["000", "001", "002", "003"],
+        "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
+        "comparator_coverage": {
+            "direct_noncrash_edges": 2,
+            "confounded_noncrash_edges": 0,
+            "crash_edges": 0,
+        },
+        "confidence": "high",
+        "uncertainty": "Implementation differences remain confounded with each semantic change.",
+        "reopen_when": "A later direct comparison improves over its parent.",
+    }
+    assert validate_experience(
+        {
+            "schema_version": 3,
+            "updated_at_run": "003",
+            "generation": 0,
+            "summary": "Two direct comparisons cover the filtered hypothesis.",
+            "promising_regions": [],
+            "lessons": [],
+            "bottlenecks": [],
+            "dimension_evidence": [],
+            "hypothesis_evidence": [covered_belief],
+        },
+        registry,
+        evidence_ledger,
+    ) == []
+    weak_belief = copy.deepcopy(covered_belief)
+    weak_belief["confidence"] = "med"
+    errors = validate_experience(
+        {
+            "schema_version": 3,
+            "updated_at_run": "003",
+            "generation": 0,
+            "summary": "Pruning requires high-confidence comparator coverage.",
+            "promising_regions": [],
+            "lessons": [],
+            "bottlenecks": [],
+            "dimension_evidence": [],
+            "hypothesis_evidence": [weak_belief],
+        },
+        registry,
+        evidence_ledger,
+    )
+    assert any("pruned requires" in error for error in errors), errors
+
+    print("P2 semantic background, edge, belief, and policy-state checks passed.")
     return 0
 
 

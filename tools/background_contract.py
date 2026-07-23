@@ -23,8 +23,17 @@ from typing import Any
 from search_backends import canonical_key, validate_manifest
 from search_space_state import validate_search_space_state
 from semantic_evidence import (
+    COVERAGE_KEYS,
+    EVALUATION_STATES,
+    MAX_DIMENSION_TARGETS,
+    MAX_EDGES_PER_TARGET,
+    MAX_HYPOTHESIS_TARGETS,
+    MAX_RUNS_PER_TARGET,
     SemanticEvidenceError,
+    comparator_coverage,
+    edge_index,
     render_target_evidence,
+    target_evaluation_state,
     validate_semantic_edges,
 )
 from semantic_space import (
@@ -34,6 +43,7 @@ from semantic_space import (
     complete_point,
     coverage_from_records,
     derive_semantic_lineage,
+    dimension_map,
     hypothesis_map,
     load_catalog,
     point_id,
@@ -1125,17 +1135,276 @@ def render_space(
     }
 
 
+TARGET_EVIDENCE_REQUIRED = {
+    "target_id",
+    "evaluation_state",
+    "assessment",
+    "recommended_status",
+    "claim",
+    "evidence_run_ids",
+    "evidence_edge_ids",
+    "comparator_coverage",
+    "confidence",
+    "uncertainty",
+}
+TARGET_EVIDENCE_OPTIONAL = {"reopen_when"}
+TARGET_ASSESSMENTS = {"unknown", "promising", "mixed", "unpromising"}
+TARGET_RECOMMENDATIONS = {"active", "deprioritized", "pruned"}
+EXPERIENCE_CONFIDENCE = {"low", "med", "high"}
+
+
+def _validate_target_evidence(
+    items: Any,
+    *,
+    field: str,
+    target_kind: str,
+    registry: dict[str, Any],
+    ledger: dict[str, Any],
+    limit: int,
+) -> list[str]:
+    """Validate one bounded two-level belief collection against cited receipts.
+
+    Comparator counts and the evaluation state are recomputed from the cited
+    run/edge ids by :mod:`semantic_evidence`; the authored values must match
+    exactly.  Recommendation gates apply identically to both levels.
+    """
+    if not isinstance(items, list):
+        return [f"experience.{field} must be a list"]
+    errors: list[str] = []
+    if len(items) > limit:
+        errors.append(f"experience.{field} may contain at most {limit} items")
+    known_targets = (
+        dimension_map(registry) if target_kind == "dimension" else hypothesis_map(registry)
+    )
+    records = {
+        str(record.get("run_id")): record
+        for record in ledger.get("records", [])
+        if isinstance(record, dict) and record.get("run_id") is not None
+    }
+    terminal_ids = {
+        run_id
+        for run_id, record in records.items()
+        if record.get("status") in {"keep", "discard", "crash"}
+    }
+    index = edge_index(ledger)
+    seen: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"experience.{field}[{position}]"
+        if not isinstance(item, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        missing = sorted(TARGET_EVIDENCE_REQUIRED - set(item))
+        unknown_fields = sorted(set(item) - TARGET_EVIDENCE_REQUIRED - TARGET_EVIDENCE_OPTIONAL)
+        if missing:
+            errors.append(f"{where} is missing fields {missing}")
+        if unknown_fields:
+            errors.append(f"{where} has unknown fields {unknown_fields}")
+        target_id = item.get("target_id")
+        if not _nonempty(target_id):
+            errors.append(f"{where}.target_id must be a non-empty {target_kind} id")
+            continue
+        target = f"{where} target '{target_id}'"
+        if target_id in seen:
+            errors.append(f"{target} duplicates an earlier {field} entry")
+        seen.add(target_id)
+        if target_id not in known_targets:
+            errors.append(f"{target} is not a known {target_kind} id")
+            continue
+        if not _nonempty(item.get("claim")) or len(item.get("claim", "")) > 600:
+            errors.append(f"{target}.claim must be non-empty and at most 600 characters")
+        if not _nonempty(item.get("uncertainty")) or len(item.get("uncertainty", "")) > 600:
+            errors.append(f"{target}.uncertainty must be non-empty and at most 600 characters")
+        if "reopen_when" in item and (
+            not _nonempty(item.get("reopen_when"))
+            or len(item.get("reopen_when", "")) > 600
+        ):
+            errors.append(
+                f"{target}.reopen_when must be non-empty and at most 600 characters when present"
+            )
+
+        raw_edge_ids = item.get("evidence_edge_ids")
+        edge_ids = (
+            [str(edge_id) for edge_id in raw_edge_ids if isinstance(edge_id, str)]
+            if isinstance(raw_edge_ids, list)
+            else []
+        )
+        if (
+            not isinstance(raw_edge_ids, list)
+            or len(raw_edge_ids) > MAX_EDGES_PER_TARGET
+            or len(edge_ids) != len(raw_edge_ids)
+            or len(set(edge_ids)) != len(edge_ids)
+            or any(edge_id not in index for edge_id in edge_ids)
+        ):
+            errors.append(
+                f"{target}.evidence_edge_ids must contain "
+                f"0–{MAX_EDGES_PER_TARGET} unique persisted semantic edge ids"
+            )
+        touching_endpoints: set[str] = set()
+        for edge_id in edge_ids:
+            receipt = index.get(edge_id)
+            if receipt is None:
+                continue
+            touches = any(
+                comparator_coverage(
+                    ledger, [edge_id], target_kind=target_kind, target_id=target_id
+                ).values()
+            )
+            if not touches:
+                errors.append(
+                    f"{target}.evidence_edge_ids cites edge '{edge_id}' "
+                    "that does not touch the target"
+                )
+            else:
+                touching_endpoints.add(str(receipt.get("parent_run_id")))
+                touching_endpoints.add(str(receipt.get("child_run_id")))
+
+        raw_run_ids = item.get("evidence_run_ids")
+        run_ids = (
+            [str(run_id) for run_id in raw_run_ids if isinstance(run_id, str)]
+            if isinstance(raw_run_ids, list)
+            else []
+        )
+        if (
+            not isinstance(raw_run_ids, list)
+            or len(raw_run_ids) > MAX_RUNS_PER_TARGET
+            or len(run_ids) != len(raw_run_ids)
+            or len(set(run_ids)) != len(run_ids)
+            or any(run_id not in terminal_ids for run_id in run_ids)
+        ):
+            errors.append(
+                f"{target}.evidence_run_ids must contain "
+                f"0–{MAX_RUNS_PER_TARGET} unique terminal ledger run ids"
+            )
+        for run_id in run_ids:
+            record = records.get(run_id)
+            if run_id in terminal_ids and run_id not in touching_endpoints:
+                point = record.get("semantic_point") if record is not None else None
+                selected = selected_assignments(point) if isinstance(point, dict) else {}
+                bears_target = (
+                    target_id in selected.values()
+                    if target_kind == "hypothesis"
+                    else target_id in selected
+                )
+                if not bears_target:
+                    errors.append(
+                        f"{target}.evidence_run_ids cites run '{run_id}' "
+                        "whose point does not bear the target"
+                    )
+
+        expected_coverage = comparator_coverage(
+            ledger, edge_ids, target_kind=target_kind, target_id=target_id
+        )
+        coverage = item.get("comparator_coverage")
+        if (
+            not isinstance(coverage, dict)
+            or set(coverage) != set(COVERAGE_KEYS)
+            or any(
+                not isinstance(coverage.get(key), int)
+                or isinstance(coverage.get(key), bool)
+                or coverage[key] < 0
+                for key in COVERAGE_KEYS
+            )
+        ):
+            errors.append(
+                f"{target}.comparator_coverage must hold non-negative integer "
+                f"counts for {', '.join(COVERAGE_KEYS)}"
+            )
+        elif coverage != expected_coverage:
+            errors.append(
+                f"{target}.comparator_coverage must equal the recomputed "
+                "coverage of its cited target-touching edges"
+            )
+
+        expected_state = target_evaluation_state(
+            ledger,
+            target_kind=target_kind,
+            target_id=target_id,
+            evidence_run_ids=run_ids,
+            evidence_edge_ids=edge_ids,
+        )
+        state = item.get("evaluation_state")
+        if state not in EVALUATION_STATES:
+            errors.append(
+                f"{target}.evaluation_state must be unevaluated, failed, "
+                "observed, or comparator_covered"
+            )
+        elif state != expected_state:
+            errors.append(
+                f"{target}.evaluation_state does not match the mechanical "
+                "state of its cited evidence"
+            )
+
+        assessment = item.get("assessment")
+        if assessment not in TARGET_ASSESSMENTS:
+            errors.append(
+                f"{target}.assessment must be unknown, promising, mixed, or unpromising"
+            )
+        recommended = item.get("recommended_status")
+        if recommended not in TARGET_RECOMMENDATIONS:
+            errors.append(
+                f"{target}.recommended_status must be active, deprioritized, or pruned"
+            )
+        confidence = item.get("confidence")
+        if confidence not in EXPERIENCE_CONFIDENCE:
+            errors.append(f"{target}.confidence must be low, med, or high")
+
+        direct_edges = expected_coverage["direct_noncrash_edges"]
+        if state in {"unevaluated", "failed"} and (
+            recommended != "active" or assessment != "unknown" or confidence != "low"
+        ):
+            errors.append(
+                f"{target} with evaluation_state '{state}' must keep assessment "
+                "unknown, confidence low, and recommended_status active"
+            )
+        if recommended == "deprioritized" and not (
+            assessment == "unpromising"
+            and confidence in {"med", "high"}
+            and state in {"observed", "comparator_covered"}
+            and direct_edges >= 1
+            and _nonempty(item.get("reopen_when"))
+        ):
+            errors.append(
+                f"{target}.recommended_status deprioritized requires assessment "
+                "unpromising, confidence med or high, evaluation_state observed "
+                "or comparator_covered, at least one direct non-crash edge, "
+                "and a non-empty reopen_when"
+            )
+        if recommended == "pruned" and not (
+            assessment == "unpromising"
+            and confidence == "high"
+            and state == "comparator_covered"
+            and direct_edges >= 2
+            and _nonempty(item.get("reopen_when"))
+        ):
+            errors.append(
+                f"{target}.recommended_status pruned requires assessment "
+                "unpromising, confidence high, evaluation_state "
+                "comparator_covered, at least two direct non-crash edges, "
+                "and a non-empty reopen_when"
+            )
+        if (
+            confidence == "high"
+            and assessment in {"promising", "unpromising"}
+            and state != "comparator_covered"
+        ):
+            errors.append(
+                f"{target} confidence high with assessment promising or "
+                "unpromising requires comparator_covered evaluation_state"
+            )
+    return errors
+
+
 def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
-    """Validate the bounded P1 belief view without implementing P2 semantics."""
+    """Validate the bounded schema-3 belief snapshot over the durable records.
+
+    Generic collections stay bounded.  The two-level ``dimension_evidence``
+    and ``hypothesis_evidence`` collections are replaceable belief: their
+    comparator counts and evaluation states are recomputed from cited run and
+    edge receipts and conservative recommendation gates are enforced exactly.
+    """
     if not isinstance(experience, dict):
         return ["experience must be an object"]
     errors: list[str] = []
-    deferred = {"direction_evidence", "dimension_evidence", "hypothesis_evidence"}
-    present = sorted(deferred & set(experience))
-    if present:
-        errors.append(
-            f"experience fields {present} are not a P1 contract; two-level belief extraction is P2"
-        )
     allowed_top = {
         "schema_version",
         "updated_at_run",
@@ -1144,13 +1413,15 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
         "promising_regions",
         "lessons",
         "bottlenecks",
+        "dimension_evidence",
+        "hypothesis_evidence",
         "dag_revision",
     }
-    unknown_top = sorted(set(experience) - allowed_top - deferred)
+    unknown_top = sorted(set(experience) - allowed_top)
     if unknown_top:
         errors.append(f"experience has unknown fields {unknown_top}")
-    if experience.get("schema_version") != 2:
-        errors.append("experience.schema_version must be 2")
+    if experience.get("schema_version") != 3:
+        errors.append("experience.schema_version must be 3")
     generation = experience.get("generation")
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
         errors.append("experience.generation must be a non-negative integer")
@@ -1271,6 +1542,27 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
         "bottlenecks",
         limit=6,
         required={"claim", "evidence", "confidence"},
+    )
+
+    errors.extend(
+        _validate_target_evidence(
+            experience.get("dimension_evidence"),
+            field="dimension_evidence",
+            target_kind="dimension",
+            registry=registry,
+            ledger=ledger,
+            limit=MAX_DIMENSION_TARGETS,
+        )
+    )
+    errors.extend(
+        _validate_target_evidence(
+            experience.get("hypothesis_evidence"),
+            field="hypothesis_evidence",
+            target_kind="hypothesis",
+            registry=registry,
+            ledger=ledger,
+            limit=MAX_HYPOTHESIS_TARGETS,
+        )
     )
     return errors
 
