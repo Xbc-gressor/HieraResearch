@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from search_backends import canonical_key, validate_manifest
+from semantic_evidence import SemanticEvidenceError, render_target_evidence
 from semantic_space import (
     DEFAULT_DIMENSION_STRATEGY,
     SemanticSpaceError,
@@ -1429,6 +1430,27 @@ def cmd_validate_experience(args: argparse.Namespace) -> int:
     return 0 if not errors else 1
 
 
+def cmd_target_evidence(args: argparse.Namespace) -> int:
+    registry, ledger, errors = _validated_inputs(args)
+    if errors:
+        print(json.dumps({"ok": False, "errors": errors}, separators=(",", ":")))
+        return 1
+    try:
+        view = render_target_evidence(
+            registry,
+            ledger or {},
+            max_dimensions=args.max_dimensions,
+            max_hypotheses=args.max_hypotheses,
+            max_edges_per_target=args.max_edges_per_target,
+            target_ids=args.target_id,
+        )
+    except SemanticEvidenceError as exc:
+        print(json.dumps({"ok": False, "errors": [str(exc)]}, separators=(",", ":")))
+        return 1
+    print(json.dumps(view, separators=(",", ":")))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1480,6 +1502,24 @@ def build_parser() -> argparse.ArgumentParser:
     experience.add_argument("--ledger", type=Path, required=True)
     experience.add_argument("--experience", type=Path)
     experience.set_defaults(func=cmd_validate_experience)
+
+    evidence = sub.add_parser(
+        "target-evidence",
+        help="bounded per-target comparator evidence from persisted semantic edges",
+    )
+    evidence.add_argument("--background", type=Path, required=True)
+    evidence.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
+    evidence.add_argument("--ledger", type=Path, required=True)
+    evidence.add_argument(
+        "--target-id",
+        action="append",
+        default=None,
+        help="exact known dimension/hypothesis id; repeatable; bypasses target-count caps",
+    )
+    evidence.add_argument("--max-dimensions", type=int, default=16)
+    evidence.add_argument("--max-hypotheses", type=int, default=32)
+    evidence.add_argument("--max-edges-per-target", type=int, default=5)
+    evidence.set_defaults(func=cmd_target_evidence)
     return parser
 
 

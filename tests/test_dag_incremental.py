@@ -90,6 +90,34 @@ class IncrementalDagTests(unittest.TestCase):
         self.assertEqual(compact["coverage"]["n_valid_records"], 6)
         self.assertLessEqual(len(compact["hypothesis_runs"]["hyp-model-multibranch"]), 2)
 
+        lineage = derive_semantic_lineage(registry, stored)
+        run_three = next(item for item in lineage["runs"] if item["run_id"] == "003")
+        diffs = {item["parent_run_id"]: item["changes"] for item in run_three["parent_diffs"]}
+        self.assertEqual(diffs["002"], [])
+        self.assertEqual(
+            diffs["001"],
+            [
+                {
+                    "dimension_id": "dim-model-architecture",
+                    "operation": "hypothesis_changed",
+                    "from_hypothesis_id": "hyp-model-linear",
+                    "to_hypothesis_id": "hyp-model-multibranch",
+                },
+                {
+                    "dimension_id": "dim-validation-selection",
+                    "operation": "hypothesis_changed",
+                    "from_hypothesis_id": "hyp-valid-holdout",
+                    "to_hypothesis_id": "hyp-valid-cv",
+                },
+                {
+                    "dimension_id": "dim-ensemble",
+                    "operation": "dimension_activated",
+                    "from_hypothesis_id": None,
+                    "to_hypothesis_id": "hyp-ensemble-stacking",
+                },
+            ],
+        )
+
     def test_bulk_graph_stats_match_incremental_construction(self) -> None:
         ledger = {"records": _records()}
         bulk = Graph.from_ledger(ledger)

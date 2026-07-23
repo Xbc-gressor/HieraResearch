@@ -834,24 +834,30 @@ def complete_point(
 
 def point_diff(parent: dict[str, Any], child: dict[str, Any]) -> list[dict[str, Any]]:
     parent_by_dim = {
-        item.get("dimension_id"): item
+        item["dimension_id"]: item
         for item in parent.get("assignments", [])
-        if isinstance(item, dict)
+        if isinstance(item, dict) and isinstance(item.get("dimension_id"), str)
     }
     changes: list[dict[str, Any]] = []
-    for item in child.get("assignments", []):
-        if not isinstance(item, dict):
+    for current in child.get("assignments", []):
+        if not isinstance(current, dict) or not isinstance(current.get("dimension_id"), str):
             continue
-        dimension_id = item.get("dimension_id")
-        previous = parent_by_dim.get(dimension_id, {})
-        before = (
-            previous.get("hypothesis_id")
-            if previous.get("state") == "selected"
-            else "inactive"
+        previous = parent_by_dim.get(current["dimension_id"], {})
+        before = previous.get("hypothesis_id") if previous.get("state") == "selected" else None
+        after = current.get("hypothesis_id") if current.get("state") == "selected" else None
+        if before == after:
+            continue
+        operation = (
+            "dimension_activated" if before is None
+            else "dimension_deactivated" if after is None
+            else "hypothesis_changed"
         )
-        after = item.get("hypothesis_id") if item.get("state") == "selected" else "inactive"
-        if before != after:
-            changes.append({"dimension_id": dimension_id, "from": before, "to": after})
+        changes.append({
+            "dimension_id": current["dimension_id"],
+            "operation": operation,
+            "from_hypothesis_id": before,
+            "to_hypothesis_id": after,
+        })
     return changes
 
 

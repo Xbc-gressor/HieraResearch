@@ -22,6 +22,7 @@ from background_contract import (
     validate_registry,
 )
 from search_backends import add_visit, new_manifest
+from semantic_evidence import build_semantic_edges, comparator_coverage
 from semantic_search import build_proposal_set, select_proposal, validate_proposal_set
 from semantic_space import (
     catalog_receipt,
@@ -826,6 +827,68 @@ def main() -> int:
         registry,
         stale_view_ledger,
     ) == []
+
+    # P2 target-evidence CLI: the real subprocess renders mechanical comparator
+    # coverage identical to the in-process function over persisted receipts.
+    filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+    evidence_records = [
+        record("000", "fresh", [], baseline, score=0.40, status="keep"),
+        record("001", "improve", ["000"], filtered, score=0.50, status="discard"),
+        record("002", "fresh", [], baseline, score=0.41, status="keep"),
+        record("003", "improve", ["002"], filtered, score=0.52, status="discard"),
+    ]
+    evidence_records[0]["semantic_edges"] = []
+    evidence_records[2]["semantic_edges"] = []
+    evidence_records[1]["semantic_edges"] = build_semantic_edges(
+        evidence_records[:1], evidence_records[1]
+    )
+    evidence_records[3]["semantic_edges"] = build_semantic_edges(
+        evidence_records[:3], evidence_records[3]
+    )
+    evidence_ledger = {
+        "search_space": space_receipt(registry),
+        "records": evidence_records,
+        "dag_revision": 4,
+    }
+    assert validate_registry(registry, ledger=evidence_ledger) == [], validate_registry(
+        registry, ledger=evidence_ledger
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        background_path = Path(tmp) / "background.md"
+        ledger_path = Path(tmp) / "ledger.json"
+        background_path.write_text(background_text(registry))
+        ledger_path.write_text(json.dumps(evidence_ledger))
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "background_contract.py"),
+                "target-evidence",
+                "--background",
+                str(background_path),
+                "--ledger",
+                str(ledger_path),
+                "--target-id",
+                "hyp-data-filtered",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    view = json.loads(completed.stdout)
+    (block,) = view["hypothesis_targets"]
+    assert block["evidence_edge_ids"] == ["sedge-000-001", "sedge-002-003"]
+    assert block["comparator_coverage"] == comparator_coverage(
+        evidence_ledger,
+        block["evidence_edge_ids"],
+        target_kind="hypothesis",
+        target_id="hyp-data-filtered",
+    )
+    assert block["comparator_coverage"] == {
+        "direct_noncrash_edges": 2,
+        "confounded_noncrash_edges": 0,
+        "crash_edges": 0,
+    }
 
     print("P1 semantic background, point, lineage, and policy checks passed.")
     return 0
