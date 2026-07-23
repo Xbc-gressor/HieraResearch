@@ -432,6 +432,14 @@ def cmd_add_record(args) -> int:
     record["semantic_edges"] = build_semantic_edges(data["records"], record)
     data["search_space"] = data.get("search_space") or space_receipt(registry)
     data["search_space_state"] = data.get("search_space_state") or empty_search_space_state()
+    current_revision = data["search_space_state"].get("revision", 0)
+    if policy_receipt.get("search_space_state_revision") != current_revision:
+        raise SystemExit(
+            "stale policy receipt: search_space_state_revision "
+            f"{policy_receipt.get('search_space_state_revision')!r} does not equal the "
+            f"current search space state revision {current_revision}; re-propose and "
+            "re-select against the current overlay before admission"
+        )
     data["records"].append(record)
     contract_errors = validate_registry(
         registry,

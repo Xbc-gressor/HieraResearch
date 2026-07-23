@@ -301,10 +301,11 @@ def background_text(registry: dict) -> str:
     return "\n".join(lines)
 
 
-def policy_receipt(op: str, parents: list[str], point: dict) -> dict:
+def policy_receipt(op: str, parents: list[str], point: dict, *, state_revision: int = 0) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "space_revision": point["space_revision"],
+        "search_space_state_revision": state_revision,
         "proposal_set_revision": "sha256:" + "0" * 64,
         "policy": {
             "name": "coverage",
@@ -788,6 +789,310 @@ def main() -> int:
         }, applied
         stored = json.loads(ledger_path.read_text())
         assert stored["search_space_state"] == empty_search_space_state()
+
+        # P2 selection lifecycle through real CLIs: two direct comparator
+        # edges against hyp-data-filtered drive the two-stage pruning
+        # (revision 1 deprioritized, revision 2 pruned); revision-stamped
+        # proposals and receipts track the overlay; stale artifacts are
+        # rejected; a later belief with an advanced DAG cursor reopens it.
+        prune_target = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+
+        def cli_add_record(run_id: str, op: str, parents: list[str], point: dict, receipt: dict) -> None:
+            point_path.write_text(json.dumps(point))
+            policy_path.write_text(json.dumps(receipt))
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "ledger.py"),
+                    "add-record",
+                    "--ledger", str(ledger_path),
+                    "--task", "hard-interactions",
+                    "--run-id", run_id,
+                    "--op", op,
+                    "--source-run-ids", ",".join(parents),
+                    "--background", str(background_path),
+                    "--semantic-point", str(point_path),
+                    "--policy-receipt", str(policy_path),
+                    "--idea", f"Complete fixture solution {run_id} at the selected point.",
+                    "--change", f"fixture change for {op} run {run_id}",
+                    "--candidate-name-hint", f"fixture_{run_id}",
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        def cli_record_run(run_id: str, score: float) -> None:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "ledger.py"),
+                    "record-run",
+                    "--ledger", str(ledger_path),
+                    "--task", "hard-interactions",
+                    "--run-id", run_id,
+                    "--final-best-score", str(score),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        def cli_set_experience(generation: int, updated_at_run: str, beliefs: list[dict]) -> None:
+            experience_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 3,
+                        "updated_at_run": updated_at_run,
+                        "generation": generation,
+                        "summary": "Comparator evidence against the filtered hypothesis.",
+                        "promising_regions": [],
+                        "lessons": [],
+                        "bottlenecks": [],
+                        "dimension_evidence": [],
+                        "hypothesis_evidence": beliefs,
+                    }
+                )
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "ledger.py"),
+                    "set-experience",
+                    "--ledger", str(ledger_path),
+                    "--task", "hard-interactions",
+                    "--background", str(background_path),
+                    "--from-json", str(experience_path),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        def cli_apply_space_state() -> dict:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "ledger.py"),
+                    "apply-space-state",
+                    "--ledger", str(ledger_path),
+                    "--background", str(background_path),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return json.loads(completed.stdout)
+
+        def cli_propose(output_path: Path) -> dict:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "semantic_search.py"),
+                    "propose",
+                    "--background", str(background_path),
+                    "--ledger", str(ledger_path),
+                    "--op", "fresh",
+                    "--output", str(output_path),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return json.loads(output_path.read_text())
+
+        def selects_target(proposal: dict) -> bool:
+            return (
+                selected_assignments(proposal["point"]).get("dim-data-curation")
+                == "hyp-data-filtered"
+            )
+
+        # Two matched comparisons against a fresh baseline parent, both worse.
+        baseline_point = complete_point(registry)
+        cli_add_record("002", "fresh", [], baseline_point, policy_receipt("fresh", [], baseline_point))
+        cli_record_run("002", 0.45)
+        cli_add_record("003", "improve", ["002"], prune_target, policy_receipt("improve", ["002"], prune_target))
+        cli_record_run("003", 0.6)
+        cli_add_record("004", "improve", ["002"], prune_target, policy_receipt("improve", ["002"], prune_target))
+        cli_record_run("004", 0.62)
+
+        prune_belief = {
+            "target_id": "hyp-data-filtered",
+            "evaluation_state": "comparator_covered",
+            "assessment": "unpromising",
+            "recommended_status": "pruned",
+            "claim": "Both direct comparisons were worse than their matched baseline parent.",
+            "evidence_run_ids": ["002", "003", "004"],
+            "evidence_edge_ids": ["sedge-002-003", "sedge-002-004"],
+            "comparator_coverage": {
+                "direct_noncrash_edges": 2,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+            "confidence": "high",
+            "uncertainty": "Implementation differences remain confounded with each semantic change.",
+            "reopen_when": "A later direct comparison improves over its parent.",
+        }
+        cli_set_experience(1, "004", [prune_belief])
+        applied = cli_apply_space_state()
+        assert applied == {
+            "ok": True,
+            "prior_revision": 0,
+            "revision": 1,
+            "decision_ids": ["sdec-000001"],
+        }, applied
+        cli_set_experience(2, "004", [prune_belief])
+        applied = cli_apply_space_state()
+        assert applied == {
+            "ok": True,
+            "prior_revision": 1,
+            "revision": 2,
+            "decision_ids": ["sdec-000002"],
+        }, applied
+
+        # Later pruning must not invalidate the revision-0 records.
+        stored = json.loads(ledger_path.read_text())
+        assert stored["search_space_state"]["revision"] == 2
+        assert validate_registry(registry, ledger=stored) == [], validate_registry(
+            registry, ledger=stored
+        )
+
+        # Revision-current proposals omit the pruned hypothesis and carry the stamp.
+        proposals_path = tmp_path / "proposals.json"
+        current_proposals = cli_propose(proposals_path)
+        assert current_proposals["schema_version"] == 2
+        assert current_proposals["search_space_state_revision"] == 2
+        assert current_proposals["proposals"]
+        assert not any(selects_target(item) for item in current_proposals["proposals"])
+
+        # Selection stamps the same revision into the policy receipt.
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "semantic_search.py"),
+                "select",
+                "--proposals", str(proposals_path),
+                "--ledger", str(ledger_path),
+                "--policy", "coverage",
+                "--point-output", str(point_path),
+                "--receipt-output", str(policy_path),
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        selected_receipt = json.loads(policy_path.read_text())
+        assert selected_receipt["schema_version"] == 2
+        assert selected_receipt["search_space_state_revision"] == 2
+
+        # A proposal set stamped at another revision is rejected as stale.
+        stale_proposals = copy.deepcopy(current_proposals)
+        stale_proposals["search_space_state_revision"] = 1
+        proposals_path.write_text(json.dumps(stale_proposals))
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "semantic_search.py"),
+                "select",
+                "--proposals", str(proposals_path),
+                "--ledger", str(ledger_path),
+                "--policy", "coverage",
+                "--point-output", str(point_path),
+                "--receipt-output", str(policy_path),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode != 0
+        assert "stale" in rejected.stderr, rejected.stderr
+
+        # add-record rejects a stale revision-0 receipt against revision 2.
+        point_path.write_text(json.dumps(prune_target))
+        policy_path.write_text(
+            json.dumps(policy_receipt("fresh", [], prune_target, state_revision=0))
+        )
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "ledger.py"),
+                "add-record",
+                "--ledger", str(ledger_path),
+                "--task", "hard-interactions",
+                "--run-id", "005",
+                "--op", "fresh",
+                "--source-run-ids", "",
+                "--background", str(background_path),
+                "--semantic-point", str(point_path),
+                "--policy-receipt", str(policy_path),
+                "--idea", "A forged late arrival at the pruned point.",
+                "--change", "from scratch at the pruned point",
+                "--candidate-name-hint", "fixture_stale",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode != 0
+        assert "stale" in rejected.stderr, rejected.stderr
+        stored = json.loads(ledger_path.read_text())
+        assert [item["run_id"] for item in stored["records"]] == [
+            "000", "001", "002", "003", "004",
+        ]
+
+        # A revision-current receipt admits run 005 and advances the DAG cursor.
+        cli_add_record(
+            "005",
+            "fresh",
+            [],
+            baseline_point,
+            policy_receipt("fresh", [], baseline_point, state_revision=2),
+        )
+        cli_record_run("005", 0.49)
+
+        reopen_belief = {
+            "target_id": "hyp-data-filtered",
+            "evaluation_state": "comparator_covered",
+            "assessment": "promising",
+            "recommended_status": "active",
+            "claim": "Newer evidence warrants re-admitting the filtered hypothesis to proposals.",
+            "evidence_run_ids": ["002", "003", "004"],
+            "evidence_edge_ids": ["sedge-002-003", "sedge-002-004"],
+            "comparator_coverage": {
+                "direct_noncrash_edges": 2,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+            "confidence": "high",
+            "uncertainty": "The improvement signal remains implementation-confounded.",
+        }
+        cli_set_experience(3, "005", [reopen_belief])
+        applied = cli_apply_space_state()
+        assert applied == {
+            "ok": True,
+            "prior_revision": 2,
+            "revision": 3,
+            "decision_ids": ["sdec-000003"],
+        }, applied
+
+        # Revision 3 proposals re-admit the reopened hypothesis.
+        reopened_proposals = cli_propose(proposals_path)
+        assert reopened_proposals["search_space_state_revision"] == 3
+        assert any(selects_target(item) for item in reopened_proposals["proposals"])
+        stored = json.loads(ledger_path.read_text())
+        assert stored["search_space_state"]["revision"] == 3
+        assert len(stored["search_space_state"]["decisions"]) == 3
+        assert validate_registry(registry, ledger=stored) == [], validate_registry(
+            registry, ledger=stored
+        )
 
     proposals = fresh_proposals["proposals"]
     assert len(proposals) >= 2

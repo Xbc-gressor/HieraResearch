@@ -21,7 +21,13 @@ from pathlib import Path
 from typing import Any
 
 from search_backends import canonical_key, validate_manifest
-from search_space_state import validate_search_space_state
+from search_space_state import (
+    compose_effective_selection,
+    empty_search_space_state,
+    replay_search_space_state,
+    validate_point_eligibility,
+    validate_search_space_state,
+)
 from semantic_evidence import (
     COVERAGE_KEYS,
     EVALUATION_STATES,
@@ -653,8 +659,18 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         return [f"{where}.policy_receipt must be an object distinct from observations"]
     point_object = point if isinstance(point, dict) else {}
     errors: list[str] = []
-    if receipt.get("schema_version") != 1:
-        errors.append(f"{where}.policy_receipt.schema_version must be 1")
+    if receipt.get("schema_version") != 2:
+        errors.append(f"{where}.policy_receipt.schema_version must be 2")
+    state_revision = receipt.get("search_space_state_revision")
+    if (
+        not isinstance(state_revision, int)
+        or isinstance(state_revision, bool)
+        or state_revision < 0
+    ):
+        errors.append(
+            f"{where}.policy_receipt.search_space_state_revision must be a "
+            "non-negative integer"
+        )
     if receipt.get("space_revision") != point_object.get("space_revision"):
         errors.append(f"{where}.policy_receipt.space_revision must match semantic_point")
     proposal_revision = receipt.get("proposal_set_revision")
@@ -810,6 +826,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     allowed = {
         "schema_version",
         "space_revision",
+        "search_space_state_revision",
         "proposal_set_revision",
         "policy",
         "action",
@@ -837,6 +854,14 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         errors.append(
             "ledger.search_space must preserve the exact background and catalog revision receipt"
         )
+    state = ledger.get("search_space_state")
+    state_revision = state.get("revision") if isinstance(state, dict) else None
+    state_revision_valid = (
+        isinstance(state_revision, int)
+        and not isinstance(state_revision, bool)
+        and state_revision >= 0
+    )
+    guidance = derive_hypothesis_selection(registry)
     known: set[str] = set()
     for index, record in enumerate(records):
         where = f"ledger.records[{index}]"
@@ -877,6 +902,31 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         point_errors = validate_candidate_point(record.get("semantic_point"), registry)
         errors.extend(f"{where}: {error}" for error in point_errors)
         errors.extend(_validate_policy_receipt(record, where))
+        # Replay the overlay at the record's historical selection revision, so
+        # later pruning never invalidates an earlier admitted record.
+        receipt = record.get("policy_receipt")
+        record_revision = (
+            receipt.get("search_space_state_revision")
+            if isinstance(receipt, dict)
+            else None
+        )
+        if (
+            isinstance(record_revision, int)
+            and not isinstance(record_revision, bool)
+            and state_revision_valid
+        ):
+            if not 0 <= record_revision <= state_revision:
+                errors.append(
+                    f"{where}.policy_receipt.search_space_state_revision must be in "
+                    f"[0, {state_revision}]"
+                )
+            else:
+                runtime = replay_search_space_state(registry, state, revision=record_revision)
+                effective = compose_effective_selection(registry, guidance, runtime)
+                eligibility = validate_point_eligibility(
+                    record.get("semantic_point"), registry, effective
+                )
+                errors.extend(f"{where}: {error}" for error in eligibility)
         errors.extend(validate_semantic_edges(records[:index], record, registry))
         if valid_run_id:
             known.add(run_id)
@@ -1075,7 +1125,20 @@ def render_space(
         for dimension in coverage["dimensions"]
         for item in dimension["hypotheses"]
     }
-    selection = derive_hypothesis_selection(registry)
+    state = (ledger or {}).get("search_space_state")
+    if not isinstance(state, dict):
+        state = empty_search_space_state()
+    state_revision = state.get("revision")
+    if (
+        not isinstance(state_revision, int)
+        or isinstance(state_revision, bool)
+        or state_revision < 0
+    ):
+        state_revision = 0
+    runtime = replay_search_space_state(registry, state)
+    effective = compose_effective_selection(
+        registry, derive_hypothesis_selection(registry), runtime
+    )
     dimensions = []
     for dimension in registry.get("dimensions", []):
         if not isinstance(dimension, dict):
@@ -1092,14 +1155,14 @@ def render_space(
                     "kind": hypothesis.get("kind"),
                     "claim": hypothesis.get("claim"),
                     "literature_credibility": hypothesis.get("literature_credibility"),
-                    "selection": selection.get(hypothesis_id),
+                    "selection": effective.get(hypothesis_id),
                     "coverage_count": counts.get(hypothesis_id, 0),
                 }
             )
         hypotheses.sort(
             key=lambda item: (
-                {"active": 0, "deprioritized": 1, "excluded": 2}.get(
-                    (item.get("selection") or {}).get("selection_status"), 3
+                {"active": 0, "deprioritized": 1, "pruned": 2, "excluded": 3}.get(
+                    (item.get("selection") or {}).get("effective_status"), 4
                 ),
                 item["coverage_count"],
                 item["id"],
@@ -1110,6 +1173,7 @@ def render_space(
                 "id": dimension.get("id"),
                 "mode": dimension.get("mode"),
                 "baseline_hypothesis_id": dimension.get("baseline_hypothesis_id"),
+                "runtime_status": runtime["dimensions"].get(dimension.get("id"), "active"),
                 "selection_reason": dimension.get("selection_reason"),
                 "hypotheses": hypotheses[:max_hypotheses],
                 "omitted_hypotheses": max(0, len(hypotheses) - max_hypotheses),
@@ -1118,6 +1182,7 @@ def render_space(
     return {
         "ok": True,
         "space": space_receipt(registry),
+        "search_space_state_revision": state_revision,
         "coverage": {
             "n_valid_records": coverage["n_valid_records"],
             "n_unique_points": coverage["n_unique_points"],

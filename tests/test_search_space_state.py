@@ -14,8 +14,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from background_contract import derive_hypothesis_selection, validate_ledger  # noqa: E402
-from ledger import cmd_brief  # noqa: E402
+from background_contract import (  # noqa: E402
+    ContractError,
+    derive_hypothesis_selection,
+    render_space,
+    validate_ledger,
+)
+from ledger import cmd_add_record, cmd_brief  # noqa: E402
 from search_space_state import (  # noqa: E402
     append_experience_transitions,
     compose_effective_selection,
@@ -27,9 +32,24 @@ from search_space_state import (  # noqa: E402
     validate_search_space_state,
 )
 from semantic_evidence import build_semantic_edges  # noqa: E402
-from semantic_space import complete_point, space_receipt, validate_point  # noqa: E402
+from semantic_search import (  # noqa: E402
+    build_proposal_set,
+    cmd_select,
+    select_proposal,
+)
+from semantic_space import (  # noqa: E402
+    complete_point,
+    selected_assignments,
+    space_receipt,
+    validate_point,
+)
 from tests.p2_fixtures import belief_ledger  # noqa: E402
-from validate_background import fixture_registry, record  # noqa: E402
+from validate_background import (  # noqa: E402
+    background_text,
+    fixture_registry,
+    policy_receipt,
+    record,
+)
 
 
 def _scope(intervention: str) -> dict:
@@ -862,6 +882,310 @@ class LedgerIntegrationTests(unittest.TestCase):
         self.assertEqual(brief["runtime_deprioritized_hypotheses"], 1)
         self.assertEqual(brief["runtime_pruned_hypotheses"], 1)
         self.assertNotIn("decisions", brief)
+
+
+class StateAwareSelectionLifecycleTests(unittest.TestCase):
+    """Proposals and selection receipts track the revisioned pruning overlay.
+
+    Automated pruning is two-stage (``active -> deprioritized -> pruned``), so
+    the pruned overlay is revision 2 and reopening lands at revision 3; the
+    deprioritized stage at revision 1 exercises the deterministic re-sort.
+    """
+
+    def setUp(self) -> None:
+        self.registry = fixture_registry()
+        self.filtered = complete_point(
+            self.registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+
+    def _proposals(self, ledger: dict) -> dict:
+        return build_proposal_set(
+            self.registry, ledger, op="fresh", parents=[], max_points=64
+        )
+
+    @staticmethod
+    def _selects_filtered(proposal: dict) -> bool:
+        return (
+            selected_assignments(proposal["point"]).get("dim-data-curation")
+            == "hyp-data-filtered"
+        )
+
+    def test_prune_select_stale_reject_and_reopen_lifecycle(self) -> None:
+        registry = self.registry
+
+        # 1. Revision 0 proposes a point containing hyp-data-filtered.
+        ledger: dict = {"records": [], "search_space_state": empty_search_space_state()}
+        proposals = self._proposals(ledger)
+        self.assertEqual(proposals["schema_version"], 2)
+        self.assertEqual(proposals["search_space_state_revision"], 0)
+        self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
+        _, receipt = select_proposal(proposals, policy="coverage")
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["search_space_state_revision"], 0)
+
+        # A revision-0 historical record selects the hypothesis to be pruned.
+        ledger["records"].append(
+            record("000", "fresh", [], self.filtered, score=0.5, status="discard")
+        )
+        ledger["search_space"] = space_receipt(registry)
+
+        # 2. Later state decisions prune that hypothesis (two-stage).  The
+        #    revision-1 deprioritized stage keeps the content eligible but
+        #    sorts it after active proposals at equal coverage.
+        state = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
+        ledger["search_space_state"] = state
+        proposals = self._proposals(ledger)
+        self.assertEqual(proposals["schema_version"], 2)
+        self.assertEqual(proposals["search_space_state_revision"], 1)
+        filtered_proposals = [
+            item for item in proposals["proposals"] if self._selects_filtered(item)
+        ]
+        self.assertTrue(filtered_proposals)
+        for item in filtered_proposals:
+            self.assertEqual(item["deprioritized_hypotheses"], ["hyp-data-filtered"])
+        positions = {
+            item["point_id"]: index
+            for index, item in enumerate(proposals["proposals"])
+        }
+        mixed_pairs = [
+            (active, dep)
+            for active in proposals["proposals"]
+            if not active["deprioritized_hypotheses"]
+            for dep in proposals["proposals"]
+            if dep["deprioritized_hypotheses"]
+            and active["coverage"] == dep["coverage"]
+        ]
+        self.assertTrue(mixed_pairs)  # the ordering assertion is non-vacuous
+        for active, dep in mixed_pairs:
+            self.assertLess(positions[active["point_id"]], positions[dep["point_id"]])
+        _, receipt = select_proposal(proposals, policy="coverage")
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["search_space_state_revision"], 1)
+
+        # 3. Revision 2 proposals omit the pruned hypothesis.
+        state["decisions"].append(
+            decision(2, "hyp-data-filtered", "deprioritized", "pruned")
+        )
+        state["revision"] = 2
+        proposals = self._proposals(ledger)
+        self.assertEqual(proposals["schema_version"], 2)
+        self.assertEqual(proposals["search_space_state_revision"], 2)
+        self.assertFalse(any(self._selects_filtered(p) for p in proposals["proposals"]))
+        _, receipt = select_proposal(proposals, policy="coverage")
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["search_space_state_revision"], 2)
+
+        # 4. The revision-0 historical record remains ledger-valid.
+        self.assertEqual(validate_ledger(registry, ledger), [])
+
+        # 5. add-record rejects the stale revision-0 receipt at revision 2.
+        #    Admission precedes all candidate work, so no candidate directory
+        #    or implementation is created and the ledger stays untouched.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            background_path = tmp_path / "background.md"
+            ledger_path = tmp_path / "ledger.json"
+            point_path = tmp_path / "point.json"
+            receipt_path = tmp_path / "policy.json"
+            background_path.write_text(background_text(registry))
+            ledger_path.write_text(json.dumps(ledger))
+            point_path.write_text(json.dumps(self.filtered))
+            receipt_path.write_text(
+                json.dumps(policy_receipt("fresh", [], self.filtered, state_revision=0))
+            )
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                run_id="001",
+                kind="optimization",
+                op="fresh",
+                source_run_ids="",
+                background=str(background_path),
+                catalog=None,
+                semantic_point=str(point_path),
+                policy_receipt=str(receipt_path),
+                idea="A forged late arrival at the pruned point.",
+                change="from scratch at the pruned point",
+                candidate_name_hint="fixture_stale",
+                description=None,
+            )
+            with self.assertRaises(SystemExit) as raised:
+                cmd_add_record(args)
+            self.assertIn("stale", str(raised.exception))
+            # A revision-current receipt still cannot admit a pruned point:
+            # the selected point must be eligible at its receipt revision.
+            receipt_path.write_text(
+                json.dumps(policy_receipt("fresh", [], self.filtered, state_revision=2))
+            )
+            with self.assertRaises(SystemExit) as raised:
+                cmd_add_record(args)
+            self.assertIn("pruned", str(raised.exception))
+            stored = json.loads(ledger_path.read_text())
+        self.assertEqual([item["run_id"] for item in stored["records"]], ["000"])
+
+        # 6. Reopening appends a new decision; revision 3 is eligible again.
+        state["decisions"].append(decision(3, "hyp-data-filtered", "pruned", "active"))
+        state["revision"] = 3
+        proposals = self._proposals(ledger)
+        self.assertEqual(proposals["search_space_state_revision"], 3)
+        self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
+        self.assertEqual(validate_ledger(registry, ledger), [])
+
+        # 7. A structural `requires` completion that would force the pruned
+        #    hyp-valid-cv is discarded rather than leaking an ineligible
+        #    point (stacking always completes to cross-validation).
+        cv_state = state_with(
+            hypothesis_decision(
+                1, "dim-validation-selection", "hyp-valid-cv", "active", "deprioritized"
+            ),
+            hypothesis_decision(
+                2, "dim-validation-selection", "hyp-valid-cv", "deprioritized", "pruned"
+            ),
+        )
+        cv_proposals = self._proposals(
+            {"records": [], "search_space_state": cv_state}
+        )
+        self.assertEqual(cv_proposals["search_space_state_revision"], 2)
+        self.assertTrue(cv_proposals["proposals"])
+        for item in cv_proposals["proposals"]:
+            selected = selected_assignments(item["point"])
+            self.assertNotEqual(selected.get("dim-validation-selection"), "hyp-valid-cv")
+            self.assertNotEqual(selected.get("dim-ensemble"), "hyp-ensemble-stacking")
+
+    def test_pruned_dimension_proposes_only_its_baseline(self) -> None:
+        state = state_with(
+            dimension_decision(1, "dim-data-curation", "active", "deprioritized"),
+            dimension_decision(2, "dim-data-curation", "deprioritized", "pruned"),
+        )
+        proposals = self._proposals({"records": [], "search_space_state": state})
+        self.assertEqual(proposals["search_space_state_revision"], 2)
+        chosen = {
+            selected_assignments(item["point"]).get("dim-data-curation")
+            for item in proposals["proposals"]
+        }
+        self.assertEqual(chosen, {"hyp-data-raw"})
+
+    def test_select_command_requires_matching_ledger_revision(self) -> None:
+        registry = self.registry
+        proposals = self._proposals(
+            {"records": [], "search_space_state": empty_search_space_state()}
+        )
+        state = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            proposals_path = tmp_path / "proposals.json"
+            ledger_path = tmp_path / "ledger.json"
+            point_path = tmp_path / "point.json"
+            receipt_path = tmp_path / "receipt.json"
+            proposals_path.write_text(json.dumps(proposals))
+            ledger_path.write_text(
+                json.dumps({"records": [], "search_space_state": state})
+            )
+            args = types.SimpleNamespace(
+                proposals=proposals_path,
+                predictions=None,
+                ledger=ledger_path,
+                policy="coverage",
+                cfg=None,
+                point_output=point_path,
+                receipt_output=receipt_path,
+            )
+            with self.assertRaises(ContractError) as raised:
+                cmd_select(args)
+            self.assertIn("stale", str(raised.exception))
+
+            current = self._proposals({"records": [], "search_space_state": state})
+            proposals_path.write_text(json.dumps(current))
+            self.assertEqual(cmd_select(args), 0)
+            written = json.loads(receipt_path.read_text())
+        self.assertEqual(written["schema_version"], 2)
+        self.assertEqual(written["search_space_state_revision"], 1)
+
+    def test_validate_ledger_replays_each_record_at_its_receipt_revision(self) -> None:
+        registry = self.registry
+        state = state_with(
+            decision(1, "hyp-data-filtered", "active", "deprioritized"),
+            decision(2, "hyp-data-filtered", "deprioritized", "pruned"),
+        )
+        ledger = {
+            "search_space": space_receipt(registry),
+            "records": [],
+            "search_space_state": state,
+        }
+        admitted_at_one = record(
+            "000", "fresh", [], self.filtered, score=0.5, status="keep"
+        )
+        admitted_at_one["policy_receipt"]["search_space_state_revision"] = 1
+        ledger["records"].append(admitted_at_one)
+        # Replayed at revision 1 the point was only deprioritized: still valid.
+        self.assertEqual(validate_ledger(registry, ledger), [])
+
+        forged = copy.deepcopy(admitted_at_one)
+        forged["run_id"] = "001"
+        forged["policy_receipt"]["search_space_state_revision"] = 2
+        ledger["records"].append(forged)
+        errors = validate_ledger(registry, ledger)
+        self.assertTrue(any("pruned" in error for error in errors), errors)
+
+    def test_validate_ledger_rejects_receipt_revision_beyond_state(self) -> None:
+        registry = self.registry
+        entry = record("000", "fresh", [], self.filtered, score=0.5, status="keep")
+        entry["policy_receipt"]["search_space_state_revision"] = 1
+        ledger = {
+            "search_space": space_receipt(registry),
+            "records": [entry],
+            "search_space_state": empty_search_space_state(),
+        }
+        errors = validate_ledger(registry, ledger)
+        self.assertTrue(
+            any("search_space_state_revision must be in [0," in error for error in errors),
+            errors,
+        )
+
+    def test_render_space_reports_all_status_components(self) -> None:
+        registry = self.registry
+        state = state_with(
+            decision(1, "hyp-data-filtered", "active", "deprioritized"),
+            decision(2, "hyp-data-filtered", "deprioritized", "pruned"),
+            dimension_decision(3, "dim-ensemble", "active", "deprioritized"),
+        )
+        rendered = render_space(
+            registry, {"records": [], "search_space_state": state}, max_hypotheses=8
+        )
+        self.assertEqual(rendered["search_space_state_revision"], 3)
+        dimensions = {item["id"]: item for item in rendered["dimensions"]}
+        self.assertEqual(dimensions["dim-ensemble"]["runtime_status"], "deprioritized")
+        self.assertEqual(dimensions["dim-data-curation"]["runtime_status"], "active")
+        hypotheses = {
+            item["id"]: item for item in dimensions["dim-data-curation"]["hypotheses"]
+        }
+        self.assertEqual(
+            hypotheses["hyp-data-filtered"]["selection"],
+            {
+                "guidance_status": "active",
+                "dimension_runtime_status": "active",
+                "hypothesis_runtime_status": "pruned",
+                "effective_status": "pruned",
+                "binding_guidance": [],
+                "matched_guidance": [{"id": "g-01", "effect": "caution"}],
+            },
+        )
+        # Literature credibility stays a separate, unaffected field.
+        self.assertEqual(
+            hypotheses["hyp-data-filtered"]["literature_credibility"], "preliminary"
+        )
+        self.assertEqual(
+            hypotheses["hyp-data-raw"]["selection"]["effective_status"], "active"
+        )
+        ensemble = {
+            item["id"]: item for item in dimensions["dim-ensemble"]["hypotheses"]
+        }
+        stacking = ensemble["hyp-ensemble-stacking"]["selection"]
+        self.assertEqual(stacking["dimension_runtime_status"], "deprioritized")
+        self.assertEqual(stacking["effective_status"], "deprioritized")
+        self.assertEqual(
+            ensemble["hyp-ensemble-identity"]["selection"]["effective_status"], "active"
+        )
 
 
 if __name__ == "__main__":

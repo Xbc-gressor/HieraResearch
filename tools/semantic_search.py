@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""P1 semantic-point proposal and replaceable acquisition policies.
+"""P2 semantic-point proposal and replaceable acquisition policies.
 
 ``got_select`` continues to choose the structural graph action and parents.
 This module independently turns that assignment into a bounded set of valid
-semantic points, then selects one with one of three policies:
+semantic points eligible under the ledger's revisioned ``search_space_state``
+overlay, then selects one with one of three policies:
 
 * ``coverage``: deterministic exploration without any model score;
 * ``gain``: predicted gain with explicit cost and a small coverage tie-break;
@@ -37,6 +38,12 @@ from background_contract import (
     validate_background_markdown,
     validate_registry,
 )
+from search_space_state import (
+    compose_effective_selection,
+    empty_search_space_state,
+    replay_search_space_state,
+    validate_point_eligibility,
+)
 from semantic_space import (
     SemanticSpaceError,
     complete_point,
@@ -54,9 +61,9 @@ from semantic_space import (
 )
 
 
-PROPOSAL_SCHEMA_VERSION = 1
+PROPOSAL_SCHEMA_VERSION = 2
 PREDICTION_SCHEMA_VERSION = 1
-POLICY_RECEIPT_SCHEMA_VERSION = 1
+POLICY_RECEIPT_SCHEMA_VERSION = 2
 POLICIES = {"coverage", "gain", "gain_uncertainty"}
 DEFAULT_POLICY_CONFIG = {
     "coverage_weight": 0.10,
@@ -104,8 +111,35 @@ def _validate_action(op: str, parents: list[str]) -> None:
         raise ContractError("semantic action parents must be numeric run ids")
 
 
-def _eligible_hypotheses(registry: dict[str, Any]) -> dict[str, list[str]]:
-    selection = derive_hypothesis_selection(registry)
+def _eligible_hypotheses(
+    registry: dict[str, Any], ledger: dict[str, Any]
+) -> tuple[dict[str, list[str]], dict[str, Any], int]:
+    """Selectable hypotheses and effective statuses at the ledger's state revision.
+
+    A missing bootstrap ledger or an absent top-level state replays as
+    :func:`empty_search_space_state` (the first proposal); a persisted P2
+    ledger is validated upstream to carry the overlay object.  ``excluded``
+    and ``pruned`` content is dropped, ``deprioritized`` content stays
+    eligible, and a protected baseline always remains: under a validated
+    registry and state the explicit baseline's effective status is ``active``,
+    so a runtime-pruned dimension exposes only its baseline.
+    """
+    state = ledger.get("search_space_state") if isinstance(ledger, dict) else None
+    if not isinstance(state, dict):
+        state = empty_search_space_state()
+    state_revision = state.get("revision")
+    if (
+        not isinstance(state_revision, int)
+        or isinstance(state_revision, bool)
+        or state_revision < 0
+    ):
+        raise ContractError(
+            "ledger.search_space_state.revision must be a non-negative integer"
+        )
+    runtime = replay_search_space_state(registry, state)
+    effective = compose_effective_selection(
+        registry, derive_hypothesis_selection(registry), runtime
+    )
     result: dict[str, list[str]] = {}
     for dimension in registry.get("dimensions", []):
         if not isinstance(dimension, dict):
@@ -114,10 +148,11 @@ def _eligible_hypotheses(registry: dict[str, Any]) -> dict[str, list[str]]:
             hypothesis.get("id")
             for hypothesis in dimension.get("hypotheses", [])
             if isinstance(hypothesis, dict)
-            and selection.get(hypothesis.get("id"), {}).get("selection_status") != "excluded"
+            and effective.get(hypothesis.get("id"), {}).get("effective_status")
+            not in {"excluded", "pruned"}
         ]
         result[dimension["id"]] = [str(item) for item in choices]
-    return result
+    return result, effective, state_revision
 
 
 def _activation_overrides(
@@ -138,10 +173,16 @@ def _activation_overrides(
 
 def _add_point(
     registry: dict[str, Any],
+    effective: dict[str, Any],
     values: dict[str, dict[str, Any]],
     point: dict[str, Any] | None,
 ) -> None:
     if point is None or validate_point(point, registry):
+        return
+    # Revision-current eligibility gate: deterministic completion of a
+    # `requires` relation can select a hypothesis absent from the sparse
+    # overrides, so filtering only the input choice lists is insufficient.
+    if validate_point_eligibility(point, registry, effective):
         return
     values.setdefault(point["point_id"], point)
 
@@ -156,10 +197,13 @@ def _round_robin(groups: list[list[dict[str, str]]]) -> Iterable[dict[str, str]]
 
 
 def _fresh_points(
-    registry: dict[str, Any], eligible: dict[str, list[str]], max_points: int
+    registry: dict[str, Any],
+    eligible: dict[str, list[str]],
+    effective: dict[str, Any],
+    max_points: int,
 ) -> list[dict[str, Any]]:
     values: dict[str, dict[str, Any]] = {}
-    _add_point(registry, values, complete_point(registry))
+    _add_point(registry, effective, values, complete_point(registry))
     if len(values) >= max_points:
         return list(values.values())
     dimensions = dimension_map(registry)
@@ -177,7 +221,7 @@ def _fresh_points(
         intervention_groups.append(group[:max_points])
     interventions = list(_round_robin(intervention_groups))
     for override in interventions:
-        _add_point(registry, values, complete_point(registry, override))
+        _add_point(registry, effective, values, complete_point(registry, override))
         if len(values) >= max_points:
             return list(values.values())
     # Pairwise points make interactions searchable while the deterministic cap
@@ -188,7 +232,7 @@ def _fresh_points(
         if conflict:
             continue
         merged.update(right)
-        _add_point(registry, values, complete_point(registry, merged))
+        _add_point(registry, effective, values, complete_point(registry, merged))
         if len(values) >= max_points:
             break
     return list(values.values())
@@ -198,11 +242,12 @@ def _improve_points(
     registry: dict[str, Any],
     parent: dict[str, Any],
     eligible: dict[str, list[str]],
+    effective: dict[str, Any],
     max_points: int,
 ) -> list[dict[str, Any]]:
     values: dict[str, dict[str, Any]] = {}
     parent_point = parent.get("semantic_point")
-    _add_point(registry, values, parent_point)
+    _add_point(registry, effective, values, parent_point)
     if len(values) >= max_points:
         return list(values.values())
     base = selected_assignments(parent_point)
@@ -220,7 +265,7 @@ def _improve_points(
                 group.append(overrides)
         intervention_groups.append(group[:max_points])
     for overrides in _round_robin(intervention_groups):
-        _add_point(registry, values, complete_point(registry, overrides))
+        _add_point(registry, effective, values, complete_point(registry, overrides))
         if len(values) >= max_points:
             return list(values.values())
     return list(values.values())
@@ -231,6 +276,7 @@ def _crossover_points(
     left: dict[str, Any],
     right: dict[str, Any],
     eligible: dict[str, list[str]],
+    effective: dict[str, Any],
     max_points: int,
 ) -> list[dict[str, Any]]:
     values: dict[str, dict[str, Any]] = {}
@@ -238,8 +284,8 @@ def _crossover_points(
     right_point = right.get("semantic_point")
     left_selected = selected_assignments(left_point)
     right_selected = selected_assignments(right_point)
-    _add_point(registry, values, left_point)
-    _add_point(registry, values, right_point)
+    _add_point(registry, effective, values, left_point)
+    _add_point(registry, effective, values, right_point)
     dimension_ids = list(dimension_map(registry))
     differing = [
         dimension_id
@@ -265,15 +311,15 @@ def _crossover_points(
                 overrides[dimension_id] = right_selected[dimension_id]
             elif mask[index] and dimension_id not in right_selected:
                 overrides.pop(dimension_id, None)
-        _add_point(registry, values, complete_point(registry, overrides))
+        _add_point(registry, effective, values, complete_point(registry, overrides))
         if len(values) >= max_points:
             return list(values.values())
     # If parents occupy the same or nearby point, implementation-level
     # recombination is still valid; add one-hop semantic alternatives as useful
     # neighbors without claiming that the point determines the implementation.
     if len(values) < max_points:
-        for point in _improve_points(registry, left, eligible, max_points):
-            _add_point(registry, values, point)
+        for point in _improve_points(registry, left, eligible, effective, max_points):
+            _add_point(registry, effective, values, point)
             if len(values) >= max_points:
                 break
     return list(values.values())
@@ -312,30 +358,24 @@ def build_proposal_set(
         raise ContractError(f"max_points must be an integer in [1, {MAX_PROPOSALS}]")
     _validate_action(op, parents)
     parent_records = _parent_records(ledger, parents)
-    eligible = _eligible_hypotheses(registry)
+    eligible, effective, state_revision = _eligible_hypotheses(registry, ledger)
     if any(not choices for choices in eligible.values()):
         empty = [dimension_id for dimension_id, choices in eligible.items() if not choices]
         raise ContractError(f"selected dimensions have no eligible hypotheses: {empty}")
     if op == "fresh":
-        points = _fresh_points(registry, eligible, max_points)
+        points = _fresh_points(registry, eligible, effective, max_points)
     elif op == "improve":
-        points = _improve_points(registry, parent_records[0], eligible, max_points)
+        points = _improve_points(registry, parent_records[0], eligible, effective, max_points)
     else:
         points = _crossover_points(
-            registry, parent_records[0], parent_records[1], eligible, max_points
+            registry, parent_records[0], parent_records[1], eligible, effective, max_points
         )
     if not points:
         raise ContractError(f"no valid semantic points can satisfy action {op}")
     coverage = coverage_from_records(registry, ledger.get("records", []))
-    selection = derive_hypothesis_selection(registry)
     proposals: list[dict[str, Any]] = []
     for point in points:
         selected = selected_assignments(point)
-        if any(
-            selection.get(hypothesis_id, {}).get("selection_status") == "excluded"
-            for hypothesis_id in selected.values()
-        ):
-            continue
         parent_diffs = [
             {
                 "parent_run_id": parent,
@@ -352,7 +392,7 @@ def build_proposal_set(
                 "deprioritized_hypotheses": sorted(
                     hypothesis_id
                     for hypothesis_id in selected.values()
-                    if selection.get(hypothesis_id, {}).get("selection_status")
+                    if effective.get(hypothesis_id, {}).get("effective_status")
                     == "deprioritized"
                 ),
             }
@@ -367,6 +407,7 @@ def build_proposal_set(
     value = {
         "schema_version": PROPOSAL_SCHEMA_VERSION,
         "space": space_receipt(registry),
+        "search_space_state_revision": state_revision,
         "action": {"op": op, "parents": parents},
         "coverage_snapshot": {
             "n_valid_records": coverage["n_valid_records"],
@@ -385,6 +426,7 @@ def validate_proposal_set(value: Any) -> list[str]:
     allowed_top = {
         "schema_version",
         "space",
+        "search_space_state_revision",
         "action",
         "coverage_snapshot",
         "proposals",
@@ -395,6 +437,13 @@ def validate_proposal_set(value: Any) -> list[str]:
         errors.append(f"proposal set has unknown fields {unknown_top}")
     if value.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
         errors.append(f"proposal set schema_version must be {PROPOSAL_SCHEMA_VERSION}")
+    state_revision = value.get("search_space_state_revision")
+    if (
+        not isinstance(state_revision, int)
+        or isinstance(state_revision, bool)
+        or state_revision < 0
+    ):
+        errors.append("proposal set search_space_state_revision must be a non-negative integer")
     payload = dict(value)
     revision = payload.pop("proposal_set_revision", None)
     if not isinstance(revision, str) or DIGEST_RE.fullmatch(revision) is None:
@@ -687,6 +736,7 @@ def select_proposal(
     receipt = {
         "schema_version": POLICY_RECEIPT_SCHEMA_VERSION,
         "space_revision": proposal_set["space"]["space_revision"],
+        "search_space_state_revision": proposal_set["search_space_state_revision"],
         "proposal_set_revision": proposal_set["proposal_set_revision"],
         "policy": {"name": policy, "config": cfg},
         "action": proposal_set["action"],
@@ -759,6 +809,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
                 "ok": True,
                 "output": str(args.output),
                 "proposal_set_revision": value["proposal_set_revision"],
+                "search_space_state_revision": value["search_space_state_revision"],
                 "n_proposals": len(value["proposals"]),
                 "action": value["action"],
             },
@@ -779,6 +830,24 @@ def cmd_select(args: argparse.Namespace) -> int:
         if not isinstance(override, dict):
             raise ContractError("--cfg must be a JSON object")
         config.update(override)
+    ledger = _load_object(args.ledger) if args.ledger and args.ledger.exists() else {}
+    state = ledger.get("search_space_state")
+    current_revision = state.get("revision") if isinstance(state, dict) else 0
+    if (
+        not isinstance(current_revision, int)
+        or isinstance(current_revision, bool)
+        or current_revision < 0
+    ):
+        raise ContractError(
+            "ledger.search_space_state.revision must be a non-negative integer"
+        )
+    if proposals.get("search_space_state_revision") != current_revision:
+        raise ContractError(
+            "stale proposal set: search_space_state_revision "
+            f"{proposals.get('search_space_state_revision')!r} does not equal the "
+            f"ledger's current search space state revision {current_revision}; "
+            "re-propose against the current overlay before selecting"
+        )
     point, receipt = select_proposal(
         proposals, policy=policy, predictions=predictions, config=config
     )
