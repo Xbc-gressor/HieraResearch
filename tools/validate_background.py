@@ -22,6 +22,7 @@ from background_contract import (
     validate_registry,
 )
 from search_backends import add_visit, new_manifest
+from search_space_state import empty_search_space_state
 from semantic_evidence import build_semantic_edges, comparator_coverage
 from semantic_search import build_proposal_set, select_proposal, validate_proposal_set
 from semantic_space import (
@@ -487,6 +488,7 @@ def main() -> int:
         )
     ledger = {
         "search_space": space_receipt(registry),
+        "search_space_state": empty_search_space_state(),
         "records": records,
     }
     assert validate_registry(registry, ledger=ledger) == [], validate_registry(
@@ -869,6 +871,7 @@ def main() -> int:
         )
     evidence_ledger = {
         "search_space": space_receipt(registry),
+        "search_space_state": empty_search_space_state(),
         "records": evidence_records,
         "dag_revision": 4,
     }

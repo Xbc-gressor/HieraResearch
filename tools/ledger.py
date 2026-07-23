@@ -39,6 +39,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from search_space_state import empty_search_space_state, runtime_status_counts
 from validate_tasks import ROOT, parse_task_toml
 
 
@@ -134,6 +135,9 @@ def _load_ledger(path: Path) -> dict:
         with open(path) as f:
             data = json.load(f)
         data.setdefault("records", [])
+        if data["records"]:
+            # Record-bearing ledgers always carry the append-only P2 overlay.
+            data.setdefault("search_space_state", empty_search_space_state())
         return data
     return {"task": None, "tag": None, "metric": None, "records": []}
 
@@ -423,6 +427,7 @@ def cmd_add_record(args) -> int:
     )
     record["semantic_edges"] = build_semantic_edges(data["records"], record)
     data["search_space"] = data.get("search_space") or space_receipt(registry)
+    data["search_space_state"] = data.get("search_space_state") or empty_search_space_state()
     data["records"].append(record)
     contract_errors = validate_registry(
         registry,
@@ -635,6 +640,9 @@ def cmd_brief(args) -> int:
     if budget is not None and attempted >= budget and phase != "blocked":
         phase, stop_condition = "completed", "evaluation_budget_reached"
     experience = data.get("experience") if isinstance(data.get("experience"), dict) else {}
+    state = data.get("search_space_state")
+    state = state if isinstance(state, dict) else empty_search_space_state()
+    state_counts = runtime_status_counts(state)
     result = {
         "task": data.get("task"), "tag": data.get("tag"), "metric": data.get("metric"),
         "phase": phase, "active_stop_condition": stop_condition,
@@ -658,6 +666,12 @@ def cmd_brief(args) -> int:
         "experience_generation": experience.get("generation"),
         "dag_revision": data.get("dag_revision", 0),
         "experience_dag_revision": experience.get("dag_revision"),
+        # Compact overlay summary only; the full decision log stays in show.
+        "search_space_state_revision": state.get("revision", 0),
+        "runtime_deprioritized_dimensions": state_counts["dimensions"]["deprioritized"],
+        "runtime_pruned_dimensions": state_counts["dimensions"]["pruned"],
+        "runtime_deprioritized_hypotheses": state_counts["hypotheses"]["deprioritized"],
+        "runtime_pruned_hypotheses": state_counts["hypotheses"]["pruned"],
     }
     print(json.dumps(result, separators=(",", ":")))
     return 0

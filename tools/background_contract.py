@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from search_backends import canonical_key, validate_manifest
+from search_space_state import validate_search_space_state
 from semantic_evidence import (
     SemanticEvidenceError,
     render_target_evidence,
@@ -869,6 +870,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         errors.extend(validate_semantic_edges(records[:index], record, registry))
         if valid_run_id:
             known.add(run_id)
+    errors.extend(validate_search_space_state(registry, ledger))
     experience = ledger.get("experience")
     if experience not in (None, {}):
         errors.extend(validate_experience(experience, registry, ledger))
