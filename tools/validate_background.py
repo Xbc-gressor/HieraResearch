@@ -335,8 +335,9 @@ def record(
     *,
     score: float,
     status: str,
+    prior_records: list[dict] | None = None,
 ) -> dict:
-    return {
+    entry = {
         "run_id": run_id,
         "kind": "optimization",
         "op": op,
@@ -350,6 +351,8 @@ def record(
         "status": status,
         "final_best_score": score,
     }
+    entry["semantic_edges"] = build_semantic_edges(prior_records or [], entry)
+    return entry
 
 
 def main() -> int:
@@ -469,25 +472,33 @@ def main() -> int:
 
     # Distinct implementations may occupy the same semantic point.  Numeric
     # ancestry and attribution remain separate and mechanical diffs stay empty.
+    records: list[dict] = []
+    for run_id, op, parents, point, score, status in [
+        ("000", "fresh", [], baseline, 0.50, "keep"),
+        ("001", "improve", ["000"], baseline, 0.45, "keep"),
+        ("002", "fresh", [], stacked, 0.60, "discard"),
+        ("003", "crossover", ["001", "002"], stacked, 0.40, "keep"),
+    ]:
+        records.append(
+            record(
+                run_id, op, parents, point,
+                score=score, status=status, prior_records=records,
+            )
+        )
     ledger = {
         "search_space": space_receipt(registry),
-        "records": [
-            record("000", "fresh", [], baseline, score=0.50, status="keep"),
-            record("001", "improve", ["000"], baseline, score=0.45, status="keep"),
-            record("002", "fresh", [], stacked, score=0.60, status="discard"),
-            record(
-                "003", "crossover", ["001", "002"], stacked, score=0.40, status="keep"
-            ),
-        ],
+        "records": records,
     }
     assert validate_registry(registry, ledger=ledger) == [], validate_registry(
         registry, ledger=ledger
     )
     lineage = derive_semantic_lineage(registry, ledger)
     run_one = next(item for item in lineage["runs"] if item["run_id"] == "001")
-    assert run_one["parent_diffs"] == [{"parent_run_id": "000", "changes": []}]
+    (edge,) = run_one["semantic_edges"]
+    assert edge["parent_run_id"] == "000"
+    assert edge["changes"] == []
     run_three = next(item for item in lineage["runs"] if item["run_id"] == "003")
-    assert len(run_three["parent_diffs"]) == 2
+    assert len(run_three["semantic_edges"]) == 2
     assert "attribution only" in lineage["attribution_notice"].lower()
     assert "do not claim" in lineage["attribution_notice"].lower()
 
@@ -510,6 +521,18 @@ def main() -> int:
     duplicate_run["records"][1]["run_id"] = "000"
     errors = validate_registry(registry, ledger=duplicate_run)
     assert any("duplicates an earlier record" in error for error in errors), errors
+
+    # P1 ledgers without persisted mechanical receipts are intentionally
+    # unsupported: a missing or forged semantic_edges field fails validation.
+    missing_edges = copy.deepcopy(ledger)
+    del missing_edges["records"][1]["semantic_edges"]
+    errors = validate_registry(registry, ledger=missing_edges)
+    assert any("semantic_edges" in error for error in errors), errors
+
+    forged_edges = copy.deepcopy(ledger)
+    forged_edges["records"][1]["semantic_edges"][0]["change_class"] = "multi_dimension"
+    errors = validate_registry(registry, ledger=forged_edges)
+    assert any("semantic_edges" in error for error in errors), errors
 
     # All graph actions repeatedly produce valid mapped points. Hypotheses are
     # coverage-counted, not consumed after first use.
@@ -831,20 +854,19 @@ def main() -> int:
     # P2 target-evidence CLI: the real subprocess renders mechanical comparator
     # coverage identical to the in-process function over persisted receipts.
     filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
-    evidence_records = [
-        record("000", "fresh", [], baseline, score=0.40, status="keep"),
-        record("001", "improve", ["000"], filtered, score=0.50, status="discard"),
-        record("002", "fresh", [], baseline, score=0.41, status="keep"),
-        record("003", "improve", ["002"], filtered, score=0.52, status="discard"),
-    ]
-    evidence_records[0]["semantic_edges"] = []
-    evidence_records[2]["semantic_edges"] = []
-    evidence_records[1]["semantic_edges"] = build_semantic_edges(
-        evidence_records[:1], evidence_records[1]
-    )
-    evidence_records[3]["semantic_edges"] = build_semantic_edges(
-        evidence_records[:3], evidence_records[3]
-    )
+    evidence_records: list[dict] = []
+    for run_id, op, parents, point, score, status in [
+        ("000", "fresh", [], baseline, 0.40, "keep"),
+        ("001", "improve", ["000"], filtered, 0.50, "discard"),
+        ("002", "fresh", [], baseline, 0.41, "keep"),
+        ("003", "improve", ["002"], filtered, 0.52, "discard"),
+    ]:
+        evidence_records.append(
+            record(
+                run_id, op, parents, point,
+                score=score, status=status, prior_records=evidence_records,
+            )
+        )
     evidence_ledger = {
         "search_space": space_receipt(registry),
         "records": evidence_records,

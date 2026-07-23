@@ -51,6 +51,7 @@ RECORD_FIELDS = (
     "source_run_ids",    # numeric parent run_ids only; fresh=[]
     "op",                # S-GoT op: fresh | improve | crossover (derivable from resolvable-parent count; stored for clarity)
     "semantic_point",    # complete revisioned attribution to the frozen background search space
+    "semantic_edges",    # helper-derived per-parent receipts; never model-authored
     "policy_receipt",    # derived point-selection inputs/config; separate from ancestry and observations
     "candidate_name",    # stable name: hint at add-record, log's best_model after run
     "description",
@@ -353,6 +354,7 @@ def cmd_add_record(args) -> int:
         validate_background_markdown,
         validate_registry,
     )
+    from semantic_evidence import build_semantic_edges
     from semantic_space import (
         SemanticSpaceError,
         resolve_dimension_catalog,
@@ -413,11 +415,13 @@ def cmd_add_record(args) -> int:
         source_run_ids=source_run_ids,
         op=args.op,
         semantic_point=semantic_point,
+        semantic_edges=[],
         policy_receipt=policy_receipt,
         candidate_name=args.candidate_name_hint,
         description=args.description or args.idea,
         metric=data["metric"],
     )
+    record["semantic_edges"] = build_semantic_edges(data["records"], record)
     data["search_space"] = data.get("search_space") or space_receipt(registry)
     data["records"].append(record)
     contract_errors = validate_registry(

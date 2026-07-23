@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,10 +12,16 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
+from background_contract import validate_registry  # noqa: E402
 from got_graph import CRASH, Graph, render_incremental  # noqa: E402
 from ledger import _set_experience, _touch_dag_record  # noqa: E402
+from semantic_evidence import build_semantic_edges  # noqa: E402
 from semantic_space import complete_point, derive_semantic_lineage  # noqa: E402
-from validate_background import fixture_registry  # noqa: E402
+from validate_background import (  # noqa: E402
+    background_text,
+    fixture_registry,
+    policy_receipt,
+)
 
 
 def _records() -> list[dict]:
@@ -83,8 +91,9 @@ class IncrementalDagTests(unittest.TestCase):
                 "dim-ensemble": "hyp-ensemble-stacking",
             },
         )
-        for record in stored["records"]:
+        for index, record in enumerate(stored["records"]):
             record["semantic_point"] = stacked if record["run_id"] in {"002", "003", "004", "005"} else baseline
+            record["semantic_edges"] = build_semantic_edges(stored["records"][:index], record)
         compact = derive_semantic_lineage(registry, stored, limit=2)
         self.assertEqual([item["run_id"] for item in compact["runs"]], ["004", "005"])
         self.assertEqual(compact["coverage"]["n_valid_records"], 6)
@@ -92,7 +101,7 @@ class IncrementalDagTests(unittest.TestCase):
 
         lineage = derive_semantic_lineage(registry, stored)
         run_three = next(item for item in lineage["runs"] if item["run_id"] == "003")
-        diffs = {item["parent_run_id"]: item["changes"] for item in run_three["parent_diffs"]}
+        diffs = {item["parent_run_id"]: item["changes"] for item in run_three["semantic_edges"]}
         self.assertEqual(diffs["002"], [])
         self.assertEqual(
             diffs["001"],
@@ -133,6 +142,91 @@ class IncrementalDagTests(unittest.TestCase):
                 (bulk.N(run_id), bulk.nodes[run_id].ec, bulk.V_max(run_id)),
                 (online.N(run_id), online.nodes[run_id].ec, online.V_max(run_id)),
             )
+
+
+class SemanticEdgePersistenceTests(unittest.TestCase):
+    """The real CLI persists helper-derived receipts and the graph reuses them."""
+
+    def test_real_cli_persists_and_renders_semantic_edges(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            background_path = tmp_path / "background.md"
+            point_path = tmp_path / "point.json"
+            policy_path = tmp_path / "policy.json"
+            ledger_path = tmp_path / "ledger.json"
+            background_path.write_text(background_text(registry))
+
+            def add_record(run_id: str, op: str, parents: list[str], point: dict) -> None:
+                point_path.write_text(json.dumps(point))
+                policy_path.write_text(json.dumps(policy_receipt(op, parents, point)))
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "tools" / "ledger.py"),
+                        "add-record",
+                        "--ledger", str(ledger_path),
+                        "--task", "hard-interactions",
+                        "--run-id", run_id,
+                        "--op", op,
+                        "--source-run-ids", ",".join(parents),
+                        "--background", str(background_path),
+                        "--semantic-point", str(point_path),
+                        "--policy-receipt", str(policy_path),
+                        "--idea", f"Complete fixture solution {run_id} at the selected point.",
+                        "--change", f"fixture change for {op} run {run_id}",
+                        "--candidate-name-hint", f"fixture_{run_id}",
+                    ],
+                    cwd=ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            def record_run(run_id: str, score: float) -> None:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "tools" / "ledger.py"),
+                        "record-run",
+                        "--ledger", str(ledger_path),
+                        "--task", "hard-interactions",
+                        "--run-id", run_id,
+                        "--final-best-score", str(score),
+                    ],
+                    cwd=ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            add_record("000", "fresh", [], baseline)
+            record_run("000", 0.5)
+            add_record("001", "improve", ["000"], filtered)
+            record_run("001", 0.4)
+
+            stored = json.loads(ledger_path.read_text())
+            self.assertEqual(stored["records"][0]["semantic_edges"], [])
+            edge = stored["records"][1]["semantic_edges"][0]
+            self.assertEqual(edge["edge_id"], "sedge-000-001")
+            self.assertEqual(edge["parent_run_id"], "000")
+            self.assertEqual(edge["child_run_id"], "001")
+
+            view = render_incremental(stored, top=1, bottom=1)
+            rendered = next(item for item in view["delta_edges"] if item["child"] == "001")
+            self.assertEqual(rendered["semantic_edge"], edge)
+
+            removed = copy.deepcopy(stored)
+            del removed["records"][1]["semantic_edges"]
+            errors = validate_registry(registry, ledger=removed)
+            self.assertTrue(any("semantic_edges" in error for error in errors), errors)
+
+            forged = copy.deepcopy(stored)
+            forged["records"][1]["semantic_edges"][0]["change_class"] = "same_point"
+            errors = validate_registry(registry, ledger=forged)
+            self.assertTrue(any("semantic_edges" in error for error in errors), errors)
 
 
 if __name__ == "__main__":

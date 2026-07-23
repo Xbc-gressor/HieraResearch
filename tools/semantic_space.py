@@ -926,13 +926,9 @@ def derive_semantic_lineage(
         missing = [parent for parent in parents if parent not in records]
         if missing:
             warnings.append(f"run {run_id} references missing parents {missing}")
-        diffs = []
-        for parent in parents:
-            parent_point = records.get(parent, {}).get("semantic_point")
-            if isinstance(parent_point, dict) and not validate_point(parent_point, registry):
-                diffs.append(
-                    {"parent_run_id": parent, "changes": point_diff(parent_point, point)}
-                )
+        semantic_edges = record.get("semantic_edges")
+        if not isinstance(semantic_edges, list):
+            semantic_edges = []
         selected = selected_assignments(point)
         for hypothesis_id in selected.values():
             hypothesis_runs.setdefault(hypothesis_id, []).append(run_id)
@@ -943,7 +939,7 @@ def derive_semantic_lineage(
                 "parent_run_ids": parents,
                 "point_id": point.get("point_id"),
                 "assignments": selected,
-                "parent_diffs": diffs,
+                "semantic_edges": semantic_edges,
                 "status": record.get("status"),
                 "score": record.get("final_best_score"),
             }

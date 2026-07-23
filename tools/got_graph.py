@@ -316,11 +316,19 @@ def _node_view(g: Graph, recs: dict, nid: str, *, best_id=None, **marks) -> dict
 def _edge_view(g: Graph, recs: dict, parent: str, child: str) -> dict:
     cs, ps = g.nodes[child].score, g.nodes[parent].score
     delta = None if (cs == CRASH or ps == CRASH) else round(cs - ps, 4)
+    receipts = recs.get(child, {}).get("semantic_edges")
+    semantic_receipt = None
+    if isinstance(receipts, list):
+        for receipt in receipts:
+            if isinstance(receipt, dict) and str(receipt.get("parent_run_id")) == str(parent):
+                semantic_receipt = receipt
+                break
     return {
         "child": child,
         "parent": parent,
         "delta": delta,
         "change": _change_for_parent(recs.get(child, {}).get("change"), parent),
+        "semantic_edge": semantic_receipt,
     }
 
 

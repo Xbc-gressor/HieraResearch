@@ -21,7 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from search_backends import canonical_key, validate_manifest
-from semantic_evidence import SemanticEvidenceError, render_target_evidence
+from semantic_evidence import (
+    SemanticEvidenceError,
+    render_target_evidence,
+    validate_semantic_edges,
+)
 from semantic_space import (
     DEFAULT_DIMENSION_STRATEGY,
     SemanticSpaceError,
@@ -862,6 +866,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         point_errors = validate_candidate_point(record.get("semantic_point"), registry)
         errors.extend(f"{where}: {error}" for error in point_errors)
         errors.extend(_validate_policy_receipt(record, where))
+        errors.extend(validate_semantic_edges(records[:index], record, registry))
         if valid_run_id:
             known.add(run_id)
     experience = ledger.get("experience")
