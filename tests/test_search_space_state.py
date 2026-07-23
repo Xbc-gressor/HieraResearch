@@ -405,7 +405,7 @@ class PointEligibilityTests(unittest.TestCase):
         errors = validate_point_eligibility(point, registry, effective)
         self.assertTrue(any("pruned" in error for error in errors), errors)
 
-    def test_deprioritized_dimension_pins_to_baseline(self) -> None:
+    def test_deprioritized_dimension_remains_eligible(self) -> None:
         registry = fixture_registry()
         guidance = derive_hypothesis_selection(registry)
         runtime = {
@@ -413,11 +413,17 @@ class PointEligibilityTests(unittest.TestCase):
             "hypotheses": {},
         }
         effective = compose_effective_selection(registry, guidance, runtime)
+        # Deprioritization only re-sorts; non-baseline content stays eligible.
         filtered_point = complete_point(
             registry, {"dim-data-curation": "hyp-data-filtered"}
         )
-        errors = validate_point_eligibility(filtered_point, registry, effective)
-        self.assertTrue(any("pin" in error for error in errors), errors)
+        self.assertEqual(
+            validate_point_eligibility(filtered_point, registry, effective), []
+        )
+        self.assertEqual(
+            effective["hyp-data-filtered"]["dimension_runtime_status"],
+            "deprioritized",
+        )
         baseline_point = complete_point(registry)
         self.assertEqual(
             validate_point_eligibility(baseline_point, registry, effective), []

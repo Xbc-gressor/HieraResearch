@@ -414,16 +414,18 @@ def validate_point_eligibility(
 ) -> list[str]:
     """Check selection-time policy eligibility of one candidate point.
 
-    Only policy gates live here: guidance-excluded hypotheses, runtime-pruned
-    hypotheses (directly or via a pruned dimension), and pinning a
-    deprioritized dimension to its explicit baseline.  Structural validity
-    stays with :func:`semantic_space.validate_point`, so historical points
-    remain valid after later pruning.
+    Only policy gates live here: guidance-excluded hypotheses and runtime-pruned
+    hypotheses (directly or via a pruned dimension; a pruned dimension's
+    non-baseline hypotheses already carry ``pruned`` effective status, so
+    pinning it to its explicit baseline needs no separate check).  Runtime-
+    deprioritized dimensions and hypotheses stay eligible and only sort after
+    active content.  Structural validity stays with
+    :func:`semantic_space.validate_point`, so historical points remain valid
+    after later pruning.
     """
     errors: list[str] = []
     if not isinstance(point, dict):
         return ["semantic_point must be an object"]
-    dimensions = dimension_map(registry)
     for dimension_id, hypothesis_id in selected_assignments(point).items():
         entry = effective.get(hypothesis_id) if isinstance(effective, dict) else None
         if not isinstance(entry, dict):
@@ -437,14 +439,5 @@ def validate_point_eligibility(
             errors.append(
                 f"semantic_point selects runtime-pruned hypothesis {hypothesis_id}; "
                 "pruning bars new proposals but never erases the id"
-            )
-        dimension = dimensions.get(dimension_id, {})
-        if (
-            entry.get("dimension_runtime_status") == "deprioritized"
-            and hypothesis_id != dimension.get("baseline_hypothesis_id")
-        ):
-            errors.append(
-                f"semantic_point must pin deprioritized dimension {dimension_id} "
-                f"to its baseline {dimension.get('baseline_hypothesis_id')}"
             )
     return errors
