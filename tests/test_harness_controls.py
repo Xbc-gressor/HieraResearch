@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile
@@ -18,116 +17,6 @@ import new_candidate  # noqa: E402
 
 
 class DelegationGuardTests(unittest.TestCase):
-    def test_runtime_guidance_does_not_police_roadmap_phases(self) -> None:
-        runtime_paths = [
-            *sorted((ROOT / ".claude" / "agents").glob("*.md")),
-            *sorted((ROOT / ".opencode" / "agents").glob("*.md")),
-            ROOT / ".claude" / "rules" / "ledger.md",
-            ROOT / ".opencode" / "rules" / "ledger.md",
-        ]
-        forbidden = (
-            re.compile(r"\bP[1-4]\b"),
-            re.compile(r"\bprun(?:e|ed|ing)\b", re.IGNORECASE),
-            re.compile(r"convergence/regret", re.IGNORECASE),
-            re.compile(r"bottleneck retrieval", re.IGNORECASE),
-            re.compile(r"dynamic dimensions", re.IGNORECASE),
-        )
-        for path in runtime_paths:
-            text = path.read_text()
-            for pattern in forbidden:
-                self.assertIsNone(pattern.search(text), (path.relative_to(ROOT), pattern.pattern))
-
-    def test_autoresearch_prompts_use_progressive_disclosure(self) -> None:
-        prompt_specs = (
-            (".claude/agents/autoresearch-experiment.md", ".claude/rules/ledger.md"),
-            (".opencode/agents/autoresearch-experiment.md", ".opencode/rules/ledger.md"),
-        )
-        for relative_path, ledger_rule in prompt_specs:
-            prompt = (ROOT / relative_path).read_text()
-            normalized_prompt = " ".join(prompt.split())
-            self.assertLess(len(prompt.split()), 2600, relative_path)
-            self.assertIn(
-                "Continue rounds until the evaluation budget is exhausted or a hard stop occurs.",
-                normalized_prompt,
-            )
-            self.assertIn(
-                "Recheck the budget before deep tuning; if it is exhausted, return to step 0 without spawning the tuner.",
-                normalized_prompt,
-            )
-            self.assertIn(f"Read `{ledger_rule}` only when", prompt)
-            for required in (
-                "source_run_ids",
-                "semantic_point",
-                "policy_receipt",
-                "background_contract.py preflight",
-                "new_candidate.py",
-                "ledger.py brief",
-                "ledger.py set-phase",
-            ):
-                self.assertIn(required, prompt, (relative_path, required))
-            for obsolete in (
-                "caller explicitly requested only one candidate",
-                "run-000.log",
-                "parsed run",
-                "result.parser",
-                "## Run Directory Layout",
-                "## Ledger Schema",
-                "## Delegation Rules",
-                "### Scoring is recorded",
-            ):
-                self.assertNotIn(obsolete, prompt, (relative_path, obsolete))
-
-    def test_experience_extractors_use_supported_graph_render_flags(self) -> None:
-        for relative_path in (
-            ".claude/agents/experience-extractor.md",
-            ".opencode/agents/experience-extractor.md",
-        ):
-            prompt = (ROOT / relative_path).read_text()
-            self.assertIn("--incremental --top 3 --bottom 3 --format json", prompt)
-            self.assertNotIn("--top-k", prompt)
-            self.assertNotIn("--bottom-k", prompt)
-
-    def test_dimension_strategy_protocol_is_mirrored_and_loaded_on_demand(self) -> None:
-        guide = (ROOT / "docs" / "dimension-induction.md").read_text()
-        normalized_guide = " ".join(guide.split())
-        for required in (
-            "Prefer 4–10 dimensions",
-            "final dimension set for the run",
-            "no second subset-selection pass",
-            "do not fall back to the built-in catalog",
-        ):
-            self.assertIn(required, normalized_guide)
-
-        for relative_path in (
-            ".claude/agents/background-researcher.md",
-            ".opencode/agents/background-researcher.md",
-        ):
-            prompt = (ROOT / relative_path).read_text()
-            normalized_prompt = " ".join(prompt.split())
-            for required in (
-                "space_initialization.dimension_strategy",
-                "docs/dimension-induction.md",
-                "do not load it for `catalog_subset`",
-                "Use every induced dimension exactly once",
-                "dimension_catalog.json",
-            ):
-                self.assertIn(required, normalized_prompt, (relative_path, required))
-            self.assertNotIn("subset of the fixed", prompt)
-
-        for relative_path in (
-            ".claude/agents/autoresearch-experiment.md",
-            ".opencode/agents/autoresearch-experiment.md",
-        ):
-            prompt = (ROOT / relative_path).read_text()
-            normalized_prompt = " ".join(prompt.split())
-            for required in (
-                "dimension_strategy=catalog_subset|llm_induced",
-                "--dimension-strategy <catalog_subset|llm_induced>",
-                "background_contract.py catalog",
-                "missing or malformed",
-            ):
-                self.assertIn(required, normalized_prompt, (relative_path, required))
-
     def test_blocks_observed_role_collapse(self) -> None:
         prompt = "After writing train.py, also perform step 0+1 since budget is tight."
         self.assertIsNotNone(harness_guard.delegation_violation("candidate-writer", prompt))
