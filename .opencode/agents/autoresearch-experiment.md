@@ -47,7 +47,10 @@ Do not spawn it as a child. Its `permission.task` closure and independent child
 contexts are required for research, implementation, evaluation, and tuning.
 
 The caller provides `task_name`, `tag`, or `run_dir`, and may provide
-`dimension_strategy=catalog_subset|llm_induced`. Infer
+`dimension_strategy=catalog_subset|llm_induced`,
+`max_evaluations=<positive integer>`, and/or `timeout=<positive seconds>`.
+`timeout` is the hard limit for each config evaluation, not a whole-experiment
+deadline. Infer
 `runs/<task_name>/<tag>` when unambiguous. If `task_name` is known but `tag` is
 missing, choose a concise date/purpose tag. Existing run artifacts mean resume;
 never overwrite them. If the run identity cannot be resolved safely, record a
@@ -106,25 +109,24 @@ Use progressive disclosure after setup:
 
 ## Setup
 
-If the caller supplied `dimension_strategy` for an existing run, first invoke
-`init_run.py` with that strategy to persist it before semantic artifacts exist
-or verify that it matches the frozen run. Treat a conflict as a setup blocker.
+Initialize or resume the run first:
+
+```bash
+python tools/init_run.py <task_name> <tag> \
+  [--dimension-strategy <catalog_subset|llm_induced>] \
+  [--max-evaluations <count>] [--timeout <seconds>]
+```
+
+Pass every control supplied by the caller. The helper creates the run directory
+and copies `tasks/framework_cfg.example.json` to
+`<run_dir>/framework_cfg.json`, then persists explicit controls there so they
+cannot be shadowed by template values. On resume, evaluation budget and timeout
+may change; the dimension strategy may not change after semantic artifacts
+exist.
 
 For a new run:
 
-1. Initialize it:
-
-   ```bash
-   python tools/init_run.py <task_name> <tag> \
-     [--dimension-strategy <catalog_subset|llm_induced>]
-   ```
-
-   This creates the run directory and copies
-   `tasks/framework_cfg.example.json` to `<run_dir>/framework_cfg.json`.
-   Pass the optional flag when the caller supplied `dimension_strategy`; the
-   config is the persistent authority. On a resumed run, the helper permits the
-   same strategy but rejects a conflicting one after semantic artifacts exist.
-2. Read the required task files and verify the task environment:
+1. Read the required task files and verify the task environment:
 
    ```bash
    uv --directory tasks/<task_name> sync
@@ -132,11 +134,11 @@ For a new run:
 
    Run `run.prepare_command` through that environment only when required assets
    are absent.
-3. Spawn `Task(background-researcher)` with the run directory. It reads the
+2. Spawn `Task(background-researcher)` with the run directory. It reads the
    configured strategy and writes the evidence trace plus schema-3 hierarchical
    background. Under `llm_induced`, it also writes the final task-specific
    `<run_dir>/dimension_catalog.json` before retrieval.
-4. Validate the strategy-scoped artifacts:
+3. Validate the strategy-scoped artifacts:
 
    ```bash
    # llm_induced only
@@ -169,20 +171,20 @@ population-level deep-tuning action.
 When the ledger exists, obtain current state with:
 
 ```bash
-python tools/ledger.py brief \
-  --ledger <run_dir>/ledger.json [--budget <max_evaluations>]
+python tools/ledger.py brief --ledger <run_dir>/ledger.json
 ```
 
-The budget comes from `framework_cfg.json.max_evaluations`, then an explicit
-caller value, otherwise it is unbounded. `evaluations_done` is the sum of
-`trials_completed`; do not add `warm_start_K` again.
+The budget comes from `framework_cfg.json.max_evaluations`; setup persisted any
+explicit caller value there. If the field is absent or null, the experiment is
+unbounded. `evaluations_done` is the sum of `trials_completed`; do not add
+`warm_start_K` again.
 
 If a configured budget is exhausted, persist normal completion and return the
 compact status:
 
 ```bash
 python tools/ledger.py set-phase --ledger <run_dir>/ledger.json \
-  --phase completed [--budget <max_evaluations>]
+  --phase completed
 ```
 
 Before continuing, regenerate derived loop state with `ledger.py loop-state` if

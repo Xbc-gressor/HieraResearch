@@ -210,23 +210,27 @@ Proposal neighborhoods are deterministic:
 Hypotheses are reusable and may participate in many points. There is no
 “consumed direction” state.
 
-Three replaceable policies are implemented:
+Four replaceable policies are implemented:
 
 1. `coverage` — deterministic exploration by inverse hypothesis coverage and
    exact-point novelty; no LLM score is required.
 2. `gain` — predicted gain plus a small coverage term minus predicted cost.
 3. `gain_uncertainty` — predicted gain plus an explicit uncertainty bonus and
    coverage, minus predicted cost.
+4. `gain_uncertainty_nocost` — like `gain_uncertainty` but with no cost
+   prediction at all, for settings where pre-implementation cost estimates
+   are noise and only waste tokens.
 
 For model-scored policies, each proposal receives separate `[0,1]`
-`predicted_gain`, `uncertainty`, and `cost` rubric inputs plus evidence strings.
+`predicted_gain`, `uncertainty`, and `cost` rubric inputs plus evidence
+strings (`gain_uncertainty_nocost` omits `cost`).
 They are auditable estimates, not calibrated Bayesian posteriors. The selected
 record preserves all four components (`coverage` included), weights, proposal
 set digest, action, ranking, and evidence. These values stay in
 `policy_receipt`; they do not become observations or beliefs.
 
 Run-local configuration lives under `framework_cfg.json.semantic_search`.
-`gain_uncertainty` is the code and copied-template default; `coverage` (fully
+`gain_uncertainty_nocost` is the code and copied-template default; `coverage` (fully
 deterministic, no LLM scores) is an explicit opt-in for ablations, bootstrap
 runs, or prediction-failure fallback, for example:
 

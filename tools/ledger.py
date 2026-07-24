@@ -404,6 +404,11 @@ def cmd_add_record(args) -> int:
         raise SystemExit(
             f"{args.op} requires {expected_parent_count} distinct numeric parent ids"
         )
+    missing_parents = [
+        source for source in source_run_ids if _get_record(data, source) is None
+    ]
+    if missing_parents:
+        raise SystemExit(f"unknown parent run ids {missing_parents}")
     semantic_point = json.loads(Path(args.semantic_point).read_text())
     policy_receipt = json.loads(Path(args.policy_receipt).read_text())
     record.update(

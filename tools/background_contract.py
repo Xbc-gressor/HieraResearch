@@ -663,9 +663,11 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         "coverage",
         "gain",
         "gain_uncertainty",
+        "gain_uncertainty_nocost",
     }:
         errors.append(
-            f"{where}.policy_receipt.policy.name must be coverage, gain, or gain_uncertainty"
+            f"{where}.policy_receipt.policy.name must be coverage, gain, "
+            "gain_uncertainty, or gain_uncertainty_nocost"
         )
     config = policy.get("config") if isinstance(policy, dict) else None
     config_valid = True
@@ -717,6 +719,19 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 errors.append(
                     f"{where}.policy_receipt coverage policy must not invent model components"
                 )
+        elif policy_name == "gain_uncertainty_nocost":
+            model_components_valid = all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and 0.0 <= float(value) <= 1.0
+                for value in (components["predicted_gain"], components["uncertainty"])
+            ) and components["cost"] is None
+            if not model_components_valid:
+                errors.append(
+                    f"{where}.policy_receipt gain_uncertainty_nocost requires separate "
+                    "finite predicted_gain and uncertainty values in [0, 1] and no cost"
+                )
         elif policy_name in {"gain", "gain_uncertainty"}:
             model_components_valid = all(
                 isinstance(value, (int, float))
@@ -742,7 +757,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         evidence = []
     if policy_name == "coverage" and evidence:
         errors.append(f"{where}.policy_receipt coverage policy evidence must be empty")
-    if policy_name in {"gain", "gain_uncertainty"} and not evidence:
+    if policy_name in {"gain", "gain_uncertainty", "gain_uncertainty_nocost"} and not evidence:
         errors.append(f"{where}.policy_receipt gain policies require selection evidence")
     acquisition_score = receipt.get("acquisition_score")
     if (
@@ -756,11 +771,17 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         and config_valid
         and coverage_valid
         and model_components_valid
-        and policy_name in {"coverage", "gain", "gain_uncertainty"}
+        and policy_name in {"coverage", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
     ):
         coverage = float(components["coverage"])
         if policy_name == "coverage":
             expected_score = coverage
+        elif policy_name == "gain_uncertainty_nocost":
+            expected_score = (
+                float(components["predicted_gain"])
+                + float(config["uncertainty_weight"]) * float(components["uncertainty"])
+                + float(config["coverage_weight"]) * coverage
+            )
         elif all(components[key] is not None for key in ("predicted_gain", "uncertainty", "cost")):
             expected_score = (
                 float(components["predicted_gain"])

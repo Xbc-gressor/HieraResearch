@@ -1,10 +1,9 @@
 """validate_got.py — tools/ 计算层(got_graph/got_cdag/got_select)回归测试。
 
 三组:
-1. unit_tests        —— influence / c_dag / crash(§6.5 / §4)。
+1. unit_tests        —— influence / ancestral-only c_dag / crash(§6.5 / §4)。
 2. from_ledger_tests —— ledger dict → Graph 结构(op 推断 / 父代 / 根 / crash / pending 跳过)。
-3. toy_equivalence   —— §13 主循环 toy 跑,断言与已验证的 proto 完全一致
-                        (152 节点 / 15 crash / Nop=38,106 / 协同 17 / best≈0.0861 / A1–A7)。
+3. toy_regression    —— §13 主循环 toy 跑,断言 A1–A7 行为不变式(不锁精确轨迹值)。
 
 run:  python3 tools/validate_got.py        # 退出码 0 = 全过
 确定性:结果与 PYTHONHASHSEED 无关(alive_roots 已按 run_id 排序)。
@@ -32,13 +31,21 @@ def unit_tests():
         assert abs(w4[kk] - v) < 1e-9, ("influence", kk, w4[kk], v)
     assert abs(c_dag(g, n0, n3, G) - 1.0) < 1e-9, "两根应正交 c̃=1"
     assert c_dag(g, n2, n4, G) < 1.0, "同血统 c̃<1"
+    sg = Graph()
+    sr = sg.add("fresh", [], None, 0.5, "kept")
+    sa = sg.add("improve", [sr], None, 0.4, "kept")
+    sb = sg.add("improve", [sr], None, 0.4, "kept")
+    assert abs(c_dag(sg, sa, sb, G)) < 1e-9, (
+        "相同祖先影响的兄弟节点应 c̃=0；目标节点自身不得制造正交性",
+        c_dag(sg, sa, sb, G),
+    )
     assert g.parents(n0) == [], "fresh 应无真父代"
     assert isinstance(n0, str), "节点 id 应为 str(run_id)"
     nc = g.add("improve", [n4], None, CRASH, "crash")
     assert g.nodes[n4].ec == 1, "crash 子代仍计父代 ec"
     assert nc not in g.F(), "crash 不进 F"
     assert g.N(n4) == 1, "crash 不计入 N"
-    print("✓ 1. unit_tests(influence / c_dag / crash)")
+    print("✓ 1. unit_tests(influence / ancestral c_dag / crash)")
 
 
 # ============================ 2. from_ledger:ledger dict → Graph ============================
@@ -195,7 +202,7 @@ CFG = dict(n_seed=3, S=10, B=2, C=1.5, alpha=0.5,
            gamma=0.6, c_pucb=0.4, c_leaf=0.4, tau=0.3)
 
 
-def toy_equivalence():
+def toy_regression():
     g, hist, info = run_sgot(oracle, OPS, REGION_PRIORITY, CFG, n_gens=80)
     nodes = len(g.nodes)
     crash = sum(1 for n in g.nodes.values() if n.status == "crash")
@@ -204,14 +211,8 @@ def toy_equivalence():
               and g.parents(nid) and n.score < min(g.nodes[p].score for p in g.parents(nid)))
     boot_best, final_best = hist[2]["best"], info["best"]
 
-    # 与 proto 完全一致(结构整数全等 = 强等价证据;str-id 若改变决策这些会漂)
-    assert nodes == 156, f"nodes={nodes} (proto 156)"
-    assert crash == 16, f"crash={crash} (proto 16)"
-    assert info["Nop"] == {"improve": 17, "crossover": 129}, info["Nop"]
-    assert syn == 24, f"syn={syn} (proto 24)"
-    assert abs(final_best - 0.1215) < 1e-3, f"best={final_best}"
-
-    # A1–A7 行为(与 proto/validate.py 同)
+    # A1–A7 行为不变式(与 proto/validate.py 同)。op 解耦定额(softmax 门控)后不再锁死
+    # 精确轨迹值——nodes/crash/Nop/syn/best 随选择策略合法变化,仅打印供观察。
     assert all(hist[i]["kind"] == "fresh" for i in range(3)), "A1 自举前 3 代 fresh"
     assert final_best < 0.5 * boot_best, "A2 best 大幅下降"
     assert info["Nop"]["crossover"] > 0 and syn > 0, "A3 crossover 协同"
@@ -220,16 +221,16 @@ def toy_equivalence():
     assert all(not g.children(nid) for nid, n in g.nodes.items() if n.status == "crash"), "A6 crash 终端"
     al = g.alive_roots()
     assert len(al) >= 2 and c_dag(g, al[0], al[1], CFG["gamma"]) > 0.5, "A7 不同根 c̃_dag 偏高"
-    print(f"✓ 3. toy_equivalence(nodes={nodes} crash={crash} Nop={info['Nop']} "
-          f"syn={syn} best={final_best:.4f}) ≡ proto")
+    print(f"✓ 3. toy_regression(nodes={nodes} crash={crash} Nop={info['Nop']} "
+          f"syn={syn} best={final_best:.4f})")
 
 
 def main():
     unit_tests()
     from_ledger_tests()
     derive_state_tests()
-    toy_equivalence()
-    print("\n✓ 全部通过(tools 计算层 ≡ proto,且 PYTHONHASHSEED-无关)")
+    toy_regression()
+    print("\n✓ 全部通过(tools 计算层且 PYTHONHASHSEED-无关)")
     return True
 
 

@@ -16,9 +16,11 @@ from validate_background import fixture_registry  # noqa: E402
 
 
 class SemanticPolicyDefaultTests(unittest.TestCase):
-    def test_default_policy_is_gain_uncertainty_in_template_and_cli(self) -> None:
+    def test_default_policy_is_gain_uncertainty_nocost_in_template_and_cli(self) -> None:
         template = json.loads((ROOT / "tasks" / "framework_cfg.example.json").read_text())
-        self.assertEqual(template["semantic_search"]["policy"], "gain_uncertainty")
+        self.assertEqual(
+            template["semantic_search"]["policy"], "gain_uncertainty_nocost"
+        )
 
         proposal_set = build_proposal_set(
             fixture_registry(), {"records": []}, op="fresh", parents=[], max_points=3
@@ -31,7 +33,6 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
                     "point_id": proposal["point_id"],
                     "predicted_gain": 0.5,
                     "uncertainty": 0.5,
-                    "cost": 0.5,
                     "evidence": ["regression fixture"],
                 }
                 for proposal in proposal_set["proposals"]
@@ -60,7 +61,7 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             receipt = json.loads(receipt_path.read_text())
-            self.assertEqual(receipt["policy"]["name"], "gain_uncertainty")
+            self.assertEqual(receipt["policy"]["name"], "gain_uncertainty_nocost")
 
 
 if __name__ == "__main__":

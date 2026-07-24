@@ -106,7 +106,8 @@ would remove the independent contexts required by this project.
 - `idea-generator` — run structural **SELECT** with `got_select decide`, then use
   `semantic_search.py` to enumerate valid complete points and apply the
   replaceable coverage/gain/gain-plus-uncertainty acquisition policy before
-  **IDEATE**. It persists numeric ancestry, the complete revisioned point, and a
+  **IDEATE** (default `gain_uncertainty_nocost`: no cost prediction). It
+  persists numeric ancestry, the complete revisioned point, and a
   policy receipt with gain, uncertainty, cost, and coverage kept separate. The
   graph search still owns actions/parents; semantic policy owns only point choice.
 - `experience-extractor` — periodically (every N generations) incrementally

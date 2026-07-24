@@ -96,10 +96,10 @@ bounded, deterministic set of valid points for that action:
 Every enumerated point passes `validate_point` — admissibility under
 `requires`/`excludes` is a deterministic check, not a policy judgment.
 `semantic_search.py select` then applies a replaceable acquisition policy
-(`coverage`, `gain`, `gain_uncertainty`) over fibers, writing a policy
-receipt that keeps `coverage`, `predicted_gain`, `uncertainty`, and `cost`
-as separate components. Hypotheses are coordinates, not consumable
-resources: one `hyp-*` may participate in many points.
+(`coverage`, `gain`, `gain_uncertainty`, `gain_uncertainty_nocost`) over
+fibers, writing a policy receipt that keeps `coverage`, `predicted_gain`,
+`uncertainty`, and `cost` as separate components. Hypotheses are coordinates,
+not consumable resources: one `hyp-*` may participate in many points.
 
 Finally, a ledger record carries two different maps with different
 codomains: `source_run_ids` (ancestry — which concrete candidates informed
