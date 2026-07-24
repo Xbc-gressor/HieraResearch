@@ -142,10 +142,10 @@ exactly this shape; do not add undeclared evidence or status collections:
       "assessment": "unknown | promising | mixed | unpromising",
       "recommended_status": "active | deprioritized | pruned",
       "claim": "<bounded belief about this target>",
-      "evidence_run_ids": ["002", "004"],
-      "evidence_edge_ids": ["sedge-000-002"],
+      "evidence_run_ids": ["002", "004", "006"],
+      "evidence_edge_ids": ["sedge-000-002", "sedge-004-006"],
       "comparator_coverage": {
-        "direct_noncrash_edges": 1,
+        "direct_noncrash_edges": 2,
         "confounded_noncrash_edges": 0,
         "crash_edges": 0
       },
@@ -171,16 +171,33 @@ Recommendation gates are exact and identical for both target levels:
 - `unevaluated`/`failed` targets keep `assessment: unknown`,
   `confidence: low`, and `recommended_status: active`.
 - `deprioritized` requires `assessment: unpromising`, `confidence: med` or
-  `high`, `evaluation_state: observed` or `comparator_covered`, at least one
-  direct non-crash edge, and a non-empty `reopen_when`.
+  `high`, `evaluation_state: comparator_covered`, at least two direct
+  non-crash edges, and a non-empty `reopen_when`.
 - `pruned` requires `assessment: unpromising`, `confidence: high`,
   `evaluation_state: comparator_covered`, at least two direct non-crash edges,
   and a non-empty `reopen_when`.
 - High-confidence `promising` or `unpromising` requires `comparator_covered`.
 
+`unpromising` is a judgment about the low expected marginal value of spending
+another outer-search evaluation on the target, not a synonym for
+“worse-than-parent.” Final-score deltas are observations, never a sufficient
+decision rule. Before using `unpromising`, weigh the comparator coverage and
+attribution, consistency across implementations or contexts, a plausible
+mechanism or recurring failure mode, counterevidence, untested conditions or
+adjacent hypotheses, residual uncertainty/value of information, and evaluation
+cost. Explain that reasoning in `claim` and preserve the main caveat in
+`uncertainty`. If the evidence is only a worse score, the semantic change is
+implementation-confounded, or important variants remain untested, use
+`assessment: mixed` and keep the target `active`.
+
 An entry only recommends. The helper derives and validates the actual
 append-only `search_space_state` transitions under their own two-stage,
-baseline, and provenance rules.
+baseline, and provenance rules. A later generation alone cannot advance
+`deprioritized -> pruned` or reopen a target: the later snapshot must cite a new
+target edge or a cited target edge whose recorded observation changed. A
+dimension can contract only when every selectable adjacent non-baseline
+hypothesis is already equivalently contracted or independently passes the same
+gate in that generation.
 
 `generation` increments the prior snapshot generation. `updated_at_run` is the
 latest terminal run actually processed. The helper owns `dag_revision` and adds

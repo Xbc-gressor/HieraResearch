@@ -41,18 +41,27 @@ Then read **`_candidate_brief.json`**. `new_candidate.py` generated this compact
 immutable view from the record that `idea-generator` persisted before you were
 spawned. You do not need shell access or the full ledger.
 
-From that record take (`idea` + `change` together are your **entire** brief):
+The brief fields have distinct roles. `idea` and `change` provide the prose
+implementation guidance; the structured fields provide ancestry, attribution,
+and selection context:
 
-- **`idea`** — the **RESULT**: a self-contained description of the solution to
-  build (what it IS; it has no parent references). This is the target.
-- **`change`** — the **PROCESS**: how it differs from the parent(s) — for a
-  `crossover` written per-parent (`vs <p1>: …; vs <p2>: …`), for an `improve` the
-  implementation process, for a `fresh` `from scratch at <point-id>`. Use it to know exactly
-  what to take from / change in each parent's `train.py`.
-- **`source_run_ids`** — the genealogy. For an `improve`/`crossover` candidate
-  these are parent run ids (improve → one, crossover → two, e.g.
-  `["003","005"]`); for a `fresh` candidate it is empty. Derive
+- **`idea`** — the complete, parent-independent specification of the candidate
+  after implementation: what the resulting solution is and how its components
+  work together. Parent-independent means it must not say only "parent 003 plus
+  X"; it does **not** mean the candidate has no ancestry.
+- **`source_run_ids`** — the authoritative genealogy. For an
+  `improve`/`crossover` candidate these are parent run ids (improve → one,
+  crossover → two, e.g. `["003","005"]`); for a `fresh` candidate it is empty.
+  Never infer or rewrite parentage from the `idea` or `change` prose. Derive
   **`source_train_paths` = `[<run_dir>/candidates/<sid>/train.py` for each parent]`**.
+- **`change`** — parent-relative implementation guidance: which components or
+  behaviors to retain, add, remove, replace, or reconcile. For a `crossover` it
+  is written per parent (`vs <p1>: …; vs <p2>: …`); for an `improve` it
+  describes the delta from its sole parent. For a `fresh` candidate,
+  `from scratch at <point-id>` is a sentinel—there is no parent-relative delta.
+  The idea-generator did not inspect parent source code, so treat `change` as
+  intent-level guidance: inspect the actual parent files, then realize that
+  intent faithfully rather than expecting exact line-level edit instructions.
 - **`semantic_point`** — the complete revisioned attribution chosen before the
   idea was written. Keep the implementation consistent with its selected and
   explicitly inactive dimensions, but remember that the point is not a full

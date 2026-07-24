@@ -221,23 +221,36 @@ Proposal neighborhoods are deterministic:
 Hypotheses are reusable and may participate in many points. There is no
 “consumed direction” state.
 
-Three replaceable policies are implemented:
+Four replaceable policies are implemented:
 
 1. `coverage` — deterministic exploration by inverse hypothesis coverage and
    exact-point novelty; no LLM score is required.
 2. `gain` — predicted gain plus a small coverage term minus predicted cost.
 3. `gain_uncertainty` — predicted gain plus an explicit uncertainty bonus and
    coverage, minus predicted cost.
+4. `gain_uncertainty_nocost` — like `gain_uncertainty` but with no cost
+   prediction at all, for settings where pre-implementation cost estimates
+   are noise and only waste tokens.
 
 For model-scored policies, each proposal receives separate `[0,1]`
-`predicted_gain`, `uncertainty`, and `cost` rubric inputs plus evidence strings.
+`predicted_gain`, `uncertainty`, and `cost` rubric inputs plus evidence
+strings (`gain_uncertainty_nocost` omits `cost`).
 They are auditable estimates, not calibrated Bayesian posteriors. The selected
 record preserves all four components (`coverage` included), weights, proposal
 set digest, action, ranking, and evidence. These values stay in
 `policy_receipt`; they do not become observations or beliefs.
 
+Runtime-deprioritized proposals occupy a separate, deterministic
+semantic-admission budget lane. `deprioritized_budget_interval: N` reserves
+every Nth one-based outer admission for that lane (default `N=5`, or 20%);
+ordinary slots select only active proposals. Acquisition scores rank within
+the scheduled lane and cannot buy a deprioritized point an active slot. When
+the scheduled lane is empty, the other lane fills the slot and policy receipt
+schema 3 records the selection index, interval, scheduled/selected lanes,
+fallback reason, and the selected point's pre-lane acquisition rank.
+
 Run-local configuration lives under `framework_cfg.json.semantic_search`.
-`gain_uncertainty` is the code and copied-template default; `coverage` (fully
+`gain_uncertainty_nocost` is the code and copied-template default; `coverage` (fully
 deterministic, no LLM scores) is an explicit opt-in for ablations, bootstrap
 runs, or prediction-failure fallback, for example:
 
@@ -280,15 +293,29 @@ or `pruned`. Belief coverage is `unevaluated`, `failed`, `observed`, or
 `comparator_covered`. A crash is `+inf`, distinct from an unevaluated target,
 and cannot by itself contradict or prune a semantic element. Automated pruning
 is two-stage (`active -> deprioritized`, then `deprioritized -> pruned` in a
-later experience generation), and every recommendation is gated on
-mechanically recomputed evidence: deprioritization needs an unpromising
-med/high-confidence belief with at least one direct non-crash edge, pruning a
-high-confidence comparator-covered belief with at least two. Transitions never
-touch baselines, `baseline_only` dimensions, or externally `excluded`
-hypotheses. A dimension may be pruned only when every selectable non-baseline
-hypothesis in it is externally excluded, already runtime-pruned, or
-independently prune-recommended in the same generation, so evidence against
-one hypothesis cannot ban adjacent mechanisms. A runtime-pruned dimension keeps its explicit baseline eligible:
+later experience generation with changed evidence for the same target), and
+every recommendation is gated on mechanically recomputed evidence:
+deprioritization and pruning both require `comparator_covered` with at least
+two direct non-crash edges; deprioritization requires med/high confidence and
+pruning requires high confidence. A later generation or unrelated DAG update
+alone cannot complete the second stage or reopen a target: a new cited target
+edge or changed observation on a cited target edge is required.
+
+`unpromising` means the expected marginal value of another outer-search
+evaluation is low after considering attribution, consistency across
+implementations or contexts, a plausible mechanism or recurring failure mode,
+counterevidence, untested conditions and adjacent hypotheses, residual
+uncertainty/value of information, and cost. A worse child score or score delta
+alone is never sufficient; weakly attributed or incomplete evidence remains
+`mixed` and active.
+
+Transitions never touch baselines, `baseline_only` dimensions, or externally
+`excluded` hypotheses. A dimension may be deprioritized only when every
+selectable non-baseline hypothesis in it is externally excluded, already
+runtime-deprioritized/pruned, or independently deprioritize/prune-recommended
+in the same generation. Dimension pruning requires the corresponding stronger
+pruned state or recommendation, so evidence against one hypothesis cannot ban
+adjacent mechanisms. A runtime-pruned dimension keeps its explicit baseline eligible:
 new proposals pin the dimension to `baseline_hypothesis_id` instead of
 changing point arity or the frozen `space_revision`, because the overlay
 restricts which points may be proposed next — it does not redefine the space
@@ -404,9 +431,10 @@ Sources, hypotheses, and guidance share five exact-tag scope facets:
 
 `background_contract.py` derives claim-to-hypothesis transfer as `direct`,
 `partial`, `mismatch`, or `unknown`. Only `direct` guidance changes eligibility.
-`caution` annotates; `deprioritize` orders a directly matched hypothesis after
-active ones; `exclude` removes it from proposal generation while preserving its
-identity and receipt.
+`caution` annotates; external `deprioritize` assigns a directly matched
+hypothesis to the same limited budget lane as runtime deprioritization;
+`exclude` removes it from proposal generation while preserving its identity
+and receipt.
 
 Unverified or contested negatives may only caution. Binding guidance needs
 directly scoped, non-withdrawn primary empirical evidence. Exclusion additionally

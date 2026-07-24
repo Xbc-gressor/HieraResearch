@@ -91,28 +91,34 @@ The helper deterministically completes baselines, explicit conditional
 inactivity, requirements, and exclusions. It also owns effective eligibility:
 it composes the frozen space with the current `search_space_state` overlay,
 excludes runtime-pruned hypotheses from new proposals, pins runtime-pruned
-dimensions to their explicit baselines, orders deprioritized points last, and
-stamps the proposal set with `search_space_state_revision`. It emits bounded
-valid local choices:
+dimensions to their explicit baselines, assigns every remaining point to an
+`active` or `deprioritized` budget lane, and stamps the proposal set with
+`search_space_state_revision`. It emits bounded valid local choices:
 
 - `fresh`: under-covered baseline/intervention points, including bounded pairs;
 - `improve`: same-point reimplementation plus one-hop semantic neighbors;
 - `crossover`: valid parent recombinations plus bounded neighbors.
 
-Hypotheses are reusable values, not consumed tickets. The same point may host
-distinct concrete implementations because mapping is attribution, not a full
-program specification.
+Hypotheses are durable registry values. Recording a candidate at one adds
+coverage, and evaluating that candidate adds an observation; neither deletes,
+exhausts, or otherwise disposes of the hypothesis. Only the append-only
+`search_space_state` overlay can change its eligibility for future proposals.
+The same point may host distinct concrete implementations because mapping is
+attribution, not a full program specification.
 
 ## Step 3 — Apply the configured semantic policy
 
-Read `framework_cfg.json.semantic_search`. If absent, use `gain_uncertainty`.
+Read `framework_cfg.json.semantic_search`. If absent, use `gain_uncertainty_nocost`.
 Supported policies are:
 
 - `coverage`: no LLM scores; select by under-covered hypotheses and point
   novelty;
 - `gain`: predicted gain minus cost, with a small deterministic coverage term;
 - `gain_uncertainty`: predicted gain plus a separate uncertainty exploration
-  bonus, minus cost, plus coverage.
+  bonus, minus cost, plus coverage;
+- `gain_uncertainty_nocost`: like `gain_uncertainty` but with no cost
+  prediction—pre-implementation cost estimates are usually noise, so the
+  schema omits the `cost` field entirely.
 
 For `coverage`, select directly:
 
@@ -123,9 +129,9 @@ python tools/semantic_search.py select \
   --point-output <...>/point.json --receipt-output <...>/policy.json
 ```
 
-For `gain` or `gain_uncertainty`, read the bounded background render, parent
-records, experience, and proposals. Write `predictions.json` with one entry for
-every proposal:
+For `gain`, `gain_uncertainty`, or `gain_uncertainty_nocost`, read the bounded
+background render, parent records, experience, and proposals. Write
+`predictions.json` with one entry for every proposal:
 
 ```json
 {
@@ -149,7 +155,9 @@ Use a consistent `[0,1]` rubric:
   on mechanisms and observed comparators; do not inflate it for novelty;
 - `uncertainty`: epistemic uncertainty or unresolved interaction that makes the
   observation informative; do not treat it as expected gain;
-- `cost`: relative implementation, runtime, memory, and dependency burden;
+- `cost`: relative implementation, runtime, memory, and dependency burden —
+  required for `gain` and `gain_uncertainty`; omit the field entirely for
+  `gain_uncertainty_nocost` (its schema rejects a `cost` field);
 - `evidence`: concrete hypothesis ids, parent/run ids, or bounded belief
   receipts. Use 1–5 short strings (at most 240 characters each).
 
@@ -162,6 +170,17 @@ python tools/semantic_search.py select \
   --ledger <run_dir>/ledger.json \
   --point-output <...>/point.json --receipt-output <...>/policy.json
 ```
+
+`deprioritized` is a real outer-search budget class, not a display label or a
+score penalty. The helper uses
+`semantic_search.deprioritized_budget_interval` (default `5`): every Nth
+one-based semantic admission is reserved for the best proposal in the
+deprioritized lane, while all other admissions select only from the active
+lane. Acquisition scores rank proposals only within the scheduled lane; a high
+gain estimate cannot move a deprioritized proposal into an active slot. If the
+scheduled lane has no proposal, the other lane may fill the slot and the
+schema-3 policy receipt records the deterministic fallback, selection index,
+scheduled/selected lanes, interval, and pre-lane base rank.
 
 `select` also checks that the proposal set's `search_space_state_revision`
 equals the ledger's current overlay revision. A stale set is a protocol
@@ -176,23 +195,34 @@ missing scores.
 
 Read `point.json` and the relevant hypothesis claims. Produce:
 
-- `idea`: a self-contained complete solution describing data flow, model,
-  objective/training, validation, inference, output, and resource decisions as
-  applicable—not merely the selected hypothesis ids;
-- `change`: the implementation process relative to numeric parents. For
-  `fresh`, say it is from scratch at the selected point. For an unchanged point,
-  name the concrete implementation-level change without pretending a semantic
-  dimension changed;
+- `idea`: a standalone, implementation-ready description of the resulting
+  candidate. Explain the task-relevant components, their interactions, and how
+  the selected hypotheses are realized well enough for the candidate writer to
+  build the solution. Include only details that matter for this task; do not
+  force a fixed pipeline checklist, refer to parent history, or merely repeat
+  hypothesis ids;
+- `change`: a parent-relative implementation delta—what the candidate writer
+  should retain, add, remove, replace, or reconcile in the parent code. For
+  `fresh`, which has no parent code, use `from scratch at <point-id>`. For
+  `improve`, identify the retained foundation and the concrete alteration. For
+  `crossover`, state per parent what to inherit or modify and how those parts
+  form one coherent implementation. If the selected semantic point is
+  unchanged from a parent, describe the concrete reimplementation at that same
+  point without claiming that a semantic assignment changed;
 - a stable candidate-name hint and short description.
 
-Respect task constraints and keep scalar tuning ranges inside the downstream
-inner HPO contract. A semantic hypothesis may describe a qualitative regime,
-but this stage does not tune learning rates, depths, batch sizes, or similar
-numbers.
+Together, `idea` says what to build and `change` says how to obtain it from the
+available parent code. They must agree with each other and with the complete
+selected point. Respect task constraints and keep scalar tuning ranges inside
+the downstream inner HPO contract. A semantic hypothesis may describe a
+qualitative regime, but this stage does not tune learning rates, depths, batch
+sizes, or similar numbers.
 
 For crossover, synthesize one coherent solution; do not paste two parent ideas.
 For improve, address a parent weakness or test a local alternative. For fresh,
-cover a region selected by the semantic policy; no hypothesis becomes consumed.
+implement the selected point without parent code. `fresh` describes ancestry;
+it does not make the idea hypothesis-free or permit ignoring the relevant
+hypothesis claims.
 
 ## Step 5 — Persist atomically through the helper
 
@@ -202,7 +232,7 @@ python tools/ledger.py add-record \
   --op <op> --source-run-ids <numeric-parents-or-empty> \
   --background <run_dir>/background.md \
   --semantic-point <...>/point.json --policy-receipt <...>/policy.json \
-  --idea '<complete solution>' --change '<process>' \
+  --idea '<complete solution>' --change '<parent-relative delta>' \
   --candidate-name-hint '<name>' --description '<short summary>'
 ```
 
@@ -225,7 +255,7 @@ run_id: <id>
 op: <op>
 parents: <ids-or-none>
 point_id: <point-id>
-policy: <coverage|gain|gain_uncertainty>
+policy: <coverage|gain|gain_uncertainty|gain_uncertainty_nocost>
 candidate: <name>
 ledger: <run_dir>/ledger.json
 ```

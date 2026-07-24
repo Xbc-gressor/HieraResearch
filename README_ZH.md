@@ -106,7 +106,7 @@ background-researcher: 解析维度策略 → 多后端知识侦察 → backgrou
 idea-generator:
     SELECT-1: got_select.py decide → 获取图行动与数字父代
             (bootstrap/stall → fresh; 否则在前沿上 PUCB → ≤B improve/crossover)
-    SELECT-2: semantic_search.py → 合法点集 → coverage/gain/gain_uncertainty 选点
+    SELECT-2: semantic_search.py → 合法点集 → coverage/gain/gain_uncertainty/gain_uncertainty_nocost 选点
     IDEATE: 将点落成完整方案 → ledger.py add-record（祖先、点、策略收据分开）
         ↓
 对每个行动: tools/new_candidate.py --skip-entrypoint → 创建候选目录(prepare.py + 精简 _candidate_brief.json)
@@ -136,7 +136,7 @@ step 0+1: tunable-contract-extractor
 - 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 将预期收益、不确定性、成本、覆盖分别保存并组合。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 将预期收益、不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
@@ -214,7 +214,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 外层搜索的 LLM 着陆点，通过三步产生下一代：
 
 - **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
-- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty`。后两者用 `[0,1]` rubric 分别评估 predicted gain、uncertainty、cost，并与确定性 coverage 分栏写入 `policy_receipt`，不冒充校准后验。
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 分别评估 predicted gain、uncertainty、cost（`gain_uncertainty_nocost` 不含 cost），并与确定性 coverage 分栏写入 `policy_receipt`，不冒充校准后验。
 - **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。
@@ -347,8 +347,8 @@ runs/<task-name>/<tag>/loop_state.md
 外层 S-GoT 图搜索确定性计算层（纯函数；单元可测试）：
 
 - `got_graph.py`：开发 DAG + 反向传播（`V_max`/`V_med`/`N`/`ec`，`cap=⌈C·N^α⌉` 渐进加宽，`select_leaf`，前沿 `F`/`alive`，血统）；`from_ledger(ledger)` 从记录重建图
-- `got_cdag.py`：结构互补性 `c̃_dag`——开发 DAG 上的影响扩散向量 + 余弦
-- `got_select.py`：SELECT 层。`idea-generator` 调用 `python tools/got_select.py decide --ledger <path>` 获取本轮的行动：bootstrap/stall fresh 规则，或在前沿叶子上 PUCB（`Q=geomean(V)·(1+c̃_dag)`，`P=softmax(ḡ_op/τ)`）采样 ≤B `improve`/`crossover`。所有全局派生量从记录重新计算；无持久状态。
+- `got_cdag.py`：结构互补性 `c̃_dag`——开发 DAG 上的祖先影响扩散向量 + 余弦；计算余弦前排除两个目标节点各自的单位 self 分量，避免人为制造结构正交性
+- `got_select.py`：SELECT 层。`idea-generator` 调用 `python tools/got_select.py decide --ledger <path>` 获取本轮的行动：bootstrap/stall fresh 规则，或在前沿叶子上按 op 解耦定额选 ≤B 个动作：op 级收购 `U_op=ḡ_op+c_pucb·√σN/(1+Nop_op)` → `W=softmax(U/τ)` → 最大余数法分配 B 个槽位（确定性，受可用动作数封顶），各 op 内按 `Q` 取顶（`improve: V_max`；`crossover: geomean(V)·(1+c̃_dag)`），两 op 不混排竞争同一排序。所有全局派生量从记录重新计算；无持久状态。
 
 ### 7.5 background_contract.py
 
@@ -367,7 +367,7 @@ runs/<task-name>/<tag>/loop_state.md
 
 ### 7.6 semantic_search.py
 
-图行动之后的语义选点层：`propose` 为 fresh/improve/crossover 生成有界合法点（按账本当前 `search_space_state` revision 过滤/排序：运行时剪枝的假设出局，被剪维度钉在显式基线）；`select` 可替换 `coverage`、`gain`、`gain_uncertainty` 策略并输出 point + policy receipt，提案集与收据都带 revision 戳，过期即拒。策略可替换而不改变 registry、祖先或观测历史。
+图行动之后的语义选点层：`propose` 为 fresh/improve/crossover 生成有界合法点（按账本当前 `search_space_state` revision 过滤/排序：运行时剪枝的假设出局，被剪维度钉在显式基线）；`select` 可替换 `coverage`、`gain`、`gain_uncertainty`、`gain_uncertainty_nocost` 策略并输出 point + policy receipt，提案集与收据都带 revision 戳，过期即拒。策略可替换而不改变 registry、祖先或观测历史。
 
 ### 7.7 search_backends.py
 
@@ -552,12 +552,12 @@ runs/<task>/<tag>/framework_cfg.json
 - 任务特定的预算约束（例如，最大评估次数、单次评估时间限制）
 - 调整探索与利用的权衡
 
-**使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced` 直接持久化维度策略。
+**使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --max-evaluations 200 --timeout 60` 直接持久化维度策略、总评估预算和单次评估超时；恢复已有运行时也可更新后两项。
 
 主要配置包括：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
-- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认使用 `gain_uncertainty`，`coverage` 保留为确定性消融或失败回退策略
+- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认使用 `gain_uncertainty_nocost`（不预测成本），`coverage` 保留为确定性消融或失败回退策略
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

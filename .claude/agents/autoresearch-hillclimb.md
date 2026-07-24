@@ -63,6 +63,9 @@ The caller provides:
 
 - `task_name` (e.g. `tabular-model-search`)
 - `tag` (e.g. `20260628-hillclimb`) — propose a date/purpose tag if missing.
+- optional `max_evaluations=<positive integer>`
+- optional `timeout=<positive seconds>` — the hard limit for each evaluation,
+  not a whole-experiment deadline.
 
 For a brand-new run, `runs/<task_name>/<tag>/` should not exist. But if it already
 exists **with progress** (a `results.tsv`/`best.py`) — e.g. a previous chunk of a
@@ -172,8 +175,11 @@ copy `best.py` → `train.py`. Everything here is local state — never commit
 
 ## Setup
 
-1. Confirm `task_name` + `tag`; ensure `runs/<task_name>/<tag>/` does not exist.
-2. Create the run directory and copy the task's `prepare.py` and editable
+1. Confirm `task_name` + `tag`, then initialize or resume the run:
+   `python tools/init_run.py <task_name> <tag> [--max-evaluations <count>]
+   [--timeout <seconds>]`. Pass every supplied control so it is persisted in
+   `framework_cfg.json`; explicit values override the copied template.
+2. Copy the task's `prepare.py` and editable
    entrypoint into it (`prepare.py`, `train.py`). Treat the copied `prepare.py`
    as read-only.
 3. Read the required files above.
@@ -207,11 +213,9 @@ The loop is **budget-bounded** when a budget is set, otherwise it runs forever
 **1 round = 1 evaluation**, and `evaluations_done` = the number of result rows in
 `results.tsv` (excluding the header).
 
-Read the budget at startup from, in order:
-1. `<run_dir>/framework_cfg.json` top-level integer `max_evaluations`, if present;
-2. otherwise an explicit budget stated in the caller's instructions (e.g.
-   "run 200 rounds" / "max_evaluations=200");
-3. otherwise **no budget** → NEVER STOP.
+Read the budget at startup from `<run_dir>/framework_cfg.json` top-level integer
+`max_evaluations`. Setup persists any explicit caller value there. If the field
+is absent or null, there is **no budget** → NEVER STOP.
 
 **Check it at the very START of every iteration (before editing anything):**
 if a budget is set and `evaluations_done >= max_evaluations`, **STOP now** — this
@@ -236,8 +240,9 @@ iteration:
    `readonly_files` are off-limits; add dependencies only if
    `allow_dependencies = true`.
 3. **Run** the working copy through the task env into `run.log` (never `tee`; do
-   not flood context). Enforce `run.timeout_seconds`; if a run exceeds a generous
-   multiple of it, kill it and treat it as a crash.
+   not flood context). Enforce `framework_cfg.json.per_runtime_limit` with
+   `timed_run.py`; a timeout is a crash. If the field is absent or null, do not
+   silently substitute `task.toml`'s separate `run.timeout_seconds`.
 4. **Read the metric** (parser or grep). Empty → crashed → read `tail -n 50
    run.log` for the trace.
 5. **On crash**: if it is trivial (typo, missing import, obvious shape bug), fix

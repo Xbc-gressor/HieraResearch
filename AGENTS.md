@@ -13,17 +13,29 @@ opencode --agent autoresearch-experiment \
   --model moonshotai/kimi-k3 --auto
 ```
 
-Then provide `task_name`, `tag`, and optionally `max_evaluations`. For a
-non-interactive session:
+Then provide `task_name`, `tag`, and optionally `max_evaluations` and
+`timeout` (the hard limit in seconds for each evaluation). For a non-interactive
+session:
 
 ```bash
 opencode run --agent autoresearch-experiment \
   --model moonshotai/kimi-k3 --auto \
-  "task_name=<task> tag=<tag> max_evaluations=<n>"
+  "task_name=<task> tag=<tag> max_evaluations=<n> timeout=<seconds>"
 ```
 
 `autoresearch-hillclimb` is the deliberately simple comparison baseline and is
 started with the same commands using `--agent autoresearch-hillclimb`.
+
+The same controls can be set or changed deterministically before a run:
+
+```bash
+python tools/init_run.py <task> <tag> \
+  --max-evaluations <n> --timeout <seconds>
+```
+
+They are persisted as `max_evaluations` and `per_runtime_limit` in the run's
+`framework_cfg.json`; explicit initialization values override the copied
+template.
 
 OpenCode primary and subagents inherit `moonshotai/kimi-k3` from the launch
 command. `--auto` approves permission requests that are not explicitly denied;

@@ -371,9 +371,29 @@ def background_text(registry: dict) -> str:
     return "\n".join(lines)
 
 
-def policy_receipt(op: str, parents: list[str], point: dict, *, state_revision: int = 0) -> dict:
+def policy_receipt(
+    op: str,
+    parents: list[str],
+    point: dict,
+    *,
+    state_revision: int = 0,
+    selection_index: int = 1,
+    selected_lane: str = "active",
+    deprioritized_interval: int = 5,
+) -> dict:
+    scheduled_lane = (
+        "deprioritized"
+        if selection_index % deprioritized_interval == 0
+        else "active"
+    )
+    fallback = {
+        ("active", "active"): "none",
+        ("deprioritized", "deprioritized"): "none",
+        ("active", "deprioritized"): "no_active_proposals",
+        ("deprioritized", "active"): "no_deprioritized_proposals",
+    }[(scheduled_lane, selected_lane)]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "space_revision": point["space_revision"],
         "search_space_state_revision": state_revision,
         "proposal_set_revision": "sha256:" + "0" * 64,
@@ -383,6 +403,7 @@ def policy_receipt(op: str, parents: list[str], point: dict, *, state_revision: 
                 "coverage_weight": 0.1,
                 "cost_weight": 0.2,
                 "uncertainty_weight": 0.5,
+                "deprioritized_budget_interval": deprioritized_interval,
             },
         },
         "action": {"op": op, "parents": parents},
@@ -395,6 +416,14 @@ def policy_receipt(op: str, parents: list[str], point: dict, *, state_revision: 
         },
         "acquisition_score": 1.0,
         "evidence": [],
+        "budget": {
+            "selection_index": selection_index,
+            "deprioritized_interval": deprioritized_interval,
+            "scheduled_lane": scheduled_lane,
+            "selected_lane": selected_lane,
+            "fallback": fallback,
+            "base_rank": 1,
+        },
         "ranked_point_ids": [point["point_id"]],
     }
 
@@ -419,7 +448,12 @@ def record(
         "candidate_name": f"fixture_{run_id}",
         "description": f"Fixture candidate {run_id}.",
         "semantic_point": point,
-        "policy_receipt": policy_receipt(op, parents, point),
+        "policy_receipt": policy_receipt(
+            op,
+            parents,
+            point,
+            selection_index=int(run_id) + 1,
+        ),
         "status": status,
         "final_best_score": score,
     }
@@ -769,7 +803,13 @@ def main() -> int:
             capture_output=True,
             text=True,
         )
-        policy_path.write_text(json.dumps(policy_receipt("improve", ["000"], coverage_point)))
+        policy_path.write_text(
+            json.dumps(
+                policy_receipt(
+                    "improve", ["000"], coverage_point, selection_index=2
+                )
+            )
+        )
         subprocess.run(
             [
                 sys.executable,
@@ -905,6 +945,26 @@ def main() -> int:
 
         def cli_add_record(run_id: str, op: str, parents: list[str], point: dict, receipt: dict) -> None:
             point_path.write_text(json.dumps(point))
+            receipt = copy.deepcopy(receipt)
+            current_records = (
+                json.loads(ledger_path.read_text()).get("records", [])
+                if ledger_path.exists()
+                else []
+            )
+            budget = receipt["budget"]
+            budget["selection_index"] = len(current_records) + 1
+            interval = budget["deprioritized_interval"]
+            budget["scheduled_lane"] = (
+                "deprioritized"
+                if budget["selection_index"] % interval == 0
+                else "active"
+            )
+            budget["fallback"] = {
+                ("active", "active"): "none",
+                ("deprioritized", "deprioritized"): "none",
+                ("active", "deprioritized"): "no_active_proposals",
+                ("deprioritized", "active"): "no_deprioritized_proposals",
+            }[(budget["scheduled_lane"], budget["selected_lane"])]
             policy_path.write_text(json.dumps(receipt))
             subprocess.run(
                 [
@@ -1039,7 +1099,11 @@ def main() -> int:
             "evaluation_state": "comparator_covered",
             "assessment": "unpromising",
             "recommended_status": "pruned",
-            "claim": "Both direct comparisons were worse than their matched baseline parent.",
+            "claim": (
+                "Repeated matched comparisons show the filtering mechanism removes "
+                "useful signal without reducing downstream cost, so another outer "
+                "evaluation has low expected marginal value."
+            ),
             "evidence_run_ids": ["002", "003", "004"],
             "evidence_edge_ids": ["sedge-002-003", "sedge-002-004"],
             "comparator_coverage": {
@@ -1059,7 +1123,34 @@ def main() -> int:
             "revision": 1,
             "decision_ids": ["sdec-000001"],
         }, applied
-        cli_set_experience(2, "004", [prune_belief])
+
+        # Deprioritization has real budget semantics. At admission 6 with an
+        # interval of 2, a new direct comparison is admitted from the reserved
+        # deprioritized lane and supplies target-specific advancing evidence.
+        cli_add_record(
+            "005",
+            "improve",
+            ["002"],
+            prune_target,
+            policy_receipt(
+                "improve",
+                ["002"],
+                prune_target,
+                state_revision=1,
+                selected_lane="deprioritized",
+                deprioritized_interval=2,
+            ),
+        )
+        cli_record_run("005", 0.61)
+        prune_belief = copy.deepcopy(prune_belief)
+        prune_belief["evidence_run_ids"] = ["002", "003", "004", "005"]
+        prune_belief["evidence_edge_ids"] = [
+            "sedge-002-003",
+            "sedge-002-004",
+            "sedge-002-005",
+        ]
+        prune_belief["comparator_coverage"]["direct_noncrash_edges"] = 3
+        cli_set_experience(2, "005", [prune_belief])
         applied = cli_apply_space_state()
         assert applied == {
             "ok": True,
@@ -1078,7 +1169,7 @@ def main() -> int:
         # Revision-current proposals omit the pruned hypothesis and carry the stamp.
         proposals_path = tmp_path / "proposals.json"
         current_proposals = cli_propose(proposals_path)
-        assert current_proposals["schema_version"] == 2
+        assert current_proposals["schema_version"] == 3
         assert current_proposals["search_space_state_revision"] == 2
         assert current_proposals["proposals"]
         assert not any(selects_target(item) for item in current_proposals["proposals"])
@@ -1101,7 +1192,7 @@ def main() -> int:
             text=True,
         )
         selected_receipt = json.loads(policy_path.read_text())
-        assert selected_receipt["schema_version"] == 2
+        assert selected_receipt["schema_version"] == 3
         assert selected_receipt["search_space_state_revision"] == 2
 
         # A proposal set stamped at another revision is rejected as stale.
@@ -1139,7 +1230,7 @@ def main() -> int:
                 "add-record",
                 "--ledger", str(ledger_path),
                 "--task", "hard-interactions",
-                "--run-id", "005",
+                "--run-id", "006",
                 "--op", "fresh",
                 "--source-run-ids", "",
                 "--background", str(background_path),
@@ -1158,29 +1249,27 @@ def main() -> int:
         assert "stale" in rejected.stderr, rejected.stderr
         stored = json.loads(ledger_path.read_text())
         assert [item["run_id"] for item in stored["records"]] == [
-            "000", "001", "002", "003", "004",
+            "000", "001", "002", "003", "004", "005",
         ]
 
-        # A revision-current receipt admits run 005 and advances the DAG cursor.
-        cli_add_record(
-            "005",
-            "fresh",
-            [],
-            baseline_point,
-            policy_receipt("fresh", [], baseline_point, state_revision=2),
-        )
-        cli_record_run("005", 0.49)
+        # A changed observation on a cited target edge advances target-specific
+        # evidence and can support reopening; an unrelated run would not.
+        cli_record_run("005", 0.40)
 
         reopen_belief = {
             "target_id": "hyp-data-filtered",
             "evaluation_state": "comparator_covered",
             "assessment": "promising",
             "recommended_status": "active",
-            "claim": "Newer evidence warrants re-admitting the filtered hypothesis to proposals.",
-            "evidence_run_ids": ["002", "003", "004"],
-            "evidence_edge_ids": ["sedge-002-003", "sedge-002-004"],
+            "claim": "The updated direct comparison now improves over its matched parent.",
+            "evidence_run_ids": ["002", "003", "004", "005"],
+            "evidence_edge_ids": [
+                "sedge-002-003",
+                "sedge-002-004",
+                "sedge-002-005",
+            ],
             "comparator_coverage": {
-                "direct_noncrash_edges": 2,
+                "direct_noncrash_edges": 3,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
             },
@@ -1248,7 +1337,7 @@ def main() -> int:
             for key in ("delta_nodes", "top_nodes", "bottom_nodes")
             for node in window[key]
         }
-        assert window_ids == {"002"}, window_ids
+        assert window_ids == {"005"}, window_ids
         completed = subprocess.run(
             [
                 sys.executable,
@@ -1265,7 +1354,11 @@ def main() -> int:
         )
         view = json.loads(completed.stdout)
         (block,) = view["hypothesis_targets"]
-        assert {"sedge-002-003", "sedge-002-004"} <= set(block["evidence_edge_ids"])
+        assert {
+            "sedge-002-003",
+            "sedge-002-004",
+            "sedge-002-005",
+        } <= set(block["evidence_edge_ids"])
         assert {"003", "004"}.isdisjoint(window_ids)
         assert block["comparator_coverage"] == comparator_coverage(
             stored,
@@ -1347,7 +1440,10 @@ def main() -> int:
             "evaluation_state": "comparator_covered",
             "assessment": "unpromising",
             "recommended_status": "pruned",
-            "claim": "Both direct comparisons were worse than their matched baseline parent.",
+            "claim": (
+                "Matched comparisons consistently show the filtering mechanism "
+                "removes useful signal without offsetting cost."
+            ),
             "evidence_run_ids": ["000", "001", "002"],
             "evidence_edge_ids": ["sedge-000-001", "sedge-000-002"],
             "comparator_coverage": {
@@ -1381,17 +1477,54 @@ def main() -> int:
             "ok": True, "prior_revision": 0, "revision": 1,
             "decision_ids": ["sdec-000001"],
         }
-        cli_set_experience(1, "002", [hypothesis_prune])
+
+        cli_add_record(
+            "003",
+            "improve",
+            ["000"],
+            prune_target,
+            policy_receipt(
+                "improve",
+                ["000"],
+                prune_target,
+                state_revision=1,
+                selected_lane="deprioritized",
+                deprioritized_interval=2,
+            ),
+        )
+        cli_record_run("003", 0.61)
+        hypothesis_prune = copy.deepcopy(hypothesis_prune)
+        hypothesis_prune["evidence_run_ids"] = ["000", "001", "002", "003"]
+        hypothesis_prune["evidence_edge_ids"] = [
+            "sedge-000-001",
+            "sedge-000-002",
+            "sedge-000-003",
+        ]
+        hypothesis_prune["comparator_coverage"]["direct_noncrash_edges"] = 3
+        dimension_prune = copy.deepcopy(dimension_prune)
+        dimension_prune["evidence_run_ids"] = ["000", "001", "002", "003"]
+        dimension_prune["evidence_edge_ids"] = [
+            "sedge-000-001",
+            "sedge-000-002",
+            "sedge-000-003",
+        ]
+        dimension_prune["comparator_coverage"]["direct_noncrash_edges"] = 3
+
+        cli_set_experience(1, "003", [hypothesis_prune])
         assert cli_apply_preserving_dag() == {
             "ok": True, "prior_revision": 1, "revision": 2,
             "decision_ids": ["sdec-000002"],
         }
-        cli_set_experience(2, "002", [], dimension_beliefs=[dimension_prune])
+        cli_set_experience(2, "003", [], dimension_beliefs=[dimension_prune])
         assert cli_apply_preserving_dag() == {
             "ok": True, "prior_revision": 2, "revision": 3,
             "decision_ids": ["sdec-000003"],
         }
-        cli_set_experience(3, "002", [], dimension_beliefs=[dimension_prune])
+
+        # A later changed observation on an edge touching this dimension is
+        # required for its second-stage contraction.
+        cli_record_run("003", 0.60)
+        cli_set_experience(3, "003", [], dimension_beliefs=[dimension_prune])
         assert cli_apply_preserving_dag() == {
             "ok": True, "prior_revision": 3, "revision": 4,
             "decision_ids": ["sdec-000004"],
@@ -1605,7 +1738,10 @@ def main() -> int:
         "evaluation_state": "comparator_covered",
         "assessment": "unpromising",
         "recommended_status": "pruned",
-        "claim": "Both direct comparisons were worse than their matched baseline parents.",
+        "claim": (
+            "Matched comparisons consistently support a signal-removal failure "
+            "mechanism with low expected value from another outer evaluation."
+        ),
         "evidence_run_ids": ["000", "001", "002", "003"],
         "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
         "comparator_coverage": {

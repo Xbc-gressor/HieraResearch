@@ -4,16 +4,21 @@
 ``got_select`` continues to choose the structural graph action and parents.
 This module independently turns that assignment into a bounded set of valid
 semantic points eligible under the ledger's revisioned ``search_space_state``
-overlay, then selects one with one of three policies:
+overlay, then selects one with one of four policies:
 
 * ``coverage``: deterministic exploration without any model score;
 * ``gain``: predicted gain with explicit cost and a small coverage tie-break;
 * ``gain_uncertainty``: predicted gain plus a separate uncertainty bonus,
-  explicit cost, and coverage.
+  explicit cost, and coverage;
+* ``gain_uncertainty_nocost``: like ``gain_uncertainty`` but without any cost
+  prediction, for settings where pre-implementation cost estimates are noise.
 
 Predictions are rubric inputs, not calibrated Bayesian posteriors.  Every
 selection writes the components separately in a policy receipt; neither the
-registry nor observation history is mutated.
+registry nor observation history is mutated. Runtime-deprioritized points use
+a separate deterministic admission-budget lane: every configured Nth selection
+is reserved for that lane, and acquisition scores rank only within the
+scheduled lane.
 
 Formally (see ``docs/search-space.md``): policies rank fibers (equivalence
 classes of implementations), and every observed score is an upper bound on the
@@ -61,14 +66,15 @@ from semantic_space import (
 )
 
 
-PROPOSAL_SCHEMA_VERSION = 2
+PROPOSAL_SCHEMA_VERSION = 3
 PREDICTION_SCHEMA_VERSION = 1
-POLICY_RECEIPT_SCHEMA_VERSION = 2
-POLICIES = {"coverage", "gain", "gain_uncertainty"}
+POLICY_RECEIPT_SCHEMA_VERSION = 3
+POLICIES = {"coverage", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
 DEFAULT_POLICY_CONFIG = {
     "coverage_weight": 0.10,
     "cost_weight": 0.20,
     "uncertainty_weight": 0.50,
+    "deprioritized_budget_interval": 5,
 }
 MAX_PROPOSALS = 128
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -397,6 +403,11 @@ def build_proposal_set(
                 ),
             }
         )
+        proposals[-1]["budget_lane"] = (
+            "deprioritized"
+            if proposals[-1]["deprioritized_hypotheses"]
+            else "active"
+        )
     proposals.sort(
         key=lambda item: (
             -item["coverage"],
@@ -531,6 +542,7 @@ def validate_proposal_set(value: Any) -> list[str]:
                 "coverage",
                 "parent_diffs",
                 "deprioritized_hypotheses",
+                "budget_lane",
             }:
                 errors.append(f"{where} has an unexpected shape")
             proposal_point = proposal.get("point")
@@ -578,6 +590,13 @@ def validate_proposal_set(value: Any) -> list[str]:
                 or len(deprioritized) != len(set(deprioritized))
             ):
                 errors.append(f"{where}.deprioritized_hypotheses must be a unique string list")
+            lane = proposal.get("budget_lane")
+            if lane not in {"active", "deprioritized"}:
+                errors.append(f"{where}.budget_lane must be active or deprioritized")
+            elif lane != ("deprioritized" if deprioritized else "active"):
+                errors.append(
+                    f"{where}.budget_lane must match deprioritized_hypotheses"
+                )
         if all(
             isinstance(item, dict)
             and isinstance(item.get("coverage"), (int, float))
@@ -603,7 +622,7 @@ def validate_proposal_set(value: Any) -> list[str]:
 
 
 def _prediction_map(
-    value: dict[str, Any] | None, proposal_set: dict[str, Any]
+    value: dict[str, Any] | None, proposal_set: dict[str, Any], policy: str
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     if value is None:
         return {}, ["gain policies require a predictions JSON object"]
@@ -617,6 +636,11 @@ def _prediction_map(
         return {}, errors + ["predictions.predictions must be a list"]
     result: dict[str, dict[str, Any]] = {}
     proposal_ids = {item["point_id"] for item in proposal_set["proposals"]}
+    score_fields = ("predicted_gain", "uncertainty")
+    allowed_fields = {"point_id", "predicted_gain", "uncertainty", "evidence"}
+    if policy != "gain_uncertainty_nocost":
+        score_fields += ("cost",)
+        allowed_fields.add("cost")
     for index, prediction in enumerate(predictions):
         where = f"predictions[{index}]"
         if not isinstance(prediction, dict):
@@ -629,7 +653,7 @@ def _prediction_map(
         if point_id_value in result:
             errors.append(f"duplicate prediction for {point_id_value}")
             continue
-        for field in ("predicted_gain", "uncertainty", "cost"):
+        for field in score_fields:
             score = prediction.get(field)
             if (
                 not isinstance(score, (int, float))
@@ -652,9 +676,7 @@ def _prediction_map(
             errors.append(
                 f"{where}.evidence must contain 1–5 non-empty strings of at most 240 characters"
             )
-        unknown = sorted(
-            set(prediction) - {"point_id", "predicted_gain", "uncertainty", "cost", "evidence"}
-        )
+        unknown = sorted(set(prediction) - allowed_fields)
         if unknown:
             errors.append(f"{where} has unknown fields {unknown}")
         result[point_id_value] = prediction
@@ -669,19 +691,38 @@ def select_proposal(
     *,
     policy: str,
     predictions: dict[str, Any] | None = None,
-    config: dict[str, float] | None = None,
+    config: dict[str, float | int] | None = None,
+    selection_index: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     errors = validate_proposal_set(proposal_set)
     if errors:
         raise ContractError("invalid proposal set: " + "; ".join(errors))
     if policy not in POLICIES:
         raise ContractError(f"policy must be one of {sorted(POLICIES)}")
+    if (
+        not isinstance(selection_index, int)
+        or isinstance(selection_index, bool)
+        or selection_index < 1
+    ):
+        raise ContractError("selection_index must be a positive integer")
     cfg = dict(DEFAULT_POLICY_CONFIG)
     if config:
         unknown = sorted(set(config) - set(cfg))
         if unknown:
             raise ContractError(f"unknown semantic policy config keys {unknown}")
         for key, value in config.items():
+            if key == "deprioritized_budget_interval":
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 2 <= value <= 1000
+                ):
+                    raise ContractError(
+                        "semantic policy config deprioritized_budget_interval "
+                        "must be an integer in [2, 1000]"
+                    )
+                cfg[key] = value
+                continue
             if (
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
@@ -693,18 +734,24 @@ def select_proposal(
 
     prediction_by_id: dict[str, dict[str, Any]] = {}
     if policy != "coverage":
-        prediction_by_id, prediction_errors = _prediction_map(predictions, proposal_set)
+        prediction_by_id, prediction_errors = _prediction_map(
+            predictions, proposal_set, policy
+        )
         if prediction_errors:
             raise ContractError("invalid policy predictions: " + "; ".join(prediction_errors))
 
-    ranked: list[tuple[float, int, str, dict[str, Any], dict[str, Any]]] = []
+    ranked: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
     for proposal in proposal_set["proposals"]:
         point_id_value = proposal["point_id"]
         prediction = prediction_by_id.get(point_id_value)
         coverage = float(proposal["coverage"])
         predicted_gain = None if prediction is None else float(prediction["predicted_gain"])
         uncertainty = None if prediction is None else float(prediction["uncertainty"])
-        cost = None if prediction is None else float(prediction["cost"])
+        cost = (
+            None
+            if prediction is None or "cost" not in prediction
+            else float(prediction["cost"])
+        )
         if policy == "coverage":
             score = coverage
         elif policy == "gain":
@@ -713,12 +760,18 @@ def select_proposal(
                 + cfg["coverage_weight"] * coverage
                 - cfg["cost_weight"] * cost
             )
-        else:
+        elif policy == "gain_uncertainty":
             score = (
                 predicted_gain
                 + cfg["uncertainty_weight"] * uncertainty
                 + cfg["coverage_weight"] * coverage
                 - cfg["cost_weight"] * cost
+            )
+        else:
+            score = (
+                predicted_gain
+                + cfg["uncertainty_weight"] * uncertainty
+                + cfg["coverage_weight"] * coverage
             )
         components = {
             "coverage": coverage,
@@ -726,12 +779,36 @@ def select_proposal(
             "uncertainty": uncertainty,
             "cost": cost,
         }
-        guidance_tier = 1 if proposal["deprioritized_hypotheses"] else 0
-        ranked.append(
-            (round(score, 10), guidance_tier, point_id_value, proposal, components)
+        ranked.append((round(score, 10), point_id_value, proposal, components))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+
+    interval = cfg["deprioritized_budget_interval"]
+    scheduled_lane = (
+        "deprioritized" if selection_index % interval == 0 else "active"
+    )
+    by_lane = {
+        lane: [item for item in ranked if item[2]["budget_lane"] == lane]
+        for lane in ("active", "deprioritized")
+    }
+    if by_lane[scheduled_lane]:
+        selected_lane = scheduled_lane
+        fallback = "none"
+    else:
+        selected_lane = "active" if scheduled_lane == "deprioritized" else "deprioritized"
+        fallback = (
+            "no_deprioritized_proposals"
+            if scheduled_lane == "deprioritized"
+            else "no_active_proposals"
         )
-    ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
-    score, _, selected_id, selected, components = ranked[0]
+    lane_ranked = by_lane[selected_lane]
+    if not lane_ranked:
+        raise ContractError("proposal set has no selectable budget lane")
+    selected_item = lane_ranked[0]
+    base_rank = ranked.index(selected_item) + 1
+    final_ranked = lane_ranked + by_lane[
+        "active" if selected_lane == "deprioritized" else "deprioritized"
+    ]
+    score, selected_id, selected, components = selected_item
     prediction = prediction_by_id.get(selected_id)
     receipt = {
         "schema_version": POLICY_RECEIPT_SCHEMA_VERSION,
@@ -744,12 +821,22 @@ def select_proposal(
         "components": components,
         "acquisition_score": score,
         "evidence": [] if prediction is None else prediction["evidence"],
-        "ranked_point_ids": [item[2] for item in ranked],
+        "budget": {
+            "selection_index": selection_index,
+            "deprioritized_interval": interval,
+            "scheduled_lane": scheduled_lane,
+            "selected_lane": selected_lane,
+            "fallback": fallback,
+            "base_rank": base_rank,
+        },
+        "ranked_point_ids": [item[1] for item in final_ranked],
     }
     return selected["point"], receipt
 
 
-def _framework_policy_config(ledger_path: Path | None) -> tuple[str | None, dict[str, float]]:
+def _framework_policy_config(
+    ledger_path: Path | None,
+) -> tuple[str | None, dict[str, float | int]]:
     if ledger_path is None:
         return None, {}
     path = ledger_path.parent / "framework_cfg.json"
@@ -823,7 +910,7 @@ def cmd_select(args: argparse.Namespace) -> int:
     proposals = _load_object(args.proposals)
     predictions = _load_object(args.predictions) if args.predictions else None
     configured_policy, configured_weights = _framework_policy_config(args.ledger)
-    policy = args.policy or configured_policy or "gain_uncertainty"
+    policy = args.policy or configured_policy or "gain_uncertainty_nocost"
     config = dict(configured_weights)
     if args.cfg:
         override = json.loads(args.cfg)
@@ -831,6 +918,9 @@ def cmd_select(args: argparse.Namespace) -> int:
             raise ContractError("--cfg must be a JSON object")
         config.update(override)
     ledger = _load_object(args.ledger) if args.ledger and args.ledger.exists() else {}
+    records = ledger.get("records", [])
+    if not isinstance(records, list):
+        raise ContractError("ledger.records must be a list")
     state = ledger.get("search_space_state")
     current_revision = state.get("revision") if isinstance(state, dict) else 0
     if (
@@ -849,7 +939,11 @@ def cmd_select(args: argparse.Namespace) -> int:
             "re-propose against the current overlay before selecting"
         )
     point, receipt = select_proposal(
-        proposals, policy=policy, predictions=predictions, config=config
+        proposals,
+        policy=policy,
+        predictions=predictions,
+        config=config,
+        selection_index=len(records) + 1,
     )
     _write_object(args.point_output, point)
     _write_object(args.receipt_output, receipt)
@@ -862,6 +956,7 @@ def cmd_select(args: argparse.Namespace) -> int:
                 "point_output": str(args.point_output),
                 "receipt_output": str(args.receipt_output),
                 "components": receipt["components"],
+                "budget": receipt["budget"],
             },
             separators=(",", ":"),
         )
@@ -891,7 +986,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "required for gain policies; each point gets separate [0,1] predicted_gain, "
-            "uncertainty, cost, and non-empty evidence"
+            "uncertainty, cost, and non-empty evidence "
+            "(gain_uncertainty_nocost omits cost)"
         ),
     )
     select.add_argument("--ledger", type=Path, help="read run-local semantic_search config")

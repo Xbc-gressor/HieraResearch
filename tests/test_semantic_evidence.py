@@ -143,6 +143,20 @@ class SemanticEdgeReceiptTests(unittest.TestCase):
         child = {"run_id": "000", "source_run_ids": [], "semantic_point": baseline}
         self.assertEqual(build_semantic_edges([], child), [])
 
+    def test_build_rejects_missing_parent_with_domain_error(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        child = {
+            "run_id": "001",
+            "source_run_ids": ["999"],
+            "semantic_point": baseline,
+        }
+        with self.assertRaisesRegex(
+            SemanticEvidenceError,
+            r"record 001 parent 999 is not an earlier record",
+        ):
+            build_semantic_edges([], child)
+
     def test_unchanged_points_produce_same_point_receipt(self) -> None:
         registry = fixture_registry()
         baseline = complete_point(registry)
@@ -414,6 +428,65 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             {"direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
 
+    def test_pending_edge_is_not_noncrash_comparator_coverage(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        _append(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append(
+            records,
+            "001",
+            ["000"],
+            filtered,
+            status="pending",
+            score=None,
+            dag_revision=2,
+        )
+        ledger = {"records": records, "dag_revision": 2}
+        self.assertEqual(
+            comparator_coverage(
+                ledger,
+                ["sedge-000-001"],
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+            ),
+            {
+                "direct_noncrash_edges": 0,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+        )
+        self.assertEqual(
+            target_evaluation_state(
+                ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_run_ids=[],
+                evidence_edge_ids=["sedge-000-001"],
+            ),
+            "unevaluated",
+        )
+        view = render_target_evidence(
+            registry,
+            ledger,
+            target_ids=["hyp-data-filtered"],
+        )
+        (block,) = view["hypothesis_targets"]
+        self.assertEqual(block["evaluation_state"], "unevaluated")
+        self.assertEqual(block["evidence_run_ids"], [])
+        self.assertEqual(block["evidence_edge_ids"], [])
+        self.assertEqual(
+            block["comparator_coverage"],
+            {
+                "direct_noncrash_edges": 0,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+        )
+
     def test_comparator_coverage_separates_confounded_and_crash(self) -> None:
         registry = fixture_registry()
         baseline = complete_point(registry)
@@ -601,6 +674,32 @@ class TargetEvidenceViewTests(unittest.TestCase):
         )
         self.assertEqual(block["evidence_run_ids"], ["002", "003", "004", "005", "006"])
         self.assertEqual(block["evaluation_state"], "comparator_covered")
+
+    def test_small_edge_cap_is_enforced_across_categories(self) -> None:
+        registry = fixture_registry()
+        ledger = _category_ledger(registry)
+        view = render_target_evidence(
+            registry, ledger, max_edges_per_target=2, target_ids=["hyp-data-filtered"]
+        )
+        (block,) = view["hypothesis_targets"]
+        self.assertEqual(
+            block["evidence_edge_ids"],
+            ["sedge-004-005", "sedge-006-007"],
+        )
+        self.assertEqual(
+            block["comparator_coverage"],
+            {"direct_noncrash_edges": 2, "confounded_noncrash_edges": 0, "crash_edges": 0},
+        )
+        self.assertEqual(
+            block["available_comparator_coverage"],
+            {"direct_noncrash_edges": 4, "confounded_noncrash_edges": 2, "crash_edges": 1},
+        )
+        self.assertEqual(
+            block["omitted_edge_counts"],
+            {"direct_noncrash_edges": 2, "confounded_noncrash_edges": 2, "crash_edges": 1},
+        )
+        self.assertEqual(view["bounds"]["max_edges_per_target"], 2)
+        self.assertLessEqual(len(block["edges"]), view["bounds"]["max_edges_per_target"])
 
     def test_target_count_caps_and_omitted_ids(self) -> None:
         registry = fixture_registry()

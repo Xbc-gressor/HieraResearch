@@ -161,7 +161,16 @@ class SemanticEdgePersistenceTests(unittest.TestCase):
 
             def add_record(run_id: str, op: str, parents: list[str], point: dict) -> None:
                 point_path.write_text(json.dumps(point))
-                policy_path.write_text(json.dumps(policy_receipt(op, parents, point)))
+                policy_path.write_text(
+                    json.dumps(
+                        policy_receipt(
+                            op,
+                            parents,
+                            point,
+                            selection_index=int(run_id) + 1,
+                        )
+                    )
+                )
                 subprocess.run(
                     [
                         sys.executable,

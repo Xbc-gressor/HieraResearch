@@ -5,7 +5,7 @@
     "       (delete the rest — any omitted key uses the code default). Copying it verbatim = all defaults = no-op.",
     "READ BY (tracked code):  semantic_space.py -> the 'space_initialization' section  ·  got_select.py decide -> the 'got' section  ·  semantic_search.py select -> the 'semantic_search' section  ·  tune_tools.py select-candidate -> tuner.n_min/top_percentile  ·  bo_search.py -> tuner.bo_n_trials + bo_patience_cap/bo_patience_floor (adaptive) or bo_patience (fixed override).",
     "PRIORITY: explicit CLI flag (--catalog / --cfg / --n-min / --top-percentile / --n-trials / --patience) > this file > module default. NOTE: BO patience is adaptive by default = min(bo_patience_cap, max(bo_patience_floor, round(1.5*n_dims))); set tuner.bo_patience to force a fixed value.",
-    "SETUP: tools/init_run.py --dimension-strategy persists space_initialization.dimension_strategy here; it does not bypass this file and cannot change a run after semantic artifacts exist.",
+    "SETUP: tools/init_run.py persists --dimension-strategy, --max-evaluations, and --timeout here. Evaluation budget and timeout may change on resume; dimension strategy cannot change after semantic artifacts exist.",
     "NOTE: the sections below hold the CURRENT DEFAULTS so this doubles as a reference; '_keys' documents each. 'tuner.K' (warm-config count) is read by the tunable-contract-extractor AGENT (not a deterministic tool), but is injectable here too.",
     "runs/ is gitignored, so the copied file is local-only (not committed)."
   ],
@@ -24,10 +24,11 @@
     "dimension_strategy": "catalog_subset"
   },
   "semantic_search": {
-    "policy": "gain_uncertainty",
+    "policy": "gain_uncertainty_nocost",
     "coverage_weight": 0.1,
     "cost_weight": 0.2,
-    "uncertainty_weight": 0.5
+    "uncertainty_weight": 0.5,
+    "deprioritized_budget_interval": 5
   },
   "tuner": {
     "K": 5,
@@ -38,7 +39,7 @@
     "bo_patience_cap": 20
   },
   "max_evaluations": 200,
-  "per_runtime_limit": null,
+  "per_runtime_limit": 60,
   "_keys": {
     "got.n_seed": "outer S-GoT: bootstrap roots before PUCB exploit starts (default 5, equal-budget tuned↑ from 3 — the only robust change). OFAT {2,3,5}.",
     "got.S": "outer: stall threshold → inject B fresh candidates (default 10; fresh count = B, no separate m_fresh). OFAT {5,10,20}.",
@@ -50,10 +51,11 @@
     "got.c_leaf": "outer: select_leaf UCB exploration constant during descent (default 0.4). OFAT {0.2,0.4,0.8}.",
     "got.tau": "outer: op-prior softmax temperature (default 0.3). OFAT {0.1,0.3,0.6}.",
     "space_initialization.dimension_strategy": "search-space setup: catalog_subset selects from contracts/semantic-dimensions-v1.json (default); llm_induced makes background-researcher create and fully use a validated run-local dimension_catalog.json before retrieval. Explicit --catalog overrides the source, not the configured full-vs-subset semantics.",
-    "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage (fully deterministic, no LLM scores), gain, or gain_uncertainty. The last two require per-proposal rubric inputs and preserve predicted_gain, uncertainty, cost, and coverage separately in each record's policy_receipt.",
+    "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage (fully deterministic, no LLM scores), gain, gain_uncertainty, or gain_uncertainty_nocost (gain_uncertainty without any cost prediction, for when pre-implementation cost estimates are noise). The last three require per-proposal rubric inputs and preserve predicted_gain, uncertainty, cost (absent for gain_uncertainty_nocost), and coverage separately in each record's policy_receipt.",
     "semantic_search.coverage_weight": "semantic acquisition: additive deterministic under-coverage contribution for gain policies (default 0.1).",
     "semantic_search.cost_weight": "semantic acquisition: subtractive predicted implementation/evaluation cost contribution (default 0.2).",
-    "semantic_search.uncertainty_weight": "semantic acquisition: exploration bonus used only by gain_uncertainty (default 0.5); uncertainty is a rubric score, not a calibrated posterior.",
+    "semantic_search.uncertainty_weight": "semantic acquisition: exploration bonus used only by gain_uncertainty and gain_uncertainty_nocost (default 0.5); uncertainty is a rubric score, not a calibrated posterior.",
+    "semantic_search.deprioritized_budget_interval": "real outer-search budget allocation: every Nth one-based semantic admission is reserved for the best deprioritized proposal when one exists (default 5 = 20%); other slots select only active proposals unless that lane is empty. Must be an integer in [2,1000].",
     "tuner.K": "inner: number of warm-start configs the tunable-contract-extractor PROPOSES per candidate (default 5; read by the AGENT). OFAT {3,5,8} — highest-impact inner knob.",
     "tuner.K_eval": "inner: how many of the K proposed warm configs are EVALUATED at step 0+1 (default 3; best-of-K_eval = screening score). The remaining K−K_eval are DEFERRED — stored params-only in tune_report.phase_a.deferred_configs and evaluated by the deep-tuner FIRST (bo enqueue / grid prepend) ONLY if the candidate is promoted. Saves (K−K_eval) evals on every un-promoted candidate; budget-neutral for promoted ones (deferred are extra initial trials). K_eval>=K disables deferral (evaluate all).",
     "tuner.n_min": "inner: min population before deep-tune fires. NOW DERIVED from top_percentile = ceil(100/(100-P)) (P=80→5); this key is only an explicit OVERRIDE.",
@@ -63,6 +65,6 @@
     "tuner.bo_patience": "inner: OPTIONAL fixed-patience override; if set, disables the adaptive rule above. omit for adaptive. (patience=6 was the main HPO suppressor — don't go below ~12.)",
     "tuner.bo_patience_floor": "inner: floor for adaptive patience (default 12 — must clear the ~startup random period or HPO gets 0).",
     "max_evaluations": "OPTIONAL global stop budget = max number of evaluations (calls to the config->score fn). When set, both autoresearch agents stop at the START of the round/iteration once evaluations_done >= this. hillclimb: evaluations_done = result rows. experiment: evaluations_done = `python tools/ledger.py evaluations --ledger <run_dir>/ledger.json` = Σ trials_completed over the records. CONVENTION: trials_completed is the per-candidate TOTAL of config->score validations = the K warm-start evals PLUS any new Phase-C trials (injected warm priors are reused via add_trial, never re-evaluated, so not re-counted). It is written by CODE, not the agent (`ledger.py set-tuning --from-report` -> tune_tools.summarize counts every scored trial in the report). Because trials_completed already includes the warm evals, the budget is Σ trials_completed — do NOT add warm_start_K on top (that double-counts warm); warm_start_K is metadata (how many of the total were warm). example here is 200; null/absent = unbounded (NEVER STOP).",
-    "per_runtime_limit": "OPTIONAL per-evaluation wall-clock limit in SECONDS (one evaluate_config / one train.py run). A config/run exceeding it is hard-killed and scored +inf (crash). Enforced by the eval callers, not prepare.py: framework tuners (warmstart_eval/bo/cmaes) run each eval in a timed subprocess; hillclimb wraps its run command with a perl-alarm timeout. null/absent = no limit. THIS VALUE IS TASK-SPECIFIC — set it per run after measuring the task's heaviest legitimate candidate, never copy a number across tasks. Example for tabular-blind: 60 (winners ~13s, heaviest realistic sklearn-GBM(1000,d8) ~30s; kills the pathological tail of deep CatBoost / RBF-SVM / candidate-internal GridSearchCV). A numpy candidate on es-optimization-design takes ~3s/eval, but one wrapping pycma takes ~60s — the tabular-derived 60 would misjudge it as a crash. NOTE: task.toml's run.timeout_seconds is the run-command timeout; the tuners do NOT read it, so it is not a fallback for this key."
+    "per_runtime_limit": "OPTIONAL per-evaluation wall-clock limit in SECONDS (one evaluate_config / one train.py run). A config/run exceeding it is hard-killed and scored +inf (crash). Enforced by the eval callers, not prepare.py: framework tuners (warmstart_eval/bo/cmaes) run each eval in a timed subprocess; hillclimb uses timed_run.py. The template default is 60; use init_run.py --timeout SECONDS to choose a task-appropriate value. null/absent = no limit. THIS VALUE IS TASK-SPECIFIC — set it per run after measuring the task's heaviest legitimate candidate, never assume 60 fits every task. For tabular-blind, winners take ~13s and the heaviest realistic sklearn-GBM about 30s. A numpy candidate on es-optimization-design takes ~3s/eval, but one wrapping pycma takes ~60s. NOTE: task.toml's run.timeout_seconds is the run-command timeout; the tuners do NOT read it, so it is not a fallback for this key."
   }
 }

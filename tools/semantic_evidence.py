@@ -64,7 +64,13 @@ def build_semantic_edges(
     child_point = child_record["semantic_point"]
     receipts = []
     for parent_id in child_record.get("source_run_ids", []):
-        parent_point = by_id[str(parent_id)]["semantic_point"]
+        parent_id = str(parent_id)
+        parent = by_id.get(parent_id)
+        if parent is None:
+            raise SemanticEvidenceError(
+                f"record {child_id} parent {parent_id} is not an earlier record"
+            )
+        parent_point = parent["semantic_point"]
         changes = point_diff(parent_point, child_point)
         receipts.append({
             "schema_version": EDGE_SCHEMA_VERSION,
@@ -194,12 +200,16 @@ def _edge_touches(receipt: dict[str, Any], *, target_kind: str, target_id: str) 
     return False
 
 
-def _coverage_category(ledger: dict[str, Any], receipt: dict[str, Any]) -> str:
+def _coverage_category(
+    ledger: dict[str, Any], receipt: dict[str, Any]
+) -> str | None:
     records = _records_by_id(ledger)
     statuses = {
         records.get(str(receipt.get("parent_run_id")), {}).get("status"),
         records.get(str(receipt.get("child_run_id")), {}).get("status"),
     }
+    if not statuses.issubset(TERMINAL_STATUSES):
+        return None
     if "crash" in statuses:
         return "crash_edges"
     if receipt.get("change_class") == "single_dimension":
@@ -219,7 +229,9 @@ def comparator_coverage(
             receipt, target_kind=target_kind, target_id=target_id
         ):
             continue
-        coverage[_coverage_category(ledger, receipt)] += 1
+        category = _coverage_category(ledger, receipt)
+        if category is not None:
+            coverage[category] += 1
     return coverage
 
 
@@ -258,6 +270,7 @@ def target_evaluation_state(
         index[str(edge_id)]
         for edge_id in evidence_edge_ids or []
         if str(edge_id) in index
+        and _coverage_category(ledger, index[str(edge_id)]) is not None
     ]
     if not cited_terminal and not cited_edges:
         return "unevaluated"
@@ -315,7 +328,9 @@ def _target_block(
 ) -> dict[str, Any]:
     pools: dict[str, list[dict[str, Any]]] = {key: [] for key in COVERAGE_KEYS}
     for receipt in touching:
-        pools[_coverage_category(ledger, receipt)].append(receipt)
+        category = _coverage_category(ledger, receipt)
+        if category is not None:
+            pools[category].append(receipt)
     for pool in pools.values():
         pool.sort(key=_edge_sort_key, reverse=True)
     direct = pools["direct_noncrash_edges"]
@@ -323,9 +338,15 @@ def _target_block(
     crash = pools["crash_edges"]
 
     selected: list[dict[str, Any]] = []
-    selected.extend(direct[:2])
-    selected.extend(confounded[:1])
-    selected.extend(crash[:1])
+
+    def take(pool: list[dict[str, Any]], count: int) -> None:
+        remaining = max_edges_per_target - len(selected)
+        if remaining > 0:
+            selected.extend(pool[:min(count, remaining)])
+
+    take(direct, 2)
+    take(confounded, 1)
+    take(crash, 1)
     for pool in (direct, confounded, crash):
         for receipt in pool:
             if len(selected) >= max_edges_per_target:

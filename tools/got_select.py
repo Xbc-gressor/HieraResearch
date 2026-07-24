@@ -4,8 +4,10 @@
 idea-generator(LLM agent)调它拿指派,再做 IDEATE(写具体 idea)。本模块不含 LLM。
 
 - decide_gen:每代 fresh 代 / PUCB 代 二选一(自举 / 停滞 / 否则 PUCB)。
-- PUCB 代:动作池 = improve(L) + crossover(L 中所有不同对);
-  Q(improve)=V_max;Q(crossover)=geomean(V)·(1+c̃_dag);P=softmax(ḡ_op/τ);PUCB 选 B。
+- PUCB 代:动作池 = improve(L) + crossover(L 中所有不同对),两 op 解耦定额、不混排:
+  op 级收购 U_op = ḡ_op + c_pucb·√σN/(1+Nop_op) → W=softmax(U/τ) → 最大余数法分 B 个槽位;
+  各 op 内按 Q 取顶(Q(improve)=V_max;Q(crossover)=geomean(V)·(1+c̃_dag))。
+  (探索项只能在 op 层起作用——op 内它对同 op 动作是常数,无法影响排序。)
 
 对节点 id 类型无关(只用 graph.V_max / total_N / nodes[nid].ec + got_cdag)。
 """
@@ -58,7 +60,7 @@ def Q(graph, action, gamma) -> float:
     return geomean([graph.V_max(args[0]), graph.V_max(args[1])]) * (1.0 + c_dag(graph, args[0], args[1], gamma))
 
 
-# ---------- 动作池 + PUCB 选 B(PUCB 代,§6.1/§6.4)----------
+# ---------- 动作池 + op 解耦定额(PUCB 代,§6.1/§6.4)----------
 def build_pool(L):
     acts = [("improve", (x,)) for x in L]
     Ll = list(L)
@@ -68,20 +70,56 @@ def build_pool(L):
     return acts
 
 
+def allocate_slots(W, caps, B):
+    """把 B 个槽位按门控权重 W 确定性分给各 op(最大余数法),每 op 不超过 caps(可用动作数)。
+    余数平手按 op 名字典序;被 caps 截断释放的槽位按余数降序轮转补给未封顶的 op。"""
+    ops = sorted(op for op in W if caps.get(op, 0) > 0)
+    if not ops or B <= 0:
+        return {}
+    z = sum(W[op] for op in ops)
+    if z <= 0.0:                                 # 全零权重 → 可用 op 均分
+        W = {op: 1.0 for op in ops}
+        z = float(len(ops))
+    raw = {op: B * W[op] / z for op in ops}
+    alloc = {op: min(int(raw[op]), caps[op]) for op in ops}
+    order = sorted(ops, key=lambda o: (-(raw[o] - int(raw[o])), o))
+    left = B - sum(alloc.values())
+    while left > 0:                              # 轮转补位:全封顶(池 < B)时自然停止
+        progressed = False
+        for op in order:
+            if left == 0:
+                break
+            if alloc[op] < caps[op]:
+                alloc[op] += 1
+                left -= 1
+                progressed = True
+        if not progressed:
+            break
+    return {op: n for op, n in alloc.items() if n > 0}
+
+
 def pick_pucb(graph, L, gbar, Nop, cfg):
     pool = build_pool(L)
     if not pool:
         return []
-    P = softmax(gbar, cfg["tau"])                 # over {'improve','crossover'}
     sigmaN = max(1, graph.total_N())
-
-    def pucb(a):
-        op = a[0]
-        return (Q(graph, a, cfg["gamma"])
-                + cfg["c_pucb"] * P.get(op, 0.0) * math.sqrt(sigmaN) / (1 + Nop.get(op, 0)))
-
-    pool.sort(key=pucb, reverse=True)
-    return pool[: cfg["B"]]
+    # op 级收购 → softmax 门控 → 最大余数法定额;探索项随 Nop 衰减,给欠试 op 恢复通道
+    U = {op: gbar.get(op, 0.0) + cfg["c_pucb"] * math.sqrt(sigmaN) / (1.0 + Nop.get(op, 0))
+         for op in ("improve", "crossover")}
+    W = softmax(U, cfg["tau"])
+    by_op = {}
+    for a in pool:
+        by_op.setdefault(a[0], []).append(a)
+    alloc = allocate_slots(W, {op: len(acts) for op, acts in by_op.items()}, cfg["B"])
+    chosen = []
+    for op in ("improve", "crossover"):          # 固定 op 序:Q 平手时 improve 在前(同旧池序)
+        acts = by_op.get(op)
+        if not acts or op not in alloc:
+            continue
+        acts.sort(key=lambda a: Q(graph, a, cfg["gamma"]), reverse=True)
+        chosen.extend(acts[: alloc[op]])
+    chosen.sort(key=lambda a: Q(graph, a, cfg["gamma"]), reverse=True)
+    return chosen
 
 
 # ============================ 派生量重算 + decide CLI(SELECT,§14.1/§14.3)============================
@@ -97,6 +135,9 @@ def pick_pucb(graph, L, gbar, Nop, cfg):
 #   - c_pucb: flat in [0.1,0.8]; its "winner" flipped with the base (0.8 under B=4, 0.1
 #     under the landed B=2) → kept 0.4.  - S: flat → 10.  - B: toy liked 4 but that carries
 #     real-loop cost the toy can't model → kept 2.  - alpha/gamma/c_leaf/tau/C: default.
+# NOTE: that retune ran under the OLD mixed top-B pool. With the decoupled op-level
+# softmax gate (allocate_slots), c_pucb/tau now shape the improve/crossover slot split,
+# not a shared ranking — their flatness verdict may not carry over; re-tune pending.
 DEFAULT_CFG = dict(n_seed=5, S=10, B=2, C=1.5, alpha=0.5,
                    gamma=0.6, c_pucb=0.4, c_leaf=0.4, tau=0.3)
 

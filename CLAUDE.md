@@ -107,10 +107,12 @@ would remove the independent contexts required by this project.
   `semantic_search.py` to enumerate valid complete points at the ledger's
   current `search_space_state` revision (runtime-pruned hypotheses drop out, a
   pruned dimension pins its explicit baseline) and apply the
-  replaceable coverage/gain/gain-plus-uncertainty acquisition policy before
-  **IDEATE**. It persists numeric ancestry, the complete revisioned point, and a
-  policy receipt with gain, uncertainty, cost, and coverage kept separate. The
-  graph search still owns actions/parents; semantic policy owns only point choice.
+  replaceable coverage/gain/gain-plus-uncertainty acquisition policy within
+  deterministic active/deprioritized admission-budget lanes before **IDEATE**.
+  It persists numeric ancestry, the complete revisioned point, and a schema-3
+  policy receipt with gain, uncertainty, cost, coverage, scheduled/selected
+  lanes, and fallback kept separate. The graph search still owns
+  actions/parents; semantic policy owns only point choice.
 - `experience-extractor` — periodically (every N generations) incrementally
   revise a bounded global `experience` snapshot (schema 3) from the ledger's
   DAG revision delta plus fixed Top/Bottom anchors and compact mechanical

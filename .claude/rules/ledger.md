@@ -136,20 +136,39 @@ Recommendation gates are exact and identical for both levels:
   `confidence: low`, and `recommended_status: active`; a crash alone never
   contradicts a semantic element.
 - `deprioritized` requires `assessment: unpromising`, `confidence: med` or
-  `high`, `evaluation_state: observed` or `comparator_covered`, at least one
-  direct non-crash edge, and a non-empty `reopen_when`.
+  `high`, `evaluation_state: comparator_covered`, at least two direct
+  non-crash edges, and a non-empty `reopen_when`.
 - `pruned` requires `assessment: unpromising`, `confidence: high`,
   `evaluation_state: comparator_covered`, at least two direct non-crash
   edges, and a non-empty `reopen_when`.
 - High-confidence `promising` or `unpromising` claims require
   `comparator_covered`.
 
+`unpromising` means that another outer-search evaluation has low expected
+marginal value after considering attribution, consistency, mechanism,
+counterevidence, untested variants, residual uncertainty/value of information,
+and cost. A worse final score or score delta alone is never sufficient; when
+attribution is weak or relevant variants remain, use `mixed` and keep the
+target active.
+
 Belief recommendations stay separate from runtime eligibility: an entry only
 recommends. Actual `deprioritized`/`pruned` transitions are append-only
 `search_space_state` decisions with their own two-stage, baseline, and
-provenance rules. The experience extractor may use mechanically rendered
+provenance rules. Second-stage pruning or reopening also requires a later
+snapshot with changed evidence for that target, not merely a newer generation
+or an unrelated DAG update. Dimension contraction requires every selectable
+adjacent non-baseline hypothesis to be equivalently contracted or independently
+gate-qualified in the same generation. The experience extractor may use mechanically rendered
 point coverage, parent diffs, and bounded target evidence as context, but it
 must not rewrite the space or present membership as causal support.
+
+Runtime `deprioritized` is a real semantic-admission budget lane. Policy
+receipt schema 3 records the one-based selection index, configured
+`deprioritized_budget_interval`, scheduled and selected lanes, fallback, and
+pre-lane rank. Every Nth admission is reserved for the deprioritized lane
+(default 5, or 20%); other admissions are active-lane only. A lane may be
+crossed only when it is empty, and that deterministic fallback must be
+recorded.
 
 Validate before storing a snapshot:
 

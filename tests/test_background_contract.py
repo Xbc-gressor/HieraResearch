@@ -524,10 +524,10 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 experience[field] = [entry]
                 self.assertEqual(validate_experience(experience, registry, ledger), [])
 
-    def test_accepts_single_direct_edge_deprioritized_entry(self) -> None:
+    def test_accepts_comparator_covered_deprioritized_entry(self) -> None:
         registry = fixture_registry()
         ledger = belief_ledger(registry)
-        entry = _observed_entry()
+        entry = _comparator_covered_entry()
         entry.update(
             {
                 "recommended_status": "deprioritized",
@@ -537,6 +537,16 @@ class ExperienceSchema3Tests(unittest.TestCase):
         experience = _base_experience()
         experience["hypothesis_evidence"] = [entry]
         self.assertEqual(validate_experience(experience, registry, ledger), [])
+
+    def test_rejects_single_direct_edge_deprioritized_entry(self) -> None:
+        entry = _observed_entry()
+        entry.update(
+            {
+                "recommended_status": "deprioritized",
+                "reopen_when": "A later direct comparison improves over its parent.",
+            }
+        )
+        self._reject(entry, "comparator_covered")
 
     def _reject(self, entry: dict, needle: str, *, ledger: dict | None = None, field: str = "hypothesis_evidence") -> None:
         registry = fixture_registry()
@@ -626,10 +636,10 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 "reopen_when": "A later direct comparison improves over its parent.",
             }
         )
-        self._reject(entry, "at least one direct non-crash edge")
+        self._reject(entry, "at least two direct non-crash edges")
 
     def test_rejects_deprioritized_gate_violations(self) -> None:
-        base = _observed_entry()
+        base = _comparator_covered_entry()
         base.update(
             {
                 "recommended_status": "deprioritized",

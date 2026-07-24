@@ -111,7 +111,8 @@ SCOPE_FACETS = (
 GUIDANCE_SECTIONS = {"pitfall", "deprioritize"}
 GUIDANCE_EFFECTS = {"caution", "deprioritize", "exclude"}
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-POLICY_CONFIG_KEYS = {"coverage_weight", "cost_weight", "uncertainty_weight"}
+POLICY_CONFIG_KEYS_V2 = {"coverage_weight", "cost_weight", "uncertainty_weight"}
+POLICY_CONFIG_KEYS_V3 = POLICY_CONFIG_KEYS_V2 | {"deprioritized_budget_interval"}
 
 
 class ContractError(ValueError):
@@ -662,8 +663,9 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         return [f"{where}.policy_receipt must be an object distinct from observations"]
     point_object = point if isinstance(point, dict) else {}
     errors: list[str] = []
-    if receipt.get("schema_version") != 2:
-        errors.append(f"{where}.policy_receipt.schema_version must be 2")
+    receipt_schema = receipt.get("schema_version")
+    if receipt_schema not in {2, 3}:
+        errors.append(f"{where}.policy_receipt.schema_version must be 2 or 3")
     state_revision = receipt.get("search_space_state_revision")
     if (
         not isinstance(state_revision, int)
@@ -698,21 +700,38 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         "coverage",
         "gain",
         "gain_uncertainty",
+        "gain_uncertainty_nocost",
     }:
         errors.append(
-            f"{where}.policy_receipt.policy.name must be coverage, gain, or gain_uncertainty"
+            f"{where}.policy_receipt.policy.name must be coverage, gain, "
+            "gain_uncertainty, or gain_uncertainty_nocost"
         )
     config = policy.get("config") if isinstance(policy, dict) else None
     config_valid = True
-    if not isinstance(config, dict) or set(config) != POLICY_CONFIG_KEYS:
+    expected_config_keys = (
+        POLICY_CONFIG_KEYS_V3 if receipt_schema == 3 else POLICY_CONFIG_KEYS_V2
+    )
+    if not isinstance(config, dict) or set(config) != expected_config_keys:
         errors.append(
             f"{where}.policy_receipt.policy.config must keep exactly "
-            f"{sorted(POLICY_CONFIG_KEYS)}"
+            f"{sorted(expected_config_keys)}"
         )
         config = {}
         config_valid = False
     else:
         for key, value in config.items():
+            if key == "deprioritized_budget_interval":
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 2 <= value <= 1000
+                ):
+                    config_valid = False
+                    errors.append(
+                        f"{where}.policy_receipt.policy.config.{key} must be "
+                        "an integer in [2, 1000]"
+                    )
+                continue
             if (
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
@@ -752,6 +771,19 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 errors.append(
                     f"{where}.policy_receipt coverage policy must not invent model components"
                 )
+        elif policy_name == "gain_uncertainty_nocost":
+            model_components_valid = all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and 0.0 <= float(value) <= 1.0
+                for value in (components["predicted_gain"], components["uncertainty"])
+            ) and components["cost"] is None
+            if not model_components_valid:
+                errors.append(
+                    f"{where}.policy_receipt gain_uncertainty_nocost requires separate "
+                    "finite predicted_gain and uncertainty values in [0, 1] and no cost"
+                )
         elif policy_name in {"gain", "gain_uncertainty"}:
             model_components_valid = all(
                 isinstance(value, (int, float))
@@ -777,8 +809,105 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         evidence = []
     if policy_name == "coverage" and evidence:
         errors.append(f"{where}.policy_receipt coverage policy evidence must be empty")
-    if policy_name in {"gain", "gain_uncertainty"} and not evidence:
+    if policy_name in {"gain", "gain_uncertainty", "gain_uncertainty_nocost"} and not evidence:
         errors.append(f"{where}.policy_receipt gain policies require selection evidence")
+
+    budget = receipt.get("budget")
+    if receipt_schema == 3:
+        budget_fields = {
+            "selection_index",
+            "deprioritized_interval",
+            "scheduled_lane",
+            "selected_lane",
+            "fallback",
+            "base_rank",
+        }
+        if not isinstance(budget, dict) or set(budget) != budget_fields:
+            errors.append(
+                f"{where}.policy_receipt.budget must contain exactly "
+                f"{sorted(budget_fields)}"
+            )
+            budget = {}
+        else:
+            selection_index = budget.get("selection_index")
+            interval = budget.get("deprioritized_interval")
+            if (
+                not isinstance(selection_index, int)
+                or isinstance(selection_index, bool)
+                or selection_index < 1
+            ):
+                errors.append(
+                    f"{where}.policy_receipt.budget.selection_index must be "
+                    "a positive integer"
+                )
+            if (
+                not isinstance(interval, int)
+                or isinstance(interval, bool)
+                or not 2 <= interval <= 1000
+            ):
+                errors.append(
+                    f"{where}.policy_receipt.budget.deprioritized_interval "
+                    "must be an integer in [2, 1000]"
+                )
+            elif config and interval != config.get("deprioritized_budget_interval"):
+                errors.append(
+                    f"{where}.policy_receipt.budget.deprioritized_interval "
+                    "must match policy.config"
+                )
+            scheduled = budget.get("scheduled_lane")
+            selected = budget.get("selected_lane")
+            fallback = budget.get("fallback")
+            if scheduled not in {"active", "deprioritized"}:
+                errors.append(
+                    f"{where}.policy_receipt.budget.scheduled_lane must be "
+                    "active or deprioritized"
+                )
+            if selected not in {"active", "deprioritized"}:
+                errors.append(
+                    f"{where}.policy_receipt.budget.selected_lane must be "
+                    "active or deprioritized"
+                )
+            if (
+                isinstance(selection_index, int)
+                and not isinstance(selection_index, bool)
+                and isinstance(interval, int)
+                and not isinstance(interval, bool)
+                and interval >= 2
+            ):
+                expected_lane = (
+                    "deprioritized"
+                    if selection_index % interval == 0
+                    else "active"
+                )
+                if scheduled != expected_lane:
+                    errors.append(
+                        f"{where}.policy_receipt.budget.scheduled_lane does "
+                        "not match its deterministic slot"
+                    )
+            expected_fallbacks = {
+                ("active", "active"): "none",
+                ("deprioritized", "deprioritized"): "none",
+                ("active", "deprioritized"): "no_active_proposals",
+                ("deprioritized", "active"): "no_deprioritized_proposals",
+            }
+            expected_fallback = expected_fallbacks.get((scheduled, selected))
+            if fallback != expected_fallback:
+                errors.append(
+                    f"{where}.policy_receipt.budget.fallback must explain the "
+                    "selected lane"
+                )
+            base_rank = budget.get("base_rank")
+            if (
+                not isinstance(base_rank, int)
+                or isinstance(base_rank, bool)
+                or base_rank < 1
+            ):
+                errors.append(
+                    f"{where}.policy_receipt.budget.base_rank must be a "
+                    "positive integer"
+                )
+    elif budget is not None:
+        errors.append(f"{where}.policy_receipt schema 2 must not contain budget")
     acquisition_score = receipt.get("acquisition_score")
     if (
         not isinstance(acquisition_score, (int, float))
@@ -791,11 +920,17 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         and config_valid
         and coverage_valid
         and model_components_valid
-        and policy_name in {"coverage", "gain", "gain_uncertainty"}
+        and policy_name in {"coverage", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
     ):
         coverage = float(components["coverage"])
         if policy_name == "coverage":
             expected_score = coverage
+        elif policy_name == "gain_uncertainty_nocost":
+            expected_score = (
+                float(components["predicted_gain"])
+                + float(config["uncertainty_weight"]) * float(components["uncertainty"])
+                + float(config["coverage_weight"]) * coverage
+            )
         elif all(components[key] is not None for key in ("predicted_gain", "uncertainty", "cost")):
             expected_score = (
                 float(components["predicted_gain"])
@@ -826,6 +961,15 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         errors.append(
             f"{where}.policy_receipt.ranked_point_ids must be unique and start with the selected point"
         )
+    elif (
+        receipt_schema == 3
+        and isinstance(budget, dict)
+        and isinstance(budget.get("base_rank"), int)
+        and budget["base_rank"] > len(ranked)
+    ):
+        errors.append(
+            f"{where}.policy_receipt.budget.base_rank cannot exceed ranked_point_ids"
+        )
     allowed = {
         "schema_version",
         "space_revision",
@@ -839,6 +983,8 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         "evidence",
         "ranked_point_ids",
     }
+    if receipt_schema == 3:
+        allowed.add("budget")
     unknown = sorted(set(receipt) - allowed)
     if unknown:
         errors.append(f"{where}.policy_receipt has unknown fields {unknown}")
@@ -930,6 +1076,36 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     record.get("semantic_point"), registry, effective
                 )
                 errors.extend(f"{where}: {error}" for error in eligibility)
+                if isinstance(receipt, dict) and receipt.get("schema_version") == 3:
+                    budget = receipt.get("budget")
+                    point = record.get("semantic_point")
+                    if isinstance(point, dict):
+                        selected = selected_assignments(point)
+                        expected_lane = (
+                            "deprioritized"
+                            if any(
+                                effective.get(hypothesis_id, {}).get("effective_status")
+                                == "deprioritized"
+                                for hypothesis_id in selected.values()
+                            )
+                            else "active"
+                        )
+                        if (
+                            isinstance(budget, dict)
+                            and budget.get("selected_lane") != expected_lane
+                        ):
+                            errors.append(
+                                f"{where}.policy_receipt.budget.selected_lane must "
+                                "match the point's effective status at its selection revision"
+                            )
+                    if (
+                        isinstance(budget, dict)
+                        and budget.get("selection_index") != index + 1
+                    ):
+                        errors.append(
+                            f"{where}.policy_receipt.budget.selection_index must "
+                            f"equal the one-based admission index {index + 1}"
+                        )
         errors.extend(validate_semantic_edges(records[:index], record, registry))
         if valid_run_id:
             known.add(run_id)
@@ -1427,14 +1603,14 @@ def _validate_target_evidence(
         if recommended == "deprioritized" and not (
             assessment == "unpromising"
             and confidence in {"med", "high"}
-            and state in {"observed", "comparator_covered"}
-            and direct_edges >= 1
+            and state == "comparator_covered"
+            and direct_edges >= 2
             and _nonempty(item.get("reopen_when"))
         ):
             errors.append(
                 f"{target}.recommended_status deprioritized requires assessment "
-                "unpromising, confidence med or high, evaluation_state observed "
-                "or comparator_covered, at least one direct non-crash edge, "
+                "unpromising, confidence med or high, evaluation_state "
+                "comparator_covered, at least two direct non-crash edges, "
                 "and a non-empty reopen_when"
             )
         if recommended == "pruned" and not (

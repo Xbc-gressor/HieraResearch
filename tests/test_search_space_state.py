@@ -437,7 +437,7 @@ class PointEligibilityTests(unittest.TestCase):
             "hypotheses": {},
         }
         effective = compose_effective_selection(registry, guidance, runtime)
-        # Deprioritization only re-sorts; non-baseline content stays eligible.
+        # Deprioritization changes the admission budget, not structural eligibility.
         filtered_point = complete_point(
             registry, {"dim-data-curation": "hyp-data-filtered"}
         )
@@ -475,6 +475,11 @@ class ExperienceTransitionTests(unittest.TestCase):
         self.ledger = belief_ledger(self.registry)
         self.ledger["search_space_state"] = empty_search_space_state()
 
+    def advance_dag_cursor(self) -> None:
+        self.ledger["records"][-1]["final_best_score"] += 0.001
+        self.ledger["dag_revision"] += 1
+        self.ledger["records"][-1]["dag_revision"] = self.ledger["dag_revision"]
+
     def experience(self, generation: int) -> dict:
         return {
             "schema_version": 3,
@@ -505,13 +510,53 @@ class ExperienceTransitionTests(unittest.TestCase):
             }],
         }
 
-    def test_pruning_requires_two_generations(self) -> None:
+    def test_pruning_requires_later_generation_with_new_evidence(self) -> None:
         self.ledger["experience"] = self.experience(generation=1)
         first = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(first[0]["from_status"], "active")
         self.assertEqual(first[0]["to_status"], "deprioritized")
 
         self.ledger["experience"] = self.experience(generation=2)
+        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
+
+        # An unrelated global cursor advance is not target evidence.
+        self.ledger["dag_revision"] += 1
+        self.ledger["experience"] = self.experience(generation=3)
+        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
+
+        # A newly cited but still-pending target edge is not an observation.
+        pending = {
+            "run_id": "004",
+            "source_run_ids": ["000"],
+            "semantic_point": complete_point(
+                self.registry, {"dim-data-curation": "hyp-data-filtered"}
+            ),
+            "status": "pending",
+            "final_best_score": None,
+            "dag_revision": self.ledger["dag_revision"],
+        }
+        pending["semantic_edges"] = build_semantic_edges(
+            self.ledger["records"], pending
+        )
+        self.ledger["records"].append(pending)
+        experience = self.experience(generation=4)
+        entry = experience["hypothesis_evidence"][0]
+        entry["evidence_edge_ids"].append("sedge-000-004")
+        self.ledger["experience"] = experience
+        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
+
+        # Once that same edge becomes terminal, it is genuinely new target
+        # evidence and can complete the second stage.
+        pending["status"] = "discard"
+        pending["final_best_score"] = 0.53
+        self.ledger["dag_revision"] += 1
+        pending["dag_revision"] = self.ledger["dag_revision"]
+        experience = self.experience(generation=5)
+        entry = experience["hypothesis_evidence"][0]
+        entry["evidence_run_ids"].append("004")
+        entry["evidence_edge_ids"].append("sedge-000-004")
+        entry["comparator_coverage"]["direct_noncrash_edges"] = 3
+        self.ledger["experience"] = experience
         second = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(second[0]["from_status"], "deprioritized")
         self.assertEqual(second[0]["to_status"], "pruned")
@@ -549,7 +594,7 @@ class ExperienceTransitionTests(unittest.TestCase):
         )
         self.assertEqual(replayed["hypotheses"]["hyp-data-filtered"], "active")
 
-    def test_one_direct_edge_can_only_deprioritize(self) -> None:
+    def test_one_direct_edge_cannot_deprioritize(self) -> None:
         def one_edge(generation: int) -> dict:
             experience = self.experience(generation)
             entry = experience["hypothesis_evidence"][0]
@@ -564,17 +609,13 @@ class ExperienceTransitionTests(unittest.TestCase):
             return experience
 
         self.ledger["experience"] = one_edge(generation=1)
-        first = append_experience_transitions(self.registry, self.ledger)
-        self.assertEqual(first[0]["from_status"], "active")
-        self.assertEqual(first[0]["to_status"], "deprioritized")
-
-        # A later generation on the same single comparison still cannot prune.
+        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
         self.ledger["experience"] = one_edge(generation=2)
         self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
         replayed = replay_search_space_state(
             self.registry, self.ledger["search_space_state"]
         )
-        self.assertEqual(replayed["hypotheses"]["hyp-data-filtered"], "deprioritized")
+        self.assertEqual(replayed["hypotheses"]["hyp-data-filtered"], "active")
 
     def test_crash_only_evidence_makes_no_transition(self) -> None:
         crash_record = {
@@ -640,6 +681,7 @@ class ExperienceTransitionTests(unittest.TestCase):
     def test_reopening_appends_pruned_to_active(self) -> None:
         self.ledger["experience"] = self.experience(generation=1)
         append_experience_transitions(self.registry, self.ledger)
+        self.advance_dag_cursor()
         self.ledger["experience"] = self.experience(generation=2)
         append_experience_transitions(self.registry, self.ledger)
         replayed = replay_search_space_state(
@@ -746,6 +788,7 @@ class ExperienceTransitionTests(unittest.TestCase):
         self.assertEqual(stored["evidence_observations"][0]["child_score"], 0.5)
         self.assertEqual(stored["evidence_observations"][0]["delta"], 0.1)
         # The next decision snapshots the current observation values instead.
+        self.advance_dag_cursor()
         self.ledger["experience"] = self.experience(generation=2)
         (second,) = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(second["evidence_observations"][0]["child_score"], 0.99)
@@ -777,18 +820,11 @@ class ExperienceTransitionTests(unittest.TestCase):
 
     def test_dimension_prune_requires_scoped_hypothesis_evidence(self) -> None:
         self.ledger["experience"] = self.dimension_belief(1, with_hypothesis=False)
-        (first,) = append_experience_transitions(self.registry, self.ledger)
-        self.assertEqual(first["target"]["kind"], "dimension")
-        self.assertEqual(first["to_status"], "deprioritized")
-
-        # hyp-data-filtered is selectable, non-baseline, and neither pruned nor
-        # covered by its own same-generation prune belief: the dimension waits.
-        self.ledger["experience"] = self.dimension_belief(2, with_hypothesis=False)
         self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
         replayed = replay_search_space_state(
             self.registry, self.ledger["search_space_state"]
         )
-        self.assertEqual(replayed["dimensions"]["dim-data-curation"], "deprioritized")
+        self.assertEqual(replayed["dimensions"]["dim-data-curation"], "active")
 
     def test_dimension_prunes_after_covered_hypotheses_in_order(self) -> None:
         self.ledger["experience"] = self.dimension_belief(1, with_hypothesis=True)
@@ -797,6 +833,7 @@ class ExperienceTransitionTests(unittest.TestCase):
             [(d["target"]["kind"], d["to_status"]) for d in first],
             [("dimension", "deprioritized"), ("hypothesis", "deprioritized")],
         )
+        self.advance_dag_cursor()
         self.ledger["experience"] = self.dimension_belief(2, with_hypothesis=True)
         second = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(
@@ -813,6 +850,7 @@ class ExperienceTransitionTests(unittest.TestCase):
     def test_dimension_prunes_once_hypothesis_already_pruned(self) -> None:
         self.ledger["experience"] = self.experience(generation=1)
         append_experience_transitions(self.registry, self.ledger)
+        self.advance_dag_cursor()
         self.ledger["experience"] = self.experience(generation=2)
         append_experience_transitions(self.registry, self.ledger)
         replayed = replay_search_space_state(
@@ -823,6 +861,7 @@ class ExperienceTransitionTests(unittest.TestCase):
         self.ledger["experience"] = self.dimension_belief(3, with_hypothesis=False)
         (third,) = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(third["to_status"], "deprioritized")
+        self.advance_dag_cursor()
         self.ledger["experience"] = self.dimension_belief(4, with_hypothesis=False)
         (fourth,) = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(fourth["from_status"], "deprioritized")
@@ -831,6 +870,58 @@ class ExperienceTransitionTests(unittest.TestCase):
 
 
 class LedgerIntegrationTests(unittest.TestCase):
+    def test_policy_receipt_budget_matches_historical_lane_and_index(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        entry = record("000", "fresh", [], baseline, score=0.5, status="keep")
+        ledger = {
+            "search_space": space_receipt(registry),
+            "records": [entry],
+            "search_space_state": empty_search_space_state(),
+        }
+
+        wrong_lane = copy.deepcopy(ledger)
+        budget = wrong_lane["records"][0]["policy_receipt"]["budget"]
+        budget["selected_lane"] = "deprioritized"
+        budget["fallback"] = "no_active_proposals"
+        errors = validate_ledger(registry, wrong_lane)
+        self.assertTrue(
+            any("selected_lane must match" in error for error in errors), errors
+        )
+
+        wrong_index = copy.deepcopy(ledger)
+        receipt = wrong_index["records"][0]["policy_receipt"]
+        receipt["policy"]["config"]["deprioritized_budget_interval"] = 2
+        budget = receipt["budget"]
+        budget.update(
+            {
+                "selection_index": 2,
+                "deprioritized_interval": 2,
+                "scheduled_lane": "deprioritized",
+                "selected_lane": "active",
+                "fallback": "no_deprioritized_proposals",
+            }
+        )
+        errors = validate_ledger(registry, wrong_index)
+        self.assertTrue(
+            any("one-based admission index 1" in error for error in errors), errors
+        )
+
+    def test_historical_policy_receipt_schema_2_remains_readable(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        entry = record("000", "fresh", [], baseline, score=0.5, status="keep")
+        receipt = entry["policy_receipt"]
+        receipt["schema_version"] = 2
+        receipt.pop("budget")
+        receipt["policy"]["config"].pop("deprioritized_budget_interval")
+        ledger = {
+            "search_space": space_receipt(registry),
+            "records": [entry],
+            "search_space_state": empty_search_space_state(),
+        }
+        self.assertEqual(validate_ledger(registry, ledger), [])
+
     def test_validate_ledger_requires_state_once_records_exist(self) -> None:
         registry = fixture_registry()
         baseline = complete_point(registry)
@@ -889,7 +980,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
 
     Automated pruning is two-stage (``active -> deprioritized -> pruned``), so
     the pruned overlay is revision 2 and reopening lands at revision 3; the
-    deprioritized stage at revision 1 exercises the deterministic re-sort.
+    deprioritized stage at revision 1 exercises the deterministic budget lane.
     """
 
     def setUp(self) -> None:
@@ -910,17 +1001,58 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             == "hyp-data-filtered"
         )
 
+    def test_add_record_cleanly_rejects_missing_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            background_path = tmp_path / "background.md"
+            ledger_path = tmp_path / "ledger.json"
+            point_path = tmp_path / "point.json"
+            receipt_path = tmp_path / "policy.json"
+            background_path.write_text(background_text(self.registry))
+            point_path.write_text(json.dumps(self.filtered))
+            receipt_path.write_text(
+                json.dumps(
+                    policy_receipt(
+                        "improve",
+                        ["999"],
+                        self.filtered,
+                    )
+                )
+            )
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                run_id="001",
+                kind="optimization",
+                op="improve",
+                source_run_ids="999",
+                background=str(background_path),
+                catalog=None,
+                semantic_point=str(point_path),
+                policy_receipt=str(receipt_path),
+                idea="A candidate whose claimed parent does not exist.",
+                change="attempt to improve a missing parent",
+                candidate_name_hint="fixture_missing_parent",
+                description=None,
+            )
+            with self.assertRaises(SystemExit) as raised:
+                cmd_add_record(args)
+        self.assertIn(
+            "record 001 parent 999 is not an earlier record",
+            str(raised.exception),
+        )
+
     def test_prune_select_stale_reject_and_reopen_lifecycle(self) -> None:
         registry = self.registry
 
         # 1. Revision 0 proposes a point containing hyp-data-filtered.
         ledger: dict = {"records": [], "search_space_state": empty_search_space_state()}
         proposals = self._proposals(ledger)
-        self.assertEqual(proposals["schema_version"], 2)
+        self.assertEqual(proposals["schema_version"], 3)
         self.assertEqual(proposals["search_space_state_revision"], 0)
         self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 3)
         self.assertEqual(receipt["search_space_state_revision"], 0)
 
         # A revision-0 historical record selects the hypothesis to be pruned.
@@ -931,11 +1063,11 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
 
         # 2. Later state decisions prune that hypothesis (two-stage).  The
         #    revision-1 deprioritized stage keeps the content eligible but
-        #    sorts it after active proposals at equal coverage.
+        #    assigns it to the limited admission-budget lane.
         state = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
         ledger["search_space_state"] = state
         proposals = self._proposals(ledger)
-        self.assertEqual(proposals["schema_version"], 2)
+        self.assertEqual(proposals["schema_version"], 3)
         self.assertEqual(proposals["search_space_state_revision"], 1)
         filtered_proposals = [
             item for item in proposals["proposals"] if self._selects_filtered(item)
@@ -943,6 +1075,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertTrue(filtered_proposals)
         for item in filtered_proposals:
             self.assertEqual(item["deprioritized_hypotheses"], ["hyp-data-filtered"])
+            self.assertEqual(item["budget_lane"], "deprioritized")
         positions = {
             item["point_id"]: index
             for index, item in enumerate(proposals["proposals"])
@@ -959,8 +1092,9 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         for active, dep in mixed_pairs:
             self.assertLess(positions[active["point_id"]], positions[dep["point_id"]])
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 3)
         self.assertEqual(receipt["search_space_state_revision"], 1)
+        self.assertEqual(receipt["budget"]["selected_lane"], "active")
 
         # 3. Revision 2 proposals omit the pruned hypothesis.
         state["decisions"].append(
@@ -968,11 +1102,11 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         )
         state["revision"] = 2
         proposals = self._proposals(ledger)
-        self.assertEqual(proposals["schema_version"], 2)
+        self.assertEqual(proposals["schema_version"], 3)
         self.assertEqual(proposals["search_space_state_revision"], 2)
         self.assertFalse(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 3)
         self.assertEqual(receipt["search_space_state_revision"], 2)
 
         # 4. The revision-0 historical record remains ledger-valid.
@@ -991,7 +1125,15 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             ledger_path.write_text(json.dumps(ledger))
             point_path.write_text(json.dumps(self.filtered))
             receipt_path.write_text(
-                json.dumps(policy_receipt("fresh", [], self.filtered, state_revision=0))
+                json.dumps(
+                    policy_receipt(
+                        "fresh",
+                        [],
+                        self.filtered,
+                        state_revision=0,
+                        selection_index=2,
+                    )
+                )
             )
             args = types.SimpleNamespace(
                 ledger=str(ledger_path),
@@ -1015,7 +1157,15 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             # A revision-current receipt still cannot admit a pruned point:
             # the selected point must be eligible at its receipt revision.
             receipt_path.write_text(
-                json.dumps(policy_receipt("fresh", [], self.filtered, state_revision=2))
+                json.dumps(
+                    policy_receipt(
+                        "fresh",
+                        [],
+                        self.filtered,
+                        state_revision=2,
+                        selection_index=2,
+                    )
+                )
             )
             with self.assertRaises(SystemExit) as raised:
                 cmd_add_record(args)
@@ -1051,6 +1201,80 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             selected = selected_assignments(item["point"])
             self.assertNotEqual(selected.get("dim-validation-selection"), "hyp-valid-cv")
             self.assertNotEqual(selected.get("dim-ensemble"), "hyp-ensemble-stacking")
+
+    def test_deprioritized_lane_receives_only_its_budget_slot(self) -> None:
+        state = state_with(
+            decision(1, "hyp-data-filtered", "active", "deprioritized")
+        )
+        proposals = self._proposals(
+            {"records": [], "search_space_state": state}
+        )
+        predictions = {
+            "schema_version": 1,
+            "proposal_set_revision": proposals["proposal_set_revision"],
+            "predictions": [],
+        }
+        for proposal in proposals["proposals"]:
+            predictions["predictions"].append(
+                {
+                    "point_id": proposal["point_id"],
+                    "predicted_gain": (
+                        1.0 if proposal["budget_lane"] == "deprioritized" else 0.0
+                    ),
+                    "uncertainty": 0.0,
+                    "cost": 0.0,
+                    "evidence": ["budget-lane regression fixture"],
+                }
+            )
+
+        active_point, active_receipt = select_proposal(
+            proposals,
+            policy="gain",
+            predictions=predictions,
+            selection_index=1,
+        )
+        self.assertEqual(active_receipt["budget"]["scheduled_lane"], "active")
+        self.assertEqual(active_receipt["budget"]["selected_lane"], "active")
+        self.assertEqual(active_receipt["budget"]["fallback"], "none")
+        self.assertNotEqual(
+            selected_assignments(active_point).get("dim-data-curation"),
+            "hyp-data-filtered",
+        )
+
+        deprioritized_point, deprioritized_receipt = select_proposal(
+            proposals,
+            policy="gain",
+            predictions=predictions,
+            selection_index=5,
+        )
+        self.assertEqual(
+            deprioritized_receipt["budget"]["scheduled_lane"], "deprioritized"
+        )
+        self.assertEqual(
+            deprioritized_receipt["budget"]["selected_lane"], "deprioritized"
+        )
+        self.assertEqual(deprioritized_receipt["budget"]["fallback"], "none")
+        self.assertEqual(
+            selected_assignments(deprioritized_point).get("dim-data-curation"),
+            "hyp-data-filtered",
+        )
+        self.assertGreater(deprioritized_receipt["budget"]["base_rank"], 0)
+
+    def test_empty_scheduled_lane_records_deterministic_fallback(self) -> None:
+        proposals = self._proposals(
+            {"records": [], "search_space_state": empty_search_space_state()}
+        )
+        self.assertTrue(
+            all(item["budget_lane"] == "active" for item in proposals["proposals"])
+        )
+        _point, receipt = select_proposal(
+            proposals, policy="coverage", selection_index=5
+        )
+        self.assertEqual(receipt["budget"]["scheduled_lane"], "deprioritized")
+        self.assertEqual(receipt["budget"]["selected_lane"], "active")
+        self.assertEqual(
+            receipt["budget"]["fallback"], "no_deprioritized_proposals"
+        )
 
     def test_pruned_dimension_proposes_only_its_baseline(self) -> None:
         state = state_with(
@@ -1098,7 +1322,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             proposals_path.write_text(json.dumps(current))
             self.assertEqual(cmd_select(args), 0)
             written = json.loads(receipt_path.read_text())
-        self.assertEqual(written["schema_version"], 2)
+        self.assertEqual(written["schema_version"], 3)
         self.assertEqual(written["search_space_state_revision"], 1)
 
     def test_validate_ledger_replays_each_record_at_its_receipt_revision(self) -> None:
@@ -1116,6 +1340,12 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             "000", "fresh", [], self.filtered, score=0.5, status="keep"
         )
         admitted_at_one["policy_receipt"]["search_space_state_revision"] = 1
+        admitted_at_one["policy_receipt"]["budget"].update(
+            {
+                "selected_lane": "deprioritized",
+                "fallback": "no_active_proposals",
+            }
+        )
         ledger["records"].append(admitted_at_one)
         # Replayed at revision 1 the point was only deprioritized: still valid.
         self.assertEqual(validate_ledger(registry, ledger), [])

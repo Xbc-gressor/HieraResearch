@@ -12,7 +12,8 @@ FUTURE candidate points.
 Reopening appends a new decision; pruning never deletes an id, a record, a
 point, an observation, or a prior decision.  Automated pruning is two-stage:
 ``active -> deprioritized`` in one experience generation, then
-``deprioritized -> pruned`` in a later one; ``active -> pruned`` is forbidden.
+``deprioritized -> pruned`` in a later one with changed target evidence;
+``active -> pruned`` is forbidden.
 
 :func:`derive_experience_transitions` deterministically turns the current
 validated experience snapshot into the next decision receipts, and
@@ -29,6 +30,7 @@ import re
 from typing import Any
 
 from semantic_evidence import (
+    TERMINAL_STATUSES,
     comparator_coverage,
     edge_observation,
     target_evaluation_state,
@@ -431,8 +433,8 @@ def validate_point_eligibility(
     hypotheses (directly or via a pruned dimension; a pruned dimension's
     non-baseline hypotheses already carry ``pruned`` effective status, so
     pinning it to its explicit baseline needs no separate check).  Runtime-
-    deprioritized dimensions and hypotheses stay eligible and only sort after
-    active content.  Structural validity stays with
+    deprioritized dimensions and hypotheses stay eligible but enter the
+    selection helper's limited admission-budget lane.  Structural validity stays with
     :func:`semantic_space.validate_point`, so historical points remain valid
     after later pruning.
     """
@@ -476,8 +478,8 @@ def _effective_recommendation(
     deprioritize_ok = (
         belief.get("assessment") == "unpromising"
         and belief.get("confidence") in {"med", "high"}
-        and evaluation_state in {"observed", "comparator_covered"}
-        and coverage["direct_noncrash_edges"] >= 1
+        and evaluation_state == "comparator_covered"
+        and coverage["direct_noncrash_edges"] >= 2
         and _nonempty(belief.get("reopen_when"))
     )
     if not deprioritize_ok:
@@ -531,6 +533,21 @@ def _normalized_beliefs(
             coverage = comparator_coverage(
                 ledger, edge_ids, target_kind=target_kind, target_id=target_id
             )
+            observations = [
+                {
+                    key: observation.get(key)
+                    for key in (
+                        "edge_id",
+                        "parent_status",
+                        "child_status",
+                        "parent_score",
+                        "child_score",
+                        "delta",
+                    )
+                }
+                for edge_id in edge_ids
+                for observation in (edge_observation(ledger, edge_id),)
+            ]
             evaluation_state = target_evaluation_state(
                 ledger,
                 target_kind=target_kind,
@@ -545,6 +562,7 @@ def _normalized_beliefs(
                 "uncertainty": item.get("uncertainty"),
                 "reopen_when": item.get("reopen_when"),
                 "evidence_edge_ids": edge_ids,
+                "evidence_observations": observations,
                 "comparator_coverage": coverage,
                 "evaluation_state": evaluation_state,
                 "recommended_status": _effective_recommendation(
@@ -556,19 +574,44 @@ def _normalized_beliefs(
     return beliefs
 
 
-def _has_reopening_evidence(belief: dict[str, Any], last: dict | None) -> bool:
-    """True only for a later generation with a newer cursor or a new edge."""
+def _has_advancing_evidence(belief: dict[str, Any], last: dict | None) -> bool:
+    """True only when a later snapshot changes evidence for this target."""
     if last is None:
         return False
     if belief["experience_generation"] <= last["experience_generation"]:
         return False
-    if belief["experience_dag_revision"] > last["experience_dag_revision"]:
-        return True
+    if belief["experience_dag_revision"] <= last["experience_dag_revision"]:
+        return False
     prior_edge_ids = last.get("evidence_edge_ids")
     if not isinstance(prior_edge_ids, list):
         return False
+    prior_observations = last.get("evidence_observations")
+    current_observations = belief.get("evidence_observations")
+    if not isinstance(prior_observations, list) or not isinstance(
+        current_observations, list
+    ):
+        return False
+    terminal_current = [
+        item
+        for item in current_observations
+        if isinstance(item, dict)
+        and {
+            item.get("parent_status"),
+            item.get("child_status"),
+        }.issubset(TERMINAL_STATUSES)
+    ]
+    if any(item.get("edge_id") not in prior_edge_ids for item in terminal_current):
+        return True
+    prior_by_edge = {
+        item.get("edge_id"): item
+        for item in prior_observations
+        if isinstance(item, dict) and isinstance(item.get("edge_id"), str)
+    }
     return any(
-        edge_id not in prior_edge_ids for edge_id in belief["evidence_edge_ids"]
+        isinstance(item, dict)
+        and isinstance(item.get("edge_id"), str)
+        and prior_by_edge.get(item["edge_id"]) != item
+        for item in terminal_current
     )
 
 
@@ -577,28 +620,35 @@ def _recommended_transition(current: str, belief: dict[str, Any], last: dict | N
     if current == "active" and recommendation in {"deprioritized", "pruned"}:
         return "deprioritized"
     if current == "deprioritized" and recommendation == "pruned":
-        if last is not None and belief["experience_generation"] > last["experience_generation"]:
+        if _has_advancing_evidence(belief, last):
             return "pruned"
         return None
     if current in {"deprioritized", "pruned"} and recommendation == "active":
-        if _has_reopening_evidence(belief, last):
+        if _has_advancing_evidence(belief, last):
             return "active"
     return None
 
 
-def _dimension_prune_ready(
+def _dimension_contraction_ready(
     dimension: dict[str, Any],
     generation: int,
     runtime: dict[str, Any],
     guidance: dict[str, Any],
     beliefs: dict[tuple[str, str], dict[str, Any]],
+    to_status: str,
 ) -> bool:
-    """Scoped guard: pruning a dimension never bans adjacent mechanisms.
+    """Scoped guard: dimension contraction never suppresses adjacent mechanisms.
 
     Every non-baseline hypothesis must be externally excluded, already
-    runtime-pruned, or covered by its own same-generation belief that
-    independently satisfies the high-confidence comparator-covered prune gate.
+    at least as contracted as the requested dimension status, or covered by
+    its own same-generation belief that independently satisfies the matching
+    comparator-covered recommendation gate.
     """
+    acceptable = (
+        {"deprioritized", "pruned"}
+        if to_status == "deprioritized"
+        else {"pruned"}
+    )
     for hypothesis in dimension.get("hypotheses", []):
         if not isinstance(hypothesis, dict):
             continue
@@ -608,14 +658,14 @@ def _dimension_prune_ready(
         entry = guidance.get(hypothesis_id) if isinstance(guidance, dict) else None
         if isinstance(entry, dict) and entry.get("selection_status") == "excluded":
             continue
-        if runtime["hypotheses"].get(hypothesis_id) == "pruned":
+        if runtime["hypotheses"].get(hypothesis_id) in acceptable:
             continue
         belief = beliefs.get(("hypothesis", hypothesis_id))
         if belief is None:
             return False
         if belief["experience_generation"] != generation:
             return False
-        if belief["recommended_status"] != "pruned":
+        if belief["recommended_status"] not in acceptable:
             return False
     return True
 
@@ -635,19 +685,7 @@ def _decision_receipt(
     reopen_when = belief.get("reopen_when")
     if not _nonempty(reopen_when) and isinstance(last, dict):
         reopen_when = last.get("reopen_when")
-    observations = []
-    for edge_id in belief["evidence_edge_ids"]:
-        observation = edge_observation(ledger, edge_id)
-        observations.append(
-            {
-                "edge_id": observation.get("edge_id") or edge_id,
-                "parent_status": observation.get("parent_status"),
-                "child_status": observation.get("child_status"),
-                "parent_score": observation.get("parent_score"),
-                "child_score": observation.get("child_score"),
-                "delta": observation.get("delta"),
-            }
-        )
+    observations = [dict(item) for item in belief["evidence_observations"]]
     return {
         "schema_version": DECISION_SCHEMA_VERSION,
         "decision_id": f"sdec-{revision:06d}",
@@ -719,8 +757,13 @@ def derive_experience_transitions(
             current = runtime["dimensions"].get(dimension_id, "active")
             last = last_decisions.get(("dimension", dimension_id))
             to_status = _recommended_transition(current, belief, last)
-            if to_status == "pruned" and not _dimension_prune_ready(
-                dimension, generation, runtime, guidance, beliefs
+            if to_status in {"deprioritized", "pruned"} and not _dimension_contraction_ready(
+                dimension,
+                generation,
+                runtime,
+                guidance,
+                beliefs,
+                to_status,
             ):
                 to_status = None
             if to_status is not None:

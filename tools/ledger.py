@@ -363,7 +363,7 @@ def cmd_add_record(args) -> int:
         validate_background_markdown,
         validate_registry,
     )
-    from semantic_evidence import build_semantic_edges
+    from semantic_evidence import SemanticEvidenceError, build_semantic_edges
     from semantic_space import (
         SemanticSpaceError,
         resolve_dimension_catalog,
@@ -430,7 +430,10 @@ def cmd_add_record(args) -> int:
         description=args.description or args.idea,
         metric=data["metric"],
     )
-    record["semantic_edges"] = build_semantic_edges(data["records"], record)
+    try:
+        record["semantic_edges"] = build_semantic_edges(data["records"], record)
+    except SemanticEvidenceError as exc:
+        raise SystemExit(f"invalid candidate semantic contract: {exc}") from exc
     data["search_space"] = data.get("search_space") or space_receipt(registry)
     data["search_space_state"] = data.get("search_space_state") or empty_search_space_state()
     current_revision = data["search_space_state"].get("revision", 0)
@@ -440,6 +443,21 @@ def cmd_add_record(args) -> int:
             f"{policy_receipt.get('search_space_state_revision')!r} does not equal the "
             f"current search space state revision {current_revision}; re-propose and "
             "re-select against the current overlay before admission"
+        )
+    if policy_receipt.get("schema_version") != 3:
+        raise SystemExit(
+            "new candidate admission requires policy receipt schema 3 with an "
+            "auditable semantic-budget lane; historical schema-2 receipts remain readable"
+        )
+    budget = policy_receipt.get("budget")
+    expected_selection_index = len(data["records"]) + 1
+    if (
+        not isinstance(budget, dict)
+        or budget.get("selection_index") != expected_selection_index
+    ):
+        raise SystemExit(
+            "policy receipt budget selection_index must equal the next one-based "
+            f"admission index {expected_selection_index}"
         )
     data["records"].append(record)
     contract_errors = validate_registry(

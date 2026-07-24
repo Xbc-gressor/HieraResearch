@@ -98,10 +98,16 @@ ordered against the ledger's current `search_space_state` revision:
 Every enumerated point passes `validate_point` — admissibility under
 `requires`/`excludes` is a deterministic check, not a policy judgment.
 `semantic_search.py select` then applies a replaceable acquisition policy
-(`coverage`, `gain`, `gain_uncertainty`) over fibers, writing a policy
-receipt that keeps `coverage`, `predicted_gain`, `uncertainty`, and `cost`
-as separate components. Hypotheses are coordinates, not consumable
-resources: one `hyp-*` may participate in many points.
+(`coverage`, `gain`, `gain_uncertainty`, `gain_uncertainty_nocost`) over
+fibers, writing a policy receipt that keeps `coverage`, `predicted_gain`,
+`uncertainty`, and `cost` as separate components. Before acquisition, proposals are partitioned into
+active and deprioritized budget lanes. With interval `N` (default 5), every
+Nth one-based semantic admission selects within the deprioritized lane and
+all other admissions select within the active lane; acquisition scores never
+move a point across lanes. If a scheduled lane is empty, the other lane fills
+the slot and the schema-3 receipt records the fallback and both lanes.
+Hypotheses are coordinates, not consumable resources: one `hyp-*` may
+participate in many points.
 
 Finally, a ledger record carries two different maps with different
 codomains: `source_run_ids` (ancestry — which concrete candidates informed
@@ -136,7 +142,8 @@ subset `S_r ⊆ S`:
 - a runtime-`pruned` dimension is pinned to its explicit
   `baseline_hypothesis_id`, so `S_r` restricts the dimension's coordinate to
   the baseline value;
-- `deprioritized` content stays in `S_r` and only sorts after active content;
+- `deprioritized` content stays in `S_r` but receives only its configured
+  semantic-admission budget (default one of every five slots);
   externally `excluded` content was never in any `S_r`.
 
 Pruning a dimension pins its baseline rather than changing point arity or
