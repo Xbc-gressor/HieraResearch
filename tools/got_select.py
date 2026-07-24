@@ -21,13 +21,6 @@ from got_cdag import c_dag
 from got_graph import Graph
 
 
-def geomean(vals) -> float:
-    p = 1.0
-    for v in vals:
-        p *= max(v, 0.0)
-    return p ** (1.0 / len(vals))
-
-
 def softmax(d: dict, tau: float) -> dict:
     if not d:
         return {}
@@ -57,7 +50,10 @@ def Q(graph, action, gamma) -> float:
     op, args = action
     if op == "improve":
         return graph.V_max(args[0])
-    return geomean([graph.V_max(args[0]), graph.V_max(args[1])]) * (1.0 + c_dag(graph, args[0], args[1], gamma))
+    pair_gain = math.sqrt(
+        max(graph.V_max(args[0]), 0.0) * max(graph.V_max(args[1]), 0.0)
+    )
+    return pair_gain * (1.0 + c_dag(graph, args[0], args[1], gamma))
 
 
 # ---------- 动作池 + op 解耦定额(PUCB 代,§6.1/§6.4)----------
