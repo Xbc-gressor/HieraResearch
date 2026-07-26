@@ -168,7 +168,9 @@ All retrieval is recorded in the run-local manifest
 `<run_dir>/background_retrieval.json`, written only through
 `tools/search_backends.py`. Dispatch the planned queries together in the
 `grounding` lane, then read selected sources progressively through the adapter
-so visits are recorded.
+so visits are recorded. For arXiv sources, normally use `--view auto`; it must
+produce a substantive section or preview receipt after head triage. Never stop
+at `head`/`brief` metadata or use it to support a registry claim.
 
 ### Step 5 — Define relations and distill the search space
 
@@ -248,8 +250,10 @@ whole brief.
   begin with a matching structured `g-*` id, `task-constraint`, or `operational`.
   Every `g-*` item must appear in the section declared by its registry entry.
 - **Visited or excluded.** Every search-space source must have a successful
-  grounding-lane visit in `background_retrieval.json`. A search hit, snippet,
-  generated TLDR, or novelty-only visit is insufficient.
+  substantive grounding-lane visit (`section`, `preview`, `full_text`, or exact
+  fetched `page`) in `background_retrieval.json`. A `head`/`brief` metadata
+  receipt, search hit, snippet, generated TLDR, or novelty-only visit is
+  insufficient.
 - **One setup write.** You define and validate the run's background once. The
   semantic selector then chooses points repeatedly and inner HPO finds numbers.
   Only structured, directly matched guidance can alter initial eligibility;

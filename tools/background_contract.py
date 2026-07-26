@@ -23,7 +23,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from search_backends import canonical_key, validate_manifest
+from search_backends import (
+    canonical_key,
+    is_substantive_grounding_visit,
+    validate_manifest,
+)
 from search_space_state import (
     compose_effective_selection,
     empty_search_space_state,
@@ -290,17 +294,16 @@ def _validate_sources(
         errors.extend(validate_manifest(retrieval_manifest))
         if retrieval_manifest.get("retrieval_condition") == "mixed":
             errors.append("background evidence cannot mix frozen and live retrieval in one condition")
-        visited_grounding = {
+        substantively_visited_grounding = {
             visit.get("canonical_key")
             for visit in retrieval_manifest.get("visits", [])
-            if isinstance(visit, dict)
-            and visit.get("status") == "success"
-            and visit.get("lane") == "grounding"
+            if is_substantive_grounding_visit(visit)
         }
         for source_id, url in source_urls.items():
-            if canonical_key(url) not in visited_grounding:
+            if canonical_key(url) not in substantively_visited_grounding:
                 errors.append(
-                    f"source {source_id} was not successfully visited in the grounding lane"
+                    f"source {source_id} has no substantive grounding-lane visit "
+                    "(section, preview, full_text, or page); head/brief metadata is triage only"
                 )
     return errors, source_by_id
 

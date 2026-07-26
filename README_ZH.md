@@ -197,7 +197,7 @@ step 0+1: tunable-contract-extractor
 
 来源、结构化负面指导 `g-*` 与每个假设继续使用同一组五轴范围：模型家族、数据情境、指标、干预机制、评估协议。只有直接覆盖假设的指导可影响资格；`unverified` / `contested` 负面只能提示。每个非基线假设保存 claim、比较项、重开条件、来源关系与独立文献可信度标签。绑定负面仍必须保留范围外 `scope_probe`，不会删除邻近机制。
 
-Search space registry 中的每个来源必须在 retrieval manifest 中存在成功的 grounding visit；只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 或 OpenCode 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
+Search space registry 中的每个来源必须在 retrieval manifest 中存在成功且包含正文的 grounding visit（`section`、`preview`、`full_text` 或原样抓取的 `page`）；DeepXiv 的 `head` / `brief` 只用于筛选，不能作为证据。DeepXiv 的 `auto` 会先读取 `head`，再按检索问题选择并读取最多三个正文 section，必要时回退到 preview。只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 或 OpenCode 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
 
 冻结语料的约定路径是 `tasks/<task>/background_corpus.json`；普通 open-world 开发可不提供，但 frozen / network-disabled 评测必须提供该文件或显式等价路径。
 

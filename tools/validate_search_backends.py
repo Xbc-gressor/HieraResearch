@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -141,6 +142,142 @@ def main() -> int:
         assert implicit_external.returncode == 1
         assert "select --backend explicitly" in implicit_external.stderr
 
+        fake_deepxiv = Path(tmp) / "deepxiv"
+        fake_deepxiv.write_text(
+            """#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("deepxiv fake-1")
+elif args and args[0] == "paper" and "--head" in args:
+    paper_id = args[1]
+    print(json.dumps({
+        "title": "Progressive fixture",
+        "abstract": "A metadata-only abstract.",
+        "sections": [] if paper_id in {"2409.05592", "2409.05593"} else [
+            {"name": "Introduction", "idx": 1, "tldr": "Motivation and context.", "token_count": 700},
+            {"name": "Method", "idx": 2, "tldr": "The proposed mechanism.", "token_count": 1800},
+            {"name": "Results", "idx": 3, "tldr": "Comparators and ablations.", "token_count": 1900},
+            {"name": "Limitations", "idx": 4, "tldr": "Known failure regimes.", "token_count": 600},
+            {"name": "References", "idx": 5, "tldr": "", "token_count": 1000}
+        ]
+    }))
+elif args and args[0] == "paper" and "--section" in args:
+    name = args[args.index("--section") + 1]
+    print(json.dumps({
+        "section": name,
+        "content": "Primary source body for " + name + ". " + ("evidence " * 100)
+    }))
+elif args and args[0] == "paper" and "--preview" in args:
+    if args[1] == "2409.05593":
+        print("preview unavailable", file=sys.stderr)
+        raise SystemExit(3)
+    print(json.dumps({"content": "Fallback primary-source preview."}))
+else:
+    print("unsupported fake DeepXiv invocation", file=sys.stderr)
+    raise SystemExit(2)
+"""
+        )
+        fake_deepxiv.chmod(0o755)
+        progressive_manifest_path = Path(tmp) / "progressive.json"
+        progressive_manifest_path.write_text(json.dumps(new_manifest()))
+        progressive_env = dict(os.environ)
+        progressive_env["PATH"] = str(Path(tmp)) + os.pathsep + progressive_env.get("PATH", "")
+        progressive_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "visit",
+                "--manifest",
+                str(progressive_manifest_path),
+                "--url",
+                "https://arxiv.org/abs/2409.05591",
+                "--view",
+                "auto",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert progressive_run.returncode == 0, progressive_run.stderr or progressive_run.stdout
+        progressive_manifest = json.loads(progressive_manifest_path.read_text())
+        successful_visits = [
+            visit for visit in progressive_manifest["visits"] if visit["status"] == "success"
+        ]
+        assert successful_visits[0]["view"] == "head"
+        section_visits = [
+            visit for visit in successful_visits if visit["view"] == "section"
+        ]
+        assert {visit["section"] for visit in section_visits} == {
+            "Method",
+            "Results",
+            "Limitations",
+        }
+        assert "Primary source body for Method" in progressive_run.stdout
+        assert sum(visit["content_chars"] for visit in successful_visits) <= (
+            LANE_BUDGETS["grounding"] * 4
+        )
+        assert validate_manifest(progressive_manifest) == []
+
+        preview_manifest_path = Path(tmp) / "preview-fallback.json"
+        preview_manifest_path.write_text(json.dumps(new_manifest()))
+        preview_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "visit",
+                "--manifest",
+                str(preview_manifest_path),
+                "--url",
+                "https://arxiv.org/abs/2409.05592",
+                "--view",
+                "auto",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert preview_run.returncode == 0, preview_run.stderr or preview_run.stdout
+        preview_manifest = json.loads(preview_manifest_path.read_text())
+        assert [visit["view"] for visit in preview_manifest["visits"]] == [
+            "head",
+            "preview",
+        ]
+        assert validate_manifest(preview_manifest) == []
+
+        head_only_manifest_path = Path(tmp) / "head-only-failure.json"
+        head_only_manifest_path.write_text(json.dumps(new_manifest()))
+        head_only_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "visit",
+                "--manifest",
+                str(head_only_manifest_path),
+                "--url",
+                "https://arxiv.org/abs/2409.05593",
+                "--view",
+                "auto",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert head_only_run.returncode == 1
+        assert "head metadata but no substantive" in head_only_run.stderr
+        head_only_manifest = json.loads(head_only_manifest_path.read_text())
+        assert [visit["view"] for visit in head_only_manifest["visits"]] == [
+            "head",
+            "preview",
+        ]
+        assert head_only_manifest["visits"][-1]["status"] == "failed"
+        assert validate_manifest(head_only_manifest) == []
+
     queries = [
         {
             "id": "q-01",
@@ -218,6 +355,7 @@ def main() -> int:
         lane="grounding",
         backend="deepxiv",
         view="section",
+        section="Method",
         status="success",
         content="inspected method and results" * 40,
     )

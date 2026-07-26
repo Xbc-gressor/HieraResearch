@@ -373,7 +373,7 @@ explicitly selected condition:
 - runtime-native web tools: fallback only, with successful content recorded
   through `search_backends.py record-visit`.
 
-The run-local `background_retrieval.json` uses retrieval schema 2. In addition
+The run-local `background_retrieval.json` uses retrieval schema 3. In addition
 to backend failures, canonical deduplication, balanced selections, visits,
 content depth, budgets, versions, and hashes, each query records
 `target_dimension_ids` and `evidence_roles`. Queries are not dimensions: the
@@ -406,12 +406,16 @@ The exemption argument is omitted when queries cover every searchable
 dimension. Grounding has a 6000-token reading lane; novelty is a separate
 2048-token lane. A novelty-only visit cannot support a registry claim.
 
-All registry sources must have a successful grounding visit. Final background
-validation also joins query targets and exemptions to the registry, rejecting
-unknown ids and uncovered searchable dimensions. Search snippets, generated
-summaries, and unvisited URLs are insufficient. Frozen and live conditions
-cannot be mixed in one main evidence condition. Schema-1 retrieval manifests
-are rejected rather than migrated silently.
+All registry sources must have a successful substantive grounding visit
+(`section`, `preview`, `full_text`, or exact fetched `page`). DeepXiv
+`auto` visits record `head` as triage and then fetch up to three
+query-relevant body sections, falling back to a preview only when necessary;
+head/brief metadata alone never qualifies. Final background validation also
+joins query targets and exemptions to the registry, rejecting unknown ids and
+uncovered searchable dimensions. Search snippets, generated summaries, and
+unvisited URLs are insufficient. Frozen and live conditions cannot be mixed in
+one main evidence condition. Older retrieval manifests are rejected rather
+than migrated silently.
 
 ## Credibility, scope, and negative guidance
 

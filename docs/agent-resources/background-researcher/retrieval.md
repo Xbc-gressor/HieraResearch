@@ -75,11 +75,20 @@ python tools/search_backends.py visit \
 
 Omit `--section` unless `--view section` is used. For papers, triage metadata
 and section maps first, then read relevant method, results, or limitations
-sections. In the frozen condition, append `--frozen-corpus <pinned-corpus.json>`
-to replay retained content without network access. Outside that condition,
-`auto` uses DeepXiv for arXiv and a direct HTTP fetch for other sources; Jina
-visiting is explicit via `--visit-backend jina` and remains an optional
-live-web ablation.
+sections. Use `--view auto` for normal DeepXiv-backed arXiv reading: the adapter
+records `head` as triage, ranks up to three available body sections against the
+source's retrieval questions and evidence roles, fetches those sections, and
+falls back to `preview` when no section body can be obtained. The head and body
+receipts share the lane's total retained-content budget. If DeepXiv returns
+metadata but no section or preview body, the visit fails; head-only retrieval
+never grounds a source.
+
+Use explicit `--view head` only for triage and explicit `--view section` when
+you need to override the automatic selection. In the frozen condition, append
+`--frozen-corpus <pinned-corpus.json>` to replay retained content without
+network access. Outside that condition, `auto` uses progressive DeepXiv reading
+for arXiv and a direct HTTP fetch for other sources; Jina visiting is explicit
+via `--visit-backend jina` and remains an optional live-web ablation.
 
 ## Runtime web fallback and record-visit
 
@@ -138,6 +147,7 @@ For each promising claim, inspect enough of the actual source to assess:
 
 ## Grounding-visit requirement
 
-Every search-space source must have a successful grounding-lane visit in
-`background_retrieval.json`. A search hit, snippet, generated TLDR, or
-novelty-only visit is insufficient.
+Every search-space source must have a successful **substantive** grounding-lane
+visit in `background_retrieval.json`: `section`, `preview`, `full_text`, or an
+exact fetched `page`. A `head`/`brief` metadata receipt, search hit, snippet,
+generated TLDR, or novelty-only visit is insufficient.

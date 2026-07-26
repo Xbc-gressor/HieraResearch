@@ -547,6 +547,19 @@ def main() -> int:
         for dimension in registry["dimensions"]
         if dimension["mode"] == "searchable"
     ]
+    head_only_manifest = copy.deepcopy(manifest)
+    add_visit(
+        head_only_manifest,
+        url=registry["sources"][0]["url"],
+        lane="grounding",
+        backend="deepxiv",
+        view="head",
+        status="success",
+        content='{"abstract":"metadata only","sections":{"Method":{"token_count":100}}}',
+    )
+    errors = validate_registry(registry, retrieval_manifest=head_only_manifest)
+    assert any("head/brief metadata is triage only" in error for error in errors), errors
+
     add_visit(
         manifest,
         url=registry["sources"][0]["url"],

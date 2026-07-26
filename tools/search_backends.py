@@ -30,7 +30,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LANE_BUDGETS = {"novelty": 2048, "grounding": 6000}
 EVIDENCE_ROLES = {
     "hypothesis",
@@ -45,6 +45,8 @@ DIMENSION_BOUND_ROLES = {"hypothesis", "relation"}
 MAX_SHARED = 6
 MAX_SELECTED = 18
 HTTP_TIMEOUT = 45
+DEEPXIV_MAX_SECTIONS = 3
+SUBSTANTIVE_VIEWS = {"section", "preview", "full_text", "page"}
 
 _ARXIV_RE = re.compile(
     r"(?:arxiv\.org|alphaxiv\.org)/(?:abs|pdf)/([a-z-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?",
@@ -54,6 +56,19 @@ _VERSION_RE = re.compile(r"v\d+$", re.IGNORECASE)
 _TAG_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _HTML_RE = re.compile(r"<[^>]+>")
 _DIMENSION_RE = re.compile(r"^dim-[a-z0-9][a-z0-9-]*$")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_SECTION_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "in",
+    "of",
+    "on",
+    "the",
+    "to",
+    "with",
+}
 
 
 def arxiv_id(url: str) -> str | None:
@@ -99,6 +114,16 @@ def canonical_url(url: str) -> str:
     path = re.sub(r"/+", "/", parts.path or "/").rstrip("/") or "/"
     return urllib.parse.urlunsplit(
         ((parts.scheme or "https").lower(), parts.netloc.lower(), path, "", "")
+    )
+
+
+def is_substantive_grounding_visit(visit: Any) -> bool:
+    """Whether a receipt contains source body text suitable for grounding."""
+    return (
+        isinstance(visit, dict)
+        and visit.get("status") == "success"
+        and visit.get("lane") == "grounding"
+        and visit.get("view") in SUBSTANTIVE_VIEWS
     )
 
 
@@ -347,6 +372,12 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
                 digest = hashlib.sha256(content.encode()).hexdigest()
                 if visit.get("content_sha256") != digest:
                     errors.append(f"{where}.content_sha256 does not match retained content")
+        view = visit.get("view")
+        section = visit.get("section")
+        if view == "section" and (not isinstance(section, str) or not section.strip()):
+            errors.append(f"{where}.section must be non-empty for a section view")
+        elif view != "section" and section is not None:
+            errors.append(f"{where}.section is only valid for a section view")
         if not isinstance(visit.get("retrieved_at"), str) or not visit["retrieved_at"]:
             errors.append(f"{where}.retrieved_at must be non-empty")
     return errors
@@ -741,11 +772,17 @@ def _direct_visit(url: str) -> str:
     return _strip_html(raw)
 
 
-def _deepxiv_read(url: str, view: str, section: str | None) -> tuple[str, str, str]:
+def _deepxiv_read(
+    url: str,
+    view: str,
+    section: str | None,
+    *,
+    backend: DeepXivBackend | None = None,
+) -> tuple[str, str, str]:
     paper_id = arxiv_id(url)
     if not paper_id:
         raise RuntimeError("URL is not an arXiv paper")
-    backend = DeepXivBackend()
+    backend = backend or DeepXivBackend()
     command = backend.command + ["paper", paper_id, "--format", "json"]
     if view == "brief":
         command.append("--brief")
@@ -769,6 +806,240 @@ def _deepxiv_read(url: str, view: str, section: str | None) -> tuple[str, str, s
         message = (process.stderr or process.stdout).strip().splitlines()
         raise RuntimeError(message[-1] if message else f"exit {process.returncode}")
     return process.stdout, "deepxiv", backend.version
+
+
+def _head_sections(content: str) -> list[dict[str, Any]]:
+    """Normalize DeepXiv's dict/list section-map variants."""
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    containers: list[Any] = [payload]
+    if isinstance(payload, dict):
+        for key in ("data", "result", "paper"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+    sections: Any = None
+    for container in containers:
+        if isinstance(container, dict) and isinstance(container.get("sections"), (dict, list)):
+            sections = container["sections"]
+            break
+    normalized: list[dict[str, Any]] = []
+    if isinstance(sections, dict):
+        rows = [
+            (
+                name,
+                info if isinstance(info, dict) else {"tldr": str(info or "")},
+                position,
+            )
+            for position, (name, info) in enumerate(sections.items())
+        ]
+    elif isinstance(sections, list):
+        rows = []
+        for position, info in enumerate(sections):
+            if isinstance(info, dict):
+                name = info.get("name") or info.get("title") or info.get("section")
+                rows.append((name, info, position))
+            elif isinstance(info, str):
+                rows.append((info, {}, position))
+    else:
+        rows = []
+    seen: set[str] = set()
+    for name, info, position in rows:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        clean_name = name.strip()
+        key = clean_name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        idx = info.get("idx", position)
+        normalized.append(
+            {
+                "name": clean_name,
+                "idx": idx if isinstance(idx, (int, float)) else position,
+                "tldr": str(info.get("tldr") or info.get("summary") or ""),
+                "token_count": info.get("token_count"),
+            }
+        )
+    return normalized
+
+
+def _source_query_context(manifest: dict[str, Any], url: str) -> tuple[str, set[str]]:
+    key = canonical_key(url)
+    query_ids: set[str] = set()
+    for result in manifest.get("results", []):
+        if isinstance(result, dict) and result.get("canonical_key") == key:
+            query_ids.update(
+                item for item in result.get("query_ids", []) if isinstance(item, str)
+            )
+    texts: list[str] = []
+    roles: set[str] = set()
+    for query in manifest.get("queries", []):
+        if not isinstance(query, dict) or query.get("id") not in query_ids:
+            continue
+        if isinstance(query.get("text"), str):
+            texts.append(query["text"])
+        roles.update(
+            role for role in query.get("evidence_roles", []) if isinstance(role, str)
+        )
+    return " ".join(texts), roles
+
+
+def _select_deepxiv_sections(
+    head_content: str,
+    *,
+    query_text: str = "",
+    evidence_roles: set[str] | None = None,
+    limit: int = DEEPXIV_MAX_SECTIONS,
+) -> list[str]:
+    """Choose source-body sections for the evidence question, not document order."""
+    sections = _head_sections(head_content)
+    if not sections or limit <= 0:
+        return []
+    context_terms = {
+        term
+        for term in _WORD_RE.findall(query_text.casefold())
+        if len(term) > 2 and term not in _SECTION_STOPWORDS
+    }
+    roles = evidence_roles or set()
+    ranked: list[tuple[float, float, str]] = []
+    for section in sections:
+        name = section["name"]
+        lowered = name.casefold()
+        if re.search(
+            r"\b(abstract|references?|bibliography|acknowledg(?:e)?ments?)\b",
+            lowered,
+        ):
+            continue
+        score = 25.0
+        priorities = (
+            (r"\b(methods?|methodology|approach|algorithm|model|architecture|training)\b", 100),
+            (r"\b(experiments?|results?|evaluation|benchmark|ablation|analysis)\b", 95),
+            (r"\b(limitations?|discussion|failure|error analysis)\b", 90),
+            (r"\b(conclusions?|future work)\b", 65),
+            (r"\b(introduction|background|related work|preliminar(?:y|ies))\b", 35),
+        )
+        for pattern, priority in priorities:
+            if re.search(pattern, lowered):
+                score = max(score, float(priority))
+        if "counterevidence" in roles or "failure_mode" in roles:
+            if re.search(r"\b(limitations?|discussion|failure|error|analysis)\b", lowered):
+                score += 20
+        if "hypothesis" in roles or "relation" in roles:
+            if re.search(r"\b(methods?|approach|algorithm|model|architecture)\b", lowered):
+                score += 15
+        section_terms = set(
+            _WORD_RE.findall(f"{name} {section.get('tldr', '')}".casefold())
+        )
+        score += min(len(context_terms & section_terms), 8) * 4
+        ranked.append((-score, float(section["idx"]), name))
+    ranked.sort()
+    return [name for _, _, name in ranked[:limit]]
+
+
+def _deepxiv_progressive_read(
+    url: str, manifest: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Triage an arXiv paper, then fetch evidence-bearing body content."""
+    backend = DeepXivBackend()
+    head, backend_name, backend_version = _deepxiv_read(
+        url, "head", None, backend=backend
+    )
+    attempts: list[dict[str, Any]] = [
+        {
+            "backend": backend_name,
+            "backend_version": backend_version,
+            "view": "head",
+            "section": None,
+            "status": "success",
+            "content": head,
+            "error": None,
+        }
+    ]
+    query_text, evidence_roles = _source_query_context(manifest, url)
+    section_names = _select_deepxiv_sections(
+        head, query_text=query_text, evidence_roles=evidence_roles
+    )
+    for section_name in section_names:
+        try:
+            content, _, _ = _deepxiv_read(
+                url, "section", section_name, backend=backend
+            )
+            attempts.append(
+                {
+                    "backend": backend_name,
+                    "backend_version": backend_version,
+                    "view": "section",
+                    "section": section_name,
+                    "status": "success",
+                    "content": content,
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            attempts.append(
+                {
+                    "backend": backend_name,
+                    "backend_version": backend_version,
+                    "view": "section",
+                    "section": section_name,
+                    "status": "failed",
+                    "content": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    if not any(
+        attempt["status"] == "success" and attempt["view"] == "section"
+        for attempt in attempts
+    ):
+        try:
+            content, _, _ = _deepxiv_read(url, "preview", None, backend=backend)
+            attempts.append(
+                {
+                    "backend": backend_name,
+                    "backend_version": backend_version,
+                    "view": "preview",
+                    "section": None,
+                    "status": "success",
+                    "content": content,
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            attempts.append(
+                {
+                    "backend": backend_name,
+                    "backend_version": backend_version,
+                    "view": "preview",
+                    "section": None,
+                    "status": "failed",
+                    "content": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return attempts
+
+
+def _retain_progressive_content(
+    attempts: list[dict[str, Any]], budget_chars: int
+) -> None:
+    """Share one source-reading budget across triage and body receipts."""
+    successful = [
+        attempt for attempt in attempts if attempt["status"] == "success"
+    ]
+    head = next(
+        (attempt for attempt in successful if attempt["view"] == "head"), None
+    )
+    body = [attempt for attempt in successful if attempt["view"] in SUBSTANTIVE_VIEWS]
+    head_budget = min(4000, max(budget_chars // 6, 1)) if head else 0
+    if head:
+        head["content"] = head["content"][:head_budget]
+    remaining = max(budget_chars - head_budget, 0)
+    body_budget = max(remaining // len(body), 1) if body else 0
+    for attempt in body:
+        attempt["content"] = attempt["content"][:body_budget]
 
 
 def add_visit(
@@ -917,6 +1188,9 @@ def cmd_visit(args: argparse.Namespace) -> int:
     _reject_legacy_manifest(manifest)
     budget = manifest.get("lane_budgets", LANE_BUDGETS).get(args.lane, LANE_BUDGETS[args.lane])
     view = args.view
+    if args.section and view != "section":
+        print("visit failed: --section is only valid with --view section", file=sys.stderr)
+        return 1
     try:
         if args.frozen_corpus:
             frozen = FrozenCorpusBackend(args.frozen_corpus)
@@ -936,8 +1210,46 @@ def cmd_visit(args: argparse.Namespace) -> int:
             if view == "auto":
                 view = "full_text"
         elif arxiv_id(args.url) and view == "auto":
-            view = "head"
-            content, backend, backend_version = _deepxiv_read(args.url, view, args.section)
+            attempts = _deepxiv_progressive_read(args.url, manifest)
+            _retain_progressive_content(attempts, budget * 4)
+            for attempt in attempts:
+                add_visit(
+                    manifest,
+                    url=args.url,
+                    lane=args.lane,
+                    backend=attempt["backend"],
+                    view=attempt["view"],
+                    status=attempt["status"],
+                    content=attempt["content"],
+                    error=attempt["error"],
+                    backend_version=attempt["backend_version"],
+                    section=attempt["section"],
+                )
+            save_manifest(args.manifest, manifest)
+            body_attempts = [
+                attempt
+                for attempt in attempts
+                if attempt["status"] == "success"
+                and attempt["view"] in SUBSTANTIVE_VIEWS
+            ]
+            rendered = []
+            for attempt in attempts:
+                if attempt["status"] != "success":
+                    continue
+                label = attempt["view"]
+                if attempt["section"]:
+                    label += f": {attempt['section']}"
+                rendered.append(f"## DeepXiv {label}\n\n{attempt['content']}")
+            if rendered:
+                print("\n\n".join(rendered))
+            if not body_attempts:
+                print(
+                    "visit failed: DeepXiv returned head metadata but no substantive "
+                    "section or preview content",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
         elif arxiv_id(args.url) and view in {"brief", "head", "preview", "section", "full_text"}:
             content, backend, backend_version = _deepxiv_read(args.url, view, args.section)
         else:
