@@ -126,6 +126,7 @@ def main() -> int:
 
     distributions = build_distributions(search_space)
     prior_trials = read_prior_trials(args.tune_report_json)
+    n_priors_injected = 0
     for prior in prior_trials:
         prior_params = prior.get("params")
         prior_score = prior.get("score")
@@ -142,6 +143,7 @@ def main() -> int:
                     value=float(prior_score),
                 )
             )
+            n_priors_injected += 1
         except Exception:
             continue
 
@@ -217,20 +219,31 @@ def main() -> int:
 
     elapsed = time.time() - started
 
+    new_trials = study.trials[n_priors_injected:]
+    attempted_trials = [
+        t
+        for t in new_trials
+        if t.state in {
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.FAIL,
+        }
+    ]
     completed_trials = [
         t
-        for t in study.trials
+        for t in attempted_trials
         if t.value is not None and t.state == optuna.trial.TrialState.COMPLETE
     ]
     if not completed_trials:
-        # Every trial (and any injected prior) errored: surface a failed stage
-        # instead of crashing on study.best_value or mislabeling this "ok".
+        # Every newly attempted trial errored. Injected priors do not make this
+        # search stage successful because they were evaluated before it began.
         set_stage_meta(args.tune_report_json, "bo", status="failed",
                        elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped["flag"])
         write_json({
             "method": "bo",
             "status": "failed",
             "reason": "all BO trials errored; no completed trial",
+            "trials_completed": 0,
+            "trials_attempted": len(attempted_trials),
             "early_stopped": early_stopped["flag"],
             "early_stop_reason": early_stopped["reason"],
             "failure_refs": failure_refs[-3:],
@@ -250,8 +263,9 @@ def main() -> int:
         "status": "ok",
         "best_params": best_params,
         "best_score": best_score,
-        "trials_completed": len(completed_trials) - len(prior_trials),
-        "prior_trials_injected": len(prior_trials),
+        "trials_completed": len(completed_trials),
+        "trials_attempted": len(attempted_trials),
+        "prior_trials_injected": n_priors_injected,
         "n_dims": n_dims,
         "patience": patience,
         "early_stopped": early_stopped["flag"],

@@ -20,7 +20,7 @@ RECEIPT_FIELDS = {
     ),
     "tunable-contract-extractor": (
         ("status", "train_py", "ledger_recorded", "best_warm", "trials_completed",
-         "n_dims", "checks", "fixes", "risk_flags", "confidence"),
+         "trials_attempted", "n_dims", "checks", "fixes", "risk_flags", "confidence"),
         ("status", "train_py", "ledger_recorded"),
     ),
     "tuner-orchestrator": (

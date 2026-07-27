@@ -35,7 +35,7 @@ from prepare import PretrainEnv
 PARAM_SCHEMA = {
     "depth": "int",
     "device_batch_size": "int",
-    "total_batch_size": "int",
+    "grad_accum_steps": "int",
     "embedding_lr": ("float", "log"),
     "unembedding_lr": ("float", "log"),
     "matrix_lr": ("float", "log"),
@@ -49,7 +49,7 @@ PARAM_SCHEMA = {
 DEFAULT_PARAMS = {
     "depth": 8,                 # number of transformer layers
     "device_batch_size": 128,   # per-device batch size (reduce if OOM)
-    "total_batch_size": 2**19,  # ~524K tokens per optimizer step
+    "grad_accum_steps": 2,      # effective batch = device batch * sequence length * accumulation
     "embedding_lr": 0.6,        # learning rate for token embeddings (Adam)
     "unembedding_lr": 0.004,    # learning rate for lm_head (Adam)
     "matrix_lr": 0.04,          # learning rate for matrix parameters (Muon)
@@ -546,14 +546,12 @@ class Trainer:
         num_flops_per_token = model.estimate_flops()
         print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-        total_batch_size = p["total_batch_size"]
         device_batch_size = p["device_batch_size"]
+        grad_accum_steps = p["grad_accum_steps"]
+        if grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
         tokens_per_fwdbwd = device_batch_size * env.max_seq_len
-        assert total_batch_size % tokens_per_fwdbwd == 0, (
-            f"total_batch_size ({total_batch_size}) must be a multiple of "
-            f"device_batch_size * max_seq_len ({tokens_per_fwdbwd})"
-        )
-        grad_accum_steps = total_batch_size // tokens_per_fwdbwd
+        total_batch_size = tokens_per_fwdbwd * grad_accum_steps
 
         optimizer = model.setup_optimizer(
             unembedding_lr=p["unembedding_lr"],

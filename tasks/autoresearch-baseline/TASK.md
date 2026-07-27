@@ -50,6 +50,10 @@ Rules:
 
 - Keep `prepare.py`, the tokenizer, and the evaluation metric fixed.
 - Respect `env.train_budget_seconds`; derive all randomness from `env.seed`.
+- Express effective batch size with the independent tuner coordinates
+  `device_batch_size` and `grad_accum_steps`; derive `total_batch_size` as
+  `device_batch_size * env.max_seq_len * grad_accum_steps`. Do not expose
+  `total_batch_size` as an independently sampled coordinate.
 - VRAM is a soft constraint; do not blow it up dramatically.
 - Do not catch broad exceptions to fabricate a score. If a candidate cannot
   build/train/return a finite `val_bpb`, let it fail so the run is recorded

@@ -80,7 +80,7 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `status` | `pending`, `keep`, `discard`, or `crash` |
 | `best_warm_score`, `final_best_score` | inner-HPO and final candidate observations |
 | `n_dims`, `warm_start_K`, `warm_percentile` | tuning metadata, unrelated to semantic dimensions |
-| `phase_b_decision`, `phase_c_method`, `trials_completed`, `elapsed_seconds`, `applied` | tuning process metadata |
+| `phase_b_decision`, `phase_c_method`, `trials_completed`, `trials_attempted`, `elapsed_seconds`, `applied` | tuning process metadata; completed counts finite scores, attempted counts every config→score call and owns the run budget |
 | `dag_revision` | helper-owned graph-change cursor |
 
 The semantic point contains the exact `space_revision`, a stable content-based

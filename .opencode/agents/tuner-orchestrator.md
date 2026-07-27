@@ -132,7 +132,8 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    initial mean — AND the **deferred** warm configs (`phase_a.deferred_configs`,
    proposed but not evaluated at step 0+1), which it evaluates FIRST — BO enqueues
    them, grid prepends them — then appends all its trials to
-   `phase_c.stages[0].trials`. So `trials_completed` includes those deferred evals):
+   `phase_c.stages[0].trials`. Successful deferred evaluations contribute to
+   `trials_completed`; every deferred call contributes to `trials_attempted`):
    ```
    uv --directory <env.project> run python \
      <repo_root>/tools/tuners/<method>_search.py \
@@ -203,9 +204,9 @@ python tools/ledger.py set-tuning --ledger <run_dir>/ledger.json \
 ```
 `record-run` updates `final_best_score` (the score the graph reads next round) +
 status; `set-tuning --mark-tuned` writes `phase_c_method`, `trials_completed`,
-`elapsed_seconds`, `applied`, `warm_percentile` and sets `tune: true`. Both
-regenerate `loop_state.md`; take the Output Format values from these. Never
-hand-edit `ledger.json`.
+`trials_attempted`, `elapsed_seconds`, `applied`, `warm_percentile` and sets
+`tune: true`. Both regenerate `loop_state.md`; take the Output Format values
+from these. Never hand-edit `ledger.json`.
 
 > `phase_b_decision` stays `null` (the gate is `select-candidate` / Phase S, not a
 > per-candidate Phase B). The tuned score is **never worse** than
@@ -222,6 +223,7 @@ phase_c_method:       grid | bo | cmaes | null
 best_warm_score:      <float | n/a>
 final_best_score:     <float | n/a>     # tuned best (= select-best); recorded in place, no re-run
 trials_completed:     <int | 0>
+trials_attempted:     <int | 0>
 elapsed_seconds:      <float | 0>
 applied:              true | false
 report_path:          <absolute path to tune_report.json | n/a>
@@ -229,9 +231,10 @@ ledger_updated:       true | false
 risks:                <one short line; "none notable" allowed>
 ```
 
-`trials_completed` and `elapsed_seconds` come from the `set-tuning --from-report`
-output — do not recompute them. On a no-op (`tuned_run_id: none`), the numeric
-fields are `n/a`/`0` and `applied` is `false`.
+`trials_completed`, `trials_attempted`, and `elapsed_seconds` come from the
+`set-tuning --from-report` output — do not recompute them. On a no-op
+(`tuned_run_id: none`), the numeric fields are `n/a`/`0` and `applied` is
+`false`.
 
 ## Boundaries
 

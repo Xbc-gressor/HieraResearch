@@ -71,7 +71,8 @@ RECORD_FIELDS = (
     "warm_percentile",
     "phase_b_decision",  # continue | stop | null
     "phase_c_method",    # grid | bo | cmaes | null
-    "trials_completed",
+    "trials_completed",  # finite score observations
+    "trials_attempted",  # all config->score calls, including failures
     "elapsed_seconds",
     "applied",           # bool | null: tuned params applied to BASE_PARAMS
     "dag_revision",      # last score/status revision visible to the development DAG
@@ -85,6 +86,7 @@ TUNING_FIELDS = (
     "phase_b_decision",
     "phase_c_method",
     "trials_completed",
+    "trials_attempted",
     "elapsed_seconds",
     "applied",
 )
@@ -515,6 +517,7 @@ def cmd_set_tuning(args) -> int:
             "phase_b_decision": args.phase_b_decision,
             "phase_c_method": args.phase_c_method,
             "trials_completed": _coerce(args.trials_completed, "int"),
+            "trials_attempted": _coerce(args.trials_attempted, "int"),
             "elapsed_seconds": _coerce(args.elapsed_seconds, "float"),
             "applied": _coerce(args.applied, "bool"),
         }
@@ -605,21 +608,23 @@ def cmd_percentile(args) -> int:
 
 
 def _evaluations_done(data: dict) -> dict:
-    """Run-level evaluation budget used so far = total config->score validations =
-    Σ trials_completed over the records. `trials_completed` is a per-candidate
-    TOTAL (the K warm evals + any new Phase-C trials), so summing it counts each
-    real evaluation exactly once — never add warm_start_K on top. A candidate with
-    no trials_completed yet (e.g. crashed before set-tuning) falls back to its
-    warm_start_K, then 0."""
+    """Run-level evaluation budget used so far = all config->score attempts.
+
+    New records carry ``trials_attempted``, including failed calls. Legacy
+    records fall back to finite ``trials_completed``, then ``warm_start_K``.
+    Never add those fields together: each is a successively older total.
+    """
     records = data.get("records", [])
     per, total = [], 0
     for r in records:
-        tc = r.get("trials_completed")
-        if tc is None:
-            tc = r.get("warm_start_K") or 0
-        tc = int(tc)
-        total += tc
-        per.append({"run_id": r.get("run_id"), "evals": tc,
+        attempted = r.get("trials_attempted")
+        if attempted is None:
+            attempted = r.get("trials_completed")
+        if attempted is None:
+            attempted = r.get("warm_start_K") or 0
+        attempted = int(attempted)
+        total += attempted
+        per.append({"run_id": r.get("run_id"), "evals": attempted,
                     "tuned": bool(r.get("tune")), "status": r.get("status")})
     return {"evaluations_done": total, "n_candidates": len(records), "per_candidate": per}
 
@@ -939,6 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("best-warm-score",
                  "n-dims", "warm-start-k", "warm-percentile",
                  "phase-b-decision", "phase-c-method", "trials-completed",
+                 "trials-attempted",
                  "elapsed-seconds", "applied"):
         tune.add_argument(f"--{name}")
     tune.add_argument("--mark-tuned", action="store_true",

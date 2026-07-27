@@ -183,6 +183,45 @@ class UsageAndLifecycleTests(unittest.TestCase):
             (run_dir / "ledger.json").write_text(json.dumps(ledger))
             self.assertEqual(harness_watch._run_snapshot(run_dir)["phase"], "blocked")
 
+    def test_ledger_budget_prefers_attempts_and_reads_legacy_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = Path(tmp) / "ledger.json"
+            ledger_path.write_text(json.dumps({"records": [
+                {
+                    "run_id": "001",
+                    "status": "discard",
+                    "trials_completed": 2,
+                    "trials_attempted": 5,
+                },
+                {
+                    "run_id": "002",
+                    "status": "keep",
+                    "trials_completed": 3,
+                },
+            ]}))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "ledger.py"), "evaluations",
+                 "--ledger", str(ledger_path)],
+                check=True, capture_output=True, text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["evaluations_done"], 8)
+            self.assertEqual([row["evals"] for row in payload["per_candidate"]], [5, 3])
+
+    def test_autoresearch_batch_schema_uses_independent_coordinates(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "tuners" / "tune_tools.py"),
+             "lint-schema",
+             "--candidate-path", str(ROOT / "tasks" / "autoresearch-baseline" / "train.py")],
+            check=True, capture_output=True, text=True,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertIn("grad_accum_steps", payload["keys"])
+        self.assertNotIn("total_batch_size", payload["keys"])
+
     def test_brief_and_explicit_completion_are_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger_path = Path(tmp) / "ledger.json"

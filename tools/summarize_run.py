@@ -68,17 +68,30 @@ def summarize(data: dict, records: list[dict], threshold: Optional[float] = None
     crashes = [r for r in records if r.get("status") == "crash"]
     best = min(scored, key=lambda r: r["final_best_score"]) if scored else None
 
-    # eval budget: trials_completed already counts warm + phase_c per candidate.
-    def evals(r) -> int:
+    # Eval budget counts every score_fn call, including failures. Keep the
+    # finite-score total separately so the warm/Phase-C breakdown remains an
+    # observation breakdown instead of misclassifying failed warm retries.
+    def attempted_evals(r) -> int:
+        t = r.get("trials_attempted")
+        if not _is_num(t):
+            t = r.get("trials_completed")
+        if _is_num(t):
+            return int(t)
+        k = r.get("warm_start_K")
+        return int(k) if _is_num(k) else 0
+
+    def completed_evals(r) -> int:
         t = r.get("trials_completed")
         if _is_num(t):
             return int(t)
         k = r.get("warm_start_K")
         return int(k) if _is_num(k) else 0
 
-    total_evals = sum(evals(r) for r in records)
+    total_evals = sum(attempted_evals(r) for r in records)
+    total_completed = sum(completed_evals(r) for r in records)
     warm_evals = sum(int(r["warm_start_K"]) for r in records if _is_num(r.get("warm_start_K")))
-    phase_c_evals = total_evals - warm_evals
+    phase_c_evals = total_completed - warm_evals
+    failed_evals = total_evals - total_completed
 
     op_counts = Counter(r.get("op") for r in records)
     status_counts = Counter(r.get("status") for r in records)
@@ -143,6 +156,8 @@ def summarize(data: dict, records: list[dict], threshold: Optional[float] = None
         "n_hpo_improved": improved,
         "op_keep_counts": dict(op_keep),
         "eval_budget_total": total_evals,
+        "eval_budget_completed": total_completed,
+        "eval_budget_failed": failed_evals,
         "eval_budget_warm": warm_evals,
         "eval_budget_phase_c": phase_c_evals,
         "best": None if best is None else {

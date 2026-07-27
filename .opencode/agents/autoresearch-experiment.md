@@ -181,8 +181,9 @@ python tools/ledger.py brief --ledger <run_dir>/ledger.json
 
 The budget comes from `framework_cfg.json.max_evaluations`; setup persisted any
 explicit caller value there. If the field is absent or null, the experiment is
-unbounded. `evaluations_done` is the sum of `trials_completed`; do not add
-`warm_start_K` again.
+unbounded. `evaluations_done` is the sum of `trials_attempted`, including failed
+calls; legacy records fall back to `trials_completed` and then `warm_start_K`.
+Do not add these totals together.
 
 If a configured budget is exhausted, persist normal completion and return the
 compact status:

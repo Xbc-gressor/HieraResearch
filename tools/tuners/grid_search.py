@@ -122,11 +122,13 @@ def main() -> int:
     best_params = None
     best_score = math.inf
     trials_done = 0
+    trials_attempted = 0
     early_stopped = False
     early_stop_reason = "none"
     failure_refs = []
 
     for params in param_dicts:
+        trials_attempted += 1
         try:
             score = timed_eval(evaluate, make_model, params, args.candidate_path)
         except Exception as exc:
@@ -167,6 +169,7 @@ def main() -> int:
             "status": "failed",
             "reason": "all grid trials errored; no completed trial",
             "trials_completed": trials_done,
+            "trials_attempted": trials_attempted,
             "trials_planned": total,
             "early_stopped": early_stopped,
             "early_stop_reason": early_stop_reason,
@@ -185,6 +188,7 @@ def main() -> int:
         "best_params": best_params,
         "best_score": best_score,
         "trials_completed": trials_done,
+        "trials_attempted": trials_attempted,
         "trials_planned": total,
         "early_stopped": early_stopped,
         "early_stop_reason": early_stop_reason,

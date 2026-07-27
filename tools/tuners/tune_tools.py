@@ -18,7 +18,7 @@ Subcommands:
 - validate-params : a params dict's keys/bounds vs the candidate SEARCH_SPACE
                     -> {ok, violations}; exit 1 on any violation
 - summarize       : tune_report.json -> stored tuning summary {best_warm_score,
-                    final_best_score, trials_completed,
+                    final_best_score, trials_completed, trials_attempted,
                     elapsed_seconds}
 - check-search-space : proposed SEARCH_SPACE + survived configs -> {ok,
                     finalized_space, expansions, errors}; validates kinds vs the
@@ -425,16 +425,31 @@ def summarize(report: dict) -> dict:
         if isinstance(stage.get("elapsed_seconds"), (int, float)):
             elapsed += stage["elapsed_seconds"]
 
-    # trials_completed = TOTAL config->score validations for this candidate: the
-    # phase_a warm configs PLUS every new Phase-C trial (the injected warm priors
-    # are reused, never appended to a stage's `trials`, so they are not re-counted).
-    # It is a per-candidate total, so the run-level budget is simply
-    # Σ trials_completed over the ledger (see ledger.py `evaluations`) — never
-    # warm_start_K + trials_completed, which would double-count the warm evals.
+    # Completed trials are finite observations; attempted trials additionally
+    # include failed score_fn calls. The run-level budget uses attempted calls so
+    # crashes cannot disappear from accounting. Injected warm priors are reused
+    # and never appended to a Phase-C stage, so neither count double-counts them.
+    warm_trials = phase_a.get("warm_start_configs", [])
+    phase_a_attempted = phase_a.get("trials_attempted")
+    if not isinstance(phase_a_attempted, int) or isinstance(phase_a_attempted, bool) \
+            or phase_a_attempted < 0:
+        phase_a_attempted = len(warm_trials)
+    else:
+        phase_a_attempted = max(phase_a_attempted, len(warm_trials))
+    phase_c_attempted = sum(
+        len(stage.get("trials", []))
+        for stage in report.get("phase_c", {}).get("stages", [])
+    )
+    trials_completed = sum(1 for _ in _iter_trials(report))
+    trials_attempted = max(
+        phase_a_attempted + phase_c_attempted,
+        trials_completed,
+    )
     return {
         "best_warm_score": best_warm,
         "final_best_score": final,
-        "trials_completed": sum(1 for _ in _iter_trials(report)),
+        "trials_completed": trials_completed,
+        "trials_attempted": trials_attempted,
         "elapsed_seconds": round(elapsed, 1),
     }
 
@@ -460,6 +475,7 @@ def tuning_record(report: dict) -> dict:
         "phase_b_decision": None,  # kept as ledger schema fields, always None now
         "phase_c_method": phase_c_method,
         "trials_completed": summary["trials_completed"],
+        "trials_attempted": summary["trials_attempted"],
         "elapsed_seconds": summary["elapsed_seconds"],
         "applied": report.get("applied_to_base_params"),
     }

@@ -89,15 +89,24 @@ def main() -> int:
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
 
+    previous_report = read_tune_report(args.tune_report_json)
+    previous_phase_a = previous_report.get("phase_a", {})
+
     # Resume cache: configs already scored in a prior run, keyed by params. A
     # config the caller edited (config-invalid fix) gets new params → cache miss
     # → re-evaluated; a config that crashed has no score → re-evaluated; passed
     # configs are reused (not re-run, even after a code fix — fix-forward).
-    prev = read_tune_report(args.tune_report_json).get("phase_a", {}).get("warm_start_configs", [])
+    prev = previous_phase_a.get("warm_start_configs", [])
     cache = {_params_key(t["params"]): t["score"] for t in prev
              if isinstance(t.get("params"), dict) and is_finite_score(t.get("score"))}
+    trials_attempted = previous_phase_a.get("trials_attempted")
+    if not isinstance(trials_attempted, int) or isinstance(trials_attempted, bool) \
+            or trials_attempted < 0:
+        # Backward-compatible recovery for reports written before the explicit
+        # attempt counter: every persisted warm row came from one score_fn call.
+        trials_attempted = len(prev)
 
-    report = read_tune_report(args.tune_report_json)
+    report = previous_report
     report["phase_a"] = {
         "warm_start_configs": [],
         # deferred = proposed-but-not-evaluated-now; the deep-tuner evaluates these
@@ -105,6 +114,7 @@ def main() -> int:
         "deferred_configs": [{"params": cast_params_to_search_space(dict(d), search_space)}
                              for d in deferred],
         "search_space": search_space_for_json(search_space),
+        "trials_attempted": trials_attempted,
         "status": "running",
     }
     write_tune_report(args.tune_report_json, report)
@@ -117,6 +127,8 @@ def main() -> int:
         if key in cache:
             wsc.append({"params": params, "score": cache[key]})
         else:
+            trials_attempted += 1
+            report["phase_a"]["trials_attempted"] = trials_attempted
             try:
                 score = timed_eval(evaluate, make_model, params, args.candidate_path)
             except Exception as exc:
@@ -167,6 +179,7 @@ def main() -> int:
         "status": "ok",
         "k_evaluated": len(configs),
         "k_survived": len(wsc),
+        "trials_attempted": trials_attempted,
         "best_warm_score": best_warm_score,
         "best_warm_params": best_params,
         "elapsed_seconds": round(elapsed, 1),

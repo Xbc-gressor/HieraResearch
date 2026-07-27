@@ -60,7 +60,7 @@ def load_hc(d: Path):
 
 
 def load_exp(d: Path):
-    """framework: ledger records; evals = Σ(warm_start_K+trials_completed) cumulative;
+    """framework: ledger records; evals = Σ(trials_attempted) cumulative;
     score = final_best_score (fallback best_warm_score). Returns (evals, best, curve)."""
     f = d / "ledger.json"
     if not f.exists():
@@ -71,7 +71,11 @@ def load_exp(d: Path):
         return 0, INF, ([], [])
     cum, xs, ys, best = 0, [], [], INF
     for r in recs:
-        ev = (r.get("warm_start_K") or 0) + (r.get("trials_completed") or 0)
+        ev = r.get("trials_attempted")
+        if ev is None:
+            ev = r.get("trials_completed")
+        if ev is None:
+            ev = r.get("warm_start_K") or 0
         cum += ev
         s = r.get("final_best_score")
         if s is None:

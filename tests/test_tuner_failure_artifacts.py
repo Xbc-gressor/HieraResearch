@@ -101,6 +101,7 @@ class FailureArtifactTests(unittest.TestCase):
 
         self.assertEqual(select_best(report)["best_score"], 0.4)
         self.assertEqual(summarize(report)["trials_completed"], 1)
+        self.assertEqual(summarize(report)["trials_attempted"], 2)
 
     def test_non_finite_scores_are_not_successful_trials(self) -> None:
         report = {
@@ -129,6 +130,7 @@ class FailureArtifactTests(unittest.TestCase):
         self.assertEqual(select_best(report)["best_score"], 0.4)
         self.assertIsNone(summarize(report)["best_warm_score"])
         self.assertEqual(summarize(report)["trials_completed"], 1)
+        self.assertEqual(summarize(report)["trials_attempted"], 4)
         self.assertIsNone(
             select_candidate(
                 {
@@ -153,6 +155,27 @@ class FailureArtifactTests(unittest.TestCase):
                 read_prior_trials(report_path),
                 [{"params": {"depth": 3}, "score": 0.4}],
             )
+
+    def test_attempt_summary_preserves_warm_retries_and_phase_c_failures(self) -> None:
+        report = {
+            "phase_a": {
+                "warm_start_configs": [{"params": {"depth": 2}, "score": 0.4}],
+                "trials_attempted": 3,
+            },
+            "phase_c": {
+                "stages": [{
+                    "method": "bo",
+                    "trials": [
+                        {"params": {"depth": 3}, "score": None, "status": "failed"},
+                        {"params": {"depth": 4}, "score": 0.3},
+                    ],
+                }],
+            },
+        }
+
+        summary = summarize(report)
+        self.assertEqual(summary["trials_completed"], 2)
+        self.assertEqual(summary["trials_attempted"], 5)
 
     def test_timed_eval_rejects_non_finite_in_process_result(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-finite score"):

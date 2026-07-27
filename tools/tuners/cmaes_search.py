@@ -192,6 +192,8 @@ def main() -> int:
     best_params = dict(seed_params)
     best_score = math.inf
     evals = 0
+    trials_attempted = 0
+    trials_completed = 0
     any_success = False
     early_stopped = False
     early_stop_reason = "none"
@@ -208,6 +210,7 @@ def main() -> int:
     # the cmaes `evals` budget (cmaes still seeds x0 from the best evaluated prior).
     for d_params in read_deferred_configs(args.tune_report_json):
         params = cast_params_to_search_space(dict(d_params), search_space)
+        trials_attempted += 1
         try:
             score = timed_eval(evaluate, make_model, params, args.candidate_path)
         except Exception as exc:
@@ -227,6 +230,7 @@ def main() -> int:
             continue
         append_trial(args.tune_report_json, "cmaes", {"params": params, "score": score})
         any_success = True
+        trials_completed += 1
         if score < best_score:
             best_score, best_params = score, params
 
@@ -243,6 +247,7 @@ def main() -> int:
                 break
             params = decode(np.asarray(x))
             params = cast_params_to_search_space(params, search_space)
+            trials_attempted += 1
             try:
                 score = timed_eval(evaluate, make_model, params, args.candidate_path)
             except Exception as exc:
@@ -268,6 +273,7 @@ def main() -> int:
                 args.tune_report_json, "cmaes", {"params": params, "score": score}
             )
             any_success = True
+            trials_completed += 1
             # CMA-ES minimizes and scores are lower-is-better → fitness = score.
             fit = score
             results.append((x, fit))
@@ -301,7 +307,8 @@ def main() -> int:
             "method": "cmaes",
             "status": "failed",
             "reason": "all CMA-ES trials errored; no completed trial",
-            "trials_completed": evals,
+            "trials_completed": trials_completed,
+            "trials_attempted": trials_attempted,
             "prior_trials_seen": len(prior_trials),
             "popsize": args.popsize,
             "early_stopped": early_stopped,
@@ -320,7 +327,8 @@ def main() -> int:
         "status": "ok",
         "best_params": best_params,
         "best_score": best_score,
-        "trials_completed": evals,
+        "trials_completed": trials_completed,
+        "trials_attempted": trials_attempted,
         "prior_trials_seen": len(prior_trials),
         "x0_from_prior": best_prior is not None,
         "popsize": args.popsize,

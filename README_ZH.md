@@ -322,7 +322,7 @@ python tools/ledger.py set-tuning      ...   # 填充调优元数据 (extractor 
 python tools/ledger.py set-experience --background <background.md> ...   # 校验后写全局 experience 块
 python tools/ledger.py record-run      ...   # extractor/tuner 用 config-eval 最佳调用: 写 final_best_score + 计算 keep/discard/crash
 python tools/ledger.py percentile      ...   # 按字段的跨记录百分位 (tuner 门控 / select-candidate 使用; 只读)
-python tools/ledger.py evaluations     ...   # 预算检查: 跨记录的 Σ trials_completed
+python tools/ledger.py evaluations     ...   # 预算检查: 跨记录的 Σ trials_attempted（旧记录回退到 trials_completed）
 python tools/ledger.py loop-state      ...   # 从 ledger.json 重新生成 loop_state.md
 python tools/ledger.py show            ...   # 读取单个记录或整个账本
 ```

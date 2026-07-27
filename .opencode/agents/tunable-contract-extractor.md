@@ -158,6 +158,14 @@ config *low*, informed by lineage.
 `("categorical", [opts])`. A conservative region centered where you expect low
 scores. 
 
+`SEARCH_SPACE` is sampled as a Cartesian product, so every combination inside
+it must be executable. Do not expose two raw coordinates when one coordinate's
+valid values depend on the other (divisibility, ordering, shape compatibility,
+or a conditional range). Reparameterize to independent coordinates and derive
+the dependent value in `make_model` or the returned runnable object. For
+example, tune `device_batch_size` plus `grad_accum_steps` and derive the
+effective total batch instead of sampling both device and total batch sizes.
+
 Write both as JSON in `candidate_dir` (use `Write`):
 `_warm_configs.json` (the K dicts) and `_search_space.json` (each entry a JSON
 list, e.g. `{"depth": ["int", 3, 10]}`).
@@ -282,10 +290,14 @@ the success verdict.
 ### 3d. Abandon → record the candidate crashed
 
 ```bash
+python tools/ledger.py set-tuning --ledger <run_dir>/ledger.json --run-id <run_id> \
+  --from-report <candidate_dir>/tune_report.json
 python tools/ledger.py record-run --ledger <run_dir>/ledger.json --run-id <run_id> --status crash
 ```
 
-Return the crashed verdict; the main loop skips this candidate.
+Persist the failed calls before recording the crash so they consume the global
+evaluation budget. Return the crashed verdict; the main loop skips this
+candidate.
 
 ---
 
@@ -299,6 +311,7 @@ train_py: <absolute path>
 ledger_recorded: <yes | no>
 best_warm: <score | n/a>
 trials_completed: <int>
+trials_attempted: <int>
 n_dims: <int>
 checks: lint-schema=<ok|failed>; check-search-space=<ok|failed>
 fixes: code=<N>; config=<M>
