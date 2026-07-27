@@ -39,6 +39,7 @@ from _common import (  # noqa: E402
     resolve_score_fn,
     timed_eval,
     cast_params_to_search_space,
+    is_finite_score,
     load_candidate_modules,
     read_tune_report,
     search_space_for_json,
@@ -94,7 +95,7 @@ def main() -> int:
     # configs are reused (not re-run, even after a code fix — fix-forward).
     prev = read_tune_report(args.tune_report_json).get("phase_a", {}).get("warm_start_configs", [])
     cache = {_params_key(t["params"]): t["score"] for t in prev
-             if isinstance(t.get("score"), (int, float))}
+             if isinstance(t.get("params"), dict) and is_finite_score(t.get("score"))}
 
     report = read_tune_report(args.tune_report_json)
     report["phase_a"] = {

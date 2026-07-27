@@ -8,7 +8,7 @@ project = "tasks/autoresearch-baseline"
 [run]
 working_dir = "tasks/autoresearch-baseline"
 prepare_command = "uv run python prepare.py"
-timeout_seconds = 600
+timeout_seconds = 900
 
 [seed]
 target_count = 1

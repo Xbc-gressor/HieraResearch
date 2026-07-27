@@ -7,7 +7,8 @@ Imports the candidate's train.py + the task's prepare.py exactly as the tuners d
 (load_candidate_modules + resolve_score_fn), runs the single score_fn(make_model,
 params), and prints `RESULT:<float>` on stdout. Run in its own process group so the
 parent can hard-kill the whole tree on timeout. A non-finishing / erroring run
-prints nothing -> the parent treats it as +inf (crash).
+prints nothing -> the parent raises so the caller records a failed/crashed
+trial with a failure receipt.
 """
 import json
 import sys

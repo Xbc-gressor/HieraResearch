@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 
 from failure_artifacts import record_failure, render_failure  # noqa: E402
-from tune_tools import select_best, summarize  # noqa: E402
+from _common import is_finite_score, read_prior_trials, timed_eval  # noqa: E402
+from tune_tools import select_best, select_candidate, summarize  # noqa: E402
 
 
 TRACEBACK = """Traceback (most recent call last):
@@ -98,6 +101,94 @@ class FailureArtifactTests(unittest.TestCase):
 
         self.assertEqual(select_best(report)["best_score"], 0.4)
         self.assertEqual(summarize(report)["trials_completed"], 1)
+
+    def test_non_finite_scores_are_not_successful_trials(self) -> None:
+        report = {
+            "phase_a": {
+                "warm_start_configs": [
+                    {"params": {"depth": 1}, "score": float("inf")},
+                    {"params": {"depth": 2}, "score": float("nan")},
+                    {"params": {"depth": 3}, "score": 0.4},
+                ],
+                "best_warm_score": float("inf"),
+            },
+            "phase_c": {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "trials": [
+                            {"params": {"depth": 4}, "score": float("-inf")},
+                        ],
+                    }
+                ]
+            },
+        }
+
+        self.assertFalse(is_finite_score(float("inf")))
+        self.assertFalse(is_finite_score(float("nan")))
+        self.assertEqual(select_best(report)["best_score"], 0.4)
+        self.assertIsNone(summarize(report)["best_warm_score"])
+        self.assertEqual(summarize(report)["trials_completed"], 1)
+        self.assertIsNone(
+            select_candidate(
+                {
+                    "records": [
+                        {
+                            "run_id": "000",
+                            "status": "keep",
+                            "best_warm_score": float("inf"),
+                            "tune": False,
+                        }
+                    ]
+                },
+                n_min=1,
+                top_percentile=0,
+            )["run_id"]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "tune_report.json"
+            report_path.write_text(json.dumps(report))
+            self.assertEqual(
+                read_prior_trials(report_path),
+                [{"params": {"depth": 3}, "score": 0.4}],
+            )
+
+    def test_timed_eval_rejects_non_finite_in_process_result(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-finite score"):
+            timed_eval(
+                lambda make_model, params: float("inf"),
+                object(),
+                {},
+                Path("/tmp/no-framework-config/candidate.py"),
+            )
+
+    @mock.patch("_common.read_runtime_limit", return_value=5)
+    @mock.patch("_common.subprocess.Popen")
+    def test_timed_eval_surfaces_child_process_error(self, popen, _read_limit) -> None:
+        process = popen.return_value
+        process.communicate.return_value = ("training output", "ValueError: child failed")
+        process.returncode = 1
+
+        with self.assertRaisesRegex(RuntimeError, "child failed"):
+            timed_eval(object(), object(), {}, Path("/tmp/candidate.py"))
+
+    @mock.patch("_common.read_runtime_limit", return_value=5)
+    @mock.patch("_common.subprocess.Popen")
+    @mock.patch("_common.os.killpg")
+    @mock.patch("_common.os.getpgid", return_value=1234)
+    def test_timed_eval_surfaces_timeout(
+        self, _getpgid, _killpg, popen, _read_limit
+    ) -> None:
+        process = popen.return_value
+        process.pid = 1234
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="eval", timeout=5),
+            ("", ""),
+        ]
+
+        with self.assertRaisesRegex(TimeoutError, "per_runtime_limit=5s"):
+            timed_eval(object(), object(), {}, Path("/tmp/candidate.py"))
 
 
 if __name__ == "__main__":

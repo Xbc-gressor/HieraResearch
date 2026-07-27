@@ -27,6 +27,7 @@ import shutil
 from pathlib import Path
 
 from semantic_space import DEFAULT_DIMENSION_STRATEGY, DIMENSION_STRATEGIES
+from validate_tasks import parse_task_toml
 
 
 SEMANTIC_ARTIFACTS = ("dimension_catalog.json", "background.md", "ledger.json")
@@ -40,6 +41,19 @@ def _read_framework_config(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: framework config must be an object")
     return value
+
+
+def _task_runtime_limit(repo_root: Path, task_name: str) -> float | None:
+    """Read the maintained task's default per-evaluation wall-clock limit."""
+    task_toml = repo_root / "tasks" / task_name / "task.toml"
+    if not task_toml.is_file():
+        return None
+    try:
+        value = parse_task_toml(task_toml).get("run", {}).get("timeout_seconds")
+        value = float(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 def initialize_run(
@@ -58,6 +72,7 @@ def initialize_run(
 
     template = repo_root / "tasks" / "framework_cfg.example.json"
     target = run_dir / "framework_cfg.json"
+    target_existed = target.exists()
     if template.exists():
         if not target.exists():
             shutil.copy2(template, target)
@@ -74,6 +89,12 @@ def initialize_run(
             "skipping framework_cfg.json copy."
         )
         print("  → Framework will use code defaults.")
+
+    # New runs inherit a task-appropriate limit instead of blindly retaining
+    # the generic template's 60 seconds. Existing run-local choices remain
+    # untouched, and an explicit --timeout still wins.
+    if per_runtime_limit is None and not target_existed:
+        per_runtime_limit = _task_runtime_limit(repo_root, task_name)
 
     if (
         dimension_strategy is not None

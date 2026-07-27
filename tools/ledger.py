@@ -223,7 +223,9 @@ def _best_kept_value(data: dict, exclude_run_id: Optional[str] = None) -> Option
     values = [
         r["final_best_score"]
         for r in data["records"]
-        if r.get("status") == "keep" and isinstance(r.get("final_best_score"), (int, float))
+        if r.get("status") == "keep"
+        and isinstance(r.get("final_best_score"), (int, float))
+        and math.isfinite(float(r["final_best_score"]))
         and r.get("run_id") != exclude_run_id
     ]
     return min(values) if values else None
@@ -236,7 +238,7 @@ def _best_kept_record(data: dict) -> Optional[dict]:
         if record.get("status") != "keep":
             continue
         value = record.get("final_best_score")
-        if not isinstance(value, (int, float)):
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             continue
         if _is_improvement(value, best_value):
             best_value = value
@@ -265,9 +267,15 @@ def _percentile(data: dict, run_id: str, field: str) -> dict:
     priors = [
         r[field]
         for r in data["records"]
-        if r.get("run_id") != run_id and isinstance(r.get(field), (int, float))
+        if r.get("run_id") != run_id
+        and isinstance(r.get(field), (int, float))
+        and math.isfinite(float(r[field]))
     ]
-    if not isinstance(value, (int, float)) or not priors:
+    if (
+        not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not priors
+    ):
         return {"value": value, "count_prior": len(priors), "percentile": None}
     below = sum(1 for p in priors if p > value)
     return {

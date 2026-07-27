@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import signal
 import subprocess
@@ -49,6 +50,19 @@ from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 
 REQUIRED_SYMBOLS = ("BASE_PARAMS", "SEARCH_SPACE", "make_model")
 DEFAULT_SCORE_FN = "evaluate_config"
+
+
+def is_finite_score(value: Any) -> bool:
+    """Whether ``value`` is a real, finite tuner score.
+
+    JSON's Python implementation accepts Infinity/NaN as floats, so a numeric
+    type check alone is insufficient at every report/cache boundary.
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def load_candidate_modules(candidate_path: Path) -> tuple[Any, Any]:
@@ -169,13 +183,17 @@ def timed_eval(evaluate, make_model, params: dict, candidate_path: Any) -> float
 
     No limit -> call `evaluate(make_model, params)` in-process (fast path, no
     overhead). With a limit -> run the eval in a fresh subprocess in its own
-    process group (`_eval_one.py`), hard-killing the whole tree on timeout and
-    scoring it `+inf` (a too-slow config is treated as a crash). Scores are
-    lower-is-better, so +inf is the worst possible — the tuner discards it.
+    process group (`_eval_one.py`) and hard-kill the whole tree on timeout.
+    Timeouts, child-process errors, missing results, and non-finite scores raise
+    so callers record an auditable failed trial instead of caching ``+inf`` as
+    if it were a successful score.
     """
     limit = read_runtime_limit(candidate_path)
     if limit is None:
-        return float(evaluate(make_model, params))
+        score = float(evaluate(make_model, params))
+        if not is_finite_score(score):
+            raise ValueError(f"evaluation returned non-finite score: {score!r}")
+        return score
     eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
     posix = os.name == "posix"
     kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
@@ -186,7 +204,7 @@ def timed_eval(evaluate, make_model, params: dict, candidate_path: Any) -> float
     proc = subprocess.Popen(
         [sys.executable, eval_one, str(candidate_path), json.dumps(params)], **kwargs)
     try:
-        out, _ = proc.communicate(timeout=limit)
+        out, err = proc.communicate(timeout=limit)
     except subprocess.TimeoutExpired:
         try:
             if posix:
@@ -199,14 +217,29 @@ def timed_eval(evaluate, make_model, params: dict, candidate_path: Any) -> float
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-        return float("inf")          # exceeded per_runtime_limit -> crash
+        raise TimeoutError(
+            f"evaluation exceeded per_runtime_limit={limit:g}s"
+        ) from None
     for line in out.splitlines():
         if line.startswith("RESULT:"):
             try:
-                return float(line[len("RESULT:"):])
+                score = float(line[len("RESULT:"):])
             except ValueError:
-                return float("inf")
-    return float("inf")              # child errored / printed no result -> crash
+                raise ValueError(f"evaluation subprocess printed invalid result: {line!r}") from None
+            if not is_finite_score(score):
+                raise ValueError(f"evaluation returned non-finite score: {score!r}")
+            return score
+
+    detail = err.strip()
+    if len(detail) > 4000:
+        detail = "...[stderr truncated]...\n" + detail[-4000:]
+    message = (
+        f"evaluation subprocess exited with code {proc.returncode} "
+        "without a RESULT line"
+    )
+    if detail:
+        message += f"\nchild stderr:\n{detail}"
+    raise RuntimeError(message)
 
 
 def cast_params_to_search_space(params: dict, search_space: dict) -> dict:
@@ -316,7 +349,12 @@ def read_prior_trials(report_path: Path) -> list[dict]:
     trials.extend(phase_a.get("warm_start_configs", []))
     for stage in report.get("phase_c", {}).get("stages", []):
         trials.extend(stage.get("trials", []))
-    return trials
+    return [
+        trial
+        for trial in trials
+        if isinstance(trial.get("params"), dict)
+        and is_finite_score(trial.get("score"))
+    ]
 
 
 def read_deferred_configs(report_path: Path) -> list[dict]:
@@ -367,6 +405,6 @@ def prior_best_score(prior_trials: list[dict]) -> float | None:
     scores = [
         t["score"]
         for t in prior_trials
-        if isinstance(t.get("score"), (int, float))
+        if is_finite_score(t.get("score"))
     ]
     return min(scores) if scores else None

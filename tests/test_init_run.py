@@ -14,11 +14,17 @@ from init_run import initialize_run  # noqa: E402
 
 
 class InitRunDimensionStrategyTests(unittest.TestCase):
-    def _repo(self, root: Path) -> None:
+    def _repo(self, root: Path, *, task_timeout: int | None = None) -> None:
         tasks = root / "tasks"
         tasks.mkdir()
         template = json.loads((ROOT / "tasks" / "framework_cfg.example.json").read_text())
         (tasks / "framework_cfg.example.json").write_text(json.dumps(template))
+        if task_timeout is not None:
+            task = tasks / "toy"
+            task.mkdir()
+            (task / "task.toml").write_text(
+                f"[run]\ntimeout_seconds = {task_timeout}\n"
+            )
 
     def _strategy(self, run_dir: Path) -> str:
         config = json.loads((run_dir / "framework_cfg.json").read_text())
@@ -48,6 +54,16 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             )
 
             self.assertEqual(self._strategy(run_dir), "llm_induced")
+
+    def test_new_run_inherits_task_runtime_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root, task_timeout=900)
+
+            run_dir = initialize_run(repo_root, "toy", "task-timeout")
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(config["per_runtime_limit"], 900)
 
     def test_same_strategy_is_idempotent_after_artifacts_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

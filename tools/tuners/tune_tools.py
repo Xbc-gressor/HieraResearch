@@ -380,13 +380,21 @@ def _iter_trials(report: dict):
     env-free."""
     phase_a = report.get("phase_a", {})
     for warm in phase_a.get("warm_start_configs", []):
-        if isinstance(warm.get("score"), (int, float)):
+        if _is_finite_score(warm.get("score")):
             yield ("warm_start", warm["params"], float(warm["score"]))
     for stage in report.get("phase_c", {}).get("stages", []):
         method = stage.get("method", "phase_c")
         for trial in stage.get("trials", []):
-            if isinstance(trial.get("score"), (int, float)):
+            if _is_finite_score(trial.get("score")):
                 yield (method, trial["params"], float(trial["score"]))
+
+
+def _is_finite_score(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def select_best(report: dict) -> dict:
@@ -406,6 +414,9 @@ def summarize(report: dict) -> dict:
     elapsed_seconds/status)."""
     phase_a = report.get("phase_a", {})
     final = select_best(report)["best_score"]
+    best_warm = phase_a.get("best_warm_score")
+    if not _is_finite_score(best_warm):
+        best_warm = None
 
     elapsed = 0.0
     if isinstance(phase_a.get("elapsed_seconds"), (int, float)):
@@ -421,7 +432,7 @@ def summarize(report: dict) -> dict:
     # Σ trials_completed over the ledger (see ledger.py `evaluations`) — never
     # warm_start_K + trials_completed, which would double-count the warm evals.
     return {
-        "best_warm_score": phase_a.get("best_warm_score"),
+        "best_warm_score": best_warm,
         "final_best_score": final,
         "trials_completed": sum(1 for _ in _iter_trials(report)),
         "elapsed_seconds": round(elapsed, 1),
@@ -664,7 +675,7 @@ def select_candidate(ledger: dict, *, n_min: int = DEFAULT_N_MIN,
     candidate's best_warm_score ranks in the top (100-top_percentile)% across all
     candidates. Greedy on best_warm_score. Returns {run_id|None, reason, ...}."""
     cands = [r for r in ledger.get("records", [])
-             if r.get("status") != "crash" and isinstance(r.get("best_warm_score"), (int, float))]
+             if r.get("status") != "crash" and _is_finite_score(r.get("best_warm_score"))]
     n = len(cands)
     if n < n_min:
         return {"run_id": None, "n_candidates": n,

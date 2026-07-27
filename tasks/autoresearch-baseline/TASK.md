@@ -57,11 +57,11 @@ Rules:
 - One candidate strategy per `train.py`; do not enumerate competing candidates.
 
 Evaluation cost: one config eval is one full budgeted training run (~300 s of
-training plus startup/compilation and the final eval). Set
-`init_run.py --timeout` (the per-config `per_runtime_limit` hard kill) to ≈900 s
-for this task, and consider lowering `tuner.K` / `tuner.K_eval` in
-`framework_cfg.json` — the defaults cost 3 full training runs per candidate at
-step 0+1.
+training plus startup/compilation and the final eval). New runs inherit this
+task's 900 s `run.timeout_seconds` as their per-config `per_runtime_limit`;
+`init_run.py --timeout` may override it. Consider lowering `tuner.K` /
+`tuner.K_eval` in `framework_cfg.json` — the defaults cost 3 full training runs
+per candidate at step 0+1.
 
 ## Files
 
