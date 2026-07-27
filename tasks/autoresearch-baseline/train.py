@@ -1,7 +1,13 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
+Autoresearch pretraining candidate. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+
+Tuner contract: `make_model(env, params)` builds a trainer whose `run()`
+executes one full budgeted training run and returns the post-training
+`val_bpb`. `prepare.evaluate_config` is the ONE scoring surface for the
+experiment loop. Standalone usage (manual runs and autoresearch-hillclimb):
+`uv run train.py` runs `DEFAULT_PARAMS` through the identical path and prints
+the parseable summary.
 """
 
 import os
@@ -17,13 +23,62 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+from prepare import PretrainEnv
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+# ---------------------------------------------------------------------------
+# Tuner contract: tunable keys (PARAM_SCHEMA) + the safe-baseline config
+# (DEFAULT_PARAMS = the original hyperparameter values). SEARCH_SPACE and
+# BASE_PARAMS are written later per candidate by tunable-contract-extractor /
+# warmstart_eval — do not add them here.
+# ---------------------------------------------------------------------------
+
+PARAM_SCHEMA = {
+    "depth": "int",
+    "device_batch_size": "int",
+    "total_batch_size": "int",
+    "embedding_lr": ("float", "log"),
+    "unembedding_lr": ("float", "log"),
+    "matrix_lr": ("float", "log"),
+    "scalar_lr": ("float", "log"),
+    "weight_decay": "float",
+    "warmup_ratio": "float",
+    "warmdown_ratio": "float",
+    "final_lr_frac": "float",
+}
+
+DEFAULT_PARAMS = {
+    "depth": 8,                 # number of transformer layers
+    "device_batch_size": 128,   # per-device batch size (reduce if OOM)
+    "total_batch_size": 2**19,  # ~524K tokens per optimizer step
+    "embedding_lr": 0.6,        # learning rate for token embeddings (Adam)
+    "unembedding_lr": 0.004,    # learning rate for lm_head (Adam)
+    "matrix_lr": 0.04,          # learning rate for matrix parameters (Muon)
+    "scalar_lr": 0.5,           # learning rate for per-layer scalars (Adam)
+    "weight_decay": 0.2,        # cautious weight decay for Muon
+    "warmup_ratio": 0.0,        # fraction of time budget for LR warmup
+    "warmdown_ratio": 0.5,      # fraction of time budget for LR warmdown
+    "final_lr_frac": 0.0,       # final LR as fraction of initial
+}
+
+# Structural constants: part of the candidate's architecture/strategy code
+# (changed by ideas, not by the numeric tuner).
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 128          # target head dimension for attention
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+ADAM_BETAS = (0.8, 0.95)  # Adam beta1, beta2
+
+# Flash-attention kernel, loaded lazily inside make_model so that importing
+# this module stays CPU-safe (the tuners import every candidate train.py).
+fa3 = None
+
+def _load_fa3():
+    global fa3
+    if fa3 is None:
+        from kernels import get_kernel
+        cap = torch.cuda.get_device_capability()
+        # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+        repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+        fa3 = get_kernel(repo).flash_attn_interface
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -426,205 +481,222 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_muon(group)
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
+# Tuner contract: make_model + Trainer (one budgeted training run)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-
-# Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
-
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
-
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
-
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
-
-def build_model_config(depth):
+def build_model_config(depth, vocab_size, sequence_len):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+        sequence_len=sequence_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
+def make_model(env, params):
+    """Build the candidate trainer from the fixed env + tunable params.
 
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+    `env` is the task-defined `prepare.PretrainEnv`; `params` carries the
+    PARAM_SCHEMA keys (missing keys fall back to DEFAULT_PARAMS). Returns a
+    Trainer whose `run()` performs one full budgeted training run and returns
+    the post-training val_bpb."""
+    _load_fa3()
+    merged = {**DEFAULT_PARAMS, **(params or {})}
+    return Trainer(env, merged)
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
+class Trainer:
+    """One budgeted pretraining run. Holds no trained state until `run()`."""
 
-model = torch.compile(model, dynamic=False)
+    def __init__(self, env, params):
+        self.env = env
+        self.params = params
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+    def run(self):
+        env, p = self.env, self.params
+        budget = env.train_budget_seconds
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+        t_start = time.time()
+        torch.manual_seed(env.seed)
+        torch.cuda.manual_seed(env.seed)
+        torch.set_float32_matmul_precision("high")
+        device = torch.device(env.device)
+        autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        H100_BF16_PEAK_FLOPS = 989.5e12
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+        tokenizer = env.tokenizer
+        vocab_size = env.vocab_size
+        print(f"Vocab size: {vocab_size:,}")
 
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        config = build_model_config(p["depth"], vocab_size, env.max_seq_len)
+        print(f"Model config: {asdict(config)}")
 
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+        with torch.device("meta"):
+            model = GPT(config)
+        model.to_empty(device=device)
+        model.init_weights()
 
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+        param_counts = model.num_scaling_params()
+        print("Parameter counts:")
+        for key, value in param_counts.items():
+            print(f"  {key:24s}: {value:,}")
+        num_params = param_counts['total']
+        num_flops_per_token = model.estimate_flops()
+        print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+        total_batch_size = p["total_batch_size"]
+        device_batch_size = p["device_batch_size"]
+        tokens_per_fwdbwd = device_batch_size * env.max_seq_len
+        assert total_batch_size % tokens_per_fwdbwd == 0, (
+            f"total_batch_size ({total_batch_size}) must be a multiple of "
+            f"device_batch_size * max_seq_len ({tokens_per_fwdbwd})"
+        )
+        grad_accum_steps = total_batch_size // tokens_per_fwdbwd
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+        optimizer = model.setup_optimizer(
+            unembedding_lr=p["unembedding_lr"],
+            embedding_lr=p["embedding_lr"],
+            scalar_lr=p["scalar_lr"],
+            adam_betas=ADAM_BETAS,
+            matrix_lr=p["matrix_lr"],
+            weight_decay=p["weight_decay"],
+        )
 
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
+        model = torch.compile(model, dynamic=False)
+
+        train_loader = env.make_dataloader(tokenizer, device_batch_size, env.max_seq_len, "train")
+        x, y, epoch = next(train_loader)  # prefetch first batch
+
+        print(f"Time budget: {budget}s")
+        print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+        # Schedules (all based on progress = training_time / budget)
+
+        def get_lr_multiplier(progress):
+            warmup_ratio = p["warmup_ratio"]
+            if progress < warmup_ratio:
+                return progress / warmup_ratio if warmup_ratio > 0 else 1.0
+            elif progress < 1.0 - p["warmdown_ratio"]:
+                return 1.0
+            else:
+                cooldown = (1.0 - progress) / p["warmdown_ratio"]
+                return cooldown * 1.0 + (1 - cooldown) * p["final_lr_frac"]
+
+        def get_muon_momentum(step):
+            frac = min(step / 300, 1)
+            return (1 - frac) * 0.85 + frac * 0.95
+
+        def get_weight_decay(progress):
+            return p["weight_decay"] * (1 - progress)
+
+        # -------------------------------------------------------------------
+        # Training loop
+        # -------------------------------------------------------------------
+
+        t_start_training = time.time()
+        smooth_train_loss = 0
+        total_training_time = 0
+        step = 0
+
+        while True:
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for micro_step in range(grad_accum_steps):
+                with autocast_ctx:
+                    loss = model(x, y)
+                train_loss = loss.detach()
+                loss = loss / grad_accum_steps
+                loss.backward()
+                x, y, epoch = next(train_loader)
+
+            # Progress and schedules
+            progress = min(total_training_time / budget, 1.0)
+            lrm = get_lr_multiplier(progress)
+            muon_momentum = get_muon_momentum(step)
+            muon_weight_decay = get_weight_decay(progress)
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
+                if group['kind'] == 'muon':
+                    group["momentum"] = muon_momentum
+                    group["weight_decay"] = muon_weight_decay
+            optimizer.step()
+            model.zero_grad(set_to_none=True)
+
+            train_loss_f = train_loss.item()
+
+            # Fast fail: abort if loss is exploding or NaN (recorded as crash)
+            if math.isnan(train_loss_f) or train_loss_f > 100:
+                raise RuntimeError(f"training diverged at step {step}: loss={train_loss_f}")
+
+            torch.cuda.synchronize()
+            t1 = time.time()
+            dt = t1 - t0
+
+            if step > 10:
+                total_training_time += dt
+
+            # Logging
+            ema_beta = 0.9
+            smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+            debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+            pct_done = 100 * progress
+            tok_per_sec = int(total_batch_size / dt)
+            mfu = 100 * num_flops_per_token * total_batch_size / dt / H100_BF16_PEAK_FLOPS
+            remaining = max(0, budget - total_training_time)
+
+            print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+            # GC management (Python's GC causes ~500ms stalls)
+            if step == 0:
+                gc.collect()
+                gc.freeze()
+                gc.disable()
+            elif (step + 1) % 5000 == 0:
+                gc.collect()
+
+            step += 1
+
+            # Time's up — but only stop after warmup steps so we don't count compilation
+            if step > 10 and total_training_time >= budget:
+                break
+
+        print()  # newline after \r training log
+
+        total_tokens = step * total_batch_size
+
+        # Final eval
+        model.eval()
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next(train_loader)
+            val_bpb = env.evaluate_bpb(model, tokenizer, device_batch_size)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+        # Final summary
+        t_end = time.time()
+        startup_time = t_start_training - t_start
+        steady_state_mfu = 100 * num_flops_per_token * total_batch_size * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+        peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-    train_loss_f = train_loss.item()
+        print("---")
+        print(f"val_bpb:          {val_bpb:.6f}")
+        print(f"training_seconds: {total_training_time:.1f}")
+        print(f"total_seconds:    {t_end - t_start:.1f}")
+        print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+        print(f"mfu_percent:      {steady_state_mfu:.2f}")
+        print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+        print(f"num_steps:        {step}")
+        print(f"num_params_M:     {num_params / 1e6:.1f}")
+        print(f"depth:            {p['depth']}")
 
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
-
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-
-    if step > 10:
-        total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
+        # Release CUDA memory so sequential in-process evals start clean
+        # (a no-op for the standalone run, which exits right after).
+        del model, optimizer
+        gc.enable()
         gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
+        torch.cuda.empty_cache()
 
-    step += 1
+        return val_bpb
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
 
-print()  # newline after \r training log
-
-total_tokens = step * TOTAL_BATCH_SIZE
-
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
-
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+if __name__ == "__main__":
+    make_model(PretrainEnv(), DEFAULT_PARAMS).run()

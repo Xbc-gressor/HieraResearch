@@ -83,9 +83,14 @@ candidate from tunable choices. The first argument's name and shape, and the
 returned object's interface, are **task-defined**: use exactly what the task's
 `## Evaluation Contract` declares (`dataset` → sklearn-style estimator for the
 tabular tasks; `problem` → an optimizer object with `run() -> float` for
-`es-optimization-design`). The symbol name `make_model` and the `params` dict
+`es-optimization-design`; `env` → a trainer object with `run() -> float`
+returning the post-training `val_bpb` for `autoresearch-baseline`). The symbol
+name `make_model` and the `params` dict
 are the only framework-wide parts. Move inline construction (in `run_candidate` /
 `main` / loops / helpers) behind `make_model`, driven by `params`.
+`autoresearch-baseline`'s provided seed `train.py` already carries
+`make_model` + `PARAM_SCHEMA` — for it, segment ① is verification-only: keep
+the existing structure and original values, and go straight to the lint gate.
 
 **Do NOT write `SEARCH_SPACE` or `BASE_PARAMS` here.** `PARAM_SCHEMA` declares
 per tunable key only its **kind** (+ categorical options):

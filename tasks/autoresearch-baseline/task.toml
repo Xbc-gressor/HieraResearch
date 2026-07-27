@@ -16,11 +16,13 @@ provided = ["train.py"]
 entrypoint = "train.py"
 tune = false
 
-# The single score_fn. This legacy task scores a full training run
-# (evaluate_bpb(model, ...), model->score), NOT the generic config->score tuner
-# contract, so it is not run through the S-GoT tuner. Semantics live in TASK.md.
+# The single config->score evaluation function. Semantics + hard rules live in
+# TASK.md's `## Evaluation Contract`. score_fn(make_model, params) -> float,
+# lower-is-better; it is the ONE surface (warm-start eval + Phase C tuning) for
+# the experiment loop. The standalone `python train.py` run (manual/hillclimb)
+# still prints the summary parsed via [result].
 [evaluation]
-score_fn = "evaluate_bpb"
+score_fn = "evaluate_config"
 
 [result]
 metric = "val_bpb"

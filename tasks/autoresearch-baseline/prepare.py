@@ -365,6 +365,46 @@ def evaluate_bpb(model, tokenizer, batch_size):
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
+# The single config -> score evaluation
+# ---------------------------------------------------------------------------
+
+class PretrainEnv:
+    """The fixed task environment handed to a candidate's `make_model`.
+
+    Everything a candidate may use lives here: the fixed tokenizer, the fixed
+    dataloader factory, the fixed metric, and the fixed run constants. The
+    training-time budget (`train_budget_seconds`) is self-enforced by the
+    candidate's training loop exactly as in the standalone script (counted
+    after warmup steps; startup and compilation excluded)."""
+
+    def __init__(self):
+        self.tokenizer = Tokenizer.from_directory()
+        self.make_dataloader = make_dataloader
+        self.evaluate_bpb = evaluate_bpb
+        self.max_seq_len = MAX_SEQ_LEN
+        self.train_budget_seconds = TIME_BUDGET
+        self.vocab_size = self.tokenizer.get_vocab_size()
+        self.device = "cuda"
+        self.seed = 42
+
+
+def evaluate_config(make_model, params: dict) -> float:
+    """The single `config -> score` evaluation (lower is better).
+
+    Builds the fixed PretrainEnv, constructs the candidate's trainer via
+    `make_model(env, params)`, and runs one full budgeted training run. The
+    trainer's returned post-training val_bpb IS the candidate's score — there
+    is no separate official run (warm-start eval and Phase-C tuning both call
+    this). A non-finite result raises so the eval is recorded as a crash."""
+    env = PretrainEnv()
+    trainer = make_model(env, params)
+    val_bpb = float(trainer.run())
+    if not math.isfinite(val_bpb):
+        raise ValueError(f"trainer returned non-finite val_bpb: {val_bpb!r}")
+    return val_bpb
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
