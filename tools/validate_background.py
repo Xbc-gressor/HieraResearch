@@ -1690,7 +1690,12 @@ def main() -> int:
     experience_ledger["experience"] = experience
     context = build_gain_context(fresh_proposals, experience_ledger)
     assert context["experience_receipt"]["generation"] == 0
-    assert {item["run_id"] for item in context["cited_records"]} == {"000", "001"}
+    assert {item["run_id"] for item in context["cited_records"]} == {
+        "000",
+        "001",
+        "003",
+    }
+    assert context["cited_edges"][0]["edge_id"] == "sedge-001-003"
     assert context["experience_evidence_edge_ids"] == ["sedge-001-003"]
     conditioned = {
         "schema_version": 2,

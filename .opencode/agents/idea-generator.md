@@ -42,7 +42,7 @@ You receive one `run_dir`. Infer the task and read only:
 - `tasks/<task>/TASK.md` and `task.toml`;
 - `tools/ledger.py brief` and action-local parent records;
 - `tools/background_contract.py render` (bounded hierarchy and coverage);
-- the bounded ledger `experience` block when present;
+- the `gain-context.json` bounded experience view generated below when needed;
 - the proposal file for the current action.
 
 Do not read candidate code, full run logs, the full global DAG, or raw retrieval
@@ -163,6 +163,11 @@ Read the bounded background render, action-local parent records, proposals,
 and `gain-context.json`. Write schema-2 `predictions.json` with one entry for
 every proposal:
 
+`gain-context.json` is the sole bounded source for experience adjustments.
+Action-local parents are separate inputs to the background/mechanism prior;
+never treat an uncited parent as experience. Use live warm/final/tuning fields
+only for cited runs or endpoints of cited semantic edges.
+
 ```json
 {
   "schema_version": 2,
@@ -205,25 +210,29 @@ Use a consistent `[0,1]` rubric:
   required for `gain` and `gain_uncertainty`; omit the field entirely for
   `gain_uncertainty_nocost` (its schema rejects a `cost` field);
 - `experience_run_ids` / `experience_edge_ids`: cite up to five terminal runs
-  and five semantic edges carried by the current experience; at least one run
-  or edge is required, and `experience_rationale` briefly explains its
-  numerical effect;
+  and five semantic edges carried by the current experience; when the context
+  carries conditioning evidence, at least one run or edge is required and
+  `experience_rationale` briefly explains its numerical effect;
 - `evidence`: concrete hypothesis ids, parent/run ids, or bounded belief
   receipts. Use 1–5 short strings (at most 240 characters each).
 
-When an experience snapshot exists, it must change at least one of gain or
-uncertainty for every proposal. Weak, indirect, or confounded history may make
-only a small adjustment, but must not be acknowledged without changing either
-number. Same-point implementation failures primarily raise uncertainty unless
-comparator-covered semantic edges support a gain revision. Promising,
-mixed/unpromising, feasibility, and bottleneck beliefs must be interpreted
-according to their confidence and attribution limits; do not cherry-pick only
-the current best run.
+When the snapshot carries conditioning evidence, it must change at least one
+of gain or uncertainty for every proposal by at least `0.01`. Weak, indirect,
+or confounded history may justify the minimum adjustment, but must not be
+acknowledged without changing either number. Same-point implementation
+failures primarily raise uncertainty unless comparator-covered semantic edges
+support a gain revision. Use `tuned`, `warm_to_final_delta`, and
+`same_point_parent_run_ids` in cited records to distinguish tuning gains from
+semantic evidence; `warm_to_final_delta` is final minus warm, so a negative
+value is an inner-tuning improvement. Promising, mixed/unpromising,
+feasibility, and bottleneck beliefs must be interpreted according to their
+confidence and attribution limits; do not cherry-pick only the current best
+run.
 
-When no experience exists, copy the null experience receipt from
-`gain-context.json`, use empty `experience_run_ids`, and set both adjustments
-to exactly `0.0`. Also use empty `experience_edge_ids`; the prior and final
-values are then equal.
+When both `experience_evidence_run_ids` and `experience_evidence_edge_ids` in
+`gain-context.json` are empty, copy its exact experience receipt (which may
+still identify a valid snapshot), use empty per-prediction citation lists, and
+set both adjustments to exactly `0.0`; prior and final values are then equal.
 
 These are auditable rubric estimates, not calibrated Bayesian posteriors. Run:
 

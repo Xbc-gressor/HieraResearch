@@ -42,12 +42,52 @@ MAX_HYPOTHESIS_TARGETS = 32
 MIN_EDGES_PER_TARGET = 2
 MAX_EDGES_PER_TARGET = 5
 MAX_RUNS_PER_TARGET = 5
+MIN_EXPERIENCE_ADJUSTMENT = 0.01
 
 COVERAGE_KEYS = ("direct_noncrash_edges", "confounded_noncrash_edges", "crash_edges")
 
 
 class SemanticEvidenceError(ValueError):
     """A malformed semantic edge receipt or evidence-view request."""
+
+
+def experience_cited_ids(experience: Any) -> tuple[set[str], set[str]]:
+    """Return the run and semantic-edge receipts carried by bounded experience.
+
+    This is the shared trust boundary for gain-context rendering, prediction
+    validation, and candidate admission.  Keep collection mechanics here so
+    producer and consumers cannot silently diverge as experience schema 3
+    evolves.
+    """
+    if not isinstance(experience, dict):
+        return set(), set()
+    run_ids: set[str] = set()
+    edge_ids: set[str] = set()
+    for field in ("promising_regions", "lessons", "bottlenecks"):
+        for item in experience.get(field, []):
+            if isinstance(item, dict) and isinstance(item.get("evidence"), list):
+                run_ids.update(
+                    run_id
+                    for run_id in item["evidence"]
+                    if isinstance(run_id, str)
+                )
+    for field in ("dimension_evidence", "hypothesis_evidence"):
+        for item in experience.get(field, []):
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("evidence_run_ids"), list):
+                run_ids.update(
+                    run_id
+                    for run_id in item["evidence_run_ids"]
+                    if isinstance(run_id, str)
+                )
+            if isinstance(item.get("evidence_edge_ids"), list):
+                edge_ids.update(
+                    edge_id
+                    for edge_id in item["evidence_edge_ids"]
+                    if isinstance(edge_id, str)
+                )
+    return run_ids, edge_ids
 
 
 def _change_class(changes: list[dict[str, Any]]) -> str:

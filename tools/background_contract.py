@@ -42,6 +42,7 @@ from semantic_evidence import (
     MAX_EDGES_PER_TARGET,
     MAX_HYPOTHESIS_TARGETS,
     MAX_RUNS_PER_TARGET,
+    MIN_EXPERIENCE_ADJUSTMENT,
     SemanticEvidenceError,
     comparator_coverage,
     edge_index,
@@ -973,30 +974,59 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                         "experience as a model-score input"
                     )
             elif snapshot_present:
-                if not run_ids and not edge_ids:
+                adjustments = (
+                    components.get("experience_gain_adjustment"),
+                    components.get("experience_uncertainty_adjustment"),
+                )
+                adjustments_are_zero = all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isclose(float(value), 0.0, rel_tol=0.0, abs_tol=1e-12)
+                    for value in adjustments
+                )
+                if (run_ids or edge_ids) and adjustments_are_zero:
                     errors.append(
-                        f"{where}.policy_receipt gain policy must cite experience "
-                        "runs or edges when a snapshot exists"
+                        f"{where}.policy_receipt cited experience must change gain "
+                        "or uncertainty"
+                    )
+                elif (run_ids or edge_ids) and all(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or abs(float(value)) < MIN_EXPERIENCE_ADJUSTMENT
+                    for value in adjustments
+                ):
+                    errors.append(
+                        f"{where}.policy_receipt cited experience must change gain "
+                        "or uncertainty by at least "
+                        f"{MIN_EXPERIENCE_ADJUSTMENT:.2f}"
+                    )
+                if not run_ids and not edge_ids and not adjustments_are_zero:
+                    errors.append(
+                        f"{where}.policy_receipt cannot adjust gain or uncertainty "
+                        "without cited experience evidence"
+                    )
+            else:
+                if run_ids or edge_ids:
+                    errors.append(
+                        f"{where}.policy_receipt cannot cite experience evidence "
+                        "without an experience snapshot"
                     )
                 adjustments = (
                     components.get("experience_gain_adjustment"),
                     components.get("experience_uncertainty_adjustment"),
                 )
-                if all(
+                if any(
                     isinstance(value, (int, float))
                     and not isinstance(value, bool)
-                    and math.isclose(float(value), 0.0, rel_tol=0.0, abs_tol=1e-12)
+                    and not math.isclose(
+                        float(value), 0.0, rel_tol=0.0, abs_tol=1e-12
+                    )
                     for value in adjustments
                 ):
                     errors.append(
-                        f"{where}.policy_receipt current experience must change "
-                        "gain or uncertainty"
+                        f"{where}.policy_receipt cannot adjust gain or uncertainty "
+                        "without an experience snapshot"
                     )
-            elif run_ids or edge_ids:
-                errors.append(
-                    f"{where}.policy_receipt cannot cite experience evidence "
-                    "without an experience snapshot"
-                )
     elif experience_receipt is not None:
         errors.append(
             f"{where}.policy_receipt schemas 2 and 3 must not contain experience"

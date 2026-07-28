@@ -96,8 +96,10 @@ deterministic `coverage` separate. Its compact `experience` receipt pins the
 generation/revision, cited terminal runs/semantic edges, and adjustment
 rationale consumed by the prediction. The helper validates both
 prior-plus-adjustment equalities and
-requires a current experience snapshot to change gain or uncertainty; a model
-cannot merely mention history while reusing the same numbers. These rubric
+requires a snapshot carrying cited evidence to change gain or uncertainty by
+at least 0.01; a model cannot merely mention history while reusing the same
+numbers. A valid snapshot with no cited run or edge remains revision-pinned
+but uses empty citations and zero adjustments. These rubric
 scores are not calibrated posteriors and are never copied into observations.
 Historical schema-2/3 receipts remain readable. The outer graph policy remains
 in `got_select`; the receipt concerns only the semantic point chosen after that

@@ -103,9 +103,11 @@ fibers. For model-scored policies, `gain-context` pins the bounded experience
 generation and its cited terminal/semantic-edge observations. Prediction schema 2 separates
 the background/mechanism prior from signed experience adjustments for both
 gain and uncertainty; the helper verifies the arithmetic and requires a
-current experience snapshot to affect at least one final number. Policy receipt
-schema 4 persists those inputs separately from `coverage` and `cost`, so the
-history update is auditable rather than implied by evidence prose. Before
+snapshot carrying cited evidence to affect at least one final number by 0.01
+or more. A valid snapshot whose bounded collections cite no run or edge stays
+revision-pinned but is prediction-empty: citations and adjustments are zero.
+Policy receipt schema 4 persists those inputs separately from `coverage` and
+`cost`, so the history update is auditable rather than implied by evidence prose. Before
 acquisition, proposals are partitioned into active and deprioritized budget
 lanes. With interval `N` (default 5), every
 Nth one-based semantic admission selects within the deprioritized lane and

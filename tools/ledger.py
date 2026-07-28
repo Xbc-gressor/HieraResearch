@@ -47,6 +47,7 @@ from search_space_state import (
     empty_search_space_state,
     runtime_status_counts,
 )
+from semantic_evidence import experience_cited_ids
 from validate_tasks import ROOT, parse_task_toml
 
 
@@ -192,39 +193,6 @@ def _require_p1_record(record: dict, run_id: str) -> None:
         raise ValueError(
             f"record {run_id} has no policy_receipt; selection policy must remain traceable"
 )
-
-
-def _experience_cited_ids(experience: Any) -> tuple[set[str], set[str]]:
-    """Terminal runs and semantic edges carried by one bounded belief snapshot."""
-    if not isinstance(experience, dict):
-        return set(), set()
-    run_ids: set[str] = set()
-    edge_ids: set[str] = set()
-    for field in ("promising_regions", "lessons", "bottlenecks"):
-        for item in experience.get(field, []):
-            if isinstance(item, dict) and isinstance(item.get("evidence"), list):
-                run_ids.update(
-                    run_id
-                    for run_id in item["evidence"]
-                    if isinstance(run_id, str)
-                )
-    for field in ("dimension_evidence", "hypothesis_evidence"):
-        for item in experience.get(field, []):
-            if not isinstance(item, dict):
-                continue
-            if isinstance(item.get("evidence_run_ids"), list):
-                run_ids.update(
-                    run_id
-                    for run_id in item["evidence_run_ids"]
-                    if isinstance(run_id, str)
-                )
-            if isinstance(item.get("evidence_edge_ids"), list):
-                edge_ids.update(
-                    edge_id
-                    for edge_id in item["evidence_edge_ids"]
-                    if isinstance(edge_id, str)
-                )
-    return run_ids, edge_ids
 
 
 def _new_record(run_id: str) -> dict:
@@ -531,7 +499,7 @@ def cmd_add_record(args) -> int:
             "the ledger's current bounded belief; rebuild gain-context and re-select"
         )
     if isinstance(receipt_experience, dict):
-        allowed_run_ids, allowed_edge_ids = _experience_cited_ids(current_experience)
+        allowed_run_ids, allowed_edge_ids = experience_cited_ids(current_experience)
         cited_run_ids = receipt_experience.get("evidence_run_ids")
         cited_edge_ids = receipt_experience.get("evidence_edge_ids")
         if (
@@ -544,6 +512,36 @@ def cmd_add_record(args) -> int:
                 "invalid policy receipt: experience evidence ids must be cited "
                 "by the ledger's current bounded belief"
             )
+        policy = policy_receipt.get("policy")
+        policy_name = policy.get("name") if isinstance(policy, dict) else None
+        if policy_name in {"gain", "gain_uncertainty", "gain_uncertainty_nocost"}:
+            components = policy_receipt.get("components")
+            adjustments = (
+                components.get("experience_gain_adjustment"),
+                components.get("experience_uncertainty_adjustment"),
+            ) if isinstance(components, dict) else (None, None)
+            adjustments_are_zero = all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isclose(float(value), 0.0, rel_tol=0.0, abs_tol=1e-12)
+                for value in adjustments
+            )
+            conditioning_available = bool(allowed_run_ids or allowed_edge_ids)
+            cited_conditioning = bool(cited_run_ids or cited_edge_ids)
+            if conditioning_available and (
+                not cited_conditioning or adjustments_are_zero
+            ):
+                raise SystemExit(
+                    "invalid policy receipt: available experience evidence must "
+                    "be cited and must change gain or uncertainty"
+                )
+            if not conditioning_available and (
+                cited_conditioning or not adjustments_are_zero
+            ):
+                raise SystemExit(
+                    "invalid policy receipt: an experience snapshot without "
+                    "evidence requires empty citations and zero adjustments"
+                )
     budget = policy_receipt.get("budget")
     expected_selection_index = len(data["records"]) + 1
     if (

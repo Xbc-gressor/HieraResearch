@@ -51,6 +51,12 @@ from search_space_state import (
     replay_search_space_state,
     validate_point_eligibility,
 )
+from semantic_evidence import (
+    MIN_EXPERIENCE_ADJUSTMENT,
+    edge_index,
+    edge_observation,
+    experience_cited_ids,
+)
 from semantic_space import (
     SemanticSpaceError,
     complete_point,
@@ -69,6 +75,7 @@ from semantic_space import (
 
 
 PROPOSAL_SCHEMA_VERSION = 3
+GAIN_CONTEXT_SCHEMA_VERSION = 2
 PREDICTION_SCHEMA_VERSION = 2
 LEGACY_PREDICTION_SCHEMA_VERSION = 1
 POLICY_RECEIPT_SCHEMA_VERSION = 4
@@ -83,6 +90,7 @@ MAX_PROPOSALS = 128
 MAX_EXPERIENCE_RUN_IDS = 5
 MAX_EXPERIENCE_EDGE_IDS = 5
 MAX_GAIN_CONTEXT_RECORDS = 32
+MAX_GAIN_CONTEXT_EDGES = 32
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -136,45 +144,6 @@ def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
     }
 
 
-def _experience_evidence_run_ids(experience: Any) -> set[str]:
-    """Collect the terminal observations cited by the bounded experience."""
-    if not isinstance(experience, dict):
-        return set()
-    result: set[str] = set()
-    for field in ("promising_regions", "lessons", "bottlenecks"):
-        for item in experience.get(field, []):
-            if not isinstance(item, dict):
-                continue
-            evidence = item.get("evidence")
-            if isinstance(evidence, list):
-                result.update(str(run_id) for run_id in evidence if isinstance(run_id, str))
-    for field in ("dimension_evidence", "hypothesis_evidence"):
-        for item in experience.get(field, []):
-            if not isinstance(item, dict):
-                continue
-            evidence = item.get("evidence_run_ids")
-            if isinstance(evidence, list):
-                result.update(str(run_id) for run_id in evidence if isinstance(run_id, str))
-    return result
-
-
-def _experience_evidence_edge_ids(experience: Any) -> set[str]:
-    """Collect persisted comparator receipts cited by bounded target beliefs."""
-    if not isinstance(experience, dict):
-        return set()
-    result: set[str] = set()
-    for field in ("dimension_evidence", "hypothesis_evidence"):
-        for item in experience.get(field, []):
-            if not isinstance(item, dict):
-                continue
-            evidence = item.get("evidence_edge_ids")
-            if isinstance(evidence, list):
-                result.update(
-                    str(edge_id) for edge_id in evidence if isinstance(edge_id, str)
-                )
-    return result
-
-
 def build_gain_context(
     proposal_set: dict[str, Any], ledger: dict[str, Any]
 ) -> dict[str, Any]:
@@ -184,13 +153,34 @@ def build_gain_context(
         raise ContractError("invalid proposal set: " + "; ".join(errors))
     experience = ledger.get("experience")
     receipt = _experience_snapshot_receipt(experience)
-    cited_ids = _experience_evidence_run_ids(experience)
-    cited_edge_ids = _experience_evidence_edge_ids(experience)
+    cited_ids, cited_edge_ids = experience_cited_ids(experience)
+    indexed_edges = edge_index(ledger)
+    record_citation_roles: dict[str, set[str]] = {
+        run_id: {"run"} for run_id in cited_ids
+    }
+    cited_edges: list[dict[str, Any]] = []
+    for edge_id in sorted(cited_edge_ids):
+        edge = indexed_edges.get(edge_id)
+        if edge is None:
+            continue
+        parent_run_id = edge.get("parent_run_id")
+        child_run_id = edge.get("child_run_id")
+        if isinstance(parent_run_id, str):
+            record_citation_roles.setdefault(parent_run_id, set()).add(
+                f"edge_parent:{edge_id}"
+            )
+        if isinstance(child_run_id, str):
+            record_citation_roles.setdefault(child_run_id, set()).add(
+                f"edge_child:{edge_id}"
+            )
+        observation = edge_observation(ledger, edge_id)
+        if observation:
+            cited_edges.append(observation)
     cited_records: list[dict[str, Any]] = []
     for record in ledger.get("records", []):
         if (
             not isinstance(record, dict)
-            or str(record.get("run_id")) not in cited_ids
+            or str(record.get("run_id")) not in record_citation_roles
             or record.get("status") not in {"keep", "discard", "crash"}
         ):
             continue
@@ -202,13 +192,48 @@ def build_gain_context(
             else {}
         )
         point = record.get("semantic_point")
+        warm_score = record.get("best_warm_score")
+        final_score = record.get("final_best_score")
+        warm_to_final_delta = (
+            round(float(final_score) - float(warm_score), 12)
+            if all(
+                isinstance(score, (int, float))
+                and not isinstance(score, bool)
+                and math.isfinite(float(score))
+                for score in (warm_score, final_score)
+            )
+            else None
+        )
+        semantic_edges = record.get("semantic_edges")
+        same_point_parent_run_ids = (
+            [
+                str(edge["parent_run_id"])
+                for edge in semantic_edges
+                if isinstance(edge, dict)
+                and edge.get("change_class") == "same_point"
+                and isinstance(edge.get("parent_run_id"), str)
+            ]
+            if isinstance(semantic_edges, list)
+            else []
+        )
         cited_records.append(
             {
                 "run_id": str(record.get("run_id")),
+                "citation_roles": sorted(
+                    record_citation_roles[str(record.get("run_id"))]
+                ),
                 "point_id": point.get("point_id") if isinstance(point, dict) else None,
                 "status": record.get("status"),
-                "best_warm_score": record.get("best_warm_score"),
-                "final_best_score": record.get("final_best_score"),
+                "source_run_ids": (
+                    list(record["source_run_ids"])
+                    if isinstance(record.get("source_run_ids"), list)
+                    else []
+                ),
+                "same_point_parent_run_ids": same_point_parent_run_ids,
+                "tuned": record.get("tune") is True,
+                "best_warm_score": warm_score,
+                "final_best_score": final_score,
+                "warm_to_final_delta": warm_to_final_delta,
                 "predicted_gain": components.get("predicted_gain"),
                 "uncertainty": components.get("uncertainty"),
             }
@@ -216,8 +241,11 @@ def build_gain_context(
     omitted = max(0, len(cited_records) - MAX_GAIN_CONTEXT_RECORDS)
     if omitted:
         cited_records = cited_records[-MAX_GAIN_CONTEXT_RECORDS:]
+    omitted_edges = max(0, len(cited_edges) - MAX_GAIN_CONTEXT_EDGES)
+    if omitted_edges:
+        cited_edges = cited_edges[-MAX_GAIN_CONTEXT_EDGES:]
     return {
-        "schema_version": 1,
+        "schema_version": GAIN_CONTEXT_SCHEMA_VERSION,
         "proposal_set_revision": proposal_set["proposal_set_revision"],
         "experience_receipt": receipt,
         "experience": experience if isinstance(experience, dict) else None,
@@ -225,6 +253,8 @@ def build_gain_context(
         "experience_evidence_edge_ids": sorted(cited_edge_ids),
         "cited_records": cited_records,
         "omitted_cited_records": omitted,
+        "cited_edges": cited_edges,
+        "omitted_cited_edges": omitted_edges,
     }
 
 
@@ -783,14 +813,22 @@ def _prediction_map(
             "updated_at_run": None,
             "revision": None,
         }
-    has_experience = expected_experience["revision"] is not None
+    has_experience_snapshot = expected_experience["revision"] is not None
+    (
+        allowed_experience_run_ids,
+        allowed_experience_edge_ids,
+    ) = experience_cited_ids(experience)
+    has_conditioning_evidence = bool(
+        allowed_experience_run_ids or allowed_experience_edge_ids
+    )
     if schema_version == LEGACY_PREDICTION_SCHEMA_VERSION:
         if set(value) != {"schema_version", "proposal_set_revision", "predictions"}:
             errors.append("legacy predictions must contain only schema, proposal revision, and predictions")
-        if has_experience:
+        if has_experience_snapshot:
             errors.append(
                 "schema-2 predictions are required when ledger.experience exists; "
-                "history may not be silently ignored"
+                "the snapshot revision must be pinned even when it carries no "
+                "conditioning evidence"
             )
     elif schema_version == PREDICTION_SCHEMA_VERSION:
         if set(value) != {
@@ -813,8 +851,6 @@ def _prediction_map(
         return {}, errors + ["predictions.predictions must be a list"]
     result: dict[str, dict[str, Any]] = {}
     proposal_ids = {item["point_id"] for item in proposal_set["proposals"]}
-    allowed_experience_run_ids = _experience_evidence_run_ids(experience)
-    allowed_experience_edge_ids = _experience_evidence_edge_ids(experience)
     for index, prediction in enumerate(predictions):
         where = f"predictions[{index}]"
         if not isinstance(prediction, dict):
@@ -961,27 +997,41 @@ def _prediction_map(
                 and math.isclose(float(item), 0.0, rel_tol=0.0, abs_tol=1e-12)
                 for item in (gain_adjustment, uncertainty_adjustment)
             )
-            if has_experience:
+            if has_conditioning_evidence:
                 if not experience_run_ids and not experience_edge_ids:
                     errors.append(
-                        f"{where} must cite experience run or edge ids when experience exists"
+                        f"{where} must cite experience run or edge ids when "
+                        "conditioning evidence exists"
                     )
                 if adjustments_are_zero:
                     errors.append(
                         f"{where} must let current experience change gain or uncertainty"
                     )
+                elif all(
+                    not isinstance(item, (int, float))
+                    or isinstance(item, bool)
+                    or abs(float(item)) < MIN_EXPERIENCE_ADJUSTMENT
+                    for item in (gain_adjustment, uncertainty_adjustment)
+                ):
+                    errors.append(
+                        f"{where} experience must change gain or uncertainty by "
+                        f"at least {MIN_EXPERIENCE_ADJUSTMENT:.2f}"
+                    )
             else:
                 if experience_run_ids:
                     errors.append(
-                        f"{where}.experience_run_ids must be empty without experience"
+                        f"{where}.experience_run_ids must be empty without "
+                        "conditioning evidence"
                     )
                 if experience_edge_ids:
                     errors.append(
-                        f"{where}.experience_edge_ids must be empty without experience"
+                        f"{where}.experience_edge_ids must be empty without "
+                        "conditioning evidence"
                     )
                 if not adjustments_are_zero:
                     errors.append(
-                        f"{where} experience adjustments must be zero without experience"
+                        f"{where} experience adjustments must be zero without "
+                        "conditioning evidence"
                     )
         evidence = prediction.get("evidence")
         if (
@@ -1295,6 +1345,8 @@ def cmd_gain_context(args: argparse.Namespace) -> int:
                 "experience_receipt": context["experience_receipt"],
                 "n_cited_records": len(context["cited_records"]),
                 "omitted_cited_records": context["omitted_cited_records"],
+                "n_cited_edges": len(context["cited_edges"]),
+                "omitted_cited_edges": context["omitted_cited_edges"],
             },
             separators=(",", ":"),
         )

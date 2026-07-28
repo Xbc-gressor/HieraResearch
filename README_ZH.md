@@ -136,7 +136,7 @@ step 0+1: tunable-contract-extractor
 - 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 

@@ -16,6 +16,7 @@ from semantic_evidence import (  # noqa: E402
     comparator_coverage,
     edge_index,
     edge_observation,
+    experience_cited_ids,
     render_target_evidence,
     target_evaluation_state,
     validate_semantic_edges,
@@ -108,6 +109,25 @@ def _mixed_ledger(registry: dict) -> dict:
 
 
 class SemanticEdgeReceiptTests(unittest.TestCase):
+    def test_experience_citations_share_one_schema_walk(self) -> None:
+        experience = {
+            "promising_regions": [{"evidence": ["000", "001"]}],
+            "lessons": [{"evidence": ["001", "002"]}],
+            "bottlenecks": [],
+            "dimension_evidence": [{
+                "evidence_run_ids": ["003"],
+                "evidence_edge_ids": ["sedge-000-003"],
+            }],
+            "hypothesis_evidence": [{
+                "evidence_run_ids": ["004"],
+                "evidence_edge_ids": ["sedge-003-004"],
+            }],
+        }
+        run_ids, edge_ids = experience_cited_ids(experience)
+        self.assertEqual(run_ids, {"000", "001", "002", "003", "004"})
+        self.assertEqual(edge_ids, {"sedge-000-003", "sedge-003-004"})
+        self.assertEqual(experience_cited_ids(None), (set(), set()))
+
     def test_builds_one_persistent_receipt_per_parent(self) -> None:
         registry = fixture_registry()
         baseline = complete_point(registry)

@@ -1151,6 +1151,102 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             "experience evidence ids must be cited", str(forged.exception)
         )
 
+    def test_add_record_accepts_revision_pinned_empty_evidence_snapshot(self) -> None:
+        baseline = complete_point(self.registry)
+        existing = record(
+            "000", "fresh", [], baseline, score=0.5, status="keep"
+        )
+        experience = {
+            "schema_version": 3,
+            "updated_at_run": "000",
+            "generation": 0,
+            "summary": "The current bounded extraction found no evidence-bearing belief.",
+            "promising_regions": [],
+            "lessons": [],
+            "bottlenecks": [],
+            "dimension_evidence": [],
+            "hypothesis_evidence": [],
+        }
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "empty-experience",
+            "metric": "validation_loss",
+            "search_space": space_receipt(self.registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 0,
+            "records": [existing],
+            "experience": experience,
+        }
+        proposals = self._proposals(ledger)
+        predictions = {
+            "schema_version": 2,
+            "proposal_set_revision": proposals["proposal_set_revision"],
+            "experience": {
+                "generation": 0,
+                "updated_at_run": "000",
+                "revision": digest(experience),
+            },
+            "predictions": [
+                {
+                    "point_id": proposal["point_id"],
+                    "prior_gain": 0.5,
+                    "experience_gain_adjustment": 0.0,
+                    "predicted_gain": 0.5,
+                    "prior_uncertainty": 0.3,
+                    "experience_uncertainty_adjustment": 0.0,
+                    "uncertainty": 0.3,
+                    "experience_run_ids": [],
+                    "experience_edge_ids": [],
+                    "experience_rationale": (
+                        "The pinned snapshot carries no conditioning evidence."
+                    ),
+                    "evidence": ["background prior only"],
+                }
+                for proposal in proposals["proposals"]
+            ],
+        }
+        point, receipt = select_proposal(
+            proposals,
+            policy="gain_uncertainty_nocost",
+            predictions=predictions,
+            selection_index=2,
+            experience=experience,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            background_path = tmp_path / "background.md"
+            ledger_path = tmp_path / "ledger.json"
+            point_path = tmp_path / "point.json"
+            receipt_path = tmp_path / "policy.json"
+            background_path.write_text(background_text(self.registry))
+            ledger_path.write_text(json.dumps(ledger))
+            point_path.write_text(json.dumps(point))
+            receipt_path.write_text(json.dumps(receipt))
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                run_id="001",
+                kind="optimization",
+                op="fresh",
+                source_run_ids="",
+                background=str(background_path),
+                catalog=None,
+                semantic_point=str(point_path),
+                policy_receipt=str(receipt_path),
+                idea="A candidate with a revision-pinned empty belief snapshot.",
+                change="from scratch without usable experience evidence",
+                candidate_name_hint="fixture_empty_experience",
+                description=None,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_add_record(args), 0)
+            stored = json.loads(ledger_path.read_text())
+        self.assertEqual(stored["records"][-1]["run_id"], "001")
+        self.assertEqual(
+            stored["records"][-1]["policy_receipt"]["experience"]["evidence_run_ids"],
+            [],
+        )
+
     def test_prune_select_stale_reject_and_reopen_lifecycle(self) -> None:
         registry = self.registry
 

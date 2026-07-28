@@ -237,9 +237,11 @@ priors for gain and uncertainty, signed experience adjustments, final
 `predicted_gain`/`uncertainty`, and `cost`, plus evidence strings
 (`gain_uncertainty_nocost` omits `cost`). `semantic_search.py gain-context`
 pins the exact bounded experience generation. Prediction schema 2 must cite
-terminal runs or semantic edges carried by that experience, and a nonempty
-experience must change gain or uncertainty. The deterministic helper verifies
-that each final number equals its prior plus the signed adjustment.
+terminal runs or semantic edges carried by that experience whenever such
+evidence exists, and must change gain or uncertainty by at least 0.01. A valid
+snapshot with no cited run or edge stays revision-pinned but requires empty
+citations and zero adjustments. The deterministic helper verifies that each
+final number equals its prior plus the signed adjustment.
 
 They remain auditable rubric estimates, not calibrated Bayesian posteriors.
 Policy receipt schema 4 preserves the prior, adjustment, final score,
