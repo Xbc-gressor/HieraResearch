@@ -184,6 +184,78 @@ class EvaluationBudgetTests(unittest.TestCase):
                 3,
             )
 
+    def test_hillclimb_reserve_cli_enforces_the_same_hard_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "hillclimb"
+            run_dir.mkdir(parents=True)
+            candidate = run_dir / "train.py"
+            candidate.write_text("VALUE = 1\n")
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 1})
+            )
+            (run_dir / "results.tsv").write_text(
+                "step\tscore\tstatus\tdescription\n"
+            )
+            command = [
+                sys.executable,
+                str(ROOT / "tools" / "evaluation_budget.py"),
+                "reserve",
+                "--ref-path",
+                str(candidate),
+                "--phase",
+                "hillclimb",
+                "--method",
+                "direct",
+            ]
+
+            first = subprocess.run(command, capture_output=True, text=True)
+            second = subprocess.run(command, capture_output=True, text=True)
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(json.loads(first.stdout)["status"], "reserved")
+            (run_dir / "results.tsv").write_text(
+                "step\tscore\tstatus\tdescription\n"
+                "0\t1.0\tkeep\tbaseline\n"
+            )
+            self.assertEqual(
+                evaluation_budget.budget_status(run_dir)["evaluations_done"],
+                1,
+            )
+            self.assertEqual(second.returncode, 4, second.stderr)
+            self.assertEqual(json.loads(second.stdout)["status"], "exhausted")
+            self.assertEqual(
+                evaluation_budget.budget_status(run_dir)["evaluations_done"],
+                1,
+            )
+
+    def test_legacy_hillclimb_tsv_migrates_before_new_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "legacy-hillclimb"
+            run_dir.mkdir(parents=True)
+            candidate = run_dir / "train.py"
+            candidate.write_text("VALUE = 1\n")
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 5})
+            )
+            (run_dir / "results.tsv").write_text(
+                "step\tscore\tstatus\tdescription\n"
+                "0\t1.0\tkeep\tbaseline\n"
+                "1\tinf\tcrash\tfailed edit\n"
+            )
+
+            initial = evaluation_budget.budget_status(run_dir, create=True)
+            self.assertEqual(initial["evaluations_done"], 2)
+            evaluation_budget.reserve_evaluation(
+                candidate,
+                params={"candidate_sha256": "sha256:test"},
+                phase="hillclimb",
+                method="direct",
+            )
+            self.assertEqual(
+                evaluation_budget.budget_status(run_dir)["evaluations_done"],
+                3,
+            )
+
 
 class EnvironmentPreflightTests(unittest.TestCase):
     def test_environment_hook_runs_without_score_surface_call(self) -> None:
@@ -272,6 +344,55 @@ def make_model(env, params):
                 evaluation_budget.budget_status(run_dir)["evaluations_done"],
                 1,
             )
+
+    def test_standalone_preflight_uses_default_params_without_tuner_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = (
+                Path(tmp)
+                / "runs"
+                / "autoresearch-baseline"
+                / "hillclimb"
+            )
+            run_dir.mkdir(parents=True)
+            candidate = run_dir / "train.py"
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 1, "preflight_runtime_limit": 30})
+            )
+            (run_dir / "prepare.py").write_text(
+                """
+def evaluate_config(make_model, params):
+    raise AssertionError("objective surface must not run during preflight")
+
+def preflight_config(make_model, params):
+    return {"status": "ok", "seen": make_model(None, params)}
+""".lstrip()
+            )
+            candidate.write_text(
+                """
+DEFAULT_PARAMS = {"x": 7}
+
+def make_model(env, params):
+    return params["x"]
+""".lstrip()
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "preflight_candidate.py"),
+                    "--candidate-path",
+                    str(candidate),
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["params_source"], "DEFAULT_PARAMS")
+            self.assertEqual(payload["result"]["seen"], 7)
+            self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
 
 
 if __name__ == "__main__":

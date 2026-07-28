@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Durable, strict reservation ledger for objective-function evaluations.
 
-Every tuner calls :func:`reserve_evaluation` immediately before entering the
-task's ``score_fn``.  The append-only JSONL file is the crash-safe authority
-for the run-level evaluation cap; aggregate fields in ``ledger.json`` remain
-the bounded per-candidate summary.
+Every objective runner calls :func:`reserve_evaluation` immediately before
+entering the task's ``score_fn``.  The append-only JSONL file is the crash-safe
+authority for the run-level evaluation cap; aggregate fields in ``ledger.json``
+remain the bounded per-candidate summary.
 
-Preflight calls never use this module.  They are tracked separately in each
-candidate's ``tune_report.json``.
+Preflight calls never use this module.  Tuner preflights are tracked separately
+in each candidate's ``tune_report.json``; the hillclimb protocol runs its
+standalone preflight before calling this module's reservation CLI.
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ def _report_attempts(report: dict) -> int:
 
 
 def _legacy_per_candidate(run_dir: Path) -> dict[str, int]:
-    """Best backward-readable objective totals from ledger + tuner reports."""
+    """Best backward-readable totals from framework or hillclimb artifacts."""
     per_candidate: dict[str, int] = {}
     ledger_path = Path(run_dir) / "ledger.json"
     try:
@@ -117,6 +118,23 @@ def _legacy_per_candidate(run_dir: Path) -> dict[str, int]:
             per_candidate.get(run_id, 0),
             _report_attempts(report),
         )
+
+    # Runs created by the deliberately-simple hillclimb have one root train.py
+    # and no candidates/ tree.  Migrate their historical one-row-per-run TSV
+    # into the strict attempt log on first reservation.
+    results_path = Path(run_dir) / "results.tsv"
+    if (
+        (Path(run_dir) / "train.py").is_file()
+        and not (Path(run_dir) / "candidates").exists()
+        and results_path.is_file()
+    ):
+        lines = [line for line in results_path.read_text().splitlines() if line.strip()]
+        if lines and lines[0].split("\t")[:3] == ["step", "score", "status"]:
+            run_id = Path(run_dir).name
+            per_candidate[run_id] = max(
+                per_candidate.get(run_id, 0),
+                len(lines) - 1,
+            )
     return per_candidate
 
 
@@ -322,9 +340,46 @@ def main() -> int:
         action="store_true",
         help="create/synchronize the append-only attempt log",
     )
+    reserve_parser = subparsers.add_parser(
+        "reserve",
+        help="atomically reserve one objective attempt before a standalone run",
+    )
+    reserve_parser.add_argument("--ref-path", required=True, type=Path)
+    reserve_parser.add_argument("--phase", default="hillclimb")
+    reserve_parser.add_argument("--method", default="direct")
     args = parser.parse_args()
     if args.command == "status":
         print(json.dumps(budget_status(args.run_dir, create=args.initialize)))
+        return 0
+    if args.command == "reserve":
+        ref_path = args.ref_path.resolve()
+        if not ref_path.is_file():
+            parser.error(f"--ref-path does not exist: {ref_path}")
+        params = {
+            "candidate_sha256": "sha256:" + hashlib.sha256(ref_path.read_bytes()).hexdigest()
+        }
+        try:
+            receipt = reserve_evaluation(
+                ref_path,
+                params=params,
+                phase=args.phase,
+                method=args.method,
+            )
+        except EvaluationBudgetExhausted as exc:
+            print(
+                json.dumps(
+                    {
+                        "status": "exhausted",
+                        "evaluations_done": exc.used,
+                        "budget": exc.budget,
+                        "run_dir": str(exc.run_dir),
+                    }
+                )
+            )
+            return 4
+        if receipt is None:
+            parser.error("--ref-path is not inside an initialized runs/<task>/<tag>")
+        print(json.dumps({"status": "reserved", "receipt": receipt}))
         return 0
     raise AssertionError(args.command)
 

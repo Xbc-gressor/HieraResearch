@@ -72,7 +72,11 @@ def is_finite_score(value: Any) -> bool:
     )
 
 
-def load_candidate_modules(candidate_path: Path) -> tuple[Any, Any]:
+def load_candidate_modules(
+    candidate_path: Path,
+    *,
+    required_symbols: tuple[str, ...] = REQUIRED_SYMBOLS,
+) -> tuple[Any, Any]:
     """Load the candidate's train.py and prepare.py modules.
 
     Returns (train_module, prepare_module). Adds the candidate dir to
@@ -98,7 +102,7 @@ def load_candidate_modules(candidate_path: Path) -> tuple[Any, Any]:
     sys.modules["candidate_train"] = train_module
     train_spec.loader.exec_module(train_module)
 
-    for symbol in REQUIRED_SYMBOLS:
+    for symbol in required_symbols:
         if not hasattr(train_module, symbol):
             raise RuntimeError(
                 f"candidate missing required symbol {symbol!r}: {candidate_path}"

@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from prepare import PretrainEnv
+from prepare import evaluate_config
 
 # ---------------------------------------------------------------------------
 # Tuner contract: tunable keys (PARAM_SCHEMA) + the safe-baseline config
@@ -759,4 +759,4 @@ class Trainer:
 
 
 if __name__ == "__main__":
-    make_model(PretrainEnv(), DEFAULT_PARAMS).run()
+    evaluate_config(make_model, DEFAULT_PARAMS)

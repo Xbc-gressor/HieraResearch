@@ -95,8 +95,10 @@ Read these from `tasks/<task_name>/task.toml` (do not hardcode the originals'
 - `env.project` — the task uv project directory (run everything through it).
 - `result.metric` — the metric to minimize (lower-is-better; a higher-is-better
   metric must already be negated inside the task's own evaluation).
-- `result.parser` / `result.required_patterns` — how to read the metric from the
-  run output (use `tools/parse_result.py` when wired, else grep `^<metric>:`).
+- `result.parser` / `result.required_patterns` — how to validate the metric in
+  the run output. A parser that requires a framework ledger is not a read-only
+  hillclimb parser; in that case validate the patterns and read
+  `^<result.metric>:` directly.
 - `run.timeout_seconds` — per-run wall-clock budget / timeout.
 - `run.prepare_command` — optional one-time asset prep.
 - `constraints.editable_files` — the file(s) you may edit (the entrypoint).
@@ -105,13 +107,48 @@ Read these from `tasks/<task_name>/task.toml` (do not hardcode the originals'
 
 ### How a candidate is evaluated
 
+Before every objective run, execute the task-declared candidate preflight in an
+isolated subprocess through the task environment:
+
+```bash
+uv --project tasks/<task_name> run python <ABS_REPO>/tools/preflight_candidate.py \
+  --candidate-path <ABS_REPO>/runs/<task_name>/<tag>/train.py
+```
+
+`status=not_declared` is a valid no-op. A failed preflight consumes no objective
+slot: diagnose and fix the working copy inline, rerun the preflight, or abandon
+the idea and restore `best.py`. Never reserve an evaluation before preflight
+passes.
+
+Candidate preflight is conservative only while the standalone entrypoint drives
+the same `make_model` and params mapping. Do not rewrite, replace, or redirect
+an existing `if __name__ == "__main__":` driver. For
+`autoresearch-baseline`, keep
+`evaluate_config(make_model, DEFAULT_PARAMS)` structurally unchanged: put
+hyperparameter value changes in `DEFAULT_PARAMS`, while structural
+model/trainer edits remain in the code reached by `make_model`. Never pass a
+second ad-hoc params dict only from `__main__`.
+
+Immediately after a passed/no-op preflight and immediately before launching the
+entrypoint, atomically reserve one objective slot:
+
+```bash
+python tools/evaluation_budget.py reserve \
+  --ref-path <ABS_REPO>/runs/<task_name>/<tag>/train.py \
+  --phase hillclimb --method direct
+```
+
+Exit 0 means the slot is durably reserved. Exit 4 means the configured budget
+was already exhausted: do not launch the entrypoint, stop normally, and do not
+write a crash row. Every launch—including a retry after a fix—needs its own new
+reservation. Preflight attempts never need one.
+
 Faithful to the original: **run the working-copy entrypoint and parse the
 metric** — but run the copy under `runs/`, through the task env:
 
 ```bash
-# Use an ABSOLUTE path to train.py: `uv --directory` changes the working dir to the
-# task project, so a relative runs/... path FAILS with file-not-found.
-uv --directory tasks/<task_name> run python <ABS_REPO>/runs/<task_name>/<tag>/train.py > <ABS_REPO>/runs/<task_name>/<tag>/run.log 2>&1
+# Keep repository/run paths absolute even though `uv --project` preserves cwd.
+uv --project tasks/<task_name> run python <ABS_REPO>/runs/<task_name>/<tag>/train.py > <ABS_REPO>/runs/<task_name>/<tag>/run.log 2>&1
 ```
 
 **Per-run time limit.** If `<run_dir>/framework_cfg.json` has a top-level
@@ -123,7 +160,7 @@ task env's interpreter (running the helper with a bare `python` can pick a
 different interpreter and break imports):
 
 ```bash
-uv --directory tasks/<task_name> run python <ABS_REPO>/tools/timed_run.py <per_runtime_limit> \
+uv --project tasks/<task_name> run python <ABS_REPO>/tools/timed_run.py <per_runtime_limit> \
   python <ABS_REPO>/runs/<task_name>/<tag>/train.py \
   > <ABS_REPO>/runs/<task_name>/<tag>/run.log 2>&1
 ```
@@ -132,19 +169,21 @@ uv --directory tasks/<task_name> run python <ABS_REPO>/tools/timed_run.py <per_r
 train.py`, which resolves to the same env interpreter.) If the limit is exceeded,
 the run is killed (`timed_run` exits 124) → `run.log` has no `<result.metric>:`
 line → record that round as a **crash** (`inf`). If `per_runtime_limit` is absent,
-run `uv --directory tasks/<task_name> run python <ABS_REPO>/.../train.py` directly.
+run `uv --project tasks/<task_name> run python <ABS_REPO>/.../train.py` directly.
 
 The working copy imports its co-located `prepare.py` (Python puts the script's
 own dir on the path), and the task uv env supplies the dependencies — same split
-the framework uses for a candidate. Then read the metric (`tools/parse_result.py`
-with the task's parser, or `grep "^<result.metric>:" run.log`).
+the framework uses for a candidate. Validate `result.required_patterns`, then
+use a read-only task parser when available or read
+`^<result.metric>:` directly.
 
-**If `run.log` has no `<result.metric>:` line, the run did NOT score — DIAGNOSE
-and FIX the cause** (most often a missing/broken `__main__` driver, an import
-error, or a code bug), then re-run. Do **not** record a `crash` and move on for a
-fixable problem, and **never** spam many identical `crash` rows to burn through the
-budget — if several runs fail the same way, fix the ROOT cause. A `crash` row is
-only for a genuine, already-diagnosed dead end.
+**If `run.log` has no `<result.metric>:` line, that reserved objective attempt
+crashed. Append its `crash`/`inf` row immediately, then diagnose the cause.** A
+fixable typo, import error, shape bug, or timeout may be repaired and retried,
+but that retry is a new attempt: rerun candidate preflight, reserve a new slot,
+launch once, and append another row. Never hide a failed objective launch merely
+because it was fixable, and never repeat an identical failure without changing
+the candidate.
 
 Fallback for tasks that expose only `evaluation.score_fn` and have no
 metric-emitting entrypoint: make the working copy a tiny driver that ALWAYS keeps
@@ -165,7 +204,9 @@ runs/<task-name>/<tag>/
   best.py           # snapshot of the current best train.py (the "HEAD")
   history/          # optional: kept-step snapshots (000.py, 001.py, …) for rewinds
   run.log           # last run's output (overwritten each run)
-  results.tsv       # the flat record (one row per run)
+  results.tsv       # flat outcomes: exactly one row per reserved objective attempt
+  evaluation_attempts.jsonl  # append-only authority for objective admission/count
+  environment_preflight.json # run-level no-score environment receipt
 ```
 
 `best.py` / `history/*.py` are **snapshots**, never run directly (only `train.py`,
@@ -183,17 +224,31 @@ copy `best.py` → `train.py`. Everything here is local state — never commit
    entrypoint into it (`prepare.py`, `train.py`). Treat the copied `prepare.py`
    as read-only.
 3. Read the required files above.
-4. Sync the task env: `uv --directory tasks/<task_name> sync`.
+4. Sync the task env: `uv --project tasks/<task_name> sync`.
 5. If assets are missing and `run.prepare_command` exists, run it through the task env.
-6. Create `runs/<task_name>/<tag>/results.tsv` with only the header (see below).
-7. **First run = baseline**: run the copied entrypoint unmodified, parse the
-   metric, record it as the baseline `keep` row, and snapshot `train.py` → `best.py`
-   (and `history/000.py`).
-8. Enter the loop.
+6. Run the fixed environment gate once (and again on resume):
+
+   ```bash
+   uv --project tasks/<task_name> run python tools/preflight_env.py \
+     --task <task_name> --run-dir <run_dir>
+   ```
+
+   A failure blocks objective work.
+7. Create `runs/<task_name>/<tag>/results.tsv` with only the header (see below),
+   or preserve it when resuming.
+8. Initialize/reconcile the strict attempt log:
+   `python tools/evaluation_budget.py status --run-dir <run_dir> --initialize`.
+   If its `evaluations_done` exceeds the number of TSV data rows, append one
+   `crash`/`inf` recovery row per missing reserved attempt before continuing.
+9. **First run = baseline**: candidate-preflight the unmodified copy, reserve
+   exactly one objective slot, run it once, append its outcome row, and on success
+   snapshot `train.py` → `best.py` (and `history/000.py`).
+10. Enter the loop.
 
 ## results.tsv
 
-Tab-separated (never commas — they break descriptions). Header + one row per run:
+Tab-separated (never commas — they break descriptions). Header + exactly one row
+per reserved objective attempt:
 
 ```
 step	score	status	description
@@ -204,34 +259,35 @@ step	score	status	description
 3. status: `keep`, `discard`, or `crash`
 4. short description of what the experiment tried
 
-Lives under the run directory (local-only, like the framework's ledger).
+Lives under the run directory. A launched timeout/crash is still one row. A
+candidate preflight failure and a refused reservation are not objective attempts
+and produce no row. Except while recovering an interrupted reservation at
+startup, append the row immediately after its run returns and before any repair.
 
 ## Budget (stop condition)
 
 The loop is **budget-bounded** when a budget is set, otherwise it runs forever
-(NEVER STOP). The budget = a maximum number of evaluations; for this agent
-**1 round = 1 evaluation**, and `evaluations_done` = the number of result rows in
-`results.tsv` (excluding the header).
+(NEVER STOP). The budget is a maximum number of objective attempts. The
+append-only `evaluation_attempts.jsonl` is authoritative:
 
-Read the budget at startup from `<run_dir>/framework_cfg.json` top-level integer
-`max_evaluations`. Setup persists any explicit caller value there. If the field
-is absent or null, there is **no budget** → NEVER STOP.
+```bash
+python tools/evaluation_budget.py status --run-dir <run_dir> --initialize
+```
 
-**Check it at the very START of every iteration (before editing anything):**
-if a budget is set and `evaluations_done >= max_evaluations`, **STOP now** — this
-is a normal, successful completion (not a crash). Print the final status. This is
-what guarantees the run reaches the budget and no more: the loop keeps going as
-long as `evaluations_done < budget`, so an early stop only happens at the budget.
+`evaluations_done` is its number of reserved objective attempts, including
+failed launches. Candidate/environment preflights do not reserve and do not
+count. Setup persists `framework_cfg.json.max_evaluations`; absent/null means
+unbounded, but every launch is still logged. Check status before beginning a new
+idea. The mandatory reservation immediately before every launch is the atomic
+hard guard: exit 4 is normal budget completion, never a crash.
 
 ## The Loop (until the budget is met, else forever)
 
 The working copy `train.py` is edited in place every iteration; `best.py` holds
-the current best, and a non-improving edit is undone by restoring it. Each
-iteration:
+the current best, and a non-improving edit is undone by restoring it. Each idea:
 
-0. **Budget check (first thing)**: compute `evaluations_done` (rows in
-   `results.tsv`); if a budget is set and `evaluations_done >= max_evaluations`,
-   STOP (normal completion). Otherwise continue.
+0. **Budget check (first thing)**: read strict status. If `reached=true`, STOP
+   normally. Otherwise continue; the later atomic reservation remains mandatory.
 1. **Sync to best**: ensure `train.py` equals `best.py` (copy `best.py` →
    `train.py` if the previous iteration was reverted). Note the current best score.
 2. **Hack an idea into `train.py`** — edit the working copy directly
@@ -239,24 +295,28 @@ iteration:
    Everything within the contract is fair game; the copied `prepare.py` and any
    `readonly_files` are off-limits; add dependencies only if
    `allow_dependencies = true`.
-3. **Run** the working copy through the task env into `run.log` (never `tee`; do
-   not flood context). Enforce `framework_cfg.json.per_runtime_limit` with
-   `timed_run.py`; a timeout is a crash. If the field is absent or null, do not
-   silently substitute `task.toml`'s separate `run.timeout_seconds`.
-4. **Read the metric** (parser or grep). Empty → crashed → read `tail -n 50
-   run.log` for the trace.
-5. **On crash**: if it is trivial (typo, missing import, obvious shape bug), fix
-   and re-run; after a few failed attempts, log `crash` and move on. If the idea
-   itself is fundamentally broken, log `crash` and move on. (No crash-diagnosis
-   subagent — judge inline.)
-6. **Record** the row in `results.tsv` (increment the step counter).
+3. **Candidate preflight**: run `preflight_candidate.py`. Fix preflight failures
+   inline without reserving an objective slot; abandon and restore `best.py` if
+   the idea is not repairable.
+4. **Reserve exactly once**, immediately before the objective command. Exit 4 →
+   normal budget completion; do not run.
+5. **Run once** through the task env into `run.log` (never `tee`; do not flood
+   context). Enforce `framework_cfg.json.per_runtime_limit` with `timed_run.py`;
+   a timeout is a crash. If the field is absent or null, do not silently
+   substitute `task.toml`'s separate `run.timeout_seconds`.
+6. **Read and record immediately**: parse/grep the metric and append exactly one
+   TSV row for this reservation. Missing/invalid metric → `score=inf`,
+   `status=crash`; inspect `tail -n 50 run.log` only after recording it.
 7. **Keep or revert** (LOWER = better; see ⚠️ in Mission):
    - **Improved** = `new_score < best` (strictly **smaller / more negative**):
      copy `train.py` → `best.py` (advance the best), append `history/<step>.py`,
      and update the best score.
    - **Equal or worse** = `new_score >= best` (a **larger / less-negative** number),
-     **or crash**: leave `best.py` unchanged; the next iteration's step 1 restores
-     `train.py` from it (discard the edit). E.g. best `-0.73`, new `-0.58` → worse → revert.
+     leave `best.py` unchanged and restore it before the next idea. E.g. best
+     `-0.73`, new `-0.58` → worse → revert.
+   - **Crash**: `best.py` stays unchanged. If the cause is fixable, you may repair
+     the current working copy and repeat steps 3–6, but the retry needs a fresh
+     reservation and row. If abandoning it, restore `best.py`.
    You may rewind to an earlier `history/<n>.py` (copy it onto `best.py` +
    `train.py`), but do this **very** sparingly, if ever.
 
@@ -279,10 +339,10 @@ code, combine previous near-misses, try more radical changes. The loop runs unti
 the human interrupts.
 
 **Exception — the budget.** If a budget is set (see Budget), reaching it is the
-one self-stop that is allowed and expected: keep going until `evaluations_done`
-reaches `max_evaluations`, then stop normally. "NEVER STOP" means never stop
-*before* the budget (or, with no budget, never stop at all) — it does not mean
-ignore the budget.
+one self-stop that is allowed and expected: keep going until strict
+`evaluations_done` reaches `max_evaluations`, then stop normally. "NEVER STOP"
+means never stop *before* the budget (or, with no budget, never stop at all) — it
+does not mean ignore the budget.
 
 ## Hard Stops
 
@@ -295,8 +355,9 @@ Stop only when:
 4. The task contract is internally inconsistent such that continuing would
    produce meaningless scores.
 
-On a hard stop, leave `best.py` on the current best, ensure the latest
-`results.tsv` is written, and return a concise reason.
+On a hard stop, leave `best.py` on the current best. If an objective slot was
+reserved, ensure its `results.tsv` outcome row is written before returning a
+concise reason.
 
 ## Status Output
 
@@ -309,7 +370,7 @@ best_score: <value|none>
 best_step: <step|none>
 last_status: keep|discard|crash|none
 last_score: <value|none>
-steps_done: <n>
+steps_done: <strict objective attempts>
 active_stop_condition: none|<reason>
 ```
 

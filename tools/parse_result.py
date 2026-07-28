@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""LEGACY log parser — NOT called by the current experiment loop.
+"""Compatibility log parser — not called by the current experiment loop.
 
 The S-GoT single `config -> score` model has no run log: a candidate's score is
 written straight to `ledger.json` by `tunable-contract-extractor` / `tuner-
-orchestrator` (`record-run`), so this script is not invoked. It is kept only so
-`validate_tasks` finds the file that `task.toml`'s `result.parser` points at, and
-for the legacy `autoresearch-baseline` task (which still scores a full training
-run). Original behavior: parse one candidate run log for the score + model name
-and hand them to `tools/ledger.py` (which owns the schema, the keep/discard/crash
-decision, and the derived `loop_state.md`).
+orchestrator` (`record-run`), so this script is not invoked there. It remains a
+functional compatibility surface for task contracts and legacy/manual flows
+that already have a framework ledger record: parse one candidate run log for
+the score + model name and hand them to `tools/ledger.py` (which owns the
+schema, keep/discard/crash decision, and derived `loop_state.md`).
 """
 
 from __future__ import annotations
@@ -94,14 +93,6 @@ def main() -> int:
         status = "crash"
 
     best_model = metrics.get("best_model", metrics.get("candidate"))
-    # Keep every extra summary line (e.g. per-dataset scores, fit_seconds) so
-    # the experience layer can read component-level signal. Task-agnostic: the
-    # values stay as the raw strings the task printed; the consumer interprets
-    # packed ones like `dataset_scores`.
-    aux_metrics = {
-        key: value for key, value in metrics.items()
-        if key not in ("metric", "score", "best_model")
-    } if has_result else None
     record = record_run(
         args.ledger,
         task_name,
@@ -110,7 +101,6 @@ def main() -> int:
         status=status,
         candidate_name=best_model,
         description=_sanitize_description(args.description),
-        aux_metrics=aux_metrics,
     )
     print(f"run {record['run_id']}: status={record['status']} "
           f"score={record['final_best_score']} -> {args.ledger}")

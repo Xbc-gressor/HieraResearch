@@ -49,13 +49,13 @@ against that function by the tuner scripts.
   post-training `val_bpb` computed by the fixed `env.evaluate_bpb`. Its return
   value **is** the candidate's `final_best_score`.
 - **Preflight**: before each proposed config may enter `evaluate_config`, the
-  tuner calls the fixed `prepare.preflight_config(make_model, params)` in an
-  isolated subprocess. It calls the trainer's `preflight()` only; it must not
-  call `evaluate_bpb`, inspect validation data, or emit a score. The fixed
-  `PreflightEnv` mechanically rejects validation and non-training dataloader
-  access. A failure creates a feasibility receipt and is repaired/rejected
-  before `score_fn`, so it is reported separately from the objective-call
-  budget.
+  framework tuner or standalone hillclimb runner calls the fixed
+  `prepare.preflight_config(make_model, params)` in an isolated subprocess. It
+  calls the trainer's `preflight()` only; it must not call `evaluate_bpb`,
+  inspect validation data, or emit a score. The fixed `PreflightEnv`
+  mechanically rejects validation and non-training dataloader access. A failure
+  creates a feasibility receipt and is repaired/rejected before `score_fn`, so
+  it is reported separately from the objective-call budget.
 
 Rules:
 
@@ -72,6 +72,12 @@ Rules:
 - Keep `preflight()` behaviorally aligned with the construction and first
   training step used by `run()`; it may return resource telemetry such as peak
   VRAM, but never `val_bpb` or another validation-derived value.
+- Keep the standalone
+  `if __name__ == "__main__": evaluate_config(make_model, DEFAULT_PARAMS)`
+  driver structurally unchanged. Candidate preflight reads `DEFAULT_PARAMS`, so
+  standalone hyperparameter changes must edit that mapping rather than pass a
+  second ad-hoc params dict only from `__main__`. Structural model/trainer
+  changes remain in the code reached by `make_model`, where both paths see them.
 - One candidate strategy per `train.py`; do not enumerate competing candidates.
 
 Evaluation cost: one config eval is one full budgeted training run (~300 s of
@@ -105,9 +111,11 @@ run-local candidate files are edited.
 
 ## Run
 
-Standalone (manual runs and `autoresearch-hillclimb`): `python train.py` runs
-`DEFAULT_PARAMS` through the identical `make_model`/trainer path and prints the
-parseable summary:
+Standalone: `python train.py` passes `make_model` + `DEFAULT_PARAMS` through the
+same fixed `evaluate_config` score surface and prints the parseable summary.
+`autoresearch-hillclimb` first runs `tools/preflight_candidate.py` against the
+working copy, atomically reserves one objective slot, and only then invokes this
+entrypoint:
 
 ```bash
 uv --directory tasks/autoresearch-baseline sync
@@ -115,9 +123,10 @@ uv --directory tasks/autoresearch-baseline run python prepare.py
 uv --directory tasks/autoresearch-baseline run python train.py
 ```
 
-Under this mode, redirect training output to a run log under the run directory
-and parse the final summary into `ledger.json` (via
-`tools/parse_result.py --ledger`).
+Under manual mode, read the printed summary directly. Under hillclimb, redirect
+it to the run log, validate the required result patterns, and append exactly one
+row per reserved objective attempt to `results.tsv`; do not create a framework
+ledger or invoke the legacy `parse_result.py --ledger` path.
 
 Under the experiment loop there is **no `python train.py` run**: a candidate is
 scored only where the tuner scripts call `evaluate_config`:

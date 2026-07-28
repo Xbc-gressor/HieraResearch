@@ -331,9 +331,9 @@ python tools/ledger.py show            ...   # 读取单个记录或整个账本
 
 `loop_state.md` 是 `ledger.json` 的派生视图，由 `ledger.py` 重新生成；不单独手动编辑。
 
-### 7.3 parse_result.py（遗留/未使用）
+### 7.3 parse_result.py（兼容 parser；当前循环未使用）
 
-S-GoT 单函数模型没有运行日志——分数通过 extractor/tuner `record-run` 直接写入。**此脚本不再被循环调用**（仅保留以满足 `validate_tasks` 对 `result.parser` 文件存在的检查）。原始行为：解析运行日志，然后通过 `ledger.py` 写入：
+S-GoT 单函数模型没有运行日志——分数通过 extractor/tuner `record-run` 直接写入，因此当前循环不会调用此脚本。它仍是 `task.toml` 声明的向后兼容日志 parser：在已有 framework ledger record 时解析运行日志，再通过 `ledger.py` 的当前 `record_run` 合约写入结果。Hillclimb 没有 framework ledger，按任务协议直接验证 required patterns 并读取 metric：
 
 ```text
 runs/<task-name>/<tag>/ledger.json
