@@ -1,6 +1,6 @@
 ---
 name: crash-diagnosis
-description: Diagnose ONE autoresearch candidate crash from its traceback and decide how to recover. Read by whoever is running the candidate inline — `tunable-contract-extractor` (a warm-config crash during eval-K) or the main thread / `autoresearch-experiment` (an official-run crash) — since sub-agents cannot spawn a diagnosis sub-agent. Classifies the crash into config-invalid / code-incompatible / abandon and returns the minimal recovery action, preferring a code fix (so the candidate adapts to more configs) whenever the config is a legitimate hyperparameter value.
+description: Diagnose ONE autoresearch candidate failure from its traceback and decide how to recover. Read inline by `tunable-contract-extractor` when a no-score candidate preflight or warm config fails, or by the main thread for a legacy official-run crash. Classifies the failure into config-invalid / code-incompatible / abandon and returns the minimal recovery action, preferring a code fix whenever the config is a legitimate hyperparameter value.
 metadata:
   short-description: Diagnose one crash → {config_invalid | code_incompatible | abandon} + minimal fix
 ---
@@ -11,8 +11,9 @@ Methodology for diagnosing **one** candidate crash and deciding how to recover.
 You follow this in your CURRENT context (you are not a separate agent) — the
 caller is the context that just ran the candidate and will apply the fix:
 
-- **`tunable-contract-extractor`, segment ③ (eval-K)** — a warm config raised;
-  you have the config + its frozen `failure_receipt` from evaluator stdout.
+- **`tunable-contract-extractor`, segment ③** — a warm config's no-score
+  preflight or admitted eval-K call raised; you have the config + its frozen
+  `failure_receipt`. A preflight failure consumed no objective slot.
 - **the main thread / `autoresearch-experiment` (official run)** — the candidate
   crashed; you have the run log.
 

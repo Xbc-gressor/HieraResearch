@@ -21,6 +21,8 @@ import sys
 import time
 from typing import Any
 
+from evaluation_budget import ATTEMPT_LOG, budget_status
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 KNOWN_AGENTS = {
@@ -118,6 +120,8 @@ def _run_snapshot(run_dir: Path | None) -> dict[str, Any] | None:
         if value is None:
             value = record.get("warm_start_K")
         attempted += _integer(value)
+    strict_budget = budget_status(run_dir)
+    attempted = max(attempted, strict_budget["evaluations_done"])
     stored = ledger.get("run_state") if isinstance(ledger.get("run_state"), dict) else {}
     budget = cfg.get("max_evaluations")
     if not isinstance(budget, int) or isinstance(budget, bool):
@@ -132,7 +136,13 @@ def _run_snapshot(run_dir: Path | None) -> dict[str, Any] | None:
     else:
         phase = "running"
         stop_condition = "none"
-    mtimes = [path.stat().st_mtime for path in (ledger_path, state_path) if path.exists()]
+    tracked_paths = (
+        ledger_path,
+        state_path,
+        run_dir / ATTEMPT_LOG,
+        run_dir / "environment_preflight.json",
+    )
+    mtimes = [path.stat().st_mtime for path in tracked_paths if path.exists()]
     return {
         "run_dir": str(run_dir),
         "task": ledger.get("task") or state.get("task"),
@@ -142,6 +152,15 @@ def _run_snapshot(run_dir: Path | None) -> dict[str, Any] | None:
         "candidates": len(records),
         "pending_run_ids": [r.get("run_id") for r in records if r.get("status") == "pending"],
         "evaluations_attempted": attempted,
+        "preflight_attempts": sum(
+            _integer(record.get("preflight_attempts")) for record in records
+        ),
+        "preflight_failures": sum(
+            _integer(record.get("preflight_failures")) for record in records
+        ),
+        "feasibility_rejections": sum(
+            _integer(record.get("feasibility_rejections")) for record in records
+        ),
         "budget": budget,
         "remaining": None if budget is None else max(0, budget - attempted),
         "last_progress_ms": int(max(mtimes) * 1000) if mtimes else 0,

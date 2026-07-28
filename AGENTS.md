@@ -99,6 +99,12 @@ to the primary context.
   specific missing field or bottleneck.
 - Do not collapse role boundaries to save time. An evaluation budget does not
   authorize combining writer, evaluation, or tuning contexts.
+- Run-level and task-owned candidate preflights are no-score engineering
+  checks. Their failures are diagnosed inline but never counted as objective
+  evaluations.
+- `evaluation_attempts.jsonl` is the strict objective-call admission log. A
+  tuner must reserve there immediately before `score_fn`; aggregate ledger
+  fields remain per-candidate summaries.
 - The outer loop searches semantic candidates; step 0+1 / step 2 tunes numeric
   parameters inside one candidate. Keep those search levels distinct.
 

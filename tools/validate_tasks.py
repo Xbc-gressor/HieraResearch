@@ -131,7 +131,11 @@ def validate_task(task_dir: Path) -> list[str]:
 
     evaluation = data.get("evaluation", {})
     if isinstance(evaluation, dict):
-        for key in ("score_fn",):  # tuning_fn retired (single config->score surface)
+        for key in (
+            "score_fn",
+            "preflight_fn",
+            "environment_preflight_fn",
+        ):  # tuning_fn retired (single config->score surface)
             value = evaluation.get(key)
             if value is None:
                 continue

@@ -32,7 +32,10 @@ against that function by the tuner scripts.
   contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) written by
   `tunable-contract-extractor`. The provided task-root `train.py` already
   carries `make_model` + `PARAM_SCHEMA`, and its `DEFAULT_PARAMS` are the
-  original hyperparameter values.
+  original hyperparameter values. The trainer also exposes
+  **`preflight() -> dict`**, which constructs the real model/optimizer and runs
+  exactly one real-shape training step, but never invokes validation or returns
+  an objective score.
 - **Train**: `env` is the task-defined `prepare.PretrainEnv`. The trainer
   trains only via `env.make_dataloader(tokenizer, B, T, "train")`, for at most
   `env.train_budget_seconds` (300 s) of training time — counted after warmup
@@ -45,6 +48,14 @@ against that function by the tuner scripts.
   surface — it runs one full budgeted training run and returns the
   post-training `val_bpb` computed by the fixed `env.evaluate_bpb`. Its return
   value **is** the candidate's `final_best_score`.
+- **Preflight**: before each proposed config may enter `evaluate_config`, the
+  tuner calls the fixed `prepare.preflight_config(make_model, params)` in an
+  isolated subprocess. It calls the trainer's `preflight()` only; it must not
+  call `evaluate_bpb`, inspect validation data, or emit a score. The fixed
+  `PreflightEnv` mechanically rejects validation and non-training dataloader
+  access. A failure creates a feasibility receipt and is repaired/rejected
+  before `score_fn`, so it is reported separately from the objective-call
+  budget.
 
 Rules:
 
@@ -58,6 +69,9 @@ Rules:
 - Do not catch broad exceptions to fabricate a score. If a candidate cannot
   build/train/return a finite `val_bpb`, let it fail so the run is recorded
   as `crash`.
+- Keep `preflight()` behaviorally aligned with the construction and first
+  training step used by `run()`; it may return resource telemetry such as peak
+  VRAM, but never `val_bpb` or another validation-derived value.
 - One candidate strategy per `train.py`; do not enumerate competing candidates.
 
 Evaluation cost: one config eval is one full budgeted training run (~300 s of
@@ -66,6 +80,12 @@ task's 900 s `run.timeout_seconds` as their per-config `per_runtime_limit`;
 `init_run.py --timeout` may override it. Consider lowering `tuner.K` /
 `tuner.K_eval` in `framework_cfg.json` — the defaults cost 3 full training runs
 per candidate at step 0+1.
+
+The run-level `tools/preflight_env.py` check and candidate preflight calls do
+not consume `max_evaluations` because they never enter `score_fn`. Their
+attempts, failures, feasibility rejections, and runtime remain auditable
+separately. Every admitted `score_fn` call—including one that later crashes—
+atomically consumes one objective slot.
 
 ## Files
 

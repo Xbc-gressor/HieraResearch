@@ -436,9 +436,26 @@ def summarize(report: dict) -> dict:
         phase_a_attempted = len(warm_trials)
     else:
         phase_a_attempted = max(phase_a_attempted, len(warm_trials))
-    phase_c_attempted = sum(
-        len(stage.get("trials", []))
+    phase_c_trials = [
+        trial
         for stage in report.get("phase_c", {}).get("stages", [])
+        for trial in stage.get("trials", [])
+    ]
+    phase_c_attempted = sum(
+        trial.get("status") != "preflight_rejected"
+        for trial in phase_c_trials
+    )
+    preflight_attempts = report.get("preflight", {}).get("attempts", [])
+    if not isinstance(preflight_attempts, list):
+        preflight_attempts = []
+    preflight_failures = sum(
+        attempt.get("status") == "failed"
+        for attempt in preflight_attempts
+        if isinstance(attempt, dict)
+    )
+    feasibility_rejections = sum(
+        trial.get("status") == "preflight_rejected"
+        for trial in phase_c_trials
     )
     trials_completed = sum(1 for _ in _iter_trials(report))
     trials_attempted = max(
@@ -450,6 +467,9 @@ def summarize(report: dict) -> dict:
         "final_best_score": final,
         "trials_completed": trials_completed,
         "trials_attempted": trials_attempted,
+        "preflight_attempts": len(preflight_attempts),
+        "preflight_failures": preflight_failures,
+        "feasibility_rejections": feasibility_rejections,
         "elapsed_seconds": round(elapsed, 1),
     }
 
@@ -476,6 +496,9 @@ def tuning_record(report: dict) -> dict:
         "phase_c_method": phase_c_method,
         "trials_completed": summary["trials_completed"],
         "trials_attempted": summary["trials_attempted"],
+        "preflight_attempts": summary["preflight_attempts"],
+        "preflight_failures": summary["preflight_failures"],
+        "feasibility_rejections": summary["feasibility_rejections"],
         "elapsed_seconds": summary["elapsed_seconds"],
         "applied": report.get("applied_to_base_params"),
     }

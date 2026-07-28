@@ -23,6 +23,8 @@ tune = false
 # still prints the summary parsed via [result].
 [evaluation]
 score_fn = "evaluate_config"
+environment_preflight_fn = "preflight_environment"
+preflight_fn = "preflight_config"
 
 [result]
 metric = "val_bpb"

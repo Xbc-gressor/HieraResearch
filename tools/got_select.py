@@ -17,6 +17,7 @@ import json
 import math
 from pathlib import Path
 
+from evaluation_budget import budget_status
 from got_cdag import c_dag
 from got_graph import Graph
 
@@ -235,7 +236,21 @@ def cmd_decide(args) -> int:
     path = Path(args.ledger)
     data = json.loads(path.read_text()) if path.exists() else {"records": []}
     graph = Graph.from_ledger(data, C=cfg["C"], alpha=cfg["alpha"])
-    print(json.dumps(decide(graph, cfg), indent=2))
+    result = decide(graph, cfg)
+    strict_budget = budget_status(path.parent)
+    remaining = strict_budget.get("remaining")
+    tuner_cfg = load_run_cfg(path, "tuner")
+    try:
+        k_eval = max(1, int(tuner_cfg.get("K_eval", 3)))
+    except (TypeError, ValueError):
+        k_eval = 3
+    if isinstance(remaining, int):
+        admission_cap = remaining // k_eval
+        result["actions"] = result["actions"][:admission_cap]
+        result["diag"]["objective_remaining"] = remaining
+        result["diag"]["candidate_admission_cap"] = admission_cap
+        result["diag"]["candidate_objective_reservation"] = k_eval
+    print(json.dumps(result, indent=2))
     return 0
 
 

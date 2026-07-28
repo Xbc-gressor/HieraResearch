@@ -144,6 +144,11 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    `<env.project>` is `task.toml`'s `env.project` (repo-root-relative, e.g.
    `tasks/tabular-model-search`) used as-is; script and `--candidate-path` /
    `--tune-report-json` paths stay absolute.
+   For a task declaring `evaluation.preflight_fn`, every proposed config first
+   passes that isolated no-score hook. Rejections are recorded as feasibility
+   evidence but do not reserve an objective slot. Immediately before `score_fn`,
+   the tuner atomically reserves from the strict run cap; it cannot overshoot
+   the configured budget.
 4. Parse the stdout JSON and branch on `status`:
    - `rejected` — the method **could not run** (grid combos exceed max_trials, or
      optuna/cma not installed); the search space is fine. Run the `fallback`
@@ -154,6 +159,9 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
      Do **not** run the fallback. Proceed to the Apply step — `select-best` falls
      back to the best warm-start config and `phase_c_method` lands `null`. Add a
      risk note that the candidate crashes within its own search space.
+   - `budget_exhausted` — no objective slot remained and no new Phase-C score
+     was produced. Do not mark the candidate tuned or run a fallback; return
+     `tuned_run_id: none` with `selection_reason: evaluation_budget_reached`.
    - `ok` — proceed to the Apply step normally.
 
 ### Apply step
@@ -204,9 +212,10 @@ python tools/ledger.py set-tuning --ledger <run_dir>/ledger.json \
 ```
 `record-run` updates `final_best_score` (the score the graph reads next round) +
 status; `set-tuning --mark-tuned` writes `phase_c_method`, `trials_completed`,
-`trials_attempted`, `elapsed_seconds`, `applied`, `warm_percentile` and sets
-`tune: true`. Both regenerate `loop_state.md`; take the Output Format values
-from these. Never hand-edit `ledger.json`.
+`trials_attempted`, `preflight_attempts`, `preflight_failures`,
+`feasibility_rejections`, `elapsed_seconds`, `applied`, `warm_percentile` and
+sets `tune: true`. Both regenerate `loop_state.md`; take the Output Format
+values from these. Never hand-edit `ledger.json`.
 
 > `phase_b_decision` stays `null` (the gate is `select-candidate` / Phase S, not a
 > per-candidate Phase B). The tuned score is **never worse** than
@@ -224,6 +233,9 @@ best_warm_score:      <float | n/a>
 final_best_score:     <float | n/a>     # tuned best (= select-best); recorded in place, no re-run
 trials_completed:     <int | 0>
 trials_attempted:     <int | 0>
+preflight_attempts:   <int | 0>
+preflight_failures:   <int | 0>
+feasibility_rejections: <int | 0>
 elapsed_seconds:      <float | 0>
 applied:              true | false
 report_path:          <absolute path to tune_report.json | n/a>
@@ -231,7 +243,7 @@ ledger_updated:       true | false
 risks:                <one short line; "none notable" allowed>
 ```
 
-`trials_completed`, `trials_attempted`, and `elapsed_seconds` come from the
+All trial/preflight counts and `elapsed_seconds` come from the
 `set-tuning --from-report` output — do not recompute them. On a no-op
 (`tuned_run_id: none`), the numeric fields are `n/a`/`0` and `applied` is
 `false`.

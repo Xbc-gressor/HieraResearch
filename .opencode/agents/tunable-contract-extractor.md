@@ -43,12 +43,13 @@ Your work has **three segments**, each with its own discipline:
 - **② propose {K configs + SEARCH_SPACE} and finalize it** — *judgment* + cheap
   static checks; deterministic tools validate.
 - **③ evaluate the K configs** — *you run the candidate here*, diagnosing and
-  fixing every crash until all K score or the candidate is abandoned.
+  running task-owned no-score preflight before each score call and fixing every
+  failure until all K score, the strict budget ends, or the candidate is abandoned.
 
 Do them in order.
 
 **Skills you follow** (`.opencode/skills/`):
-- `crash-diagnosis` — used in segment ③ to diagnose each eval-K crash (verdict:
+- `crash-diagnosis` — used in segment ③ to diagnose each preflight/eval-K failure (verdict:
   `config_invalid` / `code_incompatible` / `abandon`).
 
 ## Inputs You Will Receive
@@ -213,7 +214,11 @@ AST-inserts `SEARCH_SPACE = {...}` (create mode). Only after 2c is `ok`.
 
 ## Segment ③ — evaluate the warm configs (you run the candidate here)
 
-Now you DO run the candidate (segments ①② did not). You proposed **K** configs in
+Now you DO run the candidate (segments ①② did not). For tasks declaring
+`evaluation.preflight_fn`, the evaluator first runs that fixed hook in an
+isolated subprocess. It may construct and smoke-test the candidate but never
+calls `score_fn` or validation; only a passed config may reserve an objective
+slot and enter evaluation. You proposed **K** configs in
 ②, but only the first **`K_eval`** are evaluated now (best-of-`K_eval` = the
 screening score); the rest are **deferred** (stored params-only, evaluated later by
 the deep-tuner only if this candidate is promoted). Diagnose + fix every crash in
@@ -234,7 +239,7 @@ uv --directory <env.project> run python tools/tuners/warmstart_eval.py \
   --k-eval <tuner.K_eval or 3>
 ```
 
-It creates `BASE_PARAMS`, evaluates the first `K_eval` configs in order **reusing
+It creates `BASE_PARAMS`, preflights and evaluates the first `K_eval` configs in order **reusing
 any already scored** (a re-run only re-evaluates what changed), stores the deferred
 ones in `phase_a.deferred_configs`, and writes `phase_a` (best-of-`K_eval`). The
 deep-tuner later evaluates the deferred configs FIRST (bo enqueue / grid prepend).
@@ -243,13 +248,22 @@ deep-tuner later evaluates the deferred configs FIRST (bo enqueue / grid prepend
   finalized. Go to 3c.
 - **exit 3 (CRASHED)** — the config at `crash_index` raised. Stdout contains its
   frozen `failure_receipt` and `failure_ref`; the full traceback remains in the
-  referenced append-only artifact. Go to 3b.
+  referenced append-only artifact. `phase: preflight` means no objective slot
+  was consumed; `phase: a` means an admitted `score_fn` call failed. Go to 3b.
+- **exit 4 (BUDGET EXHAUSTED)** — the strict reservation helper refused entry
+  before `score_fn`. Do not diagnose this refusal. If the report contains prior
+  objective attempts but no finite score, persist tuning metadata and record the
+  candidate as `crash`; otherwise return `ledger_recorded: no` so the coordinator
+  leaves the record `pending` (unevaluated) and completes only because the
+  objective cap is reached. Never convert an unstarted candidate into a crash.
+  This path should be rare because `got_select` reserves `K_eval` admission
+  capacity.
 
 ### 3b. Diagnose + fix (the crash loop)
 
 **【crash-diagnosis skill】** Invoke `Skill(crash-diagnosis)` — or, if the Skill
 tool is unavailable, read `.opencode/skills/crash-diagnosis/SKILL.md` and follow it
-— on the crashing config + its `failure_receipt`. Retrieve full or ranged source
+— on the failing preflight/eval config + its `failure_receipt`. Retrieve full or ranged source
 through `tune_tools.py render-failure` only when the receipt is insufficient:
 
 - **`config_invalid`** → Edit `<candidate_dir>/_warm_configs.json`, replacing that
@@ -260,8 +274,9 @@ through `tune_tools.py render-failure` only when the receipt is insufficient:
   legitimate hyperparameter — making the code adapt grows the usable space.
 - **`abandon`** → go to 3d.
 
-Then re-run 3a — the evaluator resumes (passed configs cached, the fixed config
-re-evaluated). Loop. **Cap: at most 10 `code_incompatible` fixes**; if you exceed
+Then re-run 3a — no-score preflight rechecks the current code, while passed
+objective configs remain cached and the fixed config is evaluated only after
+preflight passes. Loop. **Cap: at most 10 `code_incompatible` fixes**; if you exceed
 it and configs still crash, treat it as `abandon`.
 
 ### 3c. Success → record the candidate's score + warm metadata
@@ -312,6 +327,8 @@ ledger_recorded: <yes | no>
 best_warm: <score | n/a>
 trials_completed: <int>
 trials_attempted: <int>
+preflight_attempts: <int>
+preflight_failures: <int>
 n_dims: <int>
 checks: lint-schema=<ok|failed>; check-search-space=<ok|failed>
 fixes: code=<N>; config=<M>

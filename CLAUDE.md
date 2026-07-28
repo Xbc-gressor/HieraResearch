@@ -44,11 +44,11 @@ reusable at many sites). A skill **owns** its protocol — callers invoke it
 **not** restate its steps. (Bootstrap is no longer a skill — the loop seeds
 itself with `fresh` candidates.)
 
-- `crash-diagnosis` — methodology for diagnosing one candidate crash and deciding
-  recovery: `config_invalid` (fix the config) / `code_incompatible` (minimally fix
-  the code, preferred) / `abandon`. Followed **inline** by whoever runs the
-  candidate — `tunable-contract-extractor` (an eval-K crash) or the main thread
-  (an official-run crash) — since sub-agents cannot spawn a diagnosis sub-agent.
+- `crash-diagnosis` — methodology for diagnosing one candidate preflight or
+  objective crash and deciding recovery: `config_invalid` (fix the config) /
+  `code_incompatible` (minimally fix the code, preferred) / `abandon`. Followed
+  **inline** by `tunable-contract-extractor`; a preflight failure consumes no
+  objective slot.
 
 ## Agents
 
@@ -140,13 +140,15 @@ would remove the independent contexts required by this project.
   ② propose K = 5 warm configs + a data-driven `SEARCH_SPACE` (from
   `lineage-evidence` + the schema), consistency pre-check, finalize via
   `check-search-space` + `apply_search_space`; ③ evaluate the K configs
-  (`warmstart_eval.py`, sequential/resumable), **diagnosing each crash inline via
-  the `crash-diagnosis` skill** (config-invalid → fix config; code-incompatible →
-  minimally fix `train.py`, ≤ 10) until all K score → it writes `BASE_PARAMS` =
-  best-of-K′ + `phase_a` and records `best_warm_score`; an unrunnable candidate →
-  it records `status: crash`. Spawned after `candidate-writer` returns, for every
-  candidate. Deep-tuning (step 2) is decoupled, so every candidate stops at
-  step 0+1 here.
+  (`warmstart_eval.py`, sequential/resumable), first running any task-declared
+  isolated no-score preflight and **diagnosing each preflight/eval crash inline
+  via the `crash-diagnosis` skill** (config-invalid → fix config;
+  code-incompatible → minimally fix `train.py`, ≤ 10). Objective calls reserve
+  atomically from the strict run cap immediately before `score_fn`. It writes
+  `BASE_PARAMS` = best-of-K′ + `phase_a` and records `best_warm_score`; an
+  unrunnable candidate → it records `status: crash`. Spawned after
+  `candidate-writer` returns, for every candidate. Deep-tuning (step 2) is
+  decoupled, so every candidate stops at step 0+1 here.
 - `tuner-orchestrator` — **step 2, decoupled (design §15)**: run **once per
   round** on the whole run, not per candidate. It runs
   `tools/tuners/tune_tools.py select-candidate` (promotion gate + greedy
@@ -155,10 +157,12 @@ would remove the independent contexts required by this project.
   dim via `select-method` (grid ≤ 2, bo=multivariate-TPE for ≥ 3, cmaes fallback only; step-1 warm trials as
   priors), the Apply step (`select-best` → `apply_base_params`, AST rewrite, no
   hand-edit), and `ledger.py set-tuning` (`tune: true`). It deep-tunes that
-  candidate **in place** and hands it back for the loop's official re-run (the
-  in-place score update the graph reads next round). **No warm-start** — `phase_a`
-  is the extractor's step-0+1 output. A `none` selection (early, or top tier
-  already tuned) is a valid no-op.
+  candidate **in place**; the best observed tuner score is the in-place score
+  update the graph reads next round, with no official re-run. Candidate
+  preflight rejections are feasibility evidence and do not consume objective
+  slots. **No warm-start** — `phase_a` is the extractor's step-0+1 output. A
+  `none` selection (early, top tier already tuned, or insufficient remaining
+  budget) is a valid no-op.
 
 ## Running A Task
 

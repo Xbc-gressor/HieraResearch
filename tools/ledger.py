@@ -40,6 +40,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from evaluation_budget import budget_status
 from search_space_state import (
     append_experience_transitions,
     empty_search_space_state,
@@ -73,6 +74,9 @@ RECORD_FIELDS = (
     "phase_c_method",    # grid | bo | cmaes | null
     "trials_completed",  # finite score observations
     "trials_attempted",  # all config->score calls, including failures
+    "preflight_attempts",  # no-score candidate feasibility calls
+    "preflight_failures",  # failed no-score feasibility calls
+    "feasibility_rejections",  # Phase-C proposals rejected before score_fn
     "elapsed_seconds",
     "applied",           # bool | null: tuned params applied to BASE_PARAMS
     "dag_revision",      # last score/status revision visible to the development DAG
@@ -87,6 +91,9 @@ TUNING_FIELDS = (
     "phase_c_method",
     "trials_completed",
     "trials_attempted",
+    "preflight_attempts",
+    "preflight_failures",
+    "feasibility_rejections",
     "elapsed_seconds",
     "applied",
 )
@@ -518,6 +525,9 @@ def cmd_set_tuning(args) -> int:
             "phase_c_method": args.phase_c_method,
             "trials_completed": _coerce(args.trials_completed, "int"),
             "trials_attempted": _coerce(args.trials_attempted, "int"),
+            "preflight_attempts": _coerce(args.preflight_attempts, "int"),
+            "preflight_failures": _coerce(args.preflight_failures, "int"),
+            "feasibility_rejections": _coerce(args.feasibility_rejections, "int"),
             "elapsed_seconds": _coerce(args.elapsed_seconds, "float"),
             "applied": _coerce(args.applied, "bool"),
         }
@@ -607,7 +617,7 @@ def cmd_percentile(args) -> int:
     return 0
 
 
-def _evaluations_done(data: dict) -> dict:
+def _evaluations_done(data: dict, ledger_path: Path | None = None) -> dict:
     """Run-level evaluation budget used so far = all config->score attempts.
 
     New records carry ``trials_attempted``, including failed calls. Legacy
@@ -626,6 +636,24 @@ def _evaluations_done(data: dict) -> dict:
         total += attempted
         per.append({"run_id": r.get("run_id"), "evals": attempted,
                     "tuned": bool(r.get("tune")), "status": r.get("status")})
+    if ledger_path is not None:
+        strict = budget_status(Path(ledger_path).parent)
+        total = max(total, strict["evaluations_done"])
+        strict_per = {
+            row["run_id"]: row["evals"]
+            for row in strict.get("per_candidate", [])
+        }
+        for row in per:
+            row["evals"] = max(row["evals"], strict_per.pop(row["run_id"], 0))
+        for run_id, attempted in sorted(strict_per.items()):
+            per.append(
+                {
+                    "run_id": run_id,
+                    "evals": attempted,
+                    "tuned": False,
+                    "status": "pending",
+                }
+            )
     return {"evaluations_done": total, "n_candidates": len(records), "per_candidate": per}
 
 
@@ -649,7 +677,7 @@ def _run_phase(ledger_path: Path, data: dict) -> tuple[str, str]:
         saved_budget = state.get("evaluation_budget")
         if isinstance(saved_budget, int) and not isinstance(saved_budget, bool):
             budget = saved_budget
-    attempted = _evaluations_done(data)["evaluations_done"]
+    attempted = _evaluations_done(data, ledger_path)["evaluations_done"]
     if state.get("phase") == "blocked":
         return "blocked", str(state.get("active_stop_condition") or "unspecified_blocker")
     if budget is not None and attempted >= budget:
@@ -660,8 +688,9 @@ def _run_phase(ledger_path: Path, data: dict) -> tuple[str, str]:
 
 
 def cmd_evaluations(args) -> int:
-    data = _load_ledger(Path(args.ledger))
-    result = _evaluations_done(data)
+    ledger_path = Path(args.ledger)
+    data = _load_ledger(ledger_path)
+    result = _evaluations_done(data, ledger_path)
     if args.budget is not None:
         result["budget"] = args.budget
         result["remaining"] = max(0, args.budget - result["evaluations_done"])
@@ -677,7 +706,7 @@ def cmd_brief(args) -> int:
     records = data.get("records", [])
     best = _best_kept_record(data)
     last = records[-1] if records else None
-    evals = _evaluations_done(data)
+    evals = _evaluations_done(data, ledger_path)
     attempted = evals["evaluations_done"]
     budget = args.budget if args.budget is not None else _framework_budget(ledger_path)
     phase, stop_condition = _run_phase(ledger_path, data)
@@ -703,6 +732,11 @@ def cmd_brief(args) -> int:
             "score": last.get("final_best_score"),
         },
         "evaluations_attempted": attempted,
+        "preflight_attempts": sum(int(r.get("preflight_attempts") or 0) for r in records),
+        "preflight_failures": sum(int(r.get("preflight_failures") or 0) for r in records),
+        "feasibility_rejections": sum(
+            int(r.get("feasibility_rejections") or 0) for r in records
+        ),
         "budget": budget,
         "remaining": None if budget is None else max(0, budget - attempted),
         "reached": None if budget is None else attempted >= budget,
@@ -727,7 +761,7 @@ def cmd_set_phase(args) -> int:
     data = _load_ledger(ledger_path)
     if args.phase == "completed":
         budget = args.budget if args.budget is not None else _framework_budget(ledger_path)
-        attempted = _evaluations_done(data)["evaluations_done"]
+        attempted = _evaluations_done(data, ledger_path)["evaluations_done"]
         if budget is None or attempted < budget:
             raise SystemExit(
                 "cannot mark completed before a configured evaluation budget is reached "
@@ -944,7 +978,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("best-warm-score",
                  "n-dims", "warm-start-k", "warm-percentile",
                  "phase-b-decision", "phase-c-method", "trials-completed",
-                 "trials-attempted",
+                 "trials-attempted", "preflight-attempts",
+                 "preflight-failures", "feasibility-rejections",
                  "elapsed-seconds", "applied"):
         tune.add_argument(f"--{name}")
     tune.add_argument("--mark-tuned", action="store_true",

@@ -84,7 +84,8 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `status` | `pending`, `keep`, `discard`, or `crash` |
 | `best_warm_score`, `final_best_score` | inner-HPO and final candidate observations |
 | `n_dims`, `warm_start_K`, `warm_percentile` | tuning metadata, unrelated to semantic dimensions |
-| `phase_b_decision`, `phase_c_method`, `trials_completed`, `trials_attempted`, `elapsed_seconds`, `applied` | tuning process metadata; completed counts finite scores, attempted counts every config→score call and owns the run budget |
+| `phase_b_decision`, `phase_c_method`, `trials_completed`, `trials_attempted`, `elapsed_seconds`, `applied` | objective/tuning metadata; completed counts finite scores and attempted counts every admitted config→score call |
+| `preflight_attempts`, `preflight_failures`, `feasibility_rejections` | no-score engineering checks; auditable but excluded from the objective-call budget |
 | `dag_revision` | helper-owned graph-change cursor |
 
 The semantic point contains the exact `space_revision`, a stable content-based
@@ -104,6 +105,12 @@ Scores are always lower-is-better. `keep` means a finite
 `final_best_score` is strictly lower than the best previous keep. A non-finite
 or missing result is a `crash` with `+inf`, never a missing success or ordinary
 discard.
+
+`evaluation_attempts.jsonl` is the helper-owned append-only reservation log for
+the strict run cap. A slot is appended immediately before entering `score_fn`;
+failed score calls still consume it, while task-owned preflight never does.
+`ledger.py brief/evaluations` reconciles the log with backward-readable
+per-record aggregates. Never hand-edit or truncate the reservation log.
 
 ## Experience boundary
 

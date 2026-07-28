@@ -139,11 +139,22 @@ For a new run:
 
    Run `run.prepare_command` through that environment only when required assets
    are absent.
-2. Spawn `Task(background-researcher)` with the run directory. It reads the
+2. Before any candidate or objective call, run the fixed environment gate:
+
+   ```bash
+   uv --project tasks/<task_name> run python tools/preflight_env.py \
+     --task <task_name> --run-dir <run_dir>
+   ```
+
+   It imports the fixed task surface and, when declared, checks task resources
+   such as device capabilities and prepared assets. It never calls `score_fn`;
+   its `environment_preflight.json` receipt is not an objective attempt. A
+   failure blocks the run before candidate admission.
+3. Spawn `Task(background-researcher)` with the run directory. It reads the
    configured strategy and writes the evidence trace plus schema-3 hierarchical
    background. Under `llm_induced`, it also writes the final task-specific
    `<run_dir>/dimension_catalog.json` before retrieval.
-3. Validate the strategy-scoped artifacts:
+4. Validate the strategy-scoped artifacts:
 
    ```bash
    # llm_induced only
@@ -163,8 +174,9 @@ Do not pre-create the ledger, loop state, candidate entrypoints, or generic
 result files. The first generated record and deterministic helpers create the
 run state.
 
-For a resumed run, skip setup work whose validated artifacts already exist and
-enter the loop using the accumulated ledger and configured budget.
+For a resumed run, skip setup work whose validated artifacts already exist,
+but rerun the environment gate because hardware, caches, and credentials may
+have changed. Enter the loop only after it passes.
 
 ## Experiment loop
 
@@ -181,9 +193,11 @@ python tools/ledger.py brief --ledger <run_dir>/ledger.json
 
 The budget comes from `framework_cfg.json.max_evaluations`; setup persisted any
 explicit caller value there. If the field is absent or null, the experiment is
-unbounded. `evaluations_done` is the sum of `trials_attempted`, including failed
-calls; legacy records fall back to `trials_completed` and then `warm_start_K`.
-Do not add these totals together.
+unbounded. Every tuner atomically appends to `evaluation_attempts.jsonl`
+immediately before entering `score_fn`; no score call may start once the cap is
+reached, including mid-round and mid-tuner. Failed admitted score calls count;
+preflight attempts/rejections do not. `ledger.py brief` reconciles that strict
+log with backward-readable record aggregates.
 
 If a configured budget is exhausted, persist normal completion and return the
 compact status:
@@ -239,6 +253,9 @@ without an intervening extractor. Treat its receipt as the authority for each
 `run_id`, op, numeric parents, point id, and policy name. Do not override or
 silently drop an action. Never create a candidate directory or spawn candidate
 implementation for a `run_id` whose record is not yet admitted to the ledger.
+`got_select decide` caps returned actions by
+`floor(remaining_objective_slots / K_eval)`; an empty action list is valid and
+leaves the remaining slots for deep tuning.
 
 For each returned action, in order:
 
@@ -254,10 +271,13 @@ For each returned action, in order:
    `train.py` from the recorded idea, numeric parents, and semantic point. Reject
    a receipt that targets another directory or violates its role boundary.
 3. Spawn `tunable-contract-extractor` with the candidate path and numeric
-   parents. It owns step 0+1: tunable contract, warm configurations, eval-K,
-   inline crash diagnosis, `BASE_PARAMS`, and ledger recording. A valid receipt
+   parents. It owns step 0+1: tunable contract, warm configurations, no-score
+   preflight, eval-K, inline crash diagnosis, `BASE_PARAMS`, and ledger recording. A valid receipt
    ends in keep, discard, or crash and states that the ledger was updated. There
-   is no coordinator evaluation afterward.
+   is no coordinator evaluation afterward. The sole exception is an exit-4
+   receipt with zero prior objective attempts: when the strict cap is reached,
+   leave that record `pending` as explicitly unevaluated and complete the
+   budget-bound run; do not fabricate a score or convert it to a crash.
 
 Resolve every candidate recorded by this generation. Recheck the budget before
 deep tuning; if it is exhausted, return to step 0 without spawning the tuner.

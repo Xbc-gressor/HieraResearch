@@ -388,6 +388,78 @@ class PretrainEnv:
         self.seed = 42
 
 
+class PreflightEnv(PretrainEnv):
+    """Candidate environment with validation access mechanically disabled."""
+
+    def __init__(self):
+        super().__init__()
+
+        def train_only_dataloader(tokenizer, B, T, split, *args, **kwargs):
+            if split != "train":
+                raise RuntimeError(
+                    "candidate preflight may only request the training split"
+                )
+            return make_dataloader(tokenizer, B, T, split, *args, **kwargs)
+
+        def validation_disabled(*_args, **_kwargs):
+            raise RuntimeError(
+                "validation is disabled inside candidate preflight"
+            )
+
+        self.make_dataloader = train_only_dataloader
+        self.evaluate_bpb = validation_disabled
+
+
+def preflight_environment() -> dict:
+    """Validate fixed runtime resources without constructing a candidate."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable")
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("the CUDA device does not support bfloat16")
+
+    tokenizer = Tokenizer.from_directory()
+    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    if not os.path.isfile(token_bytes_path):
+        raise FileNotFoundError(f"missing tokenizer byte table: {token_bytes_path}")
+    parquet_paths = list_parquet_files()
+    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    train_paths = [path for path in parquet_paths if path != val_path]
+    if not os.path.isfile(val_path):
+        raise FileNotFoundError(f"missing pinned validation shard: {val_path}")
+    if not train_paths:
+        raise FileNotFoundError(f"no training shards found under {DATA_DIR}")
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    properties = torch.cuda.get_device_properties(0)
+    return {
+        "device": properties.name,
+        "compute_capability": list(torch.cuda.get_device_capability(0)),
+        "total_vram_mb": round(total_bytes / 1024 / 1024, 1),
+        "free_vram_mb": round(free_bytes / 1024 / 1024, 1),
+        "bf16": True,
+        "vocab_size": tokenizer.get_vocab_size(),
+        "training_shards": len(train_paths),
+        "validation_shard": VAL_FILENAME,
+    }
+
+
+def preflight_config(make_model, params: dict) -> dict:
+    """Exercise candidate construction + one train step, never validation."""
+    env = PreflightEnv()
+    trainer = make_model(env, params)
+    preflight = getattr(trainer, "preflight", None)
+    if not callable(preflight):
+        raise TypeError(
+            "candidate trainer must expose preflight() for the fixed no-score check"
+        )
+    result = preflight()
+    if result is None:
+        result = {}
+    if not isinstance(result, dict):
+        raise TypeError("trainer.preflight() must return a dict or None")
+    return {"status": "ok", "objective_calls": 0, **result}
+
+
 def evaluate_config(make_model, params: dict) -> float:
     """The single `config -> score` evaluation (lower is better).
 

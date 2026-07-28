@@ -32,9 +32,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
+    EvaluationBudgetExhausted,
     resolve_score_fn,
+    resolve_preflight_fn,
     timed_eval,
+    timed_preflight,
     PatienceMonitor,
+    append_preflight_attempt,
     append_trial,
     cast_params_to_search_space,
     load_candidate_modules,
@@ -79,6 +83,7 @@ def main() -> int:
     search_space = train_module.SEARCH_SPACE
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
+    preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
 
     keys = list(search_space.keys())
     grids = [expand_entry(search_space[k], args.resolution) for k in keys]
@@ -125,13 +130,66 @@ def main() -> int:
     trials_attempted = 0
     early_stopped = False
     early_stop_reason = "none"
+    budget_exhausted = False
+    preflight_rejections = 0
     failure_refs = []
 
     for params in param_dicts:
-        trials_attempted += 1
+        if preflight_enabled:
+            try:
+                preflight_result = timed_preflight(params, args.candidate_path)
+            except Exception as exc:
+                failure = record_failure(
+                    report_path=args.tune_report_json,
+                    candidate_path=args.candidate_path,
+                    phase="preflight",
+                    method="grid",
+                    params=params,
+                    error=exc,
+                    traceback_text=traceback.format_exc(),
+                )
+                append_preflight_attempt(
+                    args.tune_report_json,
+                    source="grid",
+                    params=params,
+                    status="failed",
+                    failure=failure,
+                )
+                append_trial(
+                    args.tune_report_json,
+                    "grid",
+                    {
+                        "params": params,
+                        "score": None,
+                        "status": "preflight_rejected",
+                        **failure,
+                    },
+                )
+                preflight_rejections += 1
+                continue
+            append_preflight_attempt(
+                args.tune_report_json,
+                source="grid",
+                params=params,
+                status="ok",
+                result=preflight_result or {"status": "ok"},
+            )
         try:
-            score = timed_eval(evaluate, make_model, params, args.candidate_path)
+            score = timed_eval(
+                evaluate,
+                make_model,
+                params,
+                args.candidate_path,
+                phase="phase_c",
+                method="grid",
+            )
+        except EvaluationBudgetExhausted:
+            budget_exhausted = True
+            early_stopped = True
+            early_stop_reason = "evaluation_budget"
+            break
         except Exception as exc:
+            trials_attempted += 1
             # A bad param combo must not kill the sweep: record it and skip.
             failure = record_failure(
                 report_path=args.tune_report_json,
@@ -147,6 +205,7 @@ def main() -> int:
             if failure["failure_ref"] not in failure_refs:
                 failure_refs.append(failure["failure_ref"])
             continue
+        trials_attempted += 1
         append_trial(args.tune_report_json, "grid", {"params": params, "score": score})
         trials_done += 1
         improved = score < best_score
@@ -160,6 +219,26 @@ def main() -> int:
 
     elapsed = time.time() - started
 
+    if best_params is None and budget_exhausted:
+        set_stage_meta(
+            args.tune_report_json,
+            "grid",
+            status="budget_exhausted",
+            elapsed_seconds=round(elapsed, 1),
+            early_stopped=True,
+            preflight_rejections=preflight_rejections,
+        )
+        write_json({
+            "method": "grid",
+            "status": "budget_exhausted",
+            "reason": "global evaluation budget exhausted before score_fn",
+            "trials_completed": trials_done,
+            "trials_attempted": trials_attempted,
+            "preflight_rejections": preflight_rejections,
+            "elapsed_seconds": round(elapsed, 1),
+        })
+        return 0
+
     if best_params is None:
         # Every combo errored — surface a failed stage instead of "ok" with a null best.
         set_stage_meta(args.tune_report_json, "grid", status="failed",
@@ -170,6 +249,7 @@ def main() -> int:
             "reason": "all grid trials errored; no completed trial",
             "trials_completed": trials_done,
             "trials_attempted": trials_attempted,
+            "preflight_rejections": preflight_rejections,
             "trials_planned": total,
             "early_stopped": early_stopped,
             "early_stop_reason": early_stop_reason,
@@ -179,8 +259,15 @@ def main() -> int:
         })
         return 0
 
-    set_stage_meta(args.tune_report_json, "grid", status="ok",
-                   elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped)
+    set_stage_meta(
+        args.tune_report_json,
+        "grid",
+        status="ok",
+        elapsed_seconds=round(elapsed, 1),
+        early_stopped=early_stopped,
+        preflight_rejections=preflight_rejections,
+        budget_exhausted=budget_exhausted,
+    )
 
     write_json({
         "method": "grid",
@@ -189,6 +276,8 @@ def main() -> int:
         "best_score": best_score,
         "trials_completed": trials_done,
         "trials_attempted": trials_attempted,
+        "preflight_rejections": preflight_rejections,
+        "budget_exhausted": budget_exhausted,
         "trials_planned": total,
         "early_stopped": early_stopped,
         "early_stop_reason": early_stop_reason,

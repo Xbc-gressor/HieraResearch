@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import harness_guard  # noqa: E402
 import harness_watch  # noqa: E402
 import new_candidate  # noqa: E402
+import got_select  # noqa: E402
 
 
 class DelegationGuardTests(unittest.TestCase):
@@ -60,6 +64,15 @@ risk_flags: invalid coordinator control output
         result = harness_guard.compact_task_result("idea-generator", raw)
         self.assertIn("receipt_contract: invalid", result)
         self.assertIn("missing_fields:", result)
+
+    def test_accepts_budget_admission_no_action_receipt(self) -> None:
+        raw = """generation_run_ids: none
+selection_reason: objective_budget_admission_cap
+ledger: /tmp/run/ledger.json
+"""
+        result = harness_guard.compact_task_result("idea-generator", raw)
+        self.assertIn("receipt_contract: ok", result)
+        self.assertIn("generation_run_ids: none", result)
 
     def test_compacts_colon_delimited_semantic_receipts(self) -> None:
         raw = """run_id: 004
@@ -120,6 +133,29 @@ ledger: /tmp/run/ledger.json
 
 
 class UsageAndLifecycleTests(unittest.TestCase):
+    def test_got_select_reserves_k_eval_capacity_before_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": 2,
+                        "tuner": {"K_eval": 3},
+                    }
+                )
+            )
+            ledger_path = run_dir / "ledger.json"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                got_select.cmd_decide(
+                    SimpleNamespace(ledger=str(ledger_path), cfg=None)
+                )
+            payload = json.loads(output.getvalue())
+
+            self.assertEqual(payload["actions"], [])
+            self.assertEqual(payload["diag"]["objective_remaining"], 2)
+            self.assertEqual(payload["diag"]["candidate_admission_cap"], 0)
+
     def test_candidate_brief_contains_only_implementation_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger_path = Path(tmp) / "ledger.json"

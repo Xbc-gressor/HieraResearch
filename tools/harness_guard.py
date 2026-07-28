@@ -11,7 +11,8 @@ import sys
 
 RECEIPT_FIELDS = {
     "idea-generator": (
-        ("run_id", "op", "parents", "point_id", "policy", "candidate", "ledger"),
+        ("run_id", "op", "parents", "point_id", "policy", "candidate", "ledger",
+         "generation_run_ids", "selection_reason"),
         ("run_id", "op", "parents", "point_id", "policy", "candidate", "ledger"),
     ),
     "candidate-writer": (
@@ -20,12 +21,14 @@ RECEIPT_FIELDS = {
     ),
     "tunable-contract-extractor": (
         ("status", "train_py", "ledger_recorded", "best_warm", "trials_completed",
-         "trials_attempted", "n_dims", "checks", "fixes", "risk_flags", "confidence"),
+         "trials_attempted", "preflight_attempts", "preflight_failures",
+         "n_dims", "checks", "fixes", "risk_flags", "confidence"),
         ("status", "train_py", "ledger_recorded"),
     ),
     "tuner-orchestrator": (
         ("tuned_run_id", "selection_reason", "phase_c_method", "best_warm_score",
          "final_best_score", "trials_completed", "trials_attempted", "timeout_count",
+         "preflight_attempts", "preflight_failures", "feasibility_rejections",
          "elapsed_seconds", "applied", "report_path", "ledger_updated", "risks"),
         ("tuned_run_id", "ledger_updated"),
     ),
@@ -73,6 +76,12 @@ def compact_task_result(agent: str, raw: str) -> str:
             bucket.append(value[:500])
 
     child = re.search(r'<task\s+id="([^"]+)"', raw)
+    no_action = (
+        agent == "idea-generator"
+        and [value.lower() for value in values.get("generation_run_ids", [])] == ["none"]
+    )
+    if no_action:
+        required = ("generation_run_ids", "selection_reason", "ledger")
     missing = [key for key in required if not values.get(key)]
     invalid_values = []
     for key in allowed:
@@ -80,7 +89,7 @@ def compact_task_result(agent: str, raw: str) -> str:
         if expected and values.get(key) and any(value.lower() not in expected for value in values[key]):
             invalid_values.append(key)
     action_count_mismatch = None
-    if agent == "idea-generator" and not missing:
+    if agent == "idea-generator" and not missing and not no_action:
         counts = {key: len(values[key]) for key in required}
         if len(set(counts.values())) != 1:
             action_count_mismatch = counts

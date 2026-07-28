@@ -19,7 +19,9 @@ fix ONE crash at a time without re-evaluating what already passed:
    write it into `BASE_PARAMS`, finalize `phase_a` (warm_start_configs +
    best_warm_score + best_warm_params + search_space), exit `0`.
 
-No smoke/non-smoke distinction; no `base_score`. Run from the task uv env:
+An optional task-owned preflight runs before each score attempt in an isolated
+subprocess. It is a real-shape feasibility check, not a smoke score, and never
+reserves an objective slot. There is no `base_score`. Run from the task uv env:
 `uv --directory tasks/<task> run python tools/tuners/warmstart_eval.py ...`.
 """
 
@@ -36,8 +38,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))  # tools/ for apply_base_params
 import apply_base_params  # noqa: E402
 from _common import (  # noqa: E402
+    EvaluationBudgetExhausted,
     resolve_score_fn,
+    resolve_preflight_fn,
     timed_eval,
+    timed_preflight,
     cast_params_to_search_space,
     is_finite_score,
     load_candidate_modules,
@@ -49,6 +54,7 @@ from _common import (  # noqa: E402
 from failure_artifacts import record_failure  # noqa: E402
 
 CRASHED = 3  # a not-yet-scored config raised; the caller diagnoses + fixes + resumes
+BUDGET_EXHAUSTED = 4  # no score_fn call was started; coordinator ends the run
 
 
 def _params_key(params: dict) -> str:
@@ -88,6 +94,7 @@ def main() -> int:
     search_space = train_module.SEARCH_SPACE
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
+    preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
 
     previous_report = read_tune_report(args.tune_report_json)
     previous_phase_a = previous_report.get("phase_a", {})
@@ -107,6 +114,10 @@ def main() -> int:
         trials_attempted = len(prev)
 
     report = previous_report
+    preflight_report = report.setdefault("preflight", {"attempts": [], "invocations": 0})
+    if preflight_enabled:
+        preflight_report["invocations"] = len(preflight_report.get("attempts", []))
+        preflight_report["status"] = "running"
     report["phase_a"] = {
         "warm_start_configs": [],
         # deferred = proposed-but-not-evaluated-now; the deep-tuner evaluates these
@@ -123,15 +134,130 @@ def main() -> int:
     wsc: list[dict] = []
     for i, raw in enumerate(configs):
         params = cast_params_to_search_space(dict(raw), search_space)
+        if preflight_enabled:
+            try:
+                result = timed_preflight(params, args.candidate_path)
+            except Exception as exc:
+                tb = traceback.format_exc()
+                sys.stderr.write(tb)
+                failure = record_failure(
+                    report_path=args.tune_report_json,
+                    candidate_path=args.candidate_path,
+                    phase="preflight",
+                    method="warmstart",
+                    params=params,
+                    error=exc,
+                    traceback_text=tb,
+                )
+                preflight_report.setdefault("attempts", []).append(
+                    {
+                        "params": params,
+                        "source": "warmstart",
+                        "status": "failed",
+                        **failure,
+                    }
+                )
+                preflight_report["invocations"] = len(preflight_report["attempts"])
+                preflight_report["status"] = "failed"
+                report["phase_a"]["warm_start_configs"] = wsc
+                report["phase_a"]["status"] = "preflight_failed"
+                write_tune_report(args.tune_report_json, report)
+                write_json(
+                    {
+                        "phase": "preflight",
+                        "status": "crashed",
+                        "crash_index": i,
+                        "crash_params": params,
+                        "objective_slot_consumed": False,
+                        **failure,
+                    }
+                )
+                return CRASHED
+            preflight_report.setdefault("attempts", []).append(
+                {
+                    "params": params,
+                    "source": "warmstart",
+                    "status": "ok",
+                    "result": result or {"status": "ok"},
+                }
+            )
+            preflight_report["invocations"] = len(preflight_report["attempts"])
+            write_tune_report(args.tune_report_json, report)
+
         key = _params_key(params)
         if key in cache:
             wsc.append({"params": params, "score": cache[key]})
         else:
-            trials_attempted += 1
-            report["phase_a"]["trials_attempted"] = trials_attempted
             try:
-                score = timed_eval(evaluate, make_model, params, args.candidate_path)
+                score = timed_eval(
+                    evaluate,
+                    make_model,
+                    params,
+                    args.candidate_path,
+                    phase="phase_a",
+                    method="warmstart",
+                )
+            except EvaluationBudgetExhausted as exc:
+                if preflight_enabled:
+                    preflight_report["status"] = "ok"
+                report["phase_a"]["warm_start_configs"] = wsc
+                if wsc:
+                    unscored = configs[i:] + deferred
+                    report["phase_a"]["deferred_configs"] = [
+                        {
+                            "params": cast_params_to_search_space(
+                                dict(config),
+                                search_space,
+                            )
+                        }
+                        for config in unscored
+                    ]
+                    best_params, best_warm_score = min(
+                        ((trial["params"], trial["score"]) for trial in wsc),
+                        key=lambda item: item[1],
+                    )
+                    apply_base_params.apply(args.candidate_path, best_params)
+                    elapsed = time.time() - started
+                    report["phase_a"].update(
+                        {
+                            "best_warm_score": best_warm_score,
+                            "best_warm_params": best_params,
+                            "k_evaluated": len(wsc),
+                            "k_survived": len(wsc),
+                            "k_deferred": len(unscored),
+                            "elapsed_seconds": round(elapsed, 1),
+                            "status": "ok",
+                            "budget_exhausted": True,
+                        }
+                    )
+                    write_tune_report(args.tune_report_json, report)
+                    write_json(
+                        {
+                            "phase": "a",
+                            "status": "ok",
+                            "budget_exhausted": True,
+                            "k_evaluated": len(wsc),
+                            "trials_attempted": trials_attempted,
+                            "best_warm_score": best_warm_score,
+                            "best_warm_params": best_params,
+                            "elapsed_seconds": round(elapsed, 1),
+                        }
+                    )
+                    return 0
+                report["phase_a"]["status"] = "budget_exhausted"
+                write_tune_report(args.tune_report_json, report)
+                write_json(
+                    {
+                        "phase": "a",
+                        "status": "budget_exhausted",
+                        "reason": str(exc),
+                        "objective_slot_consumed": False,
+                    }
+                )
+                return BUDGET_EXHAUSTED
             except Exception as exc:
+                trials_attempted += 1
+                report["phase_a"]["trials_attempted"] = trials_attempted
                 tb = traceback.format_exc()
                 sys.stderr.write(tb)
                 failure = record_failure(
@@ -152,6 +278,8 @@ def main() -> int:
                             "crash_params": params,
                             **failure})
                 return CRASHED
+            trials_attempted += 1
+            report["phase_a"]["trials_attempted"] = trials_attempted
             wsc.append({"params": params, "score": score})
             cache[key] = score
         report["phase_a"]["warm_start_configs"] = wsc
@@ -172,6 +300,8 @@ def main() -> int:
         "elapsed_seconds": round(elapsed, 1),
         "status": "ok",
     })
+    if preflight_enabled:
+        preflight_report["status"] = "ok"
     write_tune_report(args.tune_report_json, report)
 
     write_json({

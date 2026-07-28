@@ -177,6 +177,40 @@ class FailureArtifactTests(unittest.TestCase):
         self.assertEqual(summary["trials_completed"], 2)
         self.assertEqual(summary["trials_attempted"], 5)
 
+    def test_preflight_rejections_are_not_objective_attempts(self) -> None:
+        report = {
+            "preflight": {
+                "attempts": [
+                    {"params": {"depth": 2}, "status": "ok"},
+                    {"params": {"depth": 4}, "status": "failed"},
+                ]
+            },
+            "phase_a": {
+                "warm_start_configs": [{"params": {"depth": 2}, "score": 0.4}],
+                "trials_attempted": 1,
+            },
+            "phase_c": {
+                "stages": [{
+                    "method": "grid",
+                    "trials": [
+                        {
+                            "params": {"depth": 4},
+                            "score": None,
+                            "status": "preflight_rejected",
+                        },
+                        {"params": {"depth": 3}, "score": 0.3},
+                    ],
+                }],
+            },
+        }
+
+        summary = summarize(report)
+        self.assertEqual(summary["trials_completed"], 2)
+        self.assertEqual(summary["trials_attempted"], 2)
+        self.assertEqual(summary["preflight_attempts"], 2)
+        self.assertEqual(summary["preflight_failures"], 1)
+        self.assertEqual(summary["feasibility_rejections"], 1)
+
     def test_timed_eval_rejects_non_finite_in_process_result(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-finite score"):
             timed_eval(

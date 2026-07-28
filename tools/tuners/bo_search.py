@@ -22,10 +22,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
+    EvaluationBudgetExhausted,
     resolve_score_fn,
+    resolve_preflight_fn,
     timed_eval,
+    timed_preflight,
     load_run_cfg,
     PatienceMonitor,
+    append_preflight_attempt,
     append_trial,
     cast_params_to_search_space,
     load_candidate_modules,
@@ -110,6 +114,7 @@ def main() -> int:
     search_space = train_module.SEARCH_SPACE
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
+    preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
 
     n_dims = len(search_space)
     if patience_override is not None:
@@ -168,6 +173,12 @@ def main() -> int:
         start_best=prior_best_score(prior_trials),
     )
     early_stopped = {"flag": False, "reason": "none"}
+    counters = {
+        "objective_attempts": 0,
+        "objective_completed": 0,
+        "preflight_rejections": 0,
+        "budget_exhausted": False,
+    }
     failure_refs = []
 
     started = time.time()
@@ -175,9 +186,62 @@ def main() -> int:
     def objective(trial):
         params = {k: suggest(trial, k, search_space[k]) for k in search_space}
         params = cast_params_to_search_space(params, search_space)
+        if preflight_enabled:
+            try:
+                preflight_result = timed_preflight(params, args.candidate_path)
+            except Exception as exc:
+                failure = record_failure(
+                    report_path=args.tune_report_json,
+                    candidate_path=args.candidate_path,
+                    phase="preflight",
+                    method="bo",
+                    params=params,
+                    error=exc,
+                    traceback_text=traceback.format_exc(),
+                )
+                append_preflight_attempt(
+                    args.tune_report_json,
+                    source="bo",
+                    params=params,
+                    status="failed",
+                    failure=failure,
+                )
+                append_trial(
+                    args.tune_report_json,
+                    "bo",
+                    {
+                        "params": params,
+                        "score": None,
+                        "status": "preflight_rejected",
+                        **failure,
+                    },
+                )
+                counters["preflight_rejections"] += 1
+                raise RuntimeError("candidate preflight rejected BO proposal") from exc
+            append_preflight_attempt(
+                args.tune_report_json,
+                source="bo",
+                params=params,
+                status="ok",
+                result=preflight_result or {"status": "ok"},
+            )
         try:
-            score = timed_eval(evaluate, make_model, params, args.candidate_path)
+            score = timed_eval(
+                evaluate,
+                make_model,
+                params,
+                args.candidate_path,
+                phase="phase_c",
+                method="bo",
+            )
+        except EvaluationBudgetExhausted:
+            counters["budget_exhausted"] = True
+            early_stopped["flag"] = True
+            early_stopped["reason"] = "evaluation_budget"
+            study.stop()
+            raise
         except Exception as exc:
+            counters["objective_attempts"] += 1
             # Record the failure so it is auditable in tune_report, then re-raise
             # so Optuna (catch= below) marks this trial FAILED and moves on.
             failure = record_failure(
@@ -196,6 +260,8 @@ def main() -> int:
             if failure["failure_ref"] not in failure_refs:
                 failure_refs.append(failure["failure_ref"])
             raise
+        counters["objective_attempts"] += 1
+        counters["objective_completed"] += 1
         append_trial(
             args.tune_report_json, "bo", {"params": params, "score": score}
         )
@@ -219,21 +285,27 @@ def main() -> int:
 
     elapsed = time.time() - started
 
-    new_trials = study.trials[n_priors_injected:]
-    attempted_trials = [
-        t
-        for t in new_trials
-        if t.state in {
-            optuna.trial.TrialState.COMPLETE,
-            optuna.trial.TrialState.FAIL,
-        }
-    ]
-    completed_trials = [
-        t
-        for t in attempted_trials
-        if t.value is not None and t.state == optuna.trial.TrialState.COMPLETE
-    ]
-    if not completed_trials:
+    if counters["objective_completed"] == 0 and counters["budget_exhausted"]:
+        set_stage_meta(
+            args.tune_report_json,
+            "bo",
+            status="budget_exhausted",
+            elapsed_seconds=round(elapsed, 1),
+            early_stopped=True,
+            preflight_rejections=counters["preflight_rejections"],
+        )
+        write_json({
+            "method": "bo",
+            "status": "budget_exhausted",
+            "reason": "global evaluation budget exhausted before score_fn",
+            "trials_completed": 0,
+            "trials_attempted": counters["objective_attempts"],
+            "preflight_rejections": counters["preflight_rejections"],
+            "elapsed_seconds": round(elapsed, 1),
+        })
+        return 0
+
+    if counters["objective_completed"] == 0:
         # Every newly attempted trial errored. Injected priors do not make this
         # search stage successful because they were evaluated before it began.
         set_stage_meta(args.tune_report_json, "bo", status="failed",
@@ -243,7 +315,8 @@ def main() -> int:
             "status": "failed",
             "reason": "all BO trials errored; no completed trial",
             "trials_completed": 0,
-            "trials_attempted": len(attempted_trials),
+            "trials_attempted": counters["objective_attempts"],
+            "preflight_rejections": counters["preflight_rejections"],
             "early_stopped": early_stopped["flag"],
             "early_stop_reason": early_stopped["reason"],
             "failure_refs": failure_refs[-3:],
@@ -252,8 +325,15 @@ def main() -> int:
         })
         return 0
 
-    set_stage_meta(args.tune_report_json, "bo", status="ok",
-                   elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped["flag"])
+    set_stage_meta(
+        args.tune_report_json,
+        "bo",
+        status="ok",
+        elapsed_seconds=round(elapsed, 1),
+        early_stopped=early_stopped["flag"],
+        preflight_rejections=counters["preflight_rejections"],
+        budget_exhausted=counters["budget_exhausted"],
+    )
 
     best_params = cast_params_to_search_space(dict(study.best_params), search_space)
     best_score = float(study.best_value)
@@ -263,8 +343,10 @@ def main() -> int:
         "status": "ok",
         "best_params": best_params,
         "best_score": best_score,
-        "trials_completed": len(completed_trials),
-        "trials_attempted": len(attempted_trials),
+        "trials_completed": counters["objective_completed"],
+        "trials_attempted": counters["objective_attempts"],
+        "preflight_rejections": counters["preflight_rejections"],
+        "budget_exhausted": counters["budget_exhausted"],
         "prior_trials_injected": n_priors_injected,
         "n_dims": n_dims,
         "patience": patience,

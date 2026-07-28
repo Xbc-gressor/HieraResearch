@@ -2,10 +2,11 @@
 Autoresearch pretraining candidate. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
 
-Tuner contract: `make_model(env, params)` builds a trainer whose `run()`
-executes one full budgeted training run and returns the post-training
-`val_bpb`. `prepare.evaluate_config` is the ONE scoring surface for the
-experiment loop. Standalone usage (manual runs and autoresearch-hillclimb):
+Tuner contract: `make_model(env, params)` builds a trainer whose `preflight()`
+runs one no-validation train step and whose `run()` executes one full budgeted
+training run and returns the post-training `val_bpb`. `prepare.evaluate_config`
+is the ONE scoring surface for the experiment loop. Standalone usage
+(manual runs and autoresearch-hillclimb):
 `uv run train.py` runs `DEFAULT_PARAMS` through the identical path and prints
 the parseable summary.
 """
@@ -78,7 +79,7 @@ def _load_fa3():
         cap = torch.cuda.get_device_capability()
         # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
         repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-        fa3 = get_kernel(repo).flash_attn_interface
+        fa3 = get_kernel(repo, version=1).flash_attn_interface
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -513,6 +514,67 @@ class Trainer:
     def __init__(self, env, params):
         self.env = env
         self.params = params
+
+    def preflight(self):
+        """Run one real-shape train step without validation or a score."""
+        env, p = self.env, self.params
+        torch.manual_seed(env.seed)
+        torch.cuda.manual_seed(env.seed)
+        torch.set_float32_matmul_precision("high")
+        device = torch.device(env.device)
+        torch.cuda.reset_peak_memory_stats(device)
+
+        config = build_model_config(p["depth"], env.vocab_size, env.max_seq_len)
+        with torch.device("meta"):
+            model = GPT(config)
+        model.to_empty(device=device)
+        model.init_weights()
+        num_params = model.num_scaling_params()["total"]
+        optimizer = model.setup_optimizer(
+            unembedding_lr=p["unembedding_lr"],
+            embedding_lr=p["embedding_lr"],
+            scalar_lr=p["scalar_lr"],
+            adam_betas=ADAM_BETAS,
+            matrix_lr=p["matrix_lr"],
+            weight_decay=p["weight_decay"],
+        )
+        model = torch.compile(model, dynamic=False)
+
+        device_batch_size = int(p["device_batch_size"])
+        if device_batch_size < 1:
+            raise ValueError(
+                f"device_batch_size must be >= 1, got {device_batch_size}"
+            )
+        if int(p["grad_accum_steps"]) < 1:
+            raise ValueError(
+                f"grad_accum_steps must be >= 1, got {p['grad_accum_steps']}"
+            )
+        train_loader = env.make_dataloader(
+            env.tokenizer,
+            device_batch_size,
+            env.max_seq_len,
+            "train",
+        )
+        x, y, _ = next(train_loader)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = model(x, y)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"preflight produced non-finite loss: {loss.item()!r}")
+        loss.backward()
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+
+        peak_vram_mb = torch.cuda.max_memory_allocated(device) / 1024 / 1024
+        del model, optimizer, x, y, loss
+        gc.collect()
+        torch.cuda.empty_cache()
+        return {
+            "peak_vram_mb": round(peak_vram_mb, 1),
+            "num_params_M": round(num_params / 1e6, 3),
+            "train_steps": 1,
+            "validation_calls": 0,
+        }
 
     def run(self):
         env, p = self.env, self.params

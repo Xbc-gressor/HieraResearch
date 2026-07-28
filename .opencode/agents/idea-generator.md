@@ -86,6 +86,14 @@ Use its actions exactly. It owns only operation and parents:
 Do not replace its parents with the current best and do not fold semantic
 acquisition into PUCB.
 
+The helper also applies the strict objective-admission cap:
+`floor(remaining_objective_slots / K_eval)`. It may therefore return
+`actions: []` even when the graph policy had proposals. This is a valid
+budget-boundary no-op; persist no record and return exactly
+`generation_run_ids: none`, `selection_reason: objective_budget_admission_cap`,
+and `ledger: <run_dir>/ledger.json` so the coordinator may spend any
+sub-`K_eval` remainder on deep tuning.
+
 ## Step 2 — Build valid semantic proposals
 
 For each action, obtain the current `next_run_id`, then write action-local

@@ -21,8 +21,9 @@ Contract assumed of the candidate's prepare.py:
 
 There is a **single global `config → score` function** (no separate official
 run): warm-start eval and Phase C tuning both call it, so the score it returns
-IS the candidate's score recorded in ledger.json. The test set is the
-optimization target, so that score is an optimistic estimate by construction.
+IS the candidate's score recorded in ledger.json. An optional task-owned
+preflight exercises feasibility without calling that score surface or consuming
+its strict run-level budget.
 
 Tuner scripts persist trial-level history to tune_report.json
 incrementally — see `append_trial` and `read_prior_trials`. Concurrency is
@@ -45,11 +46,16 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from evaluation_budget import (  # noqa: E402
+    EvaluationBudgetExhausted,
+    reserve_evaluation,
+)
 from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 
 
 REQUIRED_SYMBOLS = ("BASE_PARAMS", "SEARCH_SPACE", "make_model")
 DEFAULT_SCORE_FN = "evaluate_config"
+DEFAULT_PREFLIGHT_LIMIT = 180.0
 
 
 def is_finite_score(value: Any) -> bool:
@@ -139,6 +145,45 @@ def resolve_score_fn(prepare_module: Any, candidate_path: Path):
     return getattr(prepare_module, fn_name)
 
 
+def _configured_preflight_name(candidate_path: Path) -> str | None:
+    """Return the declared candidate preflight symbol without importing code."""
+    task_name = _infer_task_name(Path(candidate_path))
+    if not task_name:
+        return None
+    task_toml = ROOT / "tasks" / task_name / "task.toml"
+    if not task_toml.exists():
+        return None
+    try:
+        configured = parse_task_toml(task_toml).get("evaluation", {})
+    except ValueError:
+        return None
+    name = configured.get("preflight_fn") if isinstance(configured, dict) else None
+    if name is None:
+        return None
+    if not isinstance(name, str) or not name:
+        raise RuntimeError("task.toml evaluation.preflight_fn must be a non-empty string")
+    return name
+
+
+def resolve_preflight_fn(prepare_module: Any, candidate_path: Path):
+    """Return the optional task-owned no-score preflight callable.
+
+    The hook is declared as ``evaluation.preflight_fn``.  It must accept
+    ``(make_model, params)`` and must not call the task's score function or
+    validation metric.  Tasks without the declaration keep the historical
+    direct-evaluation behavior.
+    """
+    name = _configured_preflight_name(candidate_path)
+    if name is None:
+        return None
+    if not hasattr(prepare_module, name):
+        raise RuntimeError(
+            f"prepare.py missing preflight fn {name!r} "
+            f"(task.toml [evaluation].preflight_fn)"
+        )
+    return getattr(prepare_module, name)
+
+
 def load_run_cfg(ref_path: Any, section: str) -> dict:
     """Per-run framework-hyperparameter overrides from `<run_dir>/framework_cfg.json`.
 
@@ -178,31 +223,48 @@ def read_runtime_limit(ref_path: Any) -> float | None:
     return None
 
 
-def timed_eval(evaluate, make_model, params: dict, candidate_path: Any) -> float:
-    """Run ONE config eval, enforcing `per_runtime_limit` (framework_cfg.json).
+def read_preflight_limit(ref_path: Any) -> float:
+    """Return the bounded no-score preflight timeout for one config."""
+    p = Path(ref_path).resolve()
+    for anc in p.parents:
+        cfg = anc / "framework_cfg.json"
+        if cfg.is_file():
+            try:
+                data = json.loads(cfg.read_text())
+            except (ValueError, OSError):
+                break
+            value = data.get("preflight_runtime_limit")
+            if value is not None:
+                try:
+                    value = float(value)
+                    if value > 0:
+                        return value
+                except (TypeError, ValueError):
+                    pass
+            runtime = data.get("per_runtime_limit")
+            try:
+                runtime = float(runtime)
+                if runtime > 0:
+                    return min(DEFAULT_PREFLIGHT_LIMIT, runtime)
+            except (TypeError, ValueError):
+                pass
+            break
+    return DEFAULT_PREFLIGHT_LIMIT
 
-    No limit -> call `evaluate(make_model, params)` in-process (fast path, no
-    overhead). With a limit -> run the eval in a fresh subprocess in its own
-    process group (`_eval_one.py`) and hard-kill the whole tree on timeout.
-    Timeouts, child-process errors, missing results, and non-finite scores raise
-    so callers record an auditable failed trial instead of caching ``+inf`` as
-    if it were a successful score.
-    """
-    limit = read_runtime_limit(candidate_path)
-    if limit is None:
-        score = float(evaluate(make_model, params))
-        if not is_finite_score(score):
-            raise ValueError(f"evaluation returned non-finite score: {score!r}")
-        return score
-    eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
+
+def _communicate_with_limit(
+    command: list[str],
+    *,
+    limit: float,
+    label: str,
+) -> tuple[str, str, int]:
     posix = os.name == "posix"
     kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
     if posix:
-        kwargs["start_new_session"] = True       # own process group, for a clean group-kill
+        kwargs["start_new_session"] = True
     elif os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = subprocess.Popen(
-        [sys.executable, eval_one, str(candidate_path), json.dumps(params)], **kwargs)
+    proc = subprocess.Popen(command, **kwargs)
     try:
         out, err = proc.communicate(timeout=limit)
     except subprocess.TimeoutExpired:
@@ -217,9 +279,46 @@ def timed_eval(evaluate, make_model, params: dict, candidate_path: Any) -> float
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-        raise TimeoutError(
-            f"evaluation exceeded per_runtime_limit={limit:g}s"
-        ) from None
+        raise TimeoutError(f"{label}={limit:g}s") from None
+    return out, err, int(proc.returncode)
+
+
+def timed_eval(
+    evaluate,
+    make_model,
+    params: dict,
+    candidate_path: Any,
+    *,
+    phase: str = "unknown",
+    method: str = "unknown",
+) -> float:
+    """Run ONE config eval, enforcing `per_runtime_limit` (framework_cfg.json).
+
+    No limit -> call `evaluate(make_model, params)` in-process (fast path, no
+    overhead). With a limit -> run the eval in a fresh subprocess in its own
+    process group (`_eval_one.py`) and hard-kill the whole tree on timeout.
+    Timeouts, child-process errors, missing results, and non-finite scores raise
+    so callers record an auditable failed trial instead of caching ``+inf`` as
+    if it were a successful score.
+    """
+    reserve_evaluation(
+        candidate_path,
+        params=params,
+        phase=phase,
+        method=method,
+    )
+    limit = read_runtime_limit(candidate_path)
+    if limit is None:
+        score = float(evaluate(make_model, params))
+        if not is_finite_score(score):
+            raise ValueError(f"evaluation returned non-finite score: {score!r}")
+        return score
+    eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
+    out, err, returncode = _communicate_with_limit(
+        [sys.executable, eval_one, str(candidate_path), json.dumps(params)],
+        limit=limit,
+        label="evaluation exceeded per_runtime_limit",
+    )
     for line in out.splitlines():
         if line.startswith("RESULT:"):
             try:
@@ -234,8 +333,45 @@ def timed_eval(evaluate, make_model, params: dict, candidate_path: Any) -> float
     if len(detail) > 4000:
         detail = "...[stderr truncated]...\n" + detail[-4000:]
     message = (
-        f"evaluation subprocess exited with code {proc.returncode} "
+        f"evaluation subprocess exited with code {returncode} "
         "without a RESULT line"
+    )
+    if detail:
+        message += f"\nchild stderr:\n{detail}"
+    raise RuntimeError(message)
+
+
+def timed_preflight(params: dict, candidate_path: Any) -> dict | None:
+    """Run one task-owned no-score preflight in an isolated subprocess.
+
+    Returns ``None`` when the task has no ``evaluation.preflight_fn``.
+    Crucially, this function never reserves an objective evaluation slot.
+    """
+    if _configured_preflight_name(Path(candidate_path)) is None:
+        return None
+    preflight_one = str(Path(__file__).resolve().parent / "_preflight_one.py")
+    limit = read_preflight_limit(candidate_path)
+    out, err, returncode = _communicate_with_limit(
+        [sys.executable, preflight_one, str(candidate_path), json.dumps(params)],
+        limit=limit,
+        label="preflight exceeded preflight_runtime_limit",
+    )
+    for line in out.splitlines():
+        if not line.startswith("PREFLIGHT:"):
+            continue
+        payload = line[len("PREFLIGHT:"):]
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            raise ValueError(f"preflight subprocess printed invalid result: {line!r}") from None
+        return value if isinstance(value, dict) else {"result": value}
+
+    detail = err.strip()
+    if len(detail) > 4000:
+        detail = "...[stderr truncated]...\n" + detail[-4000:]
+    message = (
+        f"preflight subprocess exited with code {returncode} "
+        "without a PREFLIGHT line"
     )
     if detail:
         message += f"\nchild stderr:\n{detail}"
@@ -298,6 +434,36 @@ def write_tune_report(report_path: Path, report: dict) -> None:
     with open(tmp, "w") as f:
         json.dump(report, f, indent=2, default=_to_native)
     tmp.replace(report_path)
+
+
+def append_preflight_attempt(
+    report_path: Path,
+    *,
+    source: str,
+    params: dict,
+    status: str,
+    result: dict | None = None,
+    failure: dict | None = None,
+) -> None:
+    """Append one no-score feasibility attempt to the candidate report."""
+    report = read_tune_report(report_path)
+    preflight = report.setdefault("preflight", {"attempts": [], "invocations": 0})
+    row = {
+        "params": params,
+        "source": source,
+        "status": status,
+    }
+    if result is not None:
+        row["result"] = result
+    if failure is not None:
+        row.update(failure)
+    preflight.setdefault("attempts", []).append(row)
+    preflight["invocations"] = len(preflight["attempts"])
+    if status == "failed":
+        preflight["status"] = "failed"
+    elif preflight.get("status") != "failed":
+        preflight["status"] = "ok"
+    write_tune_report(report_path, report)
 
 
 def append_trial(report_path: Path, method: str, trial: dict) -> None:

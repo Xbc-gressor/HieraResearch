@@ -32,9 +32,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
+    EvaluationBudgetExhausted,
     resolve_score_fn,
+    resolve_preflight_fn,
     timed_eval,
+    timed_preflight,
     PatienceMonitor,
+    append_preflight_attempt,
     append_trial,
     cast_params_to_search_space,
     load_candidate_modules,
@@ -160,6 +164,7 @@ def main() -> int:
     search_space = train_module.SEARCH_SPACE
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
+    preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
 
     prior_trials = read_prior_trials(args.tune_report_json)
     best_prior = None
@@ -197,6 +202,8 @@ def main() -> int:
     any_success = False
     early_stopped = False
     early_stop_reason = "none"
+    budget_exhausted = False
+    preflight_rejections = 0
     failure_refs = []
 
     monitor = PatienceMonitor(
@@ -204,16 +211,74 @@ def main() -> int:
         start_best=prior_best_score(prior_trials),
     )
 
+    def preflight_passes(params: dict) -> bool:
+        nonlocal preflight_rejections
+        if not preflight_enabled:
+            return True
+        try:
+            result = timed_preflight(params, args.candidate_path)
+        except Exception as exc:
+            failure = record_failure(
+                report_path=args.tune_report_json,
+                candidate_path=args.candidate_path,
+                phase="preflight",
+                method="cmaes",
+                params=params,
+                error=exc,
+                traceback_text=traceback.format_exc(),
+            )
+            append_preflight_attempt(
+                args.tune_report_json,
+                source="cmaes",
+                params=params,
+                status="failed",
+                failure=failure,
+            )
+            append_trial(
+                args.tune_report_json,
+                "cmaes",
+                {
+                    "params": params,
+                    "score": None,
+                    "status": "preflight_rejected",
+                    **failure,
+                },
+            )
+            preflight_rejections += 1
+            return False
+        append_preflight_attempt(
+            args.tune_report_json,
+            source="cmaes",
+            params=params,
+            status="ok",
+            result=result or {"status": "ok"},
+        )
+        return True
+
     # Deferred warm configs (proposed at step 0+1, not evaluated there): evaluate
     # them up front so the rare cmaes path doesn't lose them. Recorded + considered
     # for best (select-best ranks the whole report); they are EXTRA — not charged to
     # the cmaes `evals` budget (cmaes still seeds x0 from the best evaluated prior).
     for d_params in read_deferred_configs(args.tune_report_json):
         params = cast_params_to_search_space(dict(d_params), search_space)
-        trials_attempted += 1
+        if not preflight_passes(params):
+            continue
         try:
-            score = timed_eval(evaluate, make_model, params, args.candidate_path)
+            score = timed_eval(
+                evaluate,
+                make_model,
+                params,
+                args.candidate_path,
+                phase="phase_c",
+                method="cmaes",
+            )
+        except EvaluationBudgetExhausted:
+            budget_exhausted = True
+            early_stopped = True
+            early_stop_reason = "evaluation_budget"
+            break
         except Exception as exc:
+            trials_attempted += 1
             failure = record_failure(
                 report_path=args.tune_report_json,
                 candidate_path=args.candidate_path,
@@ -228,13 +293,14 @@ def main() -> int:
             if failure["failure_ref"] not in failure_refs:
                 failure_refs.append(failure["failure_ref"])
             continue
+        trials_attempted += 1
         append_trial(args.tune_report_json, "cmaes", {"params": params, "score": score})
         any_success = True
         trials_completed += 1
         if score < best_score:
             best_score, best_params = score, params
 
-    while evals < args.max_evals:
+    while evals < args.max_evals and not budget_exhausted:
         if es.stop():
             early_stopped = True
             early_stop_reason = "cma_internal"
@@ -247,10 +313,27 @@ def main() -> int:
                 break
             params = decode(np.asarray(x))
             params = cast_params_to_search_space(params, search_space)
-            trials_attempted += 1
+            if not preflight_passes(params):
+                results.append((x, None))
+                evals += 1
+                continue
             try:
-                score = timed_eval(evaluate, make_model, params, args.candidate_path)
+                score = timed_eval(
+                    evaluate,
+                    make_model,
+                    params,
+                    args.candidate_path,
+                    phase="phase_c",
+                    method="cmaes",
+                )
+            except EvaluationBudgetExhausted:
+                budget_exhausted = True
+                early_stopped = True
+                early_stop_reason = "evaluation_budget"
+                stop_now = True
+                break
             except Exception as exc:
+                trials_attempted += 1
                 # One bad param region must not kill the whole search: record the
                 # failure for audit and carry it as a penalty placeholder below.
                 failure = record_failure(
@@ -269,6 +352,7 @@ def main() -> int:
                 results.append((x, None))
                 evals += 1
                 continue
+            trials_attempted += 1
             append_trial(
                 args.tune_report_json, "cmaes", {"params": params, "score": score}
             )
@@ -298,6 +382,26 @@ def main() -> int:
 
     elapsed = time.time() - started
 
+    if not any_success and budget_exhausted:
+        set_stage_meta(
+            args.tune_report_json,
+            "cmaes",
+            status="budget_exhausted",
+            elapsed_seconds=round(elapsed, 1),
+            early_stopped=True,
+            preflight_rejections=preflight_rejections,
+        )
+        write_json({
+            "method": "cmaes",
+            "status": "budget_exhausted",
+            "reason": "global evaluation budget exhausted before score_fn",
+            "trials_completed": trials_completed,
+            "trials_attempted": trials_attempted,
+            "preflight_rejections": preflight_rejections,
+            "elapsed_seconds": round(elapsed, 1),
+        })
+        return 0
+
     if not any_success:
         # Every evaluated trial errored — surface a failed stage instead of
         # writing the seed defaults as if they were a real "ok" best.
@@ -309,6 +413,7 @@ def main() -> int:
             "reason": "all CMA-ES trials errored; no completed trial",
             "trials_completed": trials_completed,
             "trials_attempted": trials_attempted,
+            "preflight_rejections": preflight_rejections,
             "prior_trials_seen": len(prior_trials),
             "popsize": args.popsize,
             "early_stopped": early_stopped,
@@ -319,8 +424,15 @@ def main() -> int:
         })
         return 0
 
-    set_stage_meta(args.tune_report_json, "cmaes", status="ok",
-                   elapsed_seconds=round(elapsed, 1), early_stopped=early_stopped)
+    set_stage_meta(
+        args.tune_report_json,
+        "cmaes",
+        status="ok",
+        elapsed_seconds=round(elapsed, 1),
+        early_stopped=early_stopped,
+        preflight_rejections=preflight_rejections,
+        budget_exhausted=budget_exhausted,
+    )
 
     write_json({
         "method": "cmaes",
@@ -329,6 +441,8 @@ def main() -> int:
         "best_score": best_score,
         "trials_completed": trials_completed,
         "trials_attempted": trials_attempted,
+        "preflight_rejections": preflight_rejections,
+        "budget_exhausted": budget_exhausted,
         "prior_trials_seen": len(prior_trials),
         "x0_from_prior": best_prior is not None,
         "popsize": args.popsize,
