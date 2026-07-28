@@ -5,8 +5,9 @@ and writes a markdown report + a PNG (best-vs-evals curves + a 6-cell bar chart)
 
 Handles incomplete runs gracefully (uses whatever has been recorded so far).
 
-Run (needs matplotlib — use a task env that has it):
-  uv --directory tasks/hard-interactions run python tools/got_benchmark/collect_compare.py
+Run (needs matplotlib — use a task env that has it; --project keeps the
+repo-root cwd so the repo-relative paths below resolve):
+  uv --project tasks/hard-interactions run python tools/got_benchmark/collect_compare.py
 """
 from __future__ import annotations
 import json

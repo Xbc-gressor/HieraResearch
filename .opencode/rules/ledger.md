@@ -72,7 +72,7 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `op` | structural graph action: `fresh`, `improve`, or `crossover` |
 | `source_run_ids` | numeric parents only: 0 / 1 / 2 for the three ops |
 | `semantic_point` | complete mapping over all selected dimensions, including explicit conditional inactivity |
-| `policy_receipt` | policy name/config, action, proposal-set digest, selected point, separate gain/uncertainty/cost/coverage components, evidence, and ranking |
+| `policy_receipt` | policy name/config, action, proposal-set digest, selected point, separate prior/experience-adjusted gain and uncertainty plus cost/coverage components, experience receipt, evidence, and ranking |
 | `idea` | self-contained complete solution, not merely a list of hypotheses |
 | `change` | implementation process relative to parents; it may be non-empty even when the point is unchanged |
 | `candidate_name`, `description`, `metric` | display metadata |
@@ -89,11 +89,19 @@ The semantic point contains the exact `space_revision`, a stable content-based
 An active dimension selects exactly one local `hyp-*`; a conditionally inactive
 dimension says `state: inactive` and cites its unsatisfied activation relations.
 
-The policy receipt is derived and replaceable. `predicted_gain`, `uncertainty`,
-`cost`, and deterministic `coverage` remain separate fields. These rubric
+The policy receipt is derived and replaceable. Schema 4 keeps `prior_gain`,
+`experience_gain_adjustment`, final `predicted_gain`, `prior_uncertainty`,
+`experience_uncertainty_adjustment`, final `uncertainty`, `cost`, and
+deterministic `coverage` separate. Its compact `experience` receipt pins the
+generation/revision, cited terminal runs/semantic edges, and adjustment
+rationale consumed by the prediction. The helper validates both
+prior-plus-adjustment equalities and
+requires a current experience snapshot to change gain or uncertainty; a model
+cannot merely mention history while reusing the same numbers. These rubric
 scores are not calibrated posteriors and are never copied into observations.
-The outer graph policy remains in `got_select`; the receipt concerns only the
-semantic point chosen after that graph action.
+Historical schema-2/3 receipts remain readable. The outer graph policy remains
+in `got_select`; the receipt concerns only the semantic point chosen after that
+graph action.
 
 ## Score and crash semantics
 

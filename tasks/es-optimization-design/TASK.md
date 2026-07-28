@@ -117,7 +117,8 @@ uv --directory tasks/es-optimization-design sync
 # Requires an existing <run_id> ledger record; also derives _candidate_brief.json.
 python tools/new_candidate.py es-optimization-design <tag> <run_id> --skip-entrypoint
 # after candidate-writer + tunable-contract-extractor produce train.py + _warm_configs.json:
-uv --directory tasks/es-optimization-design run python tools/tuners/warmstart_eval.py \
+# (--project selects the task env without chdir, so the repo-relative paths below resolve)
+uv --project tasks/es-optimization-design run python tools/tuners/warmstart_eval.py \
   --candidate-path   runs/es-optimization-design/<tag>/candidates/<run_id>/train.py \
   --configs-json     runs/es-optimization-design/<tag>/candidates/<run_id>/_warm_configs.json \
   --tune-report-json runs/es-optimization-design/<tag>/candidates/<run_id>/tune_report.json

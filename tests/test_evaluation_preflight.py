@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 
 import evaluation_budget  # noqa: E402
 import preflight_env  # noqa: E402
+import run_cfg  # noqa: E402
 from _common import timed_eval, timed_preflight  # noqa: E402
 
 
@@ -102,6 +103,19 @@ class EvaluationBudgetTests(unittest.TestCase):
                 [row["kind"] for row in rows],
                 ["baseline", "score_attempt", "score_attempt"],
             )
+
+    def test_corrupt_framework_cfg_fails_fast_instead_of_lifting_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = _run_dir(Path(tmp), budget=1)
+            # The file is designed to be hand-edited; a malformed edit must not
+            # silently degrade to "no budget configured".
+            (run_dir / "framework_cfg.json").write_text('{"max_evaluations": 1,')
+            with self.assertRaises(run_cfg.RunConfigError):
+                evaluation_budget.reserve_evaluation(
+                    candidate, params={"x": 1}, phase="phase_c", method="grid"
+                )
+            with self.assertRaises(run_cfg.RunConfigError):
+                evaluation_budget.budget_status(run_dir)
 
     def test_legacy_sync_reconciles_per_candidate_without_hiding_calls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

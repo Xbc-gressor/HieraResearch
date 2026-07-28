@@ -99,13 +99,19 @@ Every enumerated point passes `validate_point` — admissibility under
 `requires`/`excludes` is a deterministic check, not a policy judgment.
 `semantic_search.py select` then applies a replaceable acquisition policy
 (`coverage`, `gain`, `gain_uncertainty`, `gain_uncertainty_nocost`) over
-fibers, writing a policy receipt that keeps `coverage`, `predicted_gain`,
-`uncertainty`, and `cost` as separate components. Before acquisition, proposals are partitioned into
-active and deprioritized budget lanes. With interval `N` (default 5), every
+fibers. For model-scored policies, `gain-context` pins the bounded experience
+generation and its cited terminal/semantic-edge observations. Prediction schema 2 separates
+the background/mechanism prior from signed experience adjustments for both
+gain and uncertainty; the helper verifies the arithmetic and requires a
+current experience snapshot to affect at least one final number. Policy receipt
+schema 4 persists those inputs separately from `coverage` and `cost`, so the
+history update is auditable rather than implied by evidence prose. Before
+acquisition, proposals are partitioned into active and deprioritized budget
+lanes. With interval `N` (default 5), every
 Nth one-based semantic admission selects within the deprioritized lane and
 all other admissions select within the active lane; acquisition scores never
 move a point across lanes. If a scheduled lane is empty, the other lane fills
-the slot and the schema-3 receipt records the fallback and both lanes.
+the slot and the schema-4 receipt records the fallback and both lanes.
 Hypotheses are coordinates, not consumable resources: one `hyp-*` may
 participate in many points.
 

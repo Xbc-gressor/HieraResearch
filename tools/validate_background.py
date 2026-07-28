@@ -29,7 +29,12 @@ from search_space_state import (
     replay_search_space_state,
 )
 from semantic_evidence import build_semantic_edges, comparator_coverage
-from semantic_search import build_proposal_set, select_proposal, validate_proposal_set
+from semantic_search import (
+    build_gain_context,
+    build_proposal_set,
+    select_proposal,
+    validate_proposal_set,
+)
 from semantic_space import (
     catalog_receipt,
     complete_point,
@@ -393,7 +398,7 @@ def policy_receipt(
         ("deprioritized", "active"): "no_deprioritized_proposals",
     }[(scheduled_lane, selected_lane)]
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "space_revision": point["space_revision"],
         "search_space_state_revision": state_revision,
         "proposal_set_revision": "sha256:" + "0" * 64,
@@ -410,12 +415,24 @@ def policy_receipt(
         "selected_point_id": point["point_id"],
         "components": {
             "coverage": 1.0,
+            "prior_gain": None,
+            "experience_gain_adjustment": None,
             "predicted_gain": None,
+            "prior_uncertainty": None,
+            "experience_uncertainty_adjustment": None,
             "uncertainty": None,
             "cost": None,
         },
         "acquisition_score": 1.0,
         "evidence": [],
+        "experience": {
+            "generation": None,
+            "updated_at_run": None,
+            "revision": None,
+            "evidence_run_ids": [],
+            "evidence_edge_ids": [],
+            "rationale": "coverage policy does not use model-scored experience",
+        },
         "budget": {
             "selection_index": selection_index,
             "deprioritized_interval": deprioritized_interval,
@@ -964,6 +981,20 @@ def main() -> int:
                 if ledger_path.exists()
                 else []
             )
+            current_ledger = (
+                json.loads(ledger_path.read_text())
+                if ledger_path.exists()
+                else {}
+            )
+            current_experience = current_ledger.get("experience")
+            if isinstance(current_experience, dict) and current_experience:
+                receipt["experience"].update(
+                    {
+                        "generation": current_experience["generation"],
+                        "updated_at_run": current_experience["updated_at_run"],
+                        "revision": digest(current_experience),
+                    }
+                )
             budget = receipt["budget"]
             budget["selection_index"] = len(current_records) + 1
             interval = budget["deprioritized_interval"]
@@ -1205,7 +1236,7 @@ def main() -> int:
             text=True,
         )
         selected_receipt = json.loads(policy_path.read_text())
-        assert selected_receipt["schema_version"] == 3
+        assert selected_receipt["schema_version"] == 4
         assert selected_receipt["search_space_state_revision"] == 2
 
         # A proposal set stamped at another revision is rejected as stale.
@@ -1612,6 +1643,171 @@ def main() -> int:
     assert explore_receipt["components"]["predicted_gain"] == 0.65
     assert explore_receipt["components"]["uncertainty"] == 1.0
     assert gain_receipt["policy"]["name"] != explore_receipt["policy"]["name"]
+    assert gain_receipt["schema_version"] == 4
+    assert gain_receipt["components"]["prior_gain"] == 0.95
+    assert gain_receipt["components"]["experience_gain_adjustment"] == 0.0
+
+    # Schema-2 prediction closes the experience feedback loop mechanically:
+    # a versioned belief snapshot must cite its observations, must change gain
+    # or uncertainty, and the final acquisition score uses the adjusted value.
+    experience = {
+        "schema_version": 3,
+        "updated_at_run": "003",
+        "generation": 0,
+        "summary": "Repeated implementations expose meaningful outcome variance.",
+        "promising_regions": [
+            {
+                "claim": "The baseline point improved once but remains implementation-sensitive.",
+                "evidence": ["000", "001"],
+                "confidence": "med",
+                "uncertainty": "The same point has materially different implementations.",
+            }
+        ],
+        "lessons": [],
+        "bottlenecks": [],
+        "dimension_evidence": [],
+        "hypothesis_evidence": [
+            {
+                "target_id": "hyp-model-multibranch",
+                "evaluation_state": "observed",
+                "assessment": "mixed",
+                "recommended_status": "active",
+                "claim": "One confounded edge observes the multibranch hypothesis.",
+                "evidence_run_ids": [],
+                "evidence_edge_ids": ["sedge-001-003"],
+                "comparator_coverage": {
+                    "direct_noncrash_edges": 0,
+                    "confounded_noncrash_edges": 1,
+                    "crash_edges": 0,
+                },
+                "confidence": "low",
+                "uncertainty": "The only semantic comparison changes multiple dimensions.",
+            }
+        ],
+    }
+    assert validate_experience(experience, registry, ledger) == []
+    experience_ledger = copy.deepcopy(ledger)
+    experience_ledger["experience"] = experience
+    context = build_gain_context(fresh_proposals, experience_ledger)
+    assert context["experience_receipt"]["generation"] == 0
+    assert {item["run_id"] for item in context["cited_records"]} == {"000", "001"}
+    assert context["experience_evidence_edge_ids"] == ["sedge-001-003"]
+    conditioned = {
+        "schema_version": 2,
+        "proposal_set_revision": fresh_proposals["proposal_set_revision"],
+        "experience": context["experience_receipt"],
+        "predictions": [],
+    }
+    for index, proposal in enumerate(proposals):
+        if index == 0:
+            prior_gain, gain_adjustment = 0.95, -0.40
+            prior_uncertainty, uncertainty_adjustment = 0.05, 0.30
+        elif index == 1:
+            prior_gain, gain_adjustment = 0.65, 0.05
+            prior_uncertainty, uncertainty_adjustment = 0.80, 0.10
+        else:
+            prior_gain, gain_adjustment = 0.05, 0.01
+            prior_uncertainty, uncertainty_adjustment = 0.05, 0.01
+        conditioned["predictions"].append(
+            {
+                "point_id": proposal["point_id"],
+                "prior_gain": prior_gain,
+                "experience_gain_adjustment": gain_adjustment,
+                "predicted_gain": prior_gain + gain_adjustment,
+                "prior_uncertainty": prior_uncertainty,
+                "experience_uncertainty_adjustment": uncertainty_adjustment,
+                "uncertainty": prior_uncertainty + uncertainty_adjustment,
+                "cost": 0.1,
+                "experience_run_ids": ["000", "001"],
+                "experience_edge_ids": [],
+                "experience_rationale": (
+                    "The current belief changes gain or uncertainty for this point."
+                ),
+                "evidence": ["experience generation 0 over runs 000 and 001"],
+            }
+        )
+    conditioned_point, conditioned_receipt = select_proposal(
+        fresh_proposals,
+        policy="gain",
+        predictions=conditioned,
+        experience=experience,
+    )
+    assert conditioned_point["point_id"] == proposals[1]["point_id"]
+    assert conditioned_receipt["components"]["prior_gain"] == 0.65
+    assert conditioned_receipt["components"]["experience_gain_adjustment"] == 0.05
+    assert math.isclose(
+        conditioned_receipt["components"]["predicted_gain"], 0.70
+    )
+    assert conditioned_receipt["experience"]["evidence_run_ids"] == ["000", "001"]
+    edge_conditioned = copy.deepcopy(conditioned)
+    for prediction in edge_conditioned["predictions"]:
+        prediction["experience_run_ids"] = []
+        prediction["experience_edge_ids"] = ["sedge-001-003"]
+    persisted_point, persisted_receipt = select_proposal(
+        fresh_proposals,
+        policy="gain",
+        predictions=edge_conditioned,
+        experience=experience,
+        selection_index=5,
+    )
+    persisted_record = record(
+        "004",
+        "fresh",
+        [],
+        persisted_point,
+        score=0.55,
+        status="discard",
+        prior_records=records,
+    )
+    persisted_record["policy_receipt"] = persisted_receipt
+    persisted_ledger = {
+        "search_space": space_receipt(registry),
+        "search_space_state": empty_search_space_state(),
+        "records": records + [persisted_record],
+        "experience": experience,
+    }
+    assert validate_registry(registry, ledger=persisted_ledger) == []
+    assert persisted_receipt["experience"]["evidence_run_ids"] == []
+    assert persisted_receipt["experience"]["evidence_edge_ids"] == [
+        "sedge-001-003"
+    ]
+    forged_conditioning = copy.deepcopy(persisted_ledger)
+    forged_conditioning["records"][4]["policy_receipt"]["components"][
+        "predicted_gain"
+    ] = 0.99
+    errors = validate_registry(registry, ledger=forged_conditioning)
+    assert any("prior plus experience adjustment" in error for error in errors)
+
+    ignored_experience = copy.deepcopy(conditioned)
+    ignored_experience["predictions"][0]["experience_gain_adjustment"] = 0.0
+    ignored_experience["predictions"][0]["predicted_gain"] = 0.95
+    ignored_experience["predictions"][0]["experience_uncertainty_adjustment"] = 0.0
+    ignored_experience["predictions"][0]["uncertainty"] = 0.05
+    try:
+        select_proposal(
+            fresh_proposals,
+            policy="gain",
+            predictions=ignored_experience,
+            experience=experience,
+        )
+    except ContractError as exc:
+        assert "must let current experience change" in str(exc)
+    else:
+        raise AssertionError("experience was cited without changing a model score")
+
+    stale_experience = copy.deepcopy(conditioned)
+    stale_experience["experience"]["generation"] = 1
+    try:
+        select_proposal(
+            fresh_proposals,
+            policy="gain",
+            predictions=stale_experience,
+            experience=experience,
+        )
+    except ContractError as exc:
+        assert "must match the current gain-context" in str(exc)
+    else:
+        raise AssertionError("a stale experience-conditioned prediction was accepted")
 
     rendered = render_space(registry, ledger, max_hypotheses=2)
     assert rendered["coverage"]["n_valid_records"] == 4

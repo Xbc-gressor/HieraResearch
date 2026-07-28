@@ -22,6 +22,7 @@ import time
 from typing import Any
 
 from evaluation_budget import ATTEMPT_LOG, budget_status
+from run_cfg import RunConfigError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -120,8 +121,14 @@ def _run_snapshot(run_dir: Path | None) -> dict[str, Any] | None:
         if value is None:
             value = record.get("warm_start_K")
         attempted += _integer(value)
-    strict_budget = budget_status(run_dir)
-    attempted = max(attempted, strict_budget["evaluations_done"])
+    try:
+        strict_budget = budget_status(run_dir)
+        attempted = max(attempted, strict_budget["evaluations_done"])
+        cfg_error = None
+    except RunConfigError as exc:
+        # The watchdog must keep observing a run whose config is broken; surface
+        # the error explicitly instead of pretending no budget is configured.
+        cfg_error = str(exc)
     stored = ledger.get("run_state") if isinstance(ledger.get("run_state"), dict) else {}
     budget = cfg.get("max_evaluations")
     if not isinstance(budget, int) or isinstance(budget, bool):
@@ -163,6 +170,7 @@ def _run_snapshot(run_dir: Path | None) -> dict[str, Any] | None:
         ),
         "budget": budget,
         "remaining": None if budget is None else max(0, budget - attempted),
+        "config_error": cfg_error,
         "last_progress_ms": int(max(mtimes) * 1000) if mtimes else 0,
     }
 

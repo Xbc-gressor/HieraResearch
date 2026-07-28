@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from evaluation_budget import budget_status
+from run_cfg import read_framework_cfg
 from search_space_state import (
     append_experience_transitions,
     empty_search_space_state,
@@ -190,7 +191,40 @@ def _require_p1_record(record: dict, run_id: str) -> None:
     if not isinstance(record.get("policy_receipt"), dict):
         raise ValueError(
             f"record {run_id} has no policy_receipt; selection policy must remain traceable"
-        )
+)
+
+
+def _experience_cited_ids(experience: Any) -> tuple[set[str], set[str]]:
+    """Terminal runs and semantic edges carried by one bounded belief snapshot."""
+    if not isinstance(experience, dict):
+        return set(), set()
+    run_ids: set[str] = set()
+    edge_ids: set[str] = set()
+    for field in ("promising_regions", "lessons", "bottlenecks"):
+        for item in experience.get(field, []):
+            if isinstance(item, dict) and isinstance(item.get("evidence"), list):
+                run_ids.update(
+                    run_id
+                    for run_id in item["evidence"]
+                    if isinstance(run_id, str)
+                )
+    for field in ("dimension_evidence", "hypothesis_evidence"):
+        for item in experience.get(field, []):
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("evidence_run_ids"), list):
+                run_ids.update(
+                    run_id
+                    for run_id in item["evidence_run_ids"]
+                    if isinstance(run_id, str)
+                )
+            if isinstance(item.get("evidence_edge_ids"), list):
+                edge_ids.update(
+                    edge_id
+                    for edge_id in item["evidence_edge_ids"]
+                    if isinstance(edge_id, str)
+                )
+    return run_ids, edge_ids
 
 
 def _new_record(run_id: str) -> dict:
@@ -383,6 +417,7 @@ def cmd_add_record(args) -> int:
     from semantic_evidence import SemanticEvidenceError, build_semantic_edges
     from semantic_space import (
         SemanticSpaceError,
+        digest,
         resolve_dimension_catalog,
         resolve_dimension_strategy,
         space_receipt,
@@ -461,11 +496,54 @@ def cmd_add_record(args) -> int:
             f"current search space state revision {current_revision}; re-propose and "
             "re-select against the current overlay before admission"
         )
-    if policy_receipt.get("schema_version") != 3:
+    if policy_receipt.get("schema_version") != 4:
         raise SystemExit(
-            "new candidate admission requires policy receipt schema 3 with an "
-            "auditable semantic-budget lane; historical schema-2 receipts remain readable"
+            "new candidate admission requires policy receipt schema 4 with an "
+            "auditable semantic-budget lane and experience-conditioned gain "
+            "components; historical schema-2/3 receipts remain readable"
         )
+    current_experience = data.get("experience")
+    if isinstance(current_experience, dict) and current_experience:
+        expected_experience = {
+            "generation": current_experience.get("generation"),
+            "updated_at_run": current_experience.get("updated_at_run"),
+            "revision": digest(current_experience),
+        }
+    else:
+        expected_experience = {
+            "generation": None,
+            "updated_at_run": None,
+            "revision": None,
+        }
+    receipt_experience = policy_receipt.get("experience")
+    actual_experience = (
+        {
+            "generation": receipt_experience.get("generation"),
+            "updated_at_run": receipt_experience.get("updated_at_run"),
+            "revision": receipt_experience.get("revision"),
+        }
+        if isinstance(receipt_experience, dict)
+        else None
+    )
+    if actual_experience != expected_experience:
+        raise SystemExit(
+            "stale policy receipt: experience generation/revision does not match "
+            "the ledger's current bounded belief; rebuild gain-context and re-select"
+        )
+    if isinstance(receipt_experience, dict):
+        allowed_run_ids, allowed_edge_ids = _experience_cited_ids(current_experience)
+        cited_run_ids = receipt_experience.get("evidence_run_ids")
+        cited_edge_ids = receipt_experience.get("evidence_edge_ids")
+        if (
+            not isinstance(cited_run_ids, list)
+            or not set(cited_run_ids).issubset(allowed_run_ids)
+            or not isinstance(cited_edge_ids, list)
+            or not set(cited_edge_ids).issubset(allowed_edge_ids)
+        ):
+            raise SystemExit(
+                "invalid policy receipt: experience evidence ids must be cited "
+                "by the ledger's current bounded belief"
+            )
     budget = policy_receipt.get("budget")
     expected_selection_index = len(data["records"]) + 1
     if (
@@ -662,10 +740,7 @@ def _framework_budget(ledger_path: Path) -> Optional[int]:
     path = ledger_path.parent / "framework_cfg.json"
     if not path.is_file():
         return None
-    try:
-        value = json.loads(path.read_text()).get("max_evaluations")
-    except (OSError, json.JSONDecodeError):
-        return None
+    value = read_framework_cfg(path).get("max_evaluations")
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 

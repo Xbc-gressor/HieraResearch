@@ -232,13 +232,21 @@ Four replaceable policies are implemented:
    prediction at all, for settings where pre-implementation cost estimates
    are noise and only waste tokens.
 
-For model-scored policies, each proposal receives separate `[0,1]`
-`predicted_gain`, `uncertainty`, and `cost` rubric inputs plus evidence
-strings (`gain_uncertainty_nocost` omits `cost`).
-They are auditable estimates, not calibrated Bayesian posteriors. The selected
-record preserves all four components (`coverage` included), weights, proposal
-set digest, action, ranking, and evidence. These values stay in
-`policy_receipt`; they do not become observations or beliefs.
+For model-scored policies, each proposal receives separate `[0,1]` background
+priors for gain and uncertainty, signed experience adjustments, final
+`predicted_gain`/`uncertainty`, and `cost`, plus evidence strings
+(`gain_uncertainty_nocost` omits `cost`). `semantic_search.py gain-context`
+pins the exact bounded experience generation. Prediction schema 2 must cite
+terminal runs or semantic edges carried by that experience, and a nonempty
+experience must change gain or uncertainty. The deterministic helper verifies
+that each final number equals its prior plus the signed adjustment.
+
+They remain auditable rubric estimates, not calibrated Bayesian posteriors.
+Policy receipt schema 4 preserves the prior, adjustment, final score,
+experience revision/run citations, `coverage`, weights, proposal-set digest,
+action, ranking, and evidence. These values stay in `policy_receipt`; they do
+not become observations or beliefs. Historical schema-2/3 receipts remain
+readable.
 
 Runtime-deprioritized proposals occupy a separate, deterministic
 semantic-admission budget lane. `deprioritized_budget_interval: N` reserves
@@ -246,7 +254,7 @@ every Nth one-based outer admission for that lane (default `N=5`, or 20%);
 ordinary slots select only active proposals. Acquisition scores rank within
 the scheduled lane and cannot buy a deprioritized point an active slot. When
 the scheduled lane is empty, the other lane fills the slot and policy receipt
-schema 3 records the selection index, interval, scheduled/selected lanes,
+schema 4 records the selection index, interval, scheduled/selected lanes,
 fallback reason, and the selected point's pre-lane acquisition rank.
 
 Run-local configuration lives under `framework_cfg.json.semantic_search`.
@@ -504,6 +512,10 @@ python tools/background_contract.py validate-experience \
 python tools/semantic_search.py propose \
   --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
   --op <op> --parents <ids> --output <proposals.json>
+
+python tools/semantic_search.py gain-context \
+  --proposals <proposals.json> --ledger <run_dir>/ledger.json \
+  --output <gain-context.json>
 
 python tools/semantic_search.py select \
   --proposals <proposals.json> [--predictions <predictions.json>] \

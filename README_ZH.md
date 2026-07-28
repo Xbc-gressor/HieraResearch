@@ -136,7 +136,7 @@ step 0+1: tunable-contract-extractor
 - 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 将预期收益、不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
@@ -214,7 +214,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 外层搜索的 LLM 着陆点，通过三步产生下一代：
 
 - **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
-- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 分别评估 predicted gain、uncertainty、cost（`gain_uncertainty_nocost` 不含 cost），并与确定性 coverage 分栏写入 `policy_receipt`，不冒充校准后验。
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的有引用 signed adjustment 得到最终 predicted gain / uncertainty；cost（`gain_uncertainty_nocost` 不含）和确定性 coverage 继续分栏保存。schema-4 `policy_receipt` 固定 experience revision、引用 run/semantic edge 和调整理由，不冒充校准后验。
 - **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。
@@ -380,14 +380,6 @@ runs/<task-name>/<tag>/loop_state.md
 - 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash 和访问内容 hash；token 永不进入运行产物
 - `python tools/validate_search_backends.py` 提供完全离线的回归检查
 
-### 7.7 validate_skills.py
-
-检查 `.claude/skills/` 结构和元数据。
-
-```bash
-python tools/validate_skills.py
-```
-
 ### 7.8 validate_tasks.py
 
 检查 `tasks/` 任务包结构和 `task.toml`。
@@ -519,11 +511,6 @@ python tools/validate_tasks.py
 3. 前置必须有 `name` 和 `description`
 4. 将长参考材料放在 skill 自己的 `references/` 中
 5. 将确定性脚本放在 skill 自己的 `scripts/` 中
-6. 运行：
-
-```bash
-python tools/validate_skills.py
-```
 
 ### 11.3 添加智能体
 

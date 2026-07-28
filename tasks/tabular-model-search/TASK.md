@@ -141,7 +141,8 @@ python tools/new_candidate.py tabular-model-search <tag> <run_id> --skip-entrypo
 # 3. Once train.py + _warm_configs.json exist (candidate-writer +
 #    tunable-contract-extractor), score the K warm configs against evaluate_config
 #    in the task-local uv env (step 0+1):
-uv --directory tasks/tabular-model-search run python tools/tuners/warmstart_eval.py \
+#    (--project selects the task env without chdir, so the repo-relative paths below resolve)
+uv --project tasks/tabular-model-search run python tools/tuners/warmstart_eval.py \
   --candidate-path   runs/tabular-model-search/<tag>/candidates/<run_id>/train.py \
   --configs-json     runs/tabular-model-search/<tag>/candidates/<run_id>/_warm_configs.json \
   --tune-report-json runs/tabular-model-search/<tag>/candidates/<run_id>/tune_report.json

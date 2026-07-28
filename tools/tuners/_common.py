@@ -50,6 +50,7 @@ from evaluation_budget import (  # noqa: E402
     EvaluationBudgetExhausted,
     reserve_evaluation,
 )
+from run_cfg import find_framework_cfg, read_framework_cfg  # noqa: E402
 from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 
 
@@ -192,63 +193,52 @@ def load_run_cfg(ref_path: Any, section: str) -> dict:
     Shape: `{"got": {...}, "tuner": {...}}`. Returns the requested section ({} if
     absent). Lets a Phase-3 OFAT trial override framework meta-params per run
     without code edits, so a headless run honors them. Pure stdlib.
+    A cfg file that exists but cannot be parsed raises RunConfigError instead of
+    silently reverting to defaults.
     """
-    p = Path(ref_path).resolve()
-    for anc in p.parents:
-        cfg = anc / "framework_cfg.json"
-        if cfg.is_file():
-            try:
-                return dict(json.loads(cfg.read_text()).get(section, {}))
-            except (ValueError, OSError):
-                return {}
-    return {}
+    cfg = find_framework_cfg(ref_path)
+    if cfg is None:
+        return {}
+    return dict(read_framework_cfg(cfg).get(section, {}))
 
 
 def read_runtime_limit(ref_path: Any) -> float | None:
     """Top-level `per_runtime_limit` (seconds) from `<run_dir>/framework_cfg.json`
-    (walking up from ref_path). Returns a positive float, else None (no limit)."""
-    p = Path(ref_path).resolve()
-    for anc in p.parents:
-        cfg = anc / "framework_cfg.json"
-        if cfg.is_file():
-            try:
-                v = json.loads(cfg.read_text()).get("per_runtime_limit")
-            except (ValueError, OSError):
-                return None
-            try:
-                v = float(v)
-                return v if v > 0 else None
-            except (TypeError, ValueError):
-                return None
-    return None
+    (walking up from ref_path). Returns a positive float, else None (no limit).
+    A cfg file that exists but cannot be parsed raises RunConfigError: silently
+    dropping the limit would let an evaluation run unbounded."""
+    cfg = find_framework_cfg(ref_path)
+    if cfg is None:
+        return None
+    v = read_framework_cfg(cfg).get("per_runtime_limit")
+    try:
+        v = float(v)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def read_preflight_limit(ref_path: Any) -> float:
     """Return the bounded no-score preflight timeout for one config."""
-    p = Path(ref_path).resolve()
-    for anc in p.parents:
-        cfg = anc / "framework_cfg.json"
-        if cfg.is_file():
-            try:
-                data = json.loads(cfg.read_text())
-            except (ValueError, OSError):
-                break
-            value = data.get("preflight_runtime_limit")
-            if value is not None:
-                try:
-                    value = float(value)
-                    if value > 0:
-                        return value
-                except (TypeError, ValueError):
-                    pass
-            runtime = data.get("per_runtime_limit")
-            try:
-                runtime = float(runtime)
-                if runtime > 0:
-                    return min(DEFAULT_PREFLIGHT_LIMIT, runtime)
-            except (TypeError, ValueError):
-                pass
-            break
+    cfg = find_framework_cfg(ref_path)
+    if cfg is None:
+        return DEFAULT_PREFLIGHT_LIMIT
+    data = read_framework_cfg(cfg)
+    value = data.get("preflight_runtime_limit")
+    if value is not None:
+        try:
+            value = float(value)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    runtime = data.get("per_runtime_limit")
+    try:
+        runtime = float(runtime)
+        if runtime > 0:
+            return min(DEFAULT_PREFLIGHT_LIMIT, runtime)
+    except (TypeError, ValueError):
+        pass
     return DEFAULT_PREFLIGHT_LIMIT
 
 

@@ -667,8 +667,8 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     point_object = point if isinstance(point, dict) else {}
     errors: list[str] = []
     receipt_schema = receipt.get("schema_version")
-    if receipt_schema not in {2, 3}:
-        errors.append(f"{where}.policy_receipt.schema_version must be 2 or 3")
+    if receipt_schema not in {2, 3, 4}:
+        errors.append(f"{where}.policy_receipt.schema_version must be 2, 3, or 4")
     state_revision = receipt.get("search_space_state_revision")
     if (
         not isinstance(state_revision, int)
@@ -712,7 +712,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     config = policy.get("config") if isinstance(policy, dict) else None
     config_valid = True
     expected_config_keys = (
-        POLICY_CONFIG_KEYS_V3 if receipt_schema == 3 else POLICY_CONFIG_KEYS_V2
+        POLICY_CONFIG_KEYS_V3 if receipt_schema in {3, 4} else POLICY_CONFIG_KEYS_V2
     )
     if not isinstance(config, dict) or set(config) != expected_config_keys:
         errors.append(
@@ -750,6 +750,13 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     coverage_valid = False
     model_components_valid = False
     required_components = {"coverage", "predicted_gain", "uncertainty", "cost"}
+    if receipt_schema == 4:
+        required_components |= {
+            "prior_gain",
+            "experience_gain_adjustment",
+            "prior_uncertainty",
+            "experience_uncertainty_adjustment",
+        }
     if not isinstance(components, dict) or set(components) != required_components:
         errors.append(
             f"{where}.policy_receipt.components must keep {sorted(required_components)} separate"
@@ -768,9 +775,19 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         model_components = [
             components["predicted_gain"], components["uncertainty"], components["cost"]
         ]
+        conditioned_components = [
+            components.get("prior_gain"),
+            components.get("experience_gain_adjustment"),
+            components.get("prior_uncertainty"),
+            components.get("experience_uncertainty_adjustment"),
+        ]
         if policy_name == "coverage":
             model_components_valid = all(value is None for value in model_components)
-            if any(value is not None for value in model_components):
+            if receipt_schema == 4:
+                model_components_valid = model_components_valid and all(
+                    value is None for value in conditioned_components
+                )
+            if not model_components_valid:
                 errors.append(
                     f"{where}.policy_receipt coverage policy must not invent model components"
                 )
@@ -800,6 +817,70 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     f"{where}.policy_receipt gain policies require separate finite "
                     "predicted_gain, uncertainty, and cost values in [0, 1]"
                 )
+        if receipt_schema == 4 and policy_name != "coverage":
+            prior_values = (
+                components.get("prior_gain"),
+                components.get("prior_uncertainty"),
+            )
+            adjustment_values = (
+                components.get("experience_gain_adjustment"),
+                components.get("experience_uncertainty_adjustment"),
+            )
+            if not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and 0.0 <= float(value) <= 1.0
+                for value in prior_values
+            ):
+                model_components_valid = False
+                errors.append(
+                    f"{where}.policy_receipt schema 4 prior gain and uncertainty "
+                    "must be finite values in [0, 1]"
+                )
+            if not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and -1.0 <= float(value) <= 1.0
+                for value in adjustment_values
+            ):
+                model_components_valid = False
+                errors.append(
+                    f"{where}.policy_receipt schema 4 experience adjustments "
+                    "must be finite values in [-1, 1]"
+                )
+            arithmetic = (
+                (
+                    components.get("prior_gain"),
+                    components.get("experience_gain_adjustment"),
+                    components.get("predicted_gain"),
+                    "predicted_gain",
+                ),
+                (
+                    components.get("prior_uncertainty"),
+                    components.get("experience_uncertainty_adjustment"),
+                    components.get("uncertainty"),
+                    "uncertainty",
+                ),
+            )
+            for prior, adjustment, final, label in arithmetic:
+                if all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    for value in (prior, adjustment, final)
+                ) and not math.isclose(
+                    float(prior) + float(adjustment),
+                    float(final),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ):
+                    model_components_valid = False
+                    errors.append(
+                        f"{where}.policy_receipt {label} must equal its prior "
+                        "plus experience adjustment"
+                    )
     evidence = receipt.get("evidence")
     if (
         not isinstance(evidence, list)
@@ -815,8 +896,114 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     if policy_name in {"gain", "gain_uncertainty", "gain_uncertainty_nocost"} and not evidence:
         errors.append(f"{where}.policy_receipt gain policies require selection evidence")
 
+    experience_receipt = receipt.get("experience")
+    if receipt_schema == 4:
+        experience_fields = {
+            "generation",
+            "updated_at_run",
+            "revision",
+            "evidence_run_ids",
+            "evidence_edge_ids",
+            "rationale",
+        }
+        if (
+            not isinstance(experience_receipt, dict)
+            or set(experience_receipt) != experience_fields
+        ):
+            errors.append(
+                f"{where}.policy_receipt.experience must contain exactly "
+                f"{sorted(experience_fields)}"
+            )
+            experience_receipt = {}
+        else:
+            generation = experience_receipt.get("generation")
+            updated_at_run = experience_receipt.get("updated_at_run")
+            revision = experience_receipt.get("revision")
+            snapshot_absent = (
+                generation is None and updated_at_run is None and revision is None
+            )
+            snapshot_present = (
+                isinstance(generation, int)
+                and not isinstance(generation, bool)
+                and generation >= 0
+                and isinstance(updated_at_run, str)
+                and updated_at_run.isdigit()
+                and isinstance(revision, str)
+                and DIGEST_RE.fullmatch(revision) is not None
+            )
+            if not (snapshot_absent or snapshot_present):
+                errors.append(
+                    f"{where}.policy_receipt.experience snapshot fields must be "
+                    "all null or a valid generation/run/revision receipt"
+                )
+            run_ids = experience_receipt.get("evidence_run_ids")
+            if (
+                not isinstance(run_ids, list)
+                or len(run_ids) > 5
+                or any(not isinstance(run_id, str) or not run_id.isdigit() for run_id in run_ids)
+                or len(run_ids) != len(set(run_ids))
+            ):
+                errors.append(
+                    f"{where}.policy_receipt.experience.evidence_run_ids must "
+                    "contain 0–5 unique numeric run ids"
+                )
+                run_ids = []
+            edge_ids = experience_receipt.get("evidence_edge_ids")
+            if (
+                not isinstance(edge_ids, list)
+                or len(edge_ids) > 5
+                or any(not _nonempty(edge_id) for edge_id in edge_ids)
+                or len(edge_ids) != len(set(edge_ids))
+            ):
+                errors.append(
+                    f"{where}.policy_receipt.experience.evidence_edge_ids must "
+                    "contain 0–5 unique non-empty edge ids"
+                )
+                edge_ids = []
+            rationale = experience_receipt.get("rationale")
+            if not _nonempty(rationale) or len(rationale) > 240:
+                errors.append(
+                    f"{where}.policy_receipt.experience.rationale must be "
+                    "non-empty and at most 240 characters"
+                )
+            if policy_name == "coverage":
+                if run_ids or edge_ids:
+                    errors.append(
+                        f"{where}.policy_receipt coverage policy must not cite "
+                        "experience as a model-score input"
+                    )
+            elif snapshot_present:
+                if not run_ids and not edge_ids:
+                    errors.append(
+                        f"{where}.policy_receipt gain policy must cite experience "
+                        "runs or edges when a snapshot exists"
+                    )
+                adjustments = (
+                    components.get("experience_gain_adjustment"),
+                    components.get("experience_uncertainty_adjustment"),
+                )
+                if all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isclose(float(value), 0.0, rel_tol=0.0, abs_tol=1e-12)
+                    for value in adjustments
+                ):
+                    errors.append(
+                        f"{where}.policy_receipt current experience must change "
+                        "gain or uncertainty"
+                    )
+            elif run_ids or edge_ids:
+                errors.append(
+                    f"{where}.policy_receipt cannot cite experience evidence "
+                    "without an experience snapshot"
+                )
+    elif experience_receipt is not None:
+        errors.append(
+            f"{where}.policy_receipt schemas 2 and 3 must not contain experience"
+        )
+
     budget = receipt.get("budget")
-    if receipt_schema == 3:
+    if receipt_schema in {3, 4}:
         budget_fields = {
             "selection_index",
             "deprioritized_interval",
@@ -965,7 +1152,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             f"{where}.policy_receipt.ranked_point_ids must be unique and start with the selected point"
         )
     elif (
-        receipt_schema == 3
+        receipt_schema in {3, 4}
         and isinstance(budget, dict)
         and isinstance(budget.get("base_rank"), int)
         and budget["base_rank"] > len(ranked)
@@ -986,8 +1173,10 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         "evidence",
         "ranked_point_ids",
     }
-    if receipt_schema == 3:
+    if receipt_schema in {3, 4}:
         allowed.add("budget")
+    if receipt_schema == 4:
+        allowed.add("experience")
     unknown = sorted(set(receipt) - allowed)
     if unknown:
         errors.append(f"{where}.policy_receipt has unknown fields {unknown}")
@@ -1079,7 +1268,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     record.get("semantic_point"), registry, effective
                 )
                 errors.extend(f"{where}: {error}" for error in eligibility)
-                if isinstance(receipt, dict) and receipt.get("schema_version") == 3:
+                if isinstance(receipt, dict) and receipt.get("schema_version") in {3, 4}:
                     budget = receipt.get("budget")
                     point = record.get("semantic_point")
                     if isinstance(point, dict):
@@ -1109,6 +1298,50 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                             f"{where}.policy_receipt.budget.selection_index must "
                             f"equal the one-based admission index {index + 1}"
                         )
+                    if receipt.get("schema_version") == 4:
+                        experience_receipt = receipt.get("experience")
+                        if isinstance(experience_receipt, dict):
+                            updated_at_run = experience_receipt.get("updated_at_run")
+                            if (
+                                updated_at_run is not None
+                                and updated_at_run not in known
+                            ):
+                                errors.append(
+                                    f"{where}.policy_receipt.experience.updated_at_run "
+                                    "must reference an earlier record"
+                                )
+                            evidence_run_ids = experience_receipt.get(
+                                "evidence_run_ids"
+                            )
+                            if isinstance(evidence_run_ids, list):
+                                unknown_evidence = sorted(
+                                    set(evidence_run_ids) - known
+                                )
+                                if unknown_evidence:
+                                    errors.append(
+                                        f"{where}.policy_receipt.experience evidence "
+                                        f"must reference earlier records {unknown_evidence}"
+                                    )
+                            evidence_edge_ids = experience_receipt.get(
+                                "evidence_edge_ids"
+                            )
+                            if isinstance(evidence_edge_ids, list):
+                                earlier_edge_ids = {
+                                    edge.get("edge_id")
+                                    for prior_record in records[:index]
+                                    if isinstance(prior_record, dict)
+                                    for edge in prior_record.get("semantic_edges", [])
+                                    if isinstance(edge, dict)
+                                    and isinstance(edge.get("edge_id"), str)
+                                }
+                                unknown_edges = sorted(
+                                    set(evidence_edge_ids) - earlier_edge_ids
+                                )
+                                if unknown_edges:
+                                    errors.append(
+                                        f"{where}.policy_receipt.experience evidence "
+                                        f"must reference earlier edges {unknown_edges}"
+                                    )
         errors.extend(validate_semantic_edges(records[:index], record, registry))
         if valid_run_id:
             known.add(run_id)

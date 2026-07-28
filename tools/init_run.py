@@ -28,19 +28,14 @@ from pathlib import Path
 
 from semantic_space import DEFAULT_DIMENSION_STRATEGY, DIMENSION_STRATEGIES
 from validate_tasks import parse_task_toml
+from run_cfg import read_framework_cfg
 
 
 SEMANTIC_ARTIFACTS = ("dimension_catalog.json", "background.md", "ledger.json")
 
 
 def _read_framework_config(path: Path) -> dict:
-    try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read framework config {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"{path}: framework config must be an object")
-    return value
+    return read_framework_cfg(path)
 
 
 def _task_runtime_limit(repo_root: Path, task_name: str) -> float | None:

@@ -109,10 +109,11 @@ would remove the independent contexts required by this project.
   pruned dimension pins its explicit baseline) and apply the
   replaceable coverage/gain/gain-plus-uncertainty acquisition policy within
   deterministic active/deprioritized admission-budget lanes before **IDEATE**.
-  It persists numeric ancestry, the complete revisioned point, and a schema-3
-  policy receipt with gain, uncertainty, cost, coverage, scheduled/selected
-  lanes, and fallback kept separate. The graph search still owns
-  actions/parents; semantic policy owns only point choice.
+  It persists numeric ancestry, the complete revisioned point, and a schema-4
+  policy receipt with background priors, signed experience adjustments, final
+  gain/uncertainty, cost, coverage, scheduled/selected lanes, and fallback kept
+  separate. The graph search still owns actions/parents; semantic policy owns
+  only point choice.
 - `experience-extractor` — periodically (every N generations) incrementally
   revise a bounded global `experience` snapshot (schema 3) from the ledger's
   DAG revision delta plus fixed Top/Bottom anchors and compact mechanical
@@ -180,7 +181,6 @@ environment.
 ## Validation
 
 ```bash
-python tools/validate_skills.py
 python tools/validate_tasks.py
 python tools/validate_background.py
 python tools/validate_search_backends.py
@@ -220,7 +220,6 @@ python tools/validate_search_backends.py
    (the trigger Claude Code matches against user requests).
 4. Keep the body concise. Put long details in `references/` and deterministic
    helpers in `scripts/`.
-5. Run `python tools/validate_skills.py`.
 
 ## Shell Command Conventions
 

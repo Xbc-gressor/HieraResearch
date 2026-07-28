@@ -20,6 +20,7 @@ from pathlib import Path
 from evaluation_budget import budget_status
 from got_cdag import c_dag
 from got_graph import Graph
+from run_cfg import read_framework_cfg
 
 
 def softmax(d: dict, tau: float) -> dict:
@@ -215,14 +216,13 @@ def load_run_cfg(ledger_path: Path, section: str) -> dict:
     Lets a single run (e.g. a Phase-3 OFAT trial) override framework meta-params
     without code edits or CLI flags, so a headless `autoresearch-experiment` run
     honors them too. Shape: `{"got": {...s-got keys...}, "tuner": {...}}`.
-    Returns the requested section ({} if the file/section is absent).
+    Returns the requested section ({} if the file/section is absent); a file
+    that exists but cannot be parsed raises RunConfigError instead of silently
+    dropping the run's overrides.
     """
     p = Path(ledger_path).parent / "framework_cfg.json"
     if p.is_file():
-        try:
-            return dict(json.loads(p.read_text()).get(section, {}))
-        except (ValueError, OSError):
-            return {}
+        return dict(read_framework_cfg(p).get(section, {}))
     return {}
 
 

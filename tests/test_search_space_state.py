@@ -39,6 +39,7 @@ from semantic_search import (  # noqa: E402
 )
 from semantic_space import (  # noqa: E402
     complete_point,
+    digest,
     selected_assignments,
     space_receipt,
     validate_point,
@@ -914,7 +915,15 @@ class LedgerIntegrationTests(unittest.TestCase):
         receipt = entry["policy_receipt"]
         receipt["schema_version"] = 2
         receipt.pop("budget")
+        receipt.pop("experience")
         receipt["policy"]["config"].pop("deprioritized_budget_interval")
+        for field in (
+            "prior_gain",
+            "experience_gain_adjustment",
+            "prior_uncertainty",
+            "experience_uncertainty_adjustment",
+        ):
+            receipt["components"].pop(field)
         ledger = {
             "search_space": space_receipt(registry),
             "records": [entry],
@@ -1042,6 +1051,106 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             str(raised.exception),
         )
 
+    def test_add_record_rejects_stale_experience_receipt(self) -> None:
+        baseline = complete_point(self.registry)
+        existing = record(
+            "000", "fresh", [], baseline, score=0.5, status="keep"
+        )
+        experience = {
+            "schema_version": 3,
+            "updated_at_run": "000",
+            "generation": 0,
+            "summary": "The first terminal run supplies the current bounded belief.",
+            "promising_regions": [
+                {
+                    "claim": "The first point is provisionally promising.",
+                    "evidence": ["000"],
+                    "confidence": "low",
+                    "uncertainty": "Only one implementation has been observed.",
+                }
+            ],
+            "lessons": [],
+            "bottlenecks": [],
+            "dimension_evidence": [],
+            "hypothesis_evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            background_path = tmp_path / "background.md"
+            ledger_path = tmp_path / "ledger.json"
+            point_path = tmp_path / "point.json"
+            receipt_path = tmp_path / "policy.json"
+            background_path.write_text(background_text(self.registry))
+            ledger_path.write_text(
+                json.dumps(
+                    {
+                        "task": "hard-interactions",
+                        "tag": "stale-experience",
+                        "metric": "validation_loss",
+                        "search_space": space_receipt(self.registry),
+                        "search_space_state": empty_search_space_state(),
+                        "dag_revision": 0,
+                        "records": [existing],
+                        "experience": experience,
+                    }
+                )
+            )
+            point_path.write_text(json.dumps(self.filtered))
+            # This otherwise-current schema-4 receipt falsely claims that no
+            # experience snapshot existed at admission.
+            receipt_path.write_text(
+                json.dumps(
+                    policy_receipt(
+                        "fresh",
+                        [],
+                        self.filtered,
+                        selection_index=2,
+                    )
+                )
+            )
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                run_id="001",
+                kind="optimization",
+                op="fresh",
+                source_run_ids="",
+                background=str(background_path),
+                catalog=None,
+                semantic_point=str(point_path),
+                policy_receipt=str(receipt_path),
+                idea="A candidate selected with a stale belief receipt.",
+                change="from scratch at a stale belief revision",
+                candidate_name_hint="fixture_stale_experience",
+                description=None,
+            )
+            with self.assertRaises(SystemExit) as raised:
+                cmd_add_record(args)
+            self.assertIn(
+                "stale policy receipt: experience", str(raised.exception)
+            )
+
+            forged_receipt = policy_receipt(
+                "fresh",
+                [],
+                self.filtered,
+                selection_index=2,
+            )
+            forged_receipt["experience"].update(
+                {
+                    "generation": 0,
+                    "updated_at_run": "000",
+                    "revision": digest(experience),
+                    "evidence_run_ids": ["999"],
+                }
+            )
+            receipt_path.write_text(json.dumps(forged_receipt))
+            with self.assertRaises(SystemExit) as forged:
+                cmd_add_record(args)
+        self.assertIn(
+            "experience evidence ids must be cited", str(forged.exception)
+        )
+
     def test_prune_select_stale_reject_and_reopen_lifecycle(self) -> None:
         registry = self.registry
 
@@ -1052,7 +1161,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 0)
         self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 3)
+        self.assertEqual(receipt["schema_version"], 4)
         self.assertEqual(receipt["search_space_state_revision"], 0)
 
         # A revision-0 historical record selects the hypothesis to be pruned.
@@ -1092,7 +1201,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         for active, dep in mixed_pairs:
             self.assertLess(positions[active["point_id"]], positions[dep["point_id"]])
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 3)
+        self.assertEqual(receipt["schema_version"], 4)
         self.assertEqual(receipt["search_space_state_revision"], 1)
         self.assertEqual(receipt["budget"]["selected_lane"], "active")
 
@@ -1106,7 +1215,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 2)
         self.assertFalse(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 3)
+        self.assertEqual(receipt["schema_version"], 4)
         self.assertEqual(receipt["search_space_state_revision"], 2)
 
         # 4. The revision-0 historical record remains ledger-valid.
@@ -1322,7 +1431,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             proposals_path.write_text(json.dumps(current))
             self.assertEqual(cmd_select(args), 0)
             written = json.loads(receipt_path.read_text())
-        self.assertEqual(written["schema_version"], 3)
+        self.assertEqual(written["schema_version"], 4)
         self.assertEqual(written["search_space_state_revision"], 1)
 
     def test_validate_ledger_replays_each_record_at_its_receipt_revision(self) -> None:

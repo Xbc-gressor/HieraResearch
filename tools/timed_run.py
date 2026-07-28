@@ -9,33 +9,36 @@ The limit comes from, in order:
      existing file (`timed_run.py python /abs/.../train.py` → reads
      /abs/.../<run_dir>/framework_cfg.json). This matches how the framework's
      `_common.timed_eval` reads the same key, so both methods share one knob.
-If neither yields a positive limit, the command runs with NO timeout.
+If neither yields a positive limit, the command runs with NO timeout. A
+`framework_cfg.json` that exists but cannot be parsed is a hard error (exit 2):
+silently dropping the limit would let the command run unbounded.
 
 Same subprocess-kill mechanism as `timed_eval`: the command runs in its own
 session/process group; on timeout the whole group is killed and this exits 124
 (the GNU `timeout` convention). Otherwise it forwards the command's exit code.
 """
-import json
 import os
 import signal
 import subprocess
 import sys
 from pathlib import Path
 
+from run_cfg import RunConfigError, find_framework_cfg, read_framework_cfg
+
 
 def _limit_from_cfg(cmd: list[str]) -> float | None:
     entry = next((Path(a).resolve() for a in reversed(cmd) if os.path.isfile(a)), None)
     if entry is None:
         return None
-    for anc in entry.parents:
-        cfg = anc / "framework_cfg.json"
-        if cfg.is_file():
-            try:
-                v = float(json.loads(cfg.read_text()).get("per_runtime_limit"))
-                return v if v > 0 else None
-            except (ValueError, TypeError, OSError):
-                return None
-    return None
+    cfg = find_framework_cfg(entry)
+    if cfg is None:
+        return None
+    v = read_framework_cfg(cfg).get("per_runtime_limit")
+    try:
+        v = float(v)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def main() -> int:
@@ -50,7 +53,11 @@ def main() -> int:
         cmd = args[1:]
     except ValueError:
         cmd = args
-        limit = _limit_from_cfg(cmd)
+        try:
+            limit = _limit_from_cfg(cmd)
+        except RunConfigError as exc:
+            sys.stderr.write(f"timed_run.py: {exc}\n")
+            return 2
     if not cmd:
         sys.stderr.write("timed_run.py: no command\n")
         return 2

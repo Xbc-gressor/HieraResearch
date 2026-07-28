@@ -25,6 +25,8 @@ try:  # POSIX is the supported experiment runtime; keep reads usable elsewhere.
 except ImportError:  # pragma: no cover - Windows compatibility fallback
     fcntl = None
 
+from run_cfg import read_framework_cfg
+
 
 SCHEMA_VERSION = 1
 ATTEMPT_LOG = "evaluation_attempts.jsonl"
@@ -57,10 +59,9 @@ def find_run_dir(ref_path: Any) -> Path | None:
 
 def _framework_budget(run_dir: Path) -> int | None:
     path = Path(run_dir) / "framework_cfg.json"
-    try:
-        value = json.loads(path.read_text()).get("max_evaluations")
-    except (OSError, json.JSONDecodeError, AttributeError):
+    if not path.is_file():
         return None
+    value = read_framework_cfg(path).get("max_evaluations")
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None

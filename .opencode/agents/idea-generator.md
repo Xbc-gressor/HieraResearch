@@ -150,21 +150,42 @@ python tools/semantic_search.py select \
   --point-output <...>/point.json --receipt-output <...>/policy.json
 ```
 
-For `gain`, `gain_uncertainty`, or `gain_uncertainty_nocost`, read the bounded
-background render, parent records, experience, and proposals. Write
-`predictions.json` with one entry for every proposal:
+For `gain`, `gain_uncertainty`, or `gain_uncertainty_nocost`, render the exact
+bounded experience revision used by this proposal set:
+
+```bash
+python tools/semantic_search.py gain-context \
+  --proposals <...>/proposals.json --ledger <run_dir>/ledger.json \
+  --output <...>/gain-context.json
+```
+
+Read the bounded background render, action-local parent records, proposals,
+and `gain-context.json`. Write schema-2 `predictions.json` with one entry for
+every proposal:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "proposal_set_revision": "<copy exactly>",
+  "experience": {
+    "generation": 3,
+    "updated_at_run": "014",
+    "revision": "sha256:<copy exactly from gain-context>"
+  },
   "predictions": [
     {
       "point_id": "point-...",
-      "predicted_gain": 0.0,
-      "uncertainty": 0.0,
+      "prior_gain": 0.30,
+      "experience_gain_adjustment": -0.08,
+      "predicted_gain": 0.22,
+      "prior_uncertainty": 0.40,
+      "experience_uncertainty_adjustment": 0.15,
+      "uncertainty": 0.55,
       "cost": 0.0,
-      "evidence": ["hyp-... literature prior", "run 004 observation", "coverage gap"]
+      "experience_run_ids": ["004", "011"],
+      "experience_edge_ids": ["sedge-004-011"],
+      "experience_rationale": "Repeated implementation-sensitive outcomes reduce gain and raise uncertainty.",
+      "evidence": ["hyp-... literature prior", "experience runs 004/011", "coverage gap"]
     }
   ]
 }
@@ -172,15 +193,37 @@ background render, parent records, experience, and proposals. Write
 
 Use a consistent `[0,1]` rubric:
 
-- `predicted_gain`: expected normalized improvement (a lower task score), based
-  on mechanisms and observed comparators; do not inflate it for novelty;
-- `uncertainty`: epistemic uncertainty or unresolved interaction that makes the
-  observation informative; do not treat it as expected gain;
+- `prior_gain`: expected normalized improvement from the frozen background,
+  task mechanism, and proposal alone, before run experience;
+- `experience_gain_adjustment`: signed history update in `[-1,1]`;
+  `predicted_gain` must equal `prior_gain + experience_gain_adjustment` and
+  remain in `[0,1]`;
+- `prior_uncertainty`: uncertainty before run experience;
+  `experience_uncertainty_adjustment` is its signed history update and the
+  final `uncertainty` must equal their sum and remain in `[0,1]`;
 - `cost`: relative implementation, runtime, memory, and dependency burden —
   required for `gain` and `gain_uncertainty`; omit the field entirely for
   `gain_uncertainty_nocost` (its schema rejects a `cost` field);
+- `experience_run_ids` / `experience_edge_ids`: cite up to five terminal runs
+  and five semantic edges carried by the current experience; at least one run
+  or edge is required, and `experience_rationale` briefly explains its
+  numerical effect;
 - `evidence`: concrete hypothesis ids, parent/run ids, or bounded belief
   receipts. Use 1–5 short strings (at most 240 characters each).
+
+When an experience snapshot exists, it must change at least one of gain or
+uncertainty for every proposal. Weak, indirect, or confounded history may make
+only a small adjustment, but must not be acknowledged without changing either
+number. Same-point implementation failures primarily raise uncertainty unless
+comparator-covered semantic edges support a gain revision. Promising,
+mixed/unpromising, feasibility, and bottleneck beliefs must be interpreted
+according to their confidence and attribution limits; do not cherry-pick only
+the current best run.
+
+When no experience exists, copy the null experience receipt from
+`gain-context.json`, use empty `experience_run_ids`, and set both adjustments
+to exactly `0.0`. Also use empty `experience_edge_ids`; the prior and final
+values are then equal.
 
 These are auditable rubric estimates, not calibrated Bayesian posteriors. Run:
 
@@ -200,7 +243,7 @@ deprioritized lane, while all other admissions select only from the active
 lane. Acquisition scores rank proposals only within the scheduled lane; a high
 gain estimate cannot move a deprioritized proposal into an active slot. If the
 scheduled lane has no proposal, the other lane may fill the slot and the
-schema-3 policy receipt records the deterministic fallback, selection index,
+schema-4 policy receipt records the deterministic fallback, selection index,
 scheduled/selected lanes, interval, and pre-lane base rank.
 
 `select` also checks that the proposal set's `search_space_state_revision`

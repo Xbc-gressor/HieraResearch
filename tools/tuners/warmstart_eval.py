@@ -22,7 +22,9 @@ fix ONE crash at a time without re-evaluating what already passed:
 An optional task-owned preflight runs before each score attempt in an isolated
 subprocess. It is a real-shape feasibility check, not a smoke score, and never
 reserves an objective slot. There is no `base_score`. Run from the task uv env:
-`uv --directory tasks/<task> run python tools/tuners/warmstart_eval.py ...`.
+`uv --project tasks/<task> run python tools/tuners/warmstart_eval.py ...`
+(`--project` selects the task env without chdir, so repo-relative paths resolve;
+`--directory` would chdir into the task dir and break them).
 """
 
 from __future__ import annotations

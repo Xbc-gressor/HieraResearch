@@ -93,7 +93,8 @@ uv --directory tasks/hard-interactions sync
 # Requires an existing <run_id> ledger record; also derives _candidate_brief.json.
 python tools/new_candidate.py hard-interactions <tag> <run_id> --skip-entrypoint
 # after candidate-writer + tunable-contract-extractor produce train.py + _warm_configs.json:
-uv --directory tasks/hard-interactions run python tools/tuners/warmstart_eval.py \
+# (--project selects the task env without chdir, so the repo-relative paths below resolve)
+uv --project tasks/hard-interactions run python tools/tuners/warmstart_eval.py \
   --candidate-path   runs/hard-interactions/<tag>/candidates/<run_id>/train.py \
   --configs-json     runs/hard-interactions/<tag>/candidates/<run_id>/_warm_configs.json \
   --tune-report-json runs/hard-interactions/<tag>/candidates/<run_id>/tune_report.json

@@ -48,7 +48,10 @@ import math
 from pathlib import Path
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/ for run_cfg
+
 from failure_artifacts import render_failure
+from run_cfg import read_framework_cfg  # noqa: E402
 
 
 # ---------- SEARCH_SPACE via AST (no candidate import) ----------
@@ -829,13 +832,12 @@ def cmd_lineage_evidence(args) -> int:
 
 def _run_cfg(ledger_path: Path, section: str) -> dict:
     """Per-run framework overrides from `<run_dir>/framework_cfg.json` (stdlib only,
-    so select-candidate keeps needing no uv env). Shape `{"tuner": {...}, "got": {...}}`."""
+    so select-candidate keeps needing no uv env). Shape `{"tuner": {...}, "got": {...}}`.
+    A cfg file that exists but cannot be parsed raises RunConfigError instead of
+    silently reverting to module defaults."""
     p = Path(ledger_path).parent / "framework_cfg.json"
     if p.is_file():
-        try:
-            return dict(json.loads(p.read_text()).get(section, {}))
-        except (ValueError, OSError):
-            return {}
+        return dict(read_framework_cfg(p).get(section, {}))
     return {}
 
 

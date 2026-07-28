@@ -215,12 +215,17 @@ disables deferral.
 ### 3a. Run the evaluator (sequential, resumable)
 
 ```bash
-uv --directory <env.project> run python tools/tuners/warmstart_eval.py \
+uv --project <env.project> run python tools/tuners/warmstart_eval.py \
   --candidate-path <train_py> \
   --configs-json <candidate_dir>/_warm_configs.json \
   --tune-report-json <candidate_dir>/tune_report.json \
   --k-eval <tuner.K_eval or 3>
 ```
+
+Use `--project`, not `--directory`: it selects the task env without changing the
+working directory, so repo-relative paths (`tools/...`, `runs/...`) keep
+resolving. Under `--directory` uv chdirs into the task dir first and those
+relative paths break.
 
 It creates `BASE_PARAMS`, preflights and evaluates the first `K_eval` configs in order **reusing
 any already scored** (a re-run only re-evaluates what changed), stores the deferred

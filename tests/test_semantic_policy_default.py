@@ -65,7 +65,7 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
             self.assertEqual(result, 0)
             receipt = json.loads(receipt_path.read_text())
             self.assertEqual(receipt["policy"]["name"], "gain_uncertainty_nocost")
-            self.assertEqual(receipt["schema_version"], 3)
+            self.assertEqual(receipt["schema_version"], 4)
             self.assertEqual(receipt["budget"]["selected_lane"], "active")
 
 
