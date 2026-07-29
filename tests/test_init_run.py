@@ -10,7 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from init_run import initialize_run  # noqa: E402
+from init_run import _task_runtime_limit, initialize_run  # noqa: E402
 
 
 class InitRunDimensionStrategyTests(unittest.TestCase):
@@ -64,6 +64,16 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
 
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["per_runtime_limit"], 900)
+
+    def test_corrupt_task_toml_does_not_drop_the_default_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root, task_timeout=900)
+            task_toml = repo_root / "tasks" / "toy" / "task.toml"
+            task_toml.write_text("[run]\nbroken line\n")
+
+            with self.assertRaisesRegex(ValueError, "expected key = value"):
+                _task_runtime_limit(repo_root, "toy")
 
     def test_same_strategy_is_idempotent_after_artifacts_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -51,6 +51,11 @@ candidate-visible interfaces in `prepare.py`. Pin down:
 - Any task rules that forbid certain approaches (one-shot scoring, readonly
   surfaces, runtime budget).
 
+If `[seed].provided` declares the candidate entrypoint, note its path now. Under
+`llm_induced`, do not inspect that implementation until the dimension catalog is
+final: the supplied solution may ground baseline values, but must not determine
+which dimensions exist.
+
 ### Step 2 — Resolve and freeze the dimensions
 
 Read `<run_dir>/framework_cfg.json`. Resolve
@@ -93,6 +98,13 @@ Every registry dimension needs:
 
 The resolved dimensions and hypotheses freeze once the background artifacts
 validate.
+
+After the dimension set is final, read any declared provided entrypoint. Define
+each dimension's `kind: baseline` hypothesis to match the supplied solution's
+actual mechanism on that dimension, using task-contract provenance. The complete
+all-baselines point must therefore attribute that concrete provided candidate
+faithfully. Do not turn scalar default parameters into semantic hypotheses; they
+remain inner-HPO coordinates.
 
 ### Step 3 — Plan the evidence search
 

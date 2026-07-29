@@ -20,6 +20,7 @@ import harness_watch  # noqa: E402
 import new_candidate  # noqa: E402
 import got_select  # noqa: E402
 import parse_result  # noqa: E402
+from search_space_state import empty_search_space_state  # noqa: E402
 
 
 class DelegationGuardTests(unittest.TestCase):
@@ -242,6 +243,7 @@ class UsageAndLifecycleTests(unittest.TestCase):
             self.assertEqual(brief["idea"], "combined result")
             self.assertEqual(brief["semantic_point"]["point_id"], "point-abc")
             self.assertEqual(brief["policy_receipt"]["policy"]["name"], "coverage")
+            self.assertEqual(brief["implementation_source"], {"kind": "generated"})
             self.assertNotIn("final_best_score", brief)
             self.assertNotIn("tuning", brief)
 
@@ -250,6 +252,62 @@ class UsageAndLifecycleTests(unittest.TestCase):
                 "change": "from scratch", "source_run_ids": [],
             }]}))
             self.assertIsNone(new_candidate.candidate_brief(ledger_path, "008"))
+
+    def test_provided_baseline_copies_declared_entrypoint_with_source_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            task_dir = repo_root / "tasks" / "unit"
+            task_dir.mkdir(parents=True)
+            source = task_dir / "train.py"
+            source.write_text("CANDIDATE_NAME = 'provided'\n")
+            (task_dir / "prepare.py").write_text("VALUE = 1\n")
+            (task_dir / "task.toml").write_text(
+                """
+[seed]
+provided = ["train.py"]
+entrypoint = "train.py"
+
+[candidate]
+copy_files = ["prepare.py", "train.py"]
+entrypoint = "train.py"
+""".strip()
+                + "\n"
+            )
+            run_dir = repo_root / "runs" / "unit" / "tag"
+            run_dir.mkdir(parents=True)
+            (run_dir / "ledger.json").write_text(json.dumps({"records": [{
+                "run_id": "000",
+                "op": "fresh",
+                "idea": "Use the task-provided baseline.",
+                "change": "provided baseline at point-base",
+                "source_run_ids": [],
+                "candidate_name": "provided_baseline",
+                "semantic_point": {"point_id": "point-base"},
+                "policy_receipt": {"policy": {"name": "coverage"}},
+            }]}))
+
+            argv = [
+                "new_candidate.py",
+                "unit",
+                "tag",
+                "000",
+                "--provided-baseline",
+            ]
+            with (
+                mock.patch.object(new_candidate, "ROOT", repo_root),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(new_candidate.main(), 0)
+
+            candidate_dir = run_dir / "candidates" / "000"
+            self.assertEqual((candidate_dir / "train.py").read_text(), source.read_text())
+            brief = json.loads((candidate_dir / "_candidate_brief.json").read_text())
+            implementation = brief["implementation_source"]
+            self.assertEqual(brief["schema_version"], 3)
+            self.assertEqual(implementation["kind"], "provided_entrypoint")
+            self.assertEqual(implementation["path"], "tasks/unit/train.py")
+            self.assertRegex(implementation["sha256"], r"^sha256:[0-9a-f]{64}$")
 
     def test_claude_usage_deduplicates_stream_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -292,19 +350,22 @@ class UsageAndLifecycleTests(unittest.TestCase):
     def test_ledger_budget_prefers_attempts_and_reads_legacy_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger_path = Path(tmp) / "ledger.json"
-            ledger_path.write_text(json.dumps({"records": [
-                {
-                    "run_id": "001",
-                    "status": "discard",
-                    "trials_completed": 2,
-                    "trials_attempted": 5,
-                },
-                {
-                    "run_id": "002",
-                    "status": "keep",
-                    "trials_completed": 3,
-                },
-            ]}))
+            ledger_path.write_text(json.dumps({
+                "records": [
+                    {
+                        "run_id": "001",
+                        "status": "discard",
+                        "trials_completed": 2,
+                        "trials_attempted": 5,
+                    },
+                    {
+                        "run_id": "002",
+                        "status": "keep",
+                        "trials_completed": 3,
+                    },
+                ],
+                "search_space_state": empty_search_space_state(),
+            }))
             result = subprocess.run(
                 [sys.executable, str(ROOT / "tools" / "ledger.py"), "evaluations",
                  "--ledger", str(ledger_path)],
@@ -331,11 +392,14 @@ class UsageAndLifecycleTests(unittest.TestCase):
     def test_brief_and_explicit_completion_are_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger_path = Path(tmp) / "ledger.json"
-            ledger_path.write_text(json.dumps({"records": [{
-                "run_id": "001", "status": "keep", "op": "fresh",
-                "final_best_score": 0.2, "trials_attempted": 2,
-                "trials_completed": 2,
-            }]}))
+            ledger_path.write_text(json.dumps({
+                "records": [{
+                    "run_id": "001", "status": "keep", "op": "fresh",
+                    "final_best_score": 0.2, "trials_attempted": 2,
+                    "trials_completed": 2,
+                }],
+                "search_space_state": empty_search_space_state(),
+            }))
             brief = subprocess.run(
                 [sys.executable, str(ROOT / "tools" / "ledger.py"), "brief",
                  "--ledger", str(ledger_path), "--budget", "2"],

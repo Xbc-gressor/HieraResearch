@@ -54,7 +54,7 @@ from validate_tasks import ROOT, parse_task_toml
 # Field order is the on-disk record layout. Keep stable; do not rename keys.
 RECORD_FIELDS = (
     "run_id",
-    "kind",              # always optimization (seed species retired)
+    "kind",              # always optimization; a provided baseline is an ordinary fresh root
     "idea",              # RESULT: self-contained description of THIS solution — no parent references (DAG node label)
     "change",            # PROCESS: parent-relative implementation change; fresh -> from scratch at the selected point
     "source_run_ids",    # numeric parent run_ids only; fresh=[]
@@ -151,9 +151,11 @@ def _load_ledger(path: Path) -> dict:
         with open(path) as f:
             data = json.load(f)
         data.setdefault("records", [])
-        if data["records"]:
-            # Record-bearing ledgers always carry the append-only P2 overlay.
-            data.setdefault("search_space_state", empty_search_space_state())
+        if data["records"] and not isinstance(data.get("search_space_state"), dict):
+            raise ValueError(
+                f"{path}: record-bearing ledger requires search_space_state; "
+                "run an explicit migration instead of rebuilding pruning history"
+            )
         return data
     return {"task": None, "tag": None, "metric": None, "records": []}
 

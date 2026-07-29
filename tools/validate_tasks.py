@@ -177,7 +177,10 @@ def validate_task(task_dir: Path) -> list[str]:
             if not isinstance(tune, bool):
                 errors.append(f"{task_toml}: seed.tune must be a boolean")
             elif tune:
-                errors.append(f"{task_toml}: seed.tune must be false; seed candidates are not tuned")
+                errors.append(
+                    f"{task_toml}: seed.tune=true is unsupported; normal candidate "
+                    "promotion controls deep tuning"
+                )
             entrypoint = seed.get("entrypoint", "train.py")
             if not isinstance(entrypoint, str) or not entrypoint:
                 errors.append(f"{task_toml}: seed.entrypoint must be a non-empty string")

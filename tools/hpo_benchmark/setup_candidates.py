@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parents[2]
 TASK = ROOT / "tasks" / "hard-interactions"
 BENCH = ROOT / "runs" / "hard-interactions" / "hpo-bench" / "candidates"
 SRC_RUN = ROOT / "runs" / "hard-interactions" / "p3-hpotest" / "candidates"
+LEGACY_BRIEF = {
+    "schema_version": 3,
+    "implementation_source": {"kind": "legacy_generated"},
+}
 
 # ---- shared train.py preamble ----
 HEAD = '''"""HPO-benchmark candidate: {label} ({note})."""
@@ -248,6 +252,9 @@ def main() -> int:
         (d / "train.py").write_text(src)
         shutil.copy(prepare_src, d / "prepare.py")
         (d / "_warm_configs.json").write_text(json.dumps(spec["warm"], indent=2))
+        (d / "_candidate_brief.json").write_text(
+            json.dumps(LEGACY_BRIEF, indent=2) + "\n"
+        )
         print(f"wrote {label}: {len(spec['warm'])} warm configs, "
               f"{len(spec['warm'][0])} dims")
     # copy anchors 004->M1-gbdt, 005->M2-stack
@@ -258,6 +265,9 @@ def main() -> int:
             if d.exists():
                 shutil.rmtree(d)
             shutil.copytree(s, d)
+            (d / "_candidate_brief.json").write_text(
+                json.dumps(LEGACY_BRIEF, indent=2) + "\n"
+            )
             print(f"copied anchor {src_id} -> {label}")
         else:
             print(f"WARN anchor {src_id} missing at {s}")

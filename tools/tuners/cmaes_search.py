@@ -113,7 +113,7 @@ def build_codec(search_space: dict, base_params: dict):
                 vec.append(float(params[dec[1]]))
             elif kind == "categorical":
                 _, key, choices = dec
-                vec.append(float(choices.index(params[key])) if params[key] in choices else 0.0)
+                vec.append(float(choices.index(params[key])))
         return np.asarray(vec, dtype=float)
 
     def decode(x: np.ndarray) -> dict:
@@ -135,6 +135,40 @@ def build_codec(search_space: dict, base_params: dict):
         return out
 
     return keys, lower, upper, x0, encode, decode
+
+
+def _encode_prior_seed(
+    best_prior: dict | None,
+    *,
+    encode,
+    lower: list,
+    upper: list,
+    x0_default: list,
+) -> tuple[list, dict | None]:
+    """Encode a CMA prior or return the default with an explicit rejection."""
+    if best_prior is None:
+        return list(x0_default), None
+    params = best_prior.get("params")
+    try:
+        if not isinstance(params, dict):
+            raise TypeError("prior params must be an object")
+        encoded = encode(params)
+        if len(encoded) != len(lower):
+            raise ValueError("encoded prior dimension does not match search space")
+        x0 = []
+        for low, high, raw in zip(lower, upper, encoded):
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("encoded prior contains a non-finite value")
+            x0.append(max(low, min(high, value)))
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return list(x0_default), {
+            "params": params,
+            "reason": "seed_encoding_failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:300],
+        }
+    return x0, None
 
 
 def main() -> int:
@@ -173,13 +207,24 @@ def main() -> int:
     seed_params = best_prior["params"] if best_prior else base_params
 
     keys, lower, upper, x0_default, encode, decode = build_codec(
-        search_space, seed_params
+        search_space, base_params
     )
-    try:
-        x0 = encode(seed_params)
-        x0 = [max(low, min(high, float(v))) for low, high, v in zip(lower, upper, x0)]
-    except Exception:
-        x0 = x0_default
+    x0, rejected_prior = _encode_prior_seed(
+        best_prior,
+        encode=encode,
+        lower=lower,
+        upper=upper,
+        x0_default=x0_default,
+    )
+    rejected_priors = [rejected_prior] if rejected_prior is not None else []
+    if rejected_prior is not None:
+        seed_params = base_params
+    set_stage_meta(
+        args.tune_report_json,
+        "cmaes",
+        prior_trials_seen=len(prior_trials),
+        rejected_priors=rejected_priors,
+    )
 
     es = cma.CMAEvolutionStrategy(
         x0,

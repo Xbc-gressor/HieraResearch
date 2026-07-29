@@ -117,6 +117,16 @@ the slot and the schema-4 receipt records the fallback and both lanes.
 Hypotheses are coordinates, not consumable resources: one `hyp-*` may
 participate in many points.
 
+When a task declares a provided candidate entrypoint, it is admitted before
+ordinary acquisition as the first root at `complete_point(registry)`. The copy
+keeps a content receipt, its supplied default configuration is evaluated once,
+and the observation consumes the normal objective budget. It remains an
+ordinary `kind: optimization`, `op: fresh` record—there is no second seed
+species or scoring path. The only special policy action is deterministic:
+`baseline-only` proposal generation plus a one-point coverage receipt prevents
+an acquisition prior from replacing the control. Tasks without a provided
+entrypoint retain the normal `fresh` bootstrap.
+
 Finally, a ledger record carries two different maps with different
 codomains: `source_run_ids` (ancestry — which concrete candidates informed
 generation, valued in `X`) and `semantic_point` (attribution — `π(x)`,

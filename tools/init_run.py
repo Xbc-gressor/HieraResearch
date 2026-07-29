@@ -43,12 +43,25 @@ def _task_runtime_limit(repo_root: Path, task_name: str) -> float | None:
     task_toml = repo_root / "tasks" / task_name / "task.toml"
     if not task_toml.is_file():
         return None
-    try:
-        value = parse_task_toml(task_toml).get("run", {}).get("timeout_seconds")
-        value = float(value)
-    except (AttributeError, TypeError, ValueError):
+    config = parse_task_toml(task_toml)
+    run = config.get("run")
+    if run is None:
         return None
-    return value if math.isfinite(value) and value > 0 else None
+    if not isinstance(run, dict):
+        raise ValueError(f"{task_toml}: [run] must be a table")
+    value = run.get("timeout_seconds")
+    if value is None:
+        return None
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise ValueError(
+            f"{task_toml}: run.timeout_seconds must be a positive finite number"
+        )
+    return float(value)
 
 
 def initialize_run(

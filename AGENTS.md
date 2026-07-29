@@ -111,6 +111,9 @@ to the primary context.
 ## Task and run boundaries
 
 - `tasks/<task>/prepare.py` is the fixed evaluation surface.
+- A candidate entrypoint declared in `[seed].provided` is copied into run `000`
+  and evaluated first at the all-baselines point; seedless tasks bootstrap with
+  normal `fresh` candidates.
 - Experiments modify candidate copies under `runs/`, never task-source
   `train.py` in place.
 - Do not commit anything under `runs/`.

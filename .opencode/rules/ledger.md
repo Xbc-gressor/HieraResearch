@@ -68,7 +68,7 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | field | meaning |
 |---|---|
 | `run_id` | zero-padded candidate id |
-| `kind` | always `optimization` |
+| `kind` | always `optimization`; a provided baseline is an ordinary first `fresh` root, not a separate record species |
 | `op` | structural graph action: `fresh`, `improve`, or `crossover` |
 | `source_run_ids` | numeric parents only: 0 / 1 / 2 for the three ops |
 | `semantic_point` | complete mapping over all selected dimensions, including explicit conditional inactivity |

@@ -15,6 +15,8 @@ Invoked by the tuner-orchestrator agent when 3 ≤ n_dims ≤ 15.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 import time
 import traceback
@@ -41,6 +43,172 @@ from _common import (  # noqa: E402
     write_json,
 )
 from failure_artifacts import record_failure  # noqa: E402
+
+
+PREFLIGHT_CONSTRAINT_ATTR = "hiera_preflight_constraint"
+
+
+class DeferredConfigError(ValueError):
+    """One or more promised deferred configs could not be queued."""
+
+    def __init__(self, rejections: list[dict]):
+        self.rejections = rejections
+        super().__init__(
+            f"{len(rejections)} deferred config(s) could not be queued"
+        )
+
+
+def _params_key(params: dict) -> str:
+    """Canonical identity for one fully cast BO configuration."""
+    return json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _input_rejection(
+    *,
+    index: int,
+    params,
+    reason: str,
+    error: BaseException | None = None,
+) -> dict:
+    rejection = {"index": index, "params": params, "reason": reason}
+    if error is not None:
+        rejection["error_type"] = type(error).__name__
+        rejection["error"] = str(error)[:300]
+    return rejection
+
+
+def _inject_prior_trials(
+    study,
+    prior_trials: list[dict],
+    distributions: dict,
+    create_trial,
+    prior_constraint_attrs: dict,
+) -> tuple[int, list[dict]]:
+    """Inject compatible priors and return explicit receipts for rejections."""
+    injected = 0
+    rejections: list[dict] = []
+    expected_keys = set(distributions)
+    for index, prior in enumerate(prior_trials):
+        prior_params = prior.get("params")
+        prior_score = prior.get("score")
+        if not isinstance(prior_params, dict) or prior_score is None:
+            rejections.append(
+                _input_rejection(
+                    index=index,
+                    params=prior_params,
+                    reason="missing_params_or_score",
+                )
+            )
+            continue
+        prior_params = {k: v for k, v in prior_params.items() if k in distributions}
+        if set(prior_params) != expected_keys:
+            rejections.append(
+                _input_rejection(
+                    index=index,
+                    params=prior_params,
+                    reason="parameter_set_mismatch",
+                )
+            )
+            continue
+        try:
+            study.add_trial(
+                create_trial(
+                    params=prior_params,
+                    distributions=distributions,
+                    value=float(prior_score),
+                    **prior_constraint_attrs,
+                )
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError, OverflowError) as exc:
+            rejections.append(
+                _input_rejection(
+                    index=index,
+                    params=prior_params,
+                    reason="backend_rejected",
+                    error=exc,
+                )
+            )
+            continue
+        injected += 1
+    return injected, rejections
+
+
+def _enqueue_unique_deferred(
+    study,
+    deferred_configs: list[dict],
+    search_space: dict,
+    distributions: dict,
+) -> int:
+    """Enqueue every novel deferred config or raise with rejection receipts."""
+    seen = {_params_key(trial.params) for trial in study.trials}
+    n_enqueued = 0
+    rejections: list[dict] = []
+    for index, raw_params in enumerate(deferred_configs):
+        if not isinstance(raw_params, dict):
+            rejections.append(
+                _input_rejection(
+                    index=index,
+                    params=raw_params,
+                    reason="params_must_be_object",
+                )
+            )
+            continue
+        d_params = {k: v for k, v in raw_params.items() if k in distributions}
+        if set(d_params) != set(distributions):
+            rejections.append(
+                _input_rejection(
+                    index=index,
+                    params=raw_params,
+                    reason="parameter_set_mismatch",
+                )
+            )
+            continue
+        try:
+            d_params = cast_params_to_search_space(d_params, search_space)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            rejections.append(
+                _input_rejection(
+                    index=index,
+                    params=raw_params,
+                    reason="parameter_cast_failed",
+                    error=exc,
+                )
+            )
+            continue
+        key = _params_key(d_params)
+        if key in seen:
+            continue
+        try:
+            study.enqueue_trial(d_params, skip_if_exists=True)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            rejections.append(
+                _input_rejection(
+                    index=index,
+                    params=d_params,
+                    reason="backend_rejected",
+                    error=exc,
+                )
+            )
+            continue
+        seen.add(key)
+        n_enqueued += 1
+    if rejections:
+        raise DeferredConfigError(rejections)
+    return n_enqueued
+
+
+def _preflight_constraints(trial) -> tuple[float, ...]:
+    """Optuna constraint vector: positive means preflight-infeasible."""
+    values = trial.user_attrs.get(PREFLIGHT_CONSTRAINT_ATTR, (0.0,))
+    return tuple(float(value) for value in values)
+
+
+def _set_preflight_feasibility(trial, *, feasible: bool) -> None:
+    trial.set_user_attr(PREFLIGHT_CONSTRAINT_ATTR, [0.0 if feasible else 1.0])
+
+
+def _is_preflight_infeasible(trial) -> bool:
+    return any(value > 0.0 for value in _preflight_constraints(trial))
 
 
 def suggest(trial, key: str, entry) -> object:
@@ -126,46 +294,74 @@ def main() -> int:
 
     # multivariate TPE ("tpe+") was the top optimizer in the benchmark — it models
     # parameter interactions, beating plain TPE/cmaes esp. at high dims.
-    sampler = optuna.samplers.TPESampler(seed=args.seed, multivariate=True, group=True, n_startup_trials=10)
+    sampler_kwargs = {
+        "seed": args.seed,
+        "multivariate": True,
+        "group": True,
+        "n_startup_trials": 10,
+    }
+    if preflight_enabled:
+        sampler_kwargs["constraints_func"] = _preflight_constraints
+    sampler = optuna.samplers.TPESampler(
+        **sampler_kwargs,
+    )
     study = optuna.create_study(direction="minimize", sampler=sampler)
 
     distributions = build_distributions(search_space)
     prior_trials = read_prior_trials(args.tune_report_json)
-    n_priors_injected = 0
-    for prior in prior_trials:
-        prior_params = prior.get("params")
-        prior_score = prior.get("score")
-        if prior_params is None or prior_score is None:
-            continue
-        prior_params = {k: v for k, v in prior_params.items() if k in distributions}
-        if set(prior_params.keys()) != set(distributions.keys()):
-            continue
-        try:
-            study.add_trial(
-                optuna.trial.create_trial(
-                    params=prior_params,
-                    distributions=distributions,
-                    value=float(prior_score),
-                )
-            )
-            n_priors_injected += 1
-        except Exception:
-            continue
+    prior_constraint_attrs = {}
+    if preflight_enabled:
+        prior_constraint_attrs = {
+            # add_trial() does not invoke constraints_func, so explicitly mark
+            # already-successful warm/Phase-C priors as feasible.
+            "user_attrs": {PREFLIGHT_CONSTRAINT_ATTR: [0.0]},
+            "system_attrs": {"constraints": (0.0,)},
+        }
+    n_priors_injected, rejected_priors = _inject_prior_trials(
+        study,
+        prior_trials,
+        distributions,
+        optuna.trial.create_trial,
+        prior_constraint_attrs,
+    )
 
     # Deferred warm configs (proposed at step 0+1 but not evaluated there): enqueue
     # them as the FIRST trials so BO evaluates them before TPE. They are EXTRA points
     # on top of the TPE budget (n_trials += n_enqueued), so deep-search depth is
     # unchanged — the saving was purely the evals skipped on un-promoted candidates.
-    n_enqueued = 0
-    for d_params in read_deferred_configs(args.tune_report_json):
-        d_params = {k: v for k, v in d_params.items() if k in distributions}
-        if set(d_params.keys()) != set(distributions.keys()):
-            continue
-        try:
-            study.enqueue_trial(d_params)
-            n_enqueued += 1
-        except Exception:
-            continue
+    try:
+        n_enqueued = _enqueue_unique_deferred(
+            study,
+            read_deferred_configs(args.tune_report_json),
+            search_space,
+            distributions,
+        )
+    except DeferredConfigError as exc:
+        set_stage_meta(
+            args.tune_report_json,
+            "bo",
+            status="failed",
+            rejected_priors=rejected_priors,
+            deferred_rejections=exc.rejections,
+        )
+        write_json(
+            {
+                "method": "bo",
+                "status": "failed",
+                "reason": str(exc),
+                "prior_trials_injected": n_priors_injected,
+                "rejected_priors": rejected_priors,
+                "deferred_rejections": exc.rejections,
+            }
+        )
+        return 0
+    set_stage_meta(
+        args.tune_report_json,
+        "bo",
+        prior_trials_injected=n_priors_injected,
+        rejected_priors=rejected_priors,
+        deferred_rejections=[],
+    )
     n_trials = n_trials + n_enqueued
 
     monitor = PatienceMonitor(
@@ -180,6 +376,14 @@ def main() -> int:
         "budget_exhausted": False,
     }
     failure_refs = []
+    infeasible_value = max(
+        (
+            float(trial.value)
+            for trial in study.trials
+            if trial.value is not None and math.isfinite(float(trial.value))
+        ),
+        default=0.0,
+    )
 
     started = time.time()
 
@@ -190,6 +394,7 @@ def main() -> int:
             try:
                 preflight_result = timed_preflight(params, args.candidate_path)
             except Exception as exc:
+                _set_preflight_feasibility(trial, feasible=False)
                 failure = record_failure(
                     report_path=args.tune_report_json,
                     candidate_path=args.candidate_path,
@@ -217,7 +422,11 @@ def main() -> int:
                     },
                 )
                 counters["preflight_rejections"] += 1
-                raise RuntimeError("candidate preflight rejected BO proposal") from exc
+                # Complete this Optuna trial as constrained-infeasible instead of
+                # FAILED: built-in samplers ignore failed trials, while constrained
+                # TPE can use this receipt to avoid nearby infeasible proposals.
+                return infeasible_value
+            _set_preflight_feasibility(trial, feasible=True)
             append_preflight_attempt(
                 args.tune_report_json,
                 source="bo",
@@ -268,7 +477,7 @@ def main() -> int:
         return score
 
     def patience_callback(study, trial):
-        if trial.value is None:
+        if trial.value is None or _is_preflight_infeasible(trial):
             return
         if monitor.update(float(trial.value)):
             early_stopped["flag"] = True

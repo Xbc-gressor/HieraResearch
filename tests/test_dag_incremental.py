@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from background_contract import validate_registry  # noqa: E402
 from got_graph import CRASH, Graph, render_incremental  # noqa: E402
 from ledger import _set_experience, _touch_dag_record  # noqa: E402
+from search_space_state import empty_search_space_state  # noqa: E402
 from semantic_evidence import build_semantic_edges  # noqa: E402
 from semantic_space import complete_point, derive_semantic_lineage  # noqa: E402
 from validate_background import (  # noqa: E402
@@ -72,7 +73,11 @@ class IncrementalDagTests(unittest.TestCase):
 
     def test_revision_cursor_and_compact_lineage(self) -> None:
         records = _records()
-        data = {"records": records, "dag_revision": 6}
+        data = {
+            "records": records,
+            "dag_revision": 6,
+            "search_space_state": empty_search_space_state(),
+        }
         self.assertEqual(_touch_dag_record(data, records[0]), 7)
 
         with tempfile.TemporaryDirectory() as tmp:

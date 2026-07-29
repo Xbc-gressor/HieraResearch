@@ -82,6 +82,9 @@ and selection context:
 - **`policy_receipt`** — why the semantic selector chose this point. It is context,
   not an instruction to rewrite ancestry or optimize a different point.
 - **`candidate_name`** — the name hint to prefer for `CANDIDATE_NAME`.
+- **`implementation_source`** — helper-authored source receipt. `kind:
+  provided_entrypoint` carries the copied task path/hash; `kind: generated`
+  means normal writer-owned implementation.
 
 If the brief is missing, has the wrong `run_id`, lacks `idea`, or has no complete
 `semantic_point` / `policy_receipt`, stop and report that the upstream pipeline
@@ -98,10 +101,12 @@ are authoritative.
 
 Decide what to do from the file system, in this order:
 
-1. **`<target_candidate_dir>/train.py` already exists → do not write.** The
-   existing file IS the candidate (a provided-baseline seed copied from the task
-   root). Read it, run the sanity checks below, and return the verdict with
-   `wrote: false`. Never "improve" it.
+1. **Provided entrypoint → do not write.** When `implementation_source.kind` is
+   `provided_entrypoint`, require `<target_candidate_dir>/train.py` to exist.
+   The copied file IS the candidate. Read it, run the sanity checks below, and
+   return the verdict with `wrote: false`. Never "improve" it. An existing file
+   without that helper receipt is an invalid upstream collision; block rather
+   than guessing.
 2. **No parents → write from scratch.** This is a `fresh` candidate: implement
    the complete idea at its selected semantic point directly against the APIs
    exposed by `prepare.py`. Keep it runnable and within constraints; do not
@@ -119,9 +124,11 @@ Decide what to do from the file system, in this order:
 2. Write the candidate dir's `train.py` per the resolved mode. Keep the
    implementation minimal and faithful to the idea — no opportunistic refactors,
    no side-quests.
-3. Set `CANDIDATE_NAME` in the file to a lowercase_with_underscores identifier
-   that describes the experiment. Prefer the record's `candidate_name`; deviate
-   only if it is unclear or already used.
+3. For generated candidates, set `CANDIDATE_NAME` in the file to a
+   lowercase_with_underscores identifier that describes the experiment. Prefer
+   the record's `candidate_name`; deviate only if it is unclear or already used.
+   For a provided entrypoint, leave the file byte-for-byte unchanged and return
+   the record's candidate name even if the source defines no such symbol.
 4. Sanity-check before returning:
    - The file imports only symbols that exist in `prepare.py` or in
      already-imported libraries (do not silently add new dependencies).

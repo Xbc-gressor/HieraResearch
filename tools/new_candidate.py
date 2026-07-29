@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import shutil
@@ -23,6 +24,58 @@ def candidate_path(template: str, task_name: str, tag: str, run_id: str) -> Path
     return ROOT / template.format(task_name=task_name, tag=tag, run_id=run_id)
 
 
+def provided_seed_entrypoint(config: dict, task_dir: Path) -> Path | None:
+    """Resolve the task-declared provided entrypoint, if one exists.
+
+    The candidate entrypoint and seed entrypoint must agree so the normal copy
+    and evaluation paths cannot silently score a different file.
+    """
+    seed = config.get("seed")
+    if not isinstance(seed, dict):
+        return None
+    entrypoint = seed.get("entrypoint", DEFAULT_ENTRYPOINT)
+    provided = seed.get("provided", [])
+    if (
+        not isinstance(entrypoint, str)
+        or not entrypoint
+        or not isinstance(provided, list)
+        or any(not isinstance(item, str) for item in provided)
+    ):
+        return None
+    candidate = config.get("candidate", {})
+    if not isinstance(candidate, dict):
+        candidate = {}
+    candidate_entrypoint = candidate.get("entrypoint", DEFAULT_ENTRYPOINT)
+    if candidate_entrypoint != entrypoint:
+        raise ValueError(
+            "seed.entrypoint must match candidate.entrypoint for provided-baseline admission"
+        )
+
+    expected = (task_dir / entrypoint).resolve()
+    for item in provided:
+        raw = Path(item)
+        candidates = [raw] if raw.is_absolute() else [task_dir / raw, ROOT / raw]
+        for source in candidates:
+            if source.is_file() and source.resolve() == expected:
+                return source.resolve()
+    return None
+
+
+def _implementation_source(path: Path | None) -> dict:
+    if path is None:
+        return {"kind": "generated"}
+    resolved = path.resolve()
+    try:
+        display_path = resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        display_path = resolved.as_posix()
+    return {
+        "kind": "provided_entrypoint",
+        "path": display_path,
+        "sha256": "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
 def resolve_source_candidate(
     template: str,
     task_name: str,
@@ -39,7 +92,12 @@ def resolve_source_candidate(
     return candidate_path(template, task_name, tag, from_candidate)
 
 
-def candidate_brief(ledger_path: Path, run_id: str) -> dict | None:
+def candidate_brief(
+    ledger_path: Path,
+    run_id: str,
+    *,
+    implementation_source: dict | None = None,
+) -> dict | None:
     """Return the immutable implementation fields for one persisted record."""
     if not ledger_path.is_file():
         return None
@@ -68,7 +126,7 @@ def candidate_brief(ledger_path: Path, run_id: str) -> dict | None:
             ):
                 return None
             return {
-                "schema_version": 2,
+                "schema_version": 3,
                 "run_id": run_id,
                 "op": record.get("op"),
                 "idea": record.get("idea"),
@@ -77,6 +135,9 @@ def candidate_brief(ledger_path: Path, run_id: str) -> dict | None:
                 "semantic_point": record.get("semantic_point"),
                 "policy_receipt": record.get("policy_receipt"),
                 "candidate_name": record.get("candidate_name"),
+                "implementation_source": (
+                    implementation_source or _implementation_source(None)
+                ),
             }
     return None
 
@@ -97,6 +158,14 @@ def main() -> int:
             "Do not copy the entrypoint; require its ledger record and write "
             f"{BRIEF_FILENAME} for candidate-writer. Mutually exclusive with "
             "--from-candidate."
+        ),
+    )
+    parser.add_argument(
+        "--provided-baseline",
+        action="store_true",
+        help=(
+            "copy the task-declared seed entrypoint for an already-admitted "
+            "baseline record and stamp its source receipt into the candidate brief"
         ),
     )
     parser.add_argument(
@@ -128,16 +197,67 @@ def main() -> int:
         parser.error("candidate.copy_files must be a list of strings")
     if not isinstance(entrypoint, str):
         parser.error("candidate.entrypoint must be a string")
-    if args.skip_entrypoint and args.from_candidate:
-        parser.error("--skip-entrypoint and --from-candidate are mutually exclusive")
+    selected_modes = sum(
+        bool(value)
+        for value in (
+            args.skip_entrypoint,
+            args.provided_baseline,
+            args.from_candidate,
+        )
+    )
+    if selected_modes > 1:
+        parser.error(
+            "--skip-entrypoint, --provided-baseline, and --from-candidate "
+            "are mutually exclusive"
+        )
     if args.skip_entrypoint:
         copy_files = [item for item in copy_files if item != entrypoint]
+    provided_entrypoint = None
+    if args.provided_baseline:
+        try:
+            provided_entrypoint = provided_seed_entrypoint(config, task_dir)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if provided_entrypoint is None:
+            parser.error(
+                "task does not declare its candidate entrypoint in [seed].provided"
+            )
+        if entrypoint not in copy_files:
+            parser.error(
+                "candidate.copy_files must include candidate.entrypoint for "
+                "provided-baseline admission"
+            )
 
     ledger_path = ROOT / "runs" / args.task_name / args.tag / "ledger.json"
-    brief = candidate_brief(ledger_path, args.run_id) if args.skip_entrypoint else None
-    if args.skip_entrypoint and brief is None:
+    if args.provided_baseline:
+        if args.run_id != "000":
+            parser.error("--provided-baseline requires run_id 000")
+        try:
+            records = json.loads(ledger_path.read_text()).get("records", [])
+        except (OSError, json.JSONDecodeError, AttributeError):
+            records = []
+        if (
+            not isinstance(records, list)
+            or len(records) != 1
+            or records[0].get("run_id") != "000"
+        ):
+            parser.error(
+                "--provided-baseline requires run 000 to be the ledger's only record"
+            )
+    needs_brief = args.skip_entrypoint or args.provided_baseline
+    brief = (
+        candidate_brief(
+            ledger_path,
+            args.run_id,
+            implementation_source=_implementation_source(provided_entrypoint),
+        )
+        if needs_brief
+        else None
+    )
+    if needs_brief and brief is None:
         parser.error(
-            f"--skip-entrypoint requires ledger record {args.run_id}: {ledger_path}"
+            "candidate creation requires a complete admitted ledger record "
+            f"{args.run_id}: {ledger_path}"
         )
 
     dest = candidate_path(template, args.task_name, args.tag, args.run_id)
@@ -156,6 +276,8 @@ def main() -> int:
     for relative in copy_files:
         if relative == entrypoint and source_candidate is not None:
             source = source_candidate / entrypoint
+        elif relative == entrypoint and provided_entrypoint is not None:
+            source = provided_entrypoint
         else:
             source = task_dir / relative
         if not source.is_file():

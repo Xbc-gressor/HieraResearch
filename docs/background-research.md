@@ -106,6 +106,13 @@ means the dimension is not applicable; it does not mean its baseline was chosen.
 A task-fixed material choice remains visible as a one-value `baseline_only`
 dimension.
 
+If the task declares a provided candidate entrypoint, freeze the dimension set
+before inspecting its implementation under `llm_induced`, then make every local
+baseline hypothesis describe that supplied candidate's actual choice on the
+dimension. This makes the complete all-baselines point a faithful attribution
+for the concrete control without allowing one implementation to determine the
+space decomposition. Its scalar defaults remain inner-HPO settings.
+
 Each hypothesis preserves:
 
 - stable id, title, claim, `status: active`, and provenance receipts;

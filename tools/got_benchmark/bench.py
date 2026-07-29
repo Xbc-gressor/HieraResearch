@@ -1,5 +1,7 @@
-"""Offline outer-S-GoT benchmark — run the REAL search (validate_got.run_sgot)
-on synthetic toys, vary the framework cfg, measure search efficiency.
+"""Offline outer-S-GoT benchmark using the production calculation primitives.
+
+Run the deterministic benchmark loop on synthetic toys, vary the framework
+cfg, and measure search efficiency.
 
 Metrics per run: best@K-candidates (running-best after K nodes), AUC (mean of the
 best-so-far curve; lower = reached good faster), final best, crash%, crossover
@@ -17,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "got_benchmark"))
 
-from validate_got import run_sgot  # noqa: E402  (the validated §13 loop)
 from got_select import DEFAULT_CFG  # noqa: E402
+from sgot_runner import run_sgot  # noqa: E402
 import toys as toysmod  # noqa: E402
 
 KS = [10, 20, 40, 80]

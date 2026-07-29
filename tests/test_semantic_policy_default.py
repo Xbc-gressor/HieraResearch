@@ -13,11 +13,13 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from background_contract import ContractError  # noqa: E402
 from semantic_search import (  # noqa: E402
+    build_baseline_proposal_set,
     build_gain_context,
     build_proposal_set,
     cmd_select,
     select_proposal,
 )
+from semantic_space import complete_point  # noqa: E402
 from validate_background import fixture_registry  # noqa: E402
 
 
@@ -90,6 +92,30 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
         self.assertEqual(receipt["experience"]["generation"], 0)
         self.assertEqual(receipt["experience"]["evidence_run_ids"], [])
         self.assertEqual(receipt["components"]["experience_gain_adjustment"], 0.0)
+
+    def test_provided_baseline_is_the_only_first_point(self) -> None:
+        registry = fixture_registry()
+        proposal_set = build_baseline_proposal_set(registry, {"records": []})
+
+        self.assertEqual(len(proposal_set["proposals"]), 1)
+        self.assertEqual(
+            proposal_set["proposals"][0]["point"],
+            complete_point(registry),
+        )
+        point, receipt = select_proposal(
+            proposal_set,
+            policy="coverage",
+            selection_index=1,
+        )
+        self.assertEqual(point, complete_point(registry))
+        self.assertEqual(receipt["budget"]["selection_index"], 1)
+        self.assertEqual(receipt["policy"]["name"], "coverage")
+
+        with self.assertRaisesRegex(ContractError, "before any other record"):
+            build_baseline_proposal_set(
+                registry,
+                {"records": [{"run_id": "000"}]},
+            )
 
     def test_conditioning_adjustment_has_nontrivial_floor(self) -> None:
         proposal_set = build_proposal_set(

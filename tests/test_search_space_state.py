@@ -20,7 +20,7 @@ from background_contract import (  # noqa: E402
     render_space,
     validate_ledger,
 )
-from ledger import cmd_add_record, cmd_brief  # noqa: E402
+from ledger import _load_ledger, cmd_add_record, cmd_brief  # noqa: E402
 from search_space_state import (  # noqa: E402
     append_experience_transitions,
     compose_effective_selection,
@@ -947,6 +947,14 @@ class LedgerIntegrationTests(unittest.TestCase):
         )
         errors = validate_ledger(registry, ledger)
         self.assertTrue(any("search_space_state" in error for error in errors), errors)
+
+    def test_loader_does_not_rebuild_missing_state_for_record_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = Path(tmp) / "ledger.json"
+            ledger_path.write_text(json.dumps({"records": [{"run_id": "000"}]}))
+
+            with self.assertRaisesRegex(ValueError, "requires search_space_state"):
+                _load_ledger(ledger_path)
 
     def test_runtime_status_counts_and_brief_summary(self) -> None:
         state = state_with(

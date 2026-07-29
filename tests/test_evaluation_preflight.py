@@ -16,7 +16,9 @@ sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 import evaluation_budget  # noqa: E402
 import preflight_env  # noqa: E402
 import run_cfg  # noqa: E402
+import _common  # noqa: E402
 from _common import timed_eval, timed_preflight  # noqa: E402
+from warmstart_eval import validate_provided_baseline_configs  # noqa: E402
 
 
 def _run_dir(root: Path, *, budget: int) -> tuple[Path, Path]:
@@ -32,6 +34,69 @@ def _run_dir(root: Path, *, budget: int) -> tuple[Path, Path]:
 
 
 class EvaluationBudgetTests(unittest.TestCase):
+    def test_provided_baseline_allows_only_its_exact_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "candidate" / "train.py"
+            candidate.parent.mkdir()
+            candidate.write_text("DEFAULT_PARAMS = {'depth': 8, 'lr': 0.04}\n")
+            (candidate.parent / "_candidate_brief.json").write_text(json.dumps({
+                "schema_version": 3,
+                "implementation_source": {
+                    "kind": "provided_entrypoint",
+                    "path": "tasks/unit/train.py",
+                    "sha256": "sha256:" + "0" * 64,
+                },
+            }))
+            defaults = [{"depth": 8, "lr": 0.04}]
+
+            validate_provided_baseline_configs(candidate, defaults, 1)
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                validate_provided_baseline_configs(
+                    candidate,
+                    defaults + [{"depth": 9, "lr": 0.04}],
+                    1,
+                )
+            with self.assertRaisesRegex(ValueError, "literal DEFAULT_PARAMS"):
+                validate_provided_baseline_configs(
+                    candidate,
+                    [{"depth": 9, "lr": 0.04}],
+                    1,
+                )
+            candidate.write_text("DEFAULT_PARAMS = build_defaults()\n")
+            with self.assertRaisesRegex(ValueError, "module-level literal"):
+                validate_provided_baseline_configs(candidate, defaults, 1)
+
+    def test_warmstart_requires_a_valid_candidate_origin_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "candidate" / "train.py"
+            candidate.parent.mkdir()
+            candidate.write_text("DEFAULT_PARAMS = {'depth': 8}\n")
+            brief_path = candidate.parent / "_candidate_brief.json"
+
+            with self.assertRaisesRegex(ValueError, "requires candidate brief"):
+                validate_provided_baseline_configs(candidate, [{"depth": 8}], 1)
+
+            brief_path.write_text("{")
+            with self.assertRaisesRegex(ValueError, "invalid candidate brief"):
+                validate_provided_baseline_configs(candidate, [{"depth": 8}], 1)
+
+            brief_path.write_text(json.dumps({
+                "schema_version": 3,
+                "implementation_source": {"kind": "unknown"},
+            }))
+            with self.assertRaisesRegex(ValueError, "implementation_source.kind"):
+                validate_provided_baseline_configs(candidate, [{"depth": 8}], 1)
+
+            brief_path.write_text(json.dumps({
+                "schema_version": 3,
+                "implementation_source": {"kind": "generated"},
+            }))
+            validate_provided_baseline_configs(
+                candidate,
+                [{"depth": 8}, {"depth": 9}],
+                2,
+            )
+
     def test_reservation_refuses_before_score_fn_at_hard_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir, candidate = _run_dir(Path(tmp), budget=2)
@@ -116,6 +181,60 @@ class EvaluationBudgetTests(unittest.TestCase):
                 )
             with self.assertRaises(run_cfg.RunConfigError):
                 evaluation_budget.budget_status(run_dir)
+
+    def test_legal_json_with_invalid_hard_limits_fails_fast(self) -> None:
+        invalid_configs = [
+            {"max_evaluations": "1"},
+            {"max_evaluations": True},
+            {"max_evaluations": 0},
+            {"per_runtime_limit": "bad"},
+            {"per_runtime_limit": 0},
+            {"per_runtime_limit": float("nan")},
+            {"per_runtime_limit": float("inf")},
+            {"tuner": {"K_eval": "3"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = _run_dir(Path(tmp), budget=1)
+            for config in invalid_configs:
+                with self.subTest(config=config):
+                    (run_dir / "framework_cfg.json").write_text(json.dumps(config))
+                    with self.assertRaises(run_cfg.RunConfigError):
+                        evaluation_budget.reserve_evaluation(
+                            candidate,
+                            params={"x": 1},
+                            phase="phase_c",
+                            method="grid",
+                        )
+                    self.assertFalse(
+                        (run_dir / evaluation_budget.ATTEMPT_LOG).exists()
+                    )
+
+    def test_corrupt_task_contract_does_not_disable_runtime_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_root = Path(tmp)
+            task_dir = fake_root / "tasks" / "unit"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.toml").write_text("[evaluation]\nbroken line\n")
+            candidate = (
+                fake_root
+                / "runs"
+                / "unit"
+                / "tag"
+                / "candidates"
+                / "001"
+                / "train.py"
+            )
+            prepare = type(
+                "Prepare",
+                (),
+                {"evaluate_config": staticmethod(lambda _model, _params: 0.0)},
+            )
+
+            with mock.patch.object(_common, "ROOT", fake_root):
+                with self.assertRaisesRegex(ValueError, "expected key = value"):
+                    _common.resolve_score_fn(prepare, candidate)
+                with self.assertRaisesRegex(ValueError, "expected key = value"):
+                    timed_preflight({}, candidate)
 
     def test_legacy_sync_reconciles_per_candidate_without_hiding_calls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

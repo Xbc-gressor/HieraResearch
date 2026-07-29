@@ -71,8 +71,9 @@ would remove the independent contexts required by this project.
 - `autoresearch-experiment` — self-contained run-level orchestrator for one
   `task_name + tag + run_dir`. Start it as the main thread with
   `claude --agent autoresearch-experiment`. It can execute without
-  `program.md`, initializes one new run directory (setup = `background-researcher`
-  only; no seed phase — the loop bootstraps via `fresh`), then runs the loop in
+  `program.md`, initializes one new run directory, runs `background-researcher`,
+  and admits a declared provided entrypoint as the observed all-baselines root
+  (otherwise the loop bootstraps via `fresh`), then runs the loop in
   **rounds** (a generation of ≤B ideas at step 0+1, then one **decoupled**
   deep-tuning step), spawning `idea-generator`, `experience-extractor`,
   `candidate-writer`, `tunable-contract-extractor`, and `tuner-orchestrator`
@@ -133,13 +134,15 @@ would remove the independent contexts required by this project.
   contract from the dir, and keeps the implementation consistent with the
   record's `semantic_point`. Empty `source_run_ids` → write from scratch;
   numeric parents → write informed by their `train.py`; target
-  `train.py` already exists (provided baseline) → leave untouched. Returns the new
-  `train.py`, a unified diff, the chosen `CANDIDATE_NAME`, and risk flags. Does not
-  own the tuner contract. Spawned by the experiment loop.
+  `train.py` with a helper-stamped provided-entrypoint receipt → leave
+  untouched. Returns the new `train.py`, a unified diff, the chosen
+  `CANDIDATE_NAME`, and risk flags. Does not own the tuner contract. Spawned by
+  the experiment loop.
 - `tunable-contract-extractor` — **step 0+1** for one candidate `train.py`:
   ① behavior-preservingly refactor `make_model` + declare `PARAM_SCHEMA`;
-  ② propose K = 5 warm configs + a data-driven `SEARCH_SPACE` (from
-  `lineage-evidence` + the schema), consistency pre-check, finalize via
+  ② use the exact single default for a provided entrypoint, otherwise propose
+  K = 5 warm configs, plus a data-driven `SEARCH_SPACE` (from `lineage-evidence`
+  + the schema), consistency pre-check, finalize via
   `check-search-space` + `apply_search_space`; ③ evaluate the K configs
   (`warmstart_eval.py`, sequential/resumable), first running any task-declared
   isolated no-score preflight and **diagnosing each preflight/eval crash inline

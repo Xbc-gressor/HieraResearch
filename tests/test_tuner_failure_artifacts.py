@@ -14,6 +14,15 @@ sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 
 from failure_artifacts import record_failure, render_failure  # noqa: E402
 from _common import is_finite_score, read_prior_trials, timed_eval  # noqa: E402
+from bo_search import (  # noqa: E402
+    DeferredConfigError,
+    _enqueue_unique_deferred,
+    _inject_prior_trials,
+    _is_preflight_infeasible,
+    _preflight_constraints,
+    _set_preflight_feasibility,
+)
+from cmaes_search import _encode_prior_seed, build_codec  # noqa: E402
 from tune_tools import select_best, select_candidate, summarize  # noqa: E402
 
 
@@ -26,7 +35,107 @@ ValueError: depth must be positive
 """
 
 
+class _FakeTrial:
+    def __init__(self, params=None):
+        self.params = params or {}
+        self.user_attrs = {}
+
+    def set_user_attr(self, key, value):
+        self.user_attrs[key] = value
+
+
+class _FakeStudy:
+    def __init__(self, trials, *, enqueue_error=None, add_error=None):
+        self.trials = trials
+        self.enqueued = []
+        self.added = []
+        self.enqueue_error = enqueue_error
+        self.add_error = add_error
+
+    def enqueue_trial(self, params, *, skip_if_exists=False):
+        if self.enqueue_error is not None:
+            raise self.enqueue_error
+        self.enqueued.append((params, skip_if_exists))
+
+    def add_trial(self, trial):
+        if self.add_error is not None:
+            raise self.add_error
+        self.added.append(trial)
+
+
 class FailureArtifactTests(unittest.TestCase):
+    def test_bo_deferred_configs_skip_injected_priors_and_each_other(self) -> None:
+        study = _FakeStudy([_FakeTrial({"depth": 3})])
+        n_enqueued = _enqueue_unique_deferred(
+            study,
+            [{"depth": 3}, {"depth": 4}, {"depth": 4}],
+            {"depth": ("int", 1, 5)},
+            {"depth": object()},
+        )
+
+        self.assertEqual(n_enqueued, 1)
+        self.assertEqual(study.enqueued, [({"depth": 4}, True)])
+
+    def test_bo_deferred_backend_rejection_is_explicit_and_fatal(self) -> None:
+        study = _FakeStudy([], enqueue_error=ValueError("backend refused"))
+
+        with self.assertRaises(DeferredConfigError) as caught:
+            _enqueue_unique_deferred(
+                study,
+                [{"depth": 4}],
+                {"depth": ("int", 1, 5)},
+                {"depth": object()},
+            )
+
+        self.assertEqual(caught.exception.rejections[0]["reason"], "backend_rejected")
+        self.assertEqual(caught.exception.rejections[0]["error_type"], "ValueError")
+
+    def test_bo_prior_backend_rejection_has_a_receipt(self) -> None:
+        study = _FakeStudy([], add_error=ValueError("invalid prior"))
+        injected, rejections = _inject_prior_trials(
+            study,
+            [{"params": {"depth": 4}, "score": 0.5}],
+            {"depth": object()},
+            lambda **kwargs: kwargs,
+            {},
+        )
+
+        self.assertEqual(injected, 0)
+        self.assertEqual(rejections[0]["reason"], "backend_rejected")
+        self.assertEqual(rejections[0]["error"], "invalid prior")
+
+    def test_cma_prior_encoding_fallback_has_a_receipt(self) -> None:
+        search_space = {"mode": ("categorical", ["a", "b"])}
+        _, lower, upper, x0_default, encode, _ = build_codec(
+            search_space,
+            {"mode": "a"},
+        )
+
+        x0, rejection = _encode_prior_seed(
+            {"params": {"mode": "unknown"}},
+            encode=encode,
+            lower=lower,
+            upper=upper,
+            x0_default=x0_default,
+        )
+
+        self.assertEqual(x0, x0_default)
+        self.assertEqual(rejection["reason"], "seed_encoding_failed")
+        self.assertEqual(rejection["error_type"], "ValueError")
+
+    def test_bo_preflight_rejection_is_an_optuna_constraint(self) -> None:
+        trial = _FakeTrial()
+        self.assertEqual(_preflight_constraints(trial), (0.0,))
+        self.assertFalse(_is_preflight_infeasible(trial))
+
+        _set_preflight_feasibility(trial, feasible=False)
+        self.assertEqual(_preflight_constraints(trial), (1.0,))
+        self.assertTrue(_is_preflight_infeasible(trial))
+
+        _set_preflight_feasibility(trial, feasible=True)
+        self.assertEqual(_preflight_constraints(trial), (0.0,))
+        self.assertFalse(_is_preflight_infeasible(trial))
+
     def test_same_failure_is_stable_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "tune_report.json"

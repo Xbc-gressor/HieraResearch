@@ -135,12 +135,15 @@ def resolve_score_fn(prepare_module: Any, candidate_path: Path):
     if task_name:
         task_toml = ROOT / "tasks" / task_name / "task.toml"
         if task_toml.exists():
-            try:
-                configured = parse_task_toml(task_toml).get("evaluation", {})
-            except ValueError:
-                configured = {}
+            configured = parse_task_toml(task_toml).get("evaluation", {})
+            if not isinstance(configured, dict):
+                raise RuntimeError("task.toml [evaluation] must be a table")
             name = configured.get("score_fn") if isinstance(configured, dict) else None
-            if isinstance(name, str) and name:
+            if name is not None and (not isinstance(name, str) or not name):
+                raise RuntimeError(
+                    "task.toml evaluation.score_fn must be a non-empty string"
+                )
+            if name is not None:
                 fn_name = name
     if not hasattr(prepare_module, fn_name):
         raise RuntimeError(
@@ -158,10 +161,9 @@ def _configured_preflight_name(candidate_path: Path) -> str | None:
     task_toml = ROOT / "tasks" / task_name / "task.toml"
     if not task_toml.exists():
         return None
-    try:
-        configured = parse_task_toml(task_toml).get("evaluation", {})
-    except ValueError:
-        return None
+    configured = parse_task_toml(task_toml).get("evaluation", {})
+    if not isinstance(configured, dict):
+        raise RuntimeError("task.toml [evaluation] must be a table")
     name = configured.get("preflight_fn") if isinstance(configured, dict) else None
     if name is None:
         return None

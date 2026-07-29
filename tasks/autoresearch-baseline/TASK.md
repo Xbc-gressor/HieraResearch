@@ -103,11 +103,13 @@ atomically consumes one objective slot.
 - `pyproject.toml`: this task's uv environment.
 - `uv.lock`: this task's locked dependency resolution.
 
-During autonomous experiments this task uses candidate directories. If a task
-root `train.py` is present it is one provided-baseline candidate; otherwise
-`candidate-writer` writes each candidate's `train.py` (a `fresh` candidate from
-scratch, or informed by parent candidates for `improve`/`crossover`). Only
-run-local candidate files are edited.
+During autonomous experiments this task uses candidate directories. Because the
+task-root `train.py` is declared by `[seed].provided`, the experiment admits its
+unchanged run-local copy first at the all-baselines semantic point. Its exact
+`DEFAULT_PARAMS` are the sole step-0+1 baseline evaluation; the normal decoupled
+tuner may later tune that same point. Otherwise `candidate-writer` writes each
+candidate's `train.py` (a `fresh` candidate from scratch, or informed by parent
+candidates for `improve`/`crossover`). Only run-local candidate files are edited.
 
 ## Run
 
@@ -132,7 +134,9 @@ Under the experiment loop there is **no `python train.py` run**: a candidate is
 scored only where the tuner scripts call `evaluate_config`:
 
 ```bash
-# Requires an existing <run_id> ledger record; also derives _candidate_brief.json.
+# Run 000 uses --provided-baseline after deterministic all-baselines admission.
+python tools/new_candidate.py autoresearch-baseline <tag> 000 --provided-baseline
+# Later records derive _candidate_brief.json without copying the entrypoint.
 python tools/new_candidate.py autoresearch-baseline <tag> <run_id> --skip-entrypoint
 # after candidate-writer + tunable-contract-extractor produce train.py + _warm_configs.json:
 # (--project selects the task env without chdir, so the repo-relative paths below resolve)

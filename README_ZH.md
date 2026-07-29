@@ -89,7 +89,7 @@ tag: <你的运行标签>
 
 **`tasks/<task-name>/prepare.py`**：固定评估表面。正常实验期间不修改。
 
-**`tasks/<task-name>/train.py`**：可选的用户提供基线。多数任务省略它——循环通过 `fresh` 自举，`candidate-writer` 在 `runs/` 下按已验证的完整语义点从头生成 `train.py`。
+**`tasks/<task-name>/train.py`**：可选的用户提供基线。若由 `[seed].provided` 声明，框架会先把它作为 all-baselines 点的首个观测根节点原样复制并评估；多数任务省略它，此时循环仍通过 `fresh` 自举。
 
 ### 4.2 实验流程
 
@@ -100,6 +100,8 @@ tag: <你的运行标签>
         ↓
 background-researcher: 解析维度策略 → 多后端知识侦察 → background.md + background_retrieval.json
     (llm_induced 额外先生成 dimension_catalog.json；随后冻结显式基线、hyp-* 与关系)
+        ↓
+(若声明 provided entrypoint) 作为 all-baselines 根节点原样复制并评估一次默认配置
         ↓
 (每 N 轮) experience-extractor: 提炼全局经验 → ledger.json experience 块
         ↓
@@ -142,7 +144,7 @@ step 0+1: tunable-contract-extractor
 
 - **Step 0+1**（tunable-contract-extractor；一个子智能体完成；对每个候选方案运行）：
   ① 行为保持地重构构造逻辑为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）+ 声明 `PARAM_SCHEMA`
-  ② 结合**血统证据**与数据提出 K=5 个热启动配置 + 数据驱动的 `SEARCH_SPACE`；一致性预检 + `check-search-space` + `apply_search_space`
+  ② provided entrypoint 仅使用一个原始默认配置；其他候选结合**血统证据**与数据提出 K=5 个热启动配置 + 数据驱动的 `SEARCH_SPACE`；一致性预检 + `check-search-space` + `apply_search_space`
   ③ **评估 K 个配置**（warmstart_eval；顺序/可恢复）；**对每次崩溃内联 crash-diagnosis skill**（config-invalid → 修复配置；code-incompatible → 最小化修复代码 ≤10 次）；全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
   深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
 
@@ -172,7 +174,7 @@ step 0+1: tunable-contract-extractor
 
 职责：
 - 完全自包含地执行完整实验协议，不依赖 `program.md`
-- 初始化新的 `runs/<task>/<tag>/`（设置 = 仅 `background-researcher`；无种子阶段——循环通过 `fresh` 候选方案自举）
+- 初始化新的 `runs/<task>/<tag>/`（先运行 `background-researcher`；若任务声明 provided entrypoint，则先登记并评估该基线，否则循环通过 `fresh` 自举）
 - 按**轮次**推进循环：一代 ≤B 个想法经过 step 0+1，然后一次解耦深度调优步骤
 - 调用 `idea-generator` 用于 SELECT + IDEATE
 - 调用 `candidate-writer` 编写候选代码
@@ -191,7 +193,7 @@ step 0+1: tunable-contract-extractor
 
 ### 5.2 background-researcher
 
-证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置步骤）。读取 `TASK.md` / `task.toml` / `prepare.py` 的候选可见接口，并先解析 `space_initialization.dimension_strategy`。默认 `catalog_subset` 从内置目录选取任务相关维度；`llm_induced` 则在检索文献前按需读取 `docs/dimension-induction.md`，直接生成最终的任务维度集 `<run_dir>/dimension_catalog.json`。随后才分解研究问题并检索证据。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend；DeepXiv 是显式选择的 open-world 学术条件，Jina 仅作为显式 live-web fallback/ablation。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序，再轮询补齐各 query 的覆盖。随后按 grounding lane（6000 tokens）渐进阅读，并同时寻找反证、复现和官方工件。它总是产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`，在 `llm_induced` 下另加维度目录。
+证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置子代理）。读取 `TASK.md` / `task.toml` / `prepare.py` 的候选可见接口，并先解析 `space_initialization.dimension_strategy`。默认 `catalog_subset` 从内置目录选取任务相关维度；`llm_induced` 则在检索文献前按需读取 `docs/dimension-induction.md`，直接生成最终的任务维度集 `<run_dir>/dimension_catalog.json`。维度集冻结后，声明的 provided entrypoint 只用于把各维度的 baseline hypothesis 对齐到具体基线，不反过来决定维度划分。随后才分解研究问题并检索证据。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend；DeepXiv 是显式选择的 open-world 学术条件，Jina 仅作为显式 live-web fallback/ablation。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序，再轮询补齐各 query 的覆盖。随后按 grounding lane（6000 tokens）渐进阅读，并同时寻找反证、复现和官方工件。它总是产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`，在 `llm_induced` 下另加维度目录。
 
 `background.md` 现在是 schema-3 的语义搜索空间：每个维度复制已解析目录的定义/边界/来源，登记显式任务基线与稳定 `hyp-*` 值；`catalog_subset` 可使用内置目录的子集，`llm_induced` 必须完整、按序使用 run-local 目录。`activates` / `requires` / `excludes` 关系表示条件激活与不兼容组合。标量设置仍属于内层 HPO。人类可读的 Dimension coverage / Dimensions / Relations 与 JSON 层级必须一致。
 
@@ -249,7 +251,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 Step 0+1：在候选 `train.py` 准备好后运行，在一个子智能体中完成所有事情：
 
 ① 行为保持地将构造逻辑重构为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）并声明 `PARAM_SCHEMA`（仅列出可调参数 + 类型，无范围/默认值）
-② 结合**血统证据**（`lineage-evidence`）与数据一次性提出 K=5 个热启动配置 + 一个数据驱动的 `SEARCH_SPACE`，自运行 `check-search-space`（扩展边界以包含配置）+ `apply_search_space` 写回
+② provided entrypoint 仅使用一个原始默认配置；其他候选结合**血统证据**（`lineage-evidence`）与数据一次性提出 K=5 个热启动配置 + 一个数据驱动的 `SEARCH_SPACE`，自运行 `check-search-space`（扩展边界以包含配置）+ `apply_search_space` 写回
 ③ 评估这 K 个配置（`warmstart_eval`；顺序/可恢复/崩溃时停止）；**对每次崩溃内联调用 `crash-diagnosis` skill**（config-invalid → 修复配置 / code-incompatible → 最小化修复代码 ≤10 次）直到全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
 
 主循环在 `candidate-writer` 返回后对每个新候选方案运行一次此操作。深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
@@ -304,11 +306,13 @@ tools/
 
 ```bash
 python tools/new_candidate.py <task-name> <tag> <run_id>
+python tools/new_candidate.py <task-name> <tag> 000 --provided-baseline
 python tools/new_candidate.py <task-name> <tag> <run_id> --skip-entrypoint
 python tools/new_candidate.py <task-name> <tag> <run_id> --from-candidate <best_run_id>
 ```
 
-- 默认：复制 `prepare.py` 和任务根的 `train.py`（提供的基线）
+- `--provided-baseline`：仅用于已登记的首个 all-baselines 记录；验证 `[seed].provided`，复制任务根 entrypoint，并在 `_candidate_brief.json` 保存来源路径与内容哈希
+- 默认：复制 `prepare.py` 和任务根的 `train.py`（兼容性保留）
 - `--skip-entrypoint`：要求对应账本记录已存在，复制 `prepare.py` 并从该记录生成精简 `_candidate_brief.json`；`train.py` 稍后由 candidate-writer 编写（`fresh` 和所有 `improve`/`crossover` 候选方案的标准）
 - `--from-candidate`：从历史候选复制 `train.py`（兼容性保留；正常流程不再使用——`improve`/`crossover` 候选方案引用代码由 candidate-writer 自己从 `source_run_ids` 派生，而非预复制）
 

@@ -593,6 +593,43 @@ def build_proposal_set(
     return value
 
 
+def build_baseline_proposal_set(
+    registry: dict[str, Any],
+    ledger: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the single all-baselines proposal for an empty run.
+
+    A task-provided entrypoint is an observed control, not an acquisition
+    choice.  Keep its semantic admission on the normal proposal/receipt path,
+    while making the two invariants that matter deterministic: it is the first
+    record and it maps to the registry's complete all-baselines point.
+    """
+    records = ledger.get("records", [])
+    if not isinstance(records, list):
+        raise ContractError("ledger.records must be a list")
+    if records:
+        raise ContractError(
+            "the provided baseline must be admitted before any other record"
+        )
+    value = build_proposal_set(
+        registry,
+        ledger,
+        op="fresh",
+        parents=[],
+        max_points=1,
+    )
+    baseline = complete_point(registry)
+    proposals = value.get("proposals", [])
+    if (
+        len(proposals) != 1
+        or proposals[0].get("point_id") != baseline.get("point_id")
+    ):
+        raise ContractError(
+            "baseline-only proposal did not resolve to the all-baselines point"
+        )
+    return value
+
+
 def validate_proposal_set(value: Any) -> list[str]:
     if not isinstance(value, dict):
         return ["proposal set must be an object"]
@@ -1301,13 +1338,18 @@ def cmd_propose(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "errors": errors}, indent=2))
         return 1
     parents = [item.strip() for item in (args.parents or "").split(",") if item.strip()]
-    value = build_proposal_set(
-        registry,
-        ledger,
-        op=args.op,
-        parents=parents,
-        max_points=args.max_points,
-    )
+    if args.baseline_only:
+        if args.op != "fresh" or parents:
+            raise ContractError("--baseline-only requires --op fresh and no parents")
+        value = build_baseline_proposal_set(registry, ledger)
+    else:
+        value = build_proposal_set(
+            registry,
+            ledger,
+            op=args.op,
+            parents=parents,
+            max_points=args.max_points,
+        )
     _write_object(args.output, value)
     print(
         json.dumps(
@@ -1424,6 +1466,14 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--op", choices=["fresh", "improve", "crossover"], required=True)
     propose.add_argument("--parents", default="", help="comma-separated numeric parents")
     propose.add_argument("--max-points", type=int, default=128)
+    propose.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help=(
+            "for an empty run, emit only the complete all-baselines point; "
+            "requires --op fresh and no parents"
+        ),
+    )
     propose.add_argument("--output", type=Path, required=True)
     propose.set_defaults(func=cmd_propose)
 

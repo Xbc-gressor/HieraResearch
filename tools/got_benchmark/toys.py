@@ -1,14 +1,14 @@
 """Toy oracles for the offline outer-S-GoT benchmark.
 
-Each toy is a synthetic "candidate quality" function exercising the REAL search
-code (got_select/got_cdag/got_graph via validate_got.run_sgot) WITHOUT real
-LLM-written candidates. Structure: a D-dim target; each `tf-*` direction owns a
-subset of dims; a `fresh` from that direction gets its owned dims ~right and the
-rest random; `crossover` merges lineages (so combining complementary directions
-is genuinely valuable — the c_dag/gamma payoff); `improve` is a local Gaussian
+Each toy is a synthetic "candidate quality" function exercising the production
+calculation primitives through ``sgot_runner`` without real LLM-written
+candidates. Structure: a D-dim target; each `tf-*` direction owns a subset of
+dims; a `fresh` from that direction gets its owned dims ~right and the rest
+random; `crossover` merges lineages (so combining complementary directions is
+genuinely valuable — the c_dag/gamma payoff); `improve` is a local Gaussian
 walk; evals crash with prob p_crash. score = squared distance to target (lower
-is better, like the real neg-accuracy). Everything uses a LOCAL seeded RNG so the
-benchmark can average over seeds.
+is better, like the real neg-accuracy). Everything uses a LOCAL seeded RNG so
+the benchmark can average over seeds.
 """
 from __future__ import annotations
 import random

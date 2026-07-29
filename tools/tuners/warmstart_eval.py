@@ -25,11 +25,18 @@ reserves an objective slot. There is no `base_score`. Run from the task uv env:
 `uv --project tasks/<task> run python tools/tuners/warmstart_eval.py ...`
 (`--project` selects the task env without chdir, so repo-relative paths resolve;
 `--directory` would chdir into the task dir and break them).
+
+Every candidate requires a schema-3 `_candidate_brief.json` with a recognized
+implementation origin. A brief stamped
+`implementation_source.kind=provided_entrypoint` enables the observed-control
+guard: exactly one warm config may run, `k_eval` must be one, and a literal
+`DEFAULT_PARAMS` must match that config exactly.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import sys
 import time
@@ -63,6 +70,79 @@ def _params_key(params: dict) -> str:
     return json.dumps(params, sort_keys=True, default=str)
 
 
+def _literal_default_params(candidate_path: Path) -> dict | None:
+    tree = ast.parse(candidate_path.read_text())
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            isinstance(target, ast.Name) and target.id == "DEFAULT_PARAMS"
+            for target in targets
+        ):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return None
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def validate_provided_baseline_configs(
+    candidate_path: Path,
+    configs: list,
+    k_eval: int | None,
+) -> None:
+    """Validate candidate origin, then keep a provided control to one trial."""
+    brief_path = candidate_path.parent / "_candidate_brief.json"
+    try:
+        brief = json.loads(brief_path.read_text())
+    except OSError as exc:
+        raise ValueError(f"warmstart requires candidate brief {brief_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid candidate brief {brief_path}: {exc}") from exc
+    if not isinstance(brief, dict) or brief.get("schema_version") != 3:
+        raise ValueError("warmstart requires a schema-3 candidate brief")
+    source = brief.get("implementation_source")
+    if not isinstance(source, dict):
+        raise ValueError("candidate brief requires an implementation_source object")
+    source_kind = source.get("kind")
+    if source_kind not in {"generated", "legacy_generated", "provided_entrypoint"}:
+        raise ValueError(
+            "candidate brief implementation_source.kind must be generated, "
+            "legacy_generated, or provided_entrypoint"
+        )
+    if source_kind != "provided_entrypoint":
+        return
+    source_path = source.get("path")
+    source_sha256 = source.get("sha256")
+    if (
+        not isinstance(source_path, str)
+        or not source_path
+        or not isinstance(source_sha256, str)
+        or len(source_sha256) != 71
+        or not source_sha256.startswith("sha256:")
+        or any(char not in "0123456789abcdef" for char in source_sha256[7:])
+    ):
+        raise ValueError(
+            "provided_entrypoint implementation_source requires path and sha256 receipt"
+        )
+    if len(configs) != 1:
+        raise ValueError("provided baseline requires exactly one warm config")
+    if k_eval not in (None, 1):
+        raise ValueError("provided baseline requires k_eval=1")
+    defaults = _literal_default_params(candidate_path)
+    if defaults is None:
+        raise ValueError(
+            "provided baseline requires a module-level literal DEFAULT_PARAMS"
+        )
+    if configs[0] != defaults:
+        raise ValueError(
+            "provided baseline warm config must equal its literal DEFAULT_PARAMS"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-path", required=True, type=Path)
@@ -80,6 +160,14 @@ def main() -> int:
         all_configs = json.load(f)
     if not isinstance(all_configs, list) or not all_configs:
         parser.error(f"--configs-json must be a non-empty list, got {type(all_configs).__name__}")
+    try:
+        validate_provided_baseline_configs(
+            args.candidate_path,
+            all_configs,
+            args.k_eval,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Split into eval-now (first k_eval) and deferred (the rest, evaluated by the
     # tuner only if promoted). k_eval=None / >=len → evaluate all (no deferral).

@@ -49,6 +49,7 @@ Derive the rest from `train_py` (do not ask the caller):
 | `candidate_dir` | the directory containing `train_py` (where the JSON artifacts live) |
 | `run_id` | `candidate_dir`'s name (e.g. `007`) |
 | `run_dir` | the `runs/<task>/<tag>/` ancestor (holds `ledger.json`) |
+| implementation source | `candidate_dir/_candidate_brief.json` → `implementation_source` |
 | `prepare.py` (readonly) | `<candidate_dir>/prepare.py` — read for the task's problem interface (what `make_model` receives and must return), never edit |
 | `task_dir` / `env.project` | `tasks/<task>` (`<task>` = the `runs/<task>/` segment); the uv dir for segment ③ is `task.toml`'s `env.project` (usually `tasks/<task>`) |
 
@@ -56,6 +57,11 @@ Read the task contract — `TASK.md`'s `## Evaluation Contract` + `task.toml`
 `[evaluation]`/`[constraints]` — before editing. These are authoritative. If a
 required path does not resolve, stop and report. **Scores are lower-is-better**;
 everything you propose aims *low*.
+
+When `implementation_source.kind` is `provided_entrypoint`, this candidate is
+the run's observed semantic control. Preserve its supplied behavior and use the
+provided-baseline exceptions below. The source receipt is helper-authored; never
+infer baseline mode from a filename, candidate name, or prose alone.
 
 ---
 
@@ -120,11 +126,14 @@ seeds → lean on `PARAM_SCHEMA` + the task's problem interface + same-family le
 
 ### 2b. Propose K warm configs + a SEARCH_SPACE (one shot)
 
-**Determine K first (per-run override).** Read `<run_dir>/framework_cfg.json` — the
-run dir is the `candidates/..` grandparent of this candidate dir (i.e.
-`runs/<task>/<tag>/`). If it has a `tuner.K`, use that many warm configs; otherwise
-**K = 5** (the default). This lets a Phase-3 OFAT trial sweep `K` per run with no
-code edits (mirrors how `got_select`/`select-candidate`/`bo_search` read that file).
+**Determine K first (per-run override).** For a helper-stamped provided
+entrypoint, set **K = 1** and make that one config exactly the supplied original
+values; this preserves an observed default baseline. Otherwise read
+`<run_dir>/framework_cfg.json` — the run dir is the `candidates/..` grandparent
+of this candidate dir (i.e. `runs/<task>/<tag>/`). If it has a `tuner.K`, use that
+many warm configs; otherwise **K = 5** (the default). This lets a Phase-3 OFAT
+trial sweep `K` per run with no code edits (mirrors how
+`got_select`/`select-candidate`/`bo_search` read that file).
 
 Over the `PARAM_SCHEMA` keys, propose together:
 
@@ -210,7 +219,9 @@ the evaluated ones inline, until they all score or you abandon.
 `K_eval` comes from `framework_cfg.json` `tuner.K_eval` (default **3**); pass it as
 `--k-eval`. Put your **most central/robust** configs first (those get screened) and
 the **more exploratory** ones last (those get deferred to the tuner). `K_eval ≥ K`
-disables deferral.
+disables deferral. For a provided entrypoint, pass `--k-eval 1`; its only warm
+trial is the exact supplied default. The finalized `SEARCH_SPACE` remains
+available if the decoupled tuner later promotes this semantic point.
 
 ### 3a. Run the evaluator (sequential, resumable)
 
@@ -246,6 +257,12 @@ deep-tuner later evaluates the deferred configs FIRST (bo enqueue / grid prepend
   objective cap is reached. Never convert an unstarted candidate into a crash.
   This path should be rare because `got_select` reserves `K_eval` admission
   capacity.
+
+For a provided entrypoint, never change its default parameters or
+strategy-bearing behavior to turn the anchor into a success. A mechanical,
+behavior-preserving contract repair is allowed; otherwise persist the failed
+attempt and return `crash` so the coordinator can block rather than continue
+without a valid control.
 
 ### 3b. Diagnose + fix (the crash loop)
 

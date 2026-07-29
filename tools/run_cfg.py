@@ -12,12 +12,53 @@ overrides configured" state and yields the caller's default.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 
 class RunConfigError(ValueError):
-    """framework_cfg.json exists but cannot be read or parsed."""
+    """framework_cfg.json exists but cannot be read, parsed, or validated."""
+
+
+def _validate_optional_positive_int(config: dict, key: str, path: Path) -> None:
+    if key not in config or config[key] is None:
+        return
+    value = config[key]
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise RunConfigError(f"{path}: {key} must be a positive integer or null")
+
+
+def _validate_optional_positive_number(config: dict, key: str, path: Path) -> None:
+    if key not in config or config[key] is None:
+        return
+    value = config[key]
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise RunConfigError(f"{path}: {key} must be a positive finite number or null")
+
+
+def _validate_framework_cfg(config: dict, path: Path) -> None:
+    """Validate the hard-limit fields shared by deterministic consumers."""
+    _validate_optional_positive_int(config, "max_evaluations", path)
+    _validate_optional_positive_number(config, "per_runtime_limit", path)
+    _validate_optional_positive_number(config, "preflight_runtime_limit", path)
+
+    tuner = config.get("tuner")
+    if tuner is None:
+        return
+    if not isinstance(tuner, dict):
+        raise RunConfigError(f"{path}: tuner must be an object")
+    if "K_eval" in tuner and tuner["K_eval"] is not None:
+        value = tuner["K_eval"]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise RunConfigError(
+                f"{path}: tuner.K_eval must be a positive integer or null"
+            )
 
 
 def read_framework_cfg(path: Any) -> dict:
@@ -33,6 +74,7 @@ def read_framework_cfg(path: Any) -> dict:
         raise RunConfigError(f"cannot read framework config {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise RunConfigError(f"{path}: framework config must be an object")
+    _validate_framework_cfg(value, path)
     return value
 
 

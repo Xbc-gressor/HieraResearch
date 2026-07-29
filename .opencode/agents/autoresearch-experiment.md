@@ -64,9 +64,9 @@ Continue rounds until the evaluation budget is exhausted or a hard stop occurs.
   records `best_warm_score` and `final_best_score`; optional deep tuning may
   lower `final_best_score` in place. There is no separate official execution,
   run log, parser, or coordinator-owned scoring step.
-- There is no seed phase. The loop bootstraps through `fresh` candidates until
-  the graph has enough non-crash roots, then `got_select` may choose `improve`
-  or `crossover`.
+- When `[seed].provided` declares the candidate entrypoint, admit and evaluate
+  that unchanged file once as the first all-baselines root. Tasks without a
+  provided entrypoint bootstrap through `fresh` candidates as before.
 - `got_select` owns the structural action and numeric parents.
   `semantic_search.py` owns selection of a valid complete semantic point.
   `idea-generator` turns that point into a complete concrete solution.
@@ -171,8 +171,69 @@ For a new run:
    induced catalog blocks setup; never switch strategies as recovery.
 
 Do not pre-create the ledger, loop state, candidate entrypoints, or generic
-result files. The first generated record and deterministic helpers create the
-run state.
+result files. The provided-baseline admission below, when applicable, otherwise
+the first generated record, creates the run state through deterministic helpers.
+
+### Provided baseline initialization
+
+After background validation and before the experiment loop, inspect `[seed]` in
+`task.toml`. When `seed.provided` contains `seed.entrypoint` (default
+`train.py`), that file is the run's observed control:
+
+1. On an empty run, build only the complete all-baselines point and its ordinary
+   schema-4 coverage receipt:
+
+   ```bash
+   python tools/semantic_search.py propose \
+     --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
+     --op fresh --baseline-only \
+     --output <run_dir>/.semantic/000/proposals.json
+   python tools/semantic_search.py select \
+     --proposals <run_dir>/.semantic/000/proposals.json \
+     --policy coverage --ledger <run_dir>/ledger.json \
+     --point-output <run_dir>/.semantic/000/point.json \
+     --receipt-output <run_dir>/.semantic/000/policy.json
+   ```
+
+2. Admit run `000` with `op: fresh`, no parents, the selected point/receipt,
+   `candidate_name_hint: provided_baseline`, and a concise description naming
+   the task-provided entrypoint. Its idea is the unchanged supplied solution;
+   its change is `provided baseline at <point-id>`:
+
+   ```bash
+   python tools/ledger.py add-record \
+     --ledger <run_dir>/ledger.json --task <task_name> --run-id 000 \
+     --kind optimization --op fresh --source-run-ids "" \
+     --idea "Use the unchanged task-provided baseline implementation." \
+     --change "provided baseline at <point-id>" \
+     --background <run_dir>/background.md \
+     --semantic-point <run_dir>/.semantic/000/point.json \
+     --policy-receipt <run_dir>/.semantic/000/policy.json \
+     --candidate-name-hint provided_baseline \
+     --description "Task-provided baseline: <seed.entrypoint>"
+   ```
+3. Materialize it with the guarded copy mode:
+
+   ```bash
+   python tools/new_candidate.py <task_name> <tag> 000 --provided-baseline
+   ```
+
+   This requires the admitted record, verifies the task declaration, copies the
+   entrypoint, and stamps its path/hash in `_candidate_brief.json`.
+4. Spawn `Task(candidate-writer)` and require `status: existing`, `wrote: false`;
+   then spawn `Task(tunable-contract-extractor)`. The extractor evaluates only
+   the supplied default config at step 0+1, while still preparing a search space
+   that may be used by the normal later deep tuner. This objective call counts
+   against the run budget.
+
+Do not route the provided baseline through `idea-generator`, let acquisition
+replace its point, or copy it into later fresh candidates. If its exact default
+cannot be evaluated after normal no-score preflight diagnosis, record the crash
+and block the run instead of silently searching without its control.
+
+This initialization is idempotent by state: resume a pending provided-baseline
+record in place, but never insert, renumber, or retrofit one after any other
+record exists. Tasks without a declared provided entrypoint skip this section.
 
 For a resumed run, skip setup work whose validated artifacts already exist,
 but rerun the environment gate because hardware, caches, and credentials may

@@ -12,9 +12,10 @@ timeout_seconds = 900
 
 [seed]
 target_count = 1
+# Both experiment protocols admit this exact entrypoint as their observed
+# starting control.
 provided = ["train.py"]
 entrypoint = "train.py"
-tune = false
 
 # The single config->score evaluation function. Semantics + hard rules live in
 # TASK.md's `## Evaluation Contract`. score_fn(make_model, params) -> float,
