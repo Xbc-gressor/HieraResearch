@@ -3,20 +3,23 @@
 
 Run by `tunable-contract-extractor` (segment ③) after it has produced a
 candidate `train.py` (PARAM_SCHEMA + SEARCH_SPACE + make_model, NO BASE_PARAMS
-yet) and written `_warm_configs.json` (the K warm configs). It evaluates those
-configs on the score fn (`prepare`'s `score_fn`) and seeds the candidate's
-tuning. Sequential + resumable + stop-on-crash, so the extractor can diagnose +
-fix ONE crash at a time without re-evaluating what already passed:
+yet) and written `_warm_configs.json` (the K warm configs). It uniformly samples
+K_eval configs without replacement, evaluates those configs on the score fn
+(`prepare`'s `score_fn`), and seeds the candidate's tuning. Sequential +
+resumable + stop-on-crash, so the extractor can diagnose + fix ONE crash at a
+time without re-evaluating what already passed:
 
 1. CREATE `BASE_PARAMS` (so the candidate is a complete contract that imports).
-2. Evaluate the configs IN ORDER. **Resume**: any config already scored in a
-   prior run's report is reused, not re-evaluated (passed configs are cached by
-   params). On the FIRST not-yet-scored config that raises, record it (index +
-   FULL traceback) and STOP — exit `3` (CRASHED). The caller diagnoses it
-   (config-invalid → edit the config in `_warm_configs.json`; code-incompatible
-   → edit `train.py`), then re-runs this to resume.
-3. When every config has a score (no crash), pick best-of-K′ (= min over all K),
-   write it into `BASE_PARAMS`, finalize `phase_a` (warm_start_configs +
+2. Persist the random permutation, seed, and selected/deferred indices in
+   `phase_a.warm_config_selection`, then evaluate the selected configs in that
+   order. **Resume** reuses both that selection and any config already scored in
+   a prior report (passed configs are cached by params). On the FIRST
+   not-yet-scored config that raises, record it (original proposed index + FULL
+   traceback) and STOP — exit `3` (CRASHED). The caller diagnoses it
+   (config-invalid → edit that slot in `_warm_configs.json`; code-incompatible →
+   edit `train.py`), then re-runs this to resume.
+3. When every selected config has a score (no crash), pick best-of-K_eval, write
+   it into `BASE_PARAMS`, finalize `phase_a` (warm_start_configs +
    best_warm_score + best_warm_params + search_space), exit `0`.
 
 An optional task-owned preflight runs before each score attempt in an isolated
@@ -38,6 +41,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import random
 import sys
 import time
 import traceback
@@ -68,6 +72,100 @@ BUDGET_EXHAUSTED = 4  # no score_fn call was started; coordinator ends the run
 
 def _params_key(params: dict) -> str:
     return json.dumps(params, sort_keys=True, default=str)
+
+
+def select_warm_config_indices(
+    population_size: int,
+    k_eval: int,
+    previous_phase_a: dict,
+    *,
+    seed: int | None = None,
+) -> dict:
+    """Create or replay the auditable uniform-without-replacement selection."""
+    if population_size < 1:
+        raise ValueError("warm-config population must be non-empty")
+    if not 1 <= k_eval <= population_size:
+        raise ValueError("k_eval must be within the warm-config population")
+    if not isinstance(previous_phase_a, dict):
+        raise ValueError("tune_report.phase_a must be an object")
+
+    previous = previous_phase_a.get("warm_config_selection")
+    if previous is not None:
+        if not isinstance(previous, dict) or previous.get("schema_version") != 1:
+            raise ValueError("phase_a.warm_config_selection must be schema version 1")
+        if previous.get("population_size") != population_size:
+            raise ValueError(
+                "warm-config count changed after selection; edit failed configs in place"
+            )
+        if previous.get("k_eval") != k_eval:
+            raise ValueError("k_eval changed after warm configs were selected")
+
+        method = previous.get("method")
+        if method not in {"uniform_without_replacement", "legacy_prefix_resume"}:
+            raise ValueError(f"unknown warm-config selection method: {method!r}")
+        permutation = previous.get("permutation")
+        if (
+            not isinstance(permutation, list)
+            or any(
+                not isinstance(index, int) or isinstance(index, bool)
+                for index in permutation
+            )
+            or sorted(permutation) != list(range(population_size))
+        ):
+            raise ValueError(
+                "warm-config selection permutation must contain every index exactly once"
+            )
+        if previous.get("selected_indices") != permutation[:k_eval]:
+            raise ValueError("warm-config selected_indices do not match its permutation")
+        if previous.get("deferred_indices") != permutation[k_eval:]:
+            raise ValueError("warm-config deferred_indices do not match its permutation")
+
+        previous_seed = previous.get("seed")
+        if method == "uniform_without_replacement":
+            if (
+                not isinstance(previous_seed, int)
+                or isinstance(previous_seed, bool)
+                or previous_seed < 0
+            ):
+                raise ValueError("uniform warm-config selection requires a nonnegative seed")
+            expected = random.Random(previous_seed).sample(
+                range(population_size), population_size
+            )
+            if permutation != expected:
+                raise ValueError("warm-config permutation does not match its persisted seed")
+        elif previous_seed is not None:
+            raise ValueError("legacy warm-config selection must have a null seed")
+        return dict(previous)
+
+    if previous_phase_a:
+        # Reports created before selection receipts used the first K_eval
+        # configs. Preserve that already-started experiment instead of silently
+        # changing its sampled set during an upgrade.
+        permutation = list(range(population_size))
+        method = "legacy_prefix_resume"
+        selection_seed = None
+    else:
+        if seed is None:
+            selection_seed = random.SystemRandom().randrange(1 << 63)
+        elif not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+            raise ValueError("warm-config selection seed must be a nonnegative integer")
+        else:
+            selection_seed = seed
+        permutation = random.Random(selection_seed).sample(
+            range(population_size), population_size
+        )
+        method = "uniform_without_replacement"
+
+    return {
+        "schema_version": 1,
+        "method": method,
+        "seed": selection_seed,
+        "population_size": population_size,
+        "k_eval": k_eval,
+        "permutation": permutation,
+        "selected_indices": permutation[:k_eval],
+        "deferred_indices": permutation[k_eval:],
+    }
 
 
 def _literal_default_params(candidate_path: Path) -> dict | None:
@@ -150,10 +248,12 @@ def main() -> int:
                         help="JSON list of K warm config dicts (_warm_configs.json)")
     parser.add_argument("--tune-report-json", required=True, type=Path)
     parser.add_argument("--k-eval", type=int, default=None,
-                        help="evaluate only the FIRST k-eval configs now (best-of-k-eval = "
-                             "screening score); the rest are DEFERRED — stored params-only and "
-                             "evaluated later by the deep-tuner (BO enqueue / grid prepend) only if "
-                             "this candidate is selected. Default = all (no deferral).")
+                        help="uniformly sample k-eval configs without replacement for "
+                             "evaluation now (best-of-k-eval = screening score); the rest are "
+                             "DEFERRED — stored params-only and evaluated later by the deep-tuner "
+                             "(BO enqueue / grid prepend) only if this candidate is selected. "
+                             "The sampled permutation is persisted for resume. Default = all "
+                             "(no deferral).")
     args = parser.parse_args()
 
     with open(args.configs_json) as f:
@@ -169,11 +269,24 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    # Split into eval-now (first k_eval) and deferred (the rest, evaluated by the
-    # tuner only if promoted). k_eval=None / >=len → evaluate all (no deferral).
+    # Uniformly sample eval-now without replacement. Persist and replay the full
+    # permutation so a crash/resume never redraws the subset. k_eval=None /
+    # >=len means every config is selected (no deferral).
     k_eval = len(all_configs) if args.k_eval is None else max(1, min(args.k_eval, len(all_configs)))
-    configs = all_configs[:k_eval]
-    deferred = all_configs[k_eval:]
+    previous_report = read_tune_report(args.tune_report_json)
+    previous_phase_a = previous_report.get("phase_a", {})
+    try:
+        selection = select_warm_config_indices(
+            len(all_configs),
+            k_eval,
+            previous_phase_a,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    selected_indices = selection["selected_indices"]
+    deferred_indices = selection["deferred_indices"]
+    configs = [all_configs[index] for index in selected_indices]
+    deferred = [all_configs[index] for index in deferred_indices]
 
     # Ensure BASE_PARAMS exists (create on the first run, rewrite later) so
     # load_candidate_modules' REQUIRED_SYMBOLS check passes; AST reads SEARCH_SPACE
@@ -185,9 +298,6 @@ def main() -> int:
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
     preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
-
-    previous_report = read_tune_report(args.tune_report_json)
-    previous_phase_a = previous_report.get("phase_a", {})
 
     # Resume cache: configs already scored in a prior run, keyed by params. A
     # config the caller edited (config-invalid fix) gets new params → cache miss
@@ -210,6 +320,7 @@ def main() -> int:
         preflight_report["status"] = "running"
     report["phase_a"] = {
         "warm_start_configs": [],
+        "warm_config_selection": selection,
         # deferred = proposed-but-not-evaluated-now; the deep-tuner evaluates these
         # first (BO enqueue / grid prepend) only if this candidate is promoted.
         "deferred_configs": [{"params": cast_params_to_search_space(dict(d), search_space)}
@@ -223,6 +334,7 @@ def main() -> int:
     started = time.time()
     wsc: list[dict] = []
     for i, raw in enumerate(configs):
+        proposed_index = selected_indices[i]
         params = cast_params_to_search_space(dict(raw), search_space)
         if preflight_enabled:
             try:
@@ -256,7 +368,8 @@ def main() -> int:
                     {
                         "phase": "preflight",
                         "status": "crashed",
-                        "crash_index": i,
+                        "crash_index": proposed_index,
+                        "evaluation_position": i,
                         "crash_params": params,
                         "objective_slot_consumed": False,
                         **failure,
@@ -364,7 +477,9 @@ def main() -> int:
                 report["phase_a"]["warm_start_configs"] = wsc
                 report["phase_a"]["status"] = "crashed"
                 write_tune_report(args.tune_report_json, report)
-                write_json({"phase": "a", "status": "crashed", "crash_index": i,
+                write_json({"phase": "a", "status": "crashed",
+                            "crash_index": proposed_index,
+                            "evaluation_position": i,
                             "crash_params": params,
                             **failure})
                 return CRASHED
@@ -375,7 +490,7 @@ def main() -> int:
         report["phase_a"]["warm_start_configs"] = wsc
         write_tune_report(args.tune_report_json, report)
 
-    # ---- every config scored → best-of-K′ → BASE_PARAMS ----
+    # ---- every sampled config scored → best-of-K_eval → BASE_PARAMS ----
     best_params, best_warm_score = min(((t["params"], t["score"]) for t in wsc),
                                        key=lambda t: t[1])
     apply_base_params.apply(args.candidate_path, best_params)
@@ -400,6 +515,7 @@ def main() -> int:
         "k_evaluated": len(configs),
         "k_survived": len(wsc),
         "trials_attempted": trials_attempted,
+        "warm_config_selection": selection,
         "best_warm_score": best_warm_score,
         "best_warm_params": best_params,
         "elapsed_seconds": round(elapsed, 1),

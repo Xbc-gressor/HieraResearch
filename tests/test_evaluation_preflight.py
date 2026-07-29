@@ -18,7 +18,10 @@ import preflight_env  # noqa: E402
 import run_cfg  # noqa: E402
 import _common  # noqa: E402
 from _common import timed_eval, timed_preflight  # noqa: E402
-from warmstart_eval import validate_provided_baseline_configs  # noqa: E402
+from warmstart_eval import (  # noqa: E402
+    select_warm_config_indices,
+    validate_provided_baseline_configs,
+)
 
 
 def _run_dir(root: Path, *, budget: int) -> tuple[Path, Path]:
@@ -34,6 +37,60 @@ def _run_dir(root: Path, *, budget: int) -> tuple[Path, Path]:
 
 
 class EvaluationBudgetTests(unittest.TestCase):
+    def test_warm_config_selection_is_uniform_without_replacement_and_replayed(
+        self,
+    ) -> None:
+        selection = select_warm_config_indices(5, 3, {}, seed=17)
+
+        self.assertEqual(selection["method"], "uniform_without_replacement")
+        self.assertEqual(selection["seed"], 17)
+        self.assertEqual(sorted(selection["permutation"]), list(range(5)))
+        self.assertEqual(
+            selection["selected_indices"],
+            selection["permutation"][:3],
+        )
+        self.assertEqual(
+            selection["deferred_indices"],
+            selection["permutation"][3:],
+        )
+
+        replayed = select_warm_config_indices(
+            5,
+            3,
+            {"warm_config_selection": selection},
+            seed=999,
+        )
+        self.assertEqual(replayed, selection)
+
+    def test_warm_config_selection_preserves_legacy_prefix_on_resume(self) -> None:
+        selection = select_warm_config_indices(
+            5,
+            3,
+            {"status": "crashed", "warm_start_configs": []},
+            seed=17,
+        )
+
+        self.assertEqual(selection["method"], "legacy_prefix_resume")
+        self.assertIsNone(selection["seed"])
+        self.assertEqual(selection["selected_indices"], [0, 1, 2])
+        self.assertEqual(selection["deferred_indices"], [3, 4])
+
+    def test_warm_config_selection_rejects_contract_changes_on_resume(self) -> None:
+        selection = select_warm_config_indices(5, 3, {}, seed=17)
+
+        with self.assertRaisesRegex(ValueError, "k_eval changed"):
+            select_warm_config_indices(
+                5,
+                2,
+                {"warm_config_selection": selection},
+            )
+        with self.assertRaisesRegex(ValueError, "count changed"):
+            select_warm_config_indices(
+                6,
+                3,
+                {"warm_config_selection": selection},
+            )
+
     def test_provided_baseline_allows_only_its_exact_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             candidate = Path(tmp) / "candidate" / "train.py"

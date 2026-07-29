@@ -144,7 +144,8 @@ BO's priors, CMA-ES's mean). Cover distinct numeric regimes — for K=5: ① bas
 ⑤ categorical pivot. **Scale the count to K**: K<5 → keep baseline + the most
 informative spread; K>5 → add finer variations around the promising (low-score)
 region. With only 2–3 keys, spread maximally instead. No duplicates; aim every
-config *low*, informed by lineage.
+config *low*, informed by lineage. List order has no screening priority:
+`warmstart_eval.py` samples the evaluated subset uniformly without replacement.
 
 **A proposed `SEARCH_SPACE`** — one entry per key, **same kind** as the schema:
 `("float", lo, hi)` / `("float", lo, hi, "log")` / `("int", lo, hi)` /
@@ -211,14 +212,14 @@ Now you DO run the candidate (segments ①② did not). For tasks declaring
 isolated subprocess. It may construct and smoke-test the candidate but never
 calls `score_fn` or validation; only a passed config may reserve an objective
 slot and enter evaluation. You proposed **K** configs in
-②, but only the first **`K_eval`** are evaluated now (best-of-`K_eval` = the
-screening score); the rest are **deferred** (stored params-only, evaluated later by
-the deep-tuner only if this candidate is promoted). Diagnose + fix every crash in
-the evaluated ones inline, until they all score or you abandon.
+②, but only a uniform sample of **`K_eval`** configs (without replacement) is
+evaluated now (best-of-`K_eval` = the screening score); the rest are **deferred**
+(stored params-only, evaluated later by the deep-tuner only if this candidate is
+promoted). Diagnose + fix every crash in the sampled set inline, until they all
+score or you abandon.
 
 `K_eval` comes from `framework_cfg.json` `tuner.K_eval` (default **3**); pass it as
-`--k-eval`. Put your **most central/robust** configs first (those get screened) and
-the **more exploratory** ones last (those get deferred to the tuner). `K_eval ≥ K`
+`--k-eval`. Do not encode evaluation priority in list order. `K_eval ≥ K`
 disables deferral. For a provided entrypoint, pass `--k-eval 1`; its only warm
 trial is the exact supplied default. The finalized `SEARCH_SPACE` remains
 available if the decoupled tuner later promotes this semantic point.
@@ -238,14 +239,19 @@ working directory, so repo-relative paths (`tools/...`, `runs/...`) keep
 resolving. Under `--directory` uv chdirs into the task dir first and those
 relative paths break.
 
-It creates `BASE_PARAMS`, preflights and evaluates the first `K_eval` configs in order **reusing
-any already scored** (a re-run only re-evaluates what changed), stores the deferred
-ones in `phase_a.deferred_configs`, and writes `phase_a` (best-of-`K_eval`). The
-deep-tuner later evaluates the deferred configs FIRST (bo enqueue / grid prepend).
+It creates `BASE_PARAMS`, samples `K_eval` configs uniformly without replacement,
+and persists the seed, permutation, and selected/deferred indices in
+`phase_a.warm_config_selection`. It then preflights and evaluates the sampled
+configs **reusing any already scored**; a re-run reuses the same sampled set and
+only re-evaluates what changed. It stores the rest in
+`phase_a.deferred_configs` and writes `phase_a` (best-of-`K_eval`). The deep-tuner
+later evaluates the deferred configs FIRST (bo enqueue / grid prepend).
 
 - **exit 0** — every config scored; `BASE_PARAMS` = best-of-K′; `phase_a`
   finalized. Go to 3c.
-- **exit 3 (CRASHED)** — the config at `crash_index` raised. Stdout contains its
+- **exit 3 (CRASHED)** — the config at `crash_index` in the original
+  `_warm_configs.json` raised. Replace a config-invalid value in that same slot;
+  do not reorder or resize the list after sampling. Stdout contains its
   frozen `failure_receipt` and `failure_ref`; the full traceback remains in the
   referenced append-only artifact. `phase: preflight` means no objective slot
   was consumed; `phase: a` means an admitted `score_fn` call failed. Go to 3b.
