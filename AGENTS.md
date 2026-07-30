@@ -4,6 +4,11 @@ Multi-task autonomous experimentation harness. The supported interactive
 runtimes are Claude Code (`.claude/`) and OpenCode (`.opencode/`); deterministic
 state, graph search, evaluation, and tuning live in `tools/` and are shared.
 
+The loop's current bar is beating `autoresearch-hillclimb` — the deliberately
+simple edit→run→keep/revert baseline — at matched evaluation budget. It does not
+yet; see `docs/hillclimb-gap.md`. Until it does, prefer diagnosing and
+simplifying the loop over extending it.
+
 ## Start an experiment with OpenCode
 
 Run from this repository root:
@@ -56,6 +61,12 @@ not read either one again from inside the agent session.
 The ledger contract is intentionally not injected globally through
 `opencode.json`; most role agents need only a narrow helper-rendered view.
 
+Read on demand, not by default: `docs/search-space.md` (the formal model the P2
+helpers implement), `docs/background-research.md` (search-space contract,
+evidence and scope semantics), `docs/dimension-induction.md` (only for the
+`llm_induced` strategy), `docs/hillclimb-gap.md` (why the loop loses to the
+baseline), `docs/observability.md` (`harness_watch.py`).
+
 ## Runtime layout
 
 ```text
@@ -63,26 +74,40 @@ The ledger contract is intentionally not injected globally through
 .opencode/skills/                 inline capability skills
 .opencode/rules/                  on-demand state contracts
 .opencode/plugins/hiera-guard.js  delegation and receipt guard
+contracts/                        versioned shared contracts (dimension catalog)
+docs/                             search-space, background, observability notes
 tools/                            shared deterministic machinery
+tests/                            pytest suite over tools/; tests/fixtures.py
+                                  holds the shared toy search space
 tasks/<task-name>/                independent uv task projects
 runs/<task-name>/<tag>/           local experiment artifacts (gitignored)
 ```
 
+`.claude/` and `.kimi/` mirror `.opencode/` for other runtimes — keep mirrored
+contracts synchronized when a shared agent protocol changes.
+
 The experiment primary agent may invoke exactly these six subagents through
 OpenCode's `Task` tool:
 
-- `background-researcher`
-- `idea-generator`
-- `candidate-writer`
-- `tunable-contract-extractor`
-- `tuner-orchestrator`
-- `experience-extractor`
+| subagent | role | cadence |
+|---|---|---|
+| `background-researcher` | freezes `background.md` + `background_retrieval.json`: the run's semantic search space | once, before the loop (required) |
+| `idea-generator` | graph `SELECT` via `got_select`, then semantic point choice and record/receipt persistence | per round |
+| `candidate-writer` | implements one candidate's `train.py` from its own ledger record | per candidate |
+| `tunable-contract-extractor` | step 0+1: `PARAM_SCHEMA` refactor, warm configs, `SEARCH_SPACE`, screening evaluation | per candidate |
+| `tuner-orchestrator` | step 2: promotion gate, then deep-tune at most one selected candidate in place | once per round |
+| `experience-extractor` | regenerates the bounded belief snapshot and requests state transitions | per completed non-empty round |
 
-The allow-list is encoded in the primary agent's native `permission.task` map.
-Every child has `task: deny`; `candidate-writer` also has `bash: deny`.
+Each agent's prompt is authoritative for its own contract. The allow-list is
+encoded in the primary agent's native `permission.task` map. Every child has
+`task: deny`; `candidate-writer` also has `bash: deny`.
 `.opencode/plugins/hiera-guard.js` rejects the known writer/evaluation boundary
 collapse and replaces rich child output with compact receipts before it returns
 to the primary context.
+
+Step 2 is decoupled from step 0+1 (design §15): every candidate stops at step
+0+1, then `tuner-orchestrator` runs once for the whole round and picks at most
+one candidate. A `none` selection is a valid no-op.
 
 ## Context and state discipline
 
@@ -122,6 +147,16 @@ to the primary context.
 
 ## Narrow checks
 
-Add only the check implied by the touched contract. OpenCode runtime wiring is
-checked with the real CLI (`opencode debug agent <name>` and
+```bash
+python -m pytest tests -q             # the suite; fast, no GPU, no network
+python tools/validate_tasks.py        # task contracts
+python tools/validate_background.py   # background round trip, shape
+                                      # neutrality, retrieval, lifecycle
+python tools/validate_got.py          # graph/ledger invariants
+python tools/validate_search_backends.py
+```
+
+Add only the check implied by the touched contract. Do not add required-wording
+or forbidden-wording checks over agent prompts, rules, or docs. OpenCode runtime
+wiring is checked with the real CLI (`opencode debug agent <name>` and
 `opencode agent list`) rather than another repository-specific validator.

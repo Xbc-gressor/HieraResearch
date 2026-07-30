@@ -103,7 +103,7 @@ background-researcher: 解析维度策略 → 多后端知识侦察 → backgrou
         ↓
 (若声明 provided entrypoint) 作为 all-baselines 根节点原样复制并评估一次默认配置
         ↓
-(每 N 轮) experience-extractor: 提炼全局经验 → ledger.json experience 块
+(每个已完成的非空轮次后) experience-extractor: 提炼全局经验 → ledger.json experience 块
         ↓
 idea-generator:
     SELECT-1: got_select.py decide → 获取图行动与数字父代
@@ -126,8 +126,8 @@ step 0+1: tunable-contract-extractor
         ↓
 (每轮一次) tuner-orchestrator:
     tune_tools.py select-candidate → 从整个种群中选择一个符合条件的候选方案
-    → Phase C 搜索 + Apply → 原地写回 BASE_PARAMS
-    → tuner 调用 record-run + set-tuning --mark-tuned 原地更新分数 (无重新运行)
+    → Phase C 搜索
+    → finalize_tuning.py 验证终态后统一应用参数并原地关闭 report + ledger (无重新运行)
 ```
 
 使用 `opencode --agent autoresearch-experiment` 或 `claude --agent autoresearch-experiment` 时，主代理内部编码此协议。OpenCode 通过原生 `permission.task` 将调用闭包限制为六个角色；崩溃诊断使用 `crash-diagnosis` skill 内联。
@@ -138,7 +138,7 @@ step 0+1: tunable-contract-extractor
 - 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。`llm_intelligence_score` 是运行前固定的 `[0,100]` 启发式可信度先验：以 `score/100` 缩放完整的 LLM 判断项，不缩放确定性的 coverage，也不改写原始预测；它不是校准概率。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
@@ -151,7 +151,7 @@ step 0+1: tunable-contract-extractor
 - **Step 2（解耦深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
   - 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——门控：种群 ≥ N_min=10 且按 `best_warm_score` 的最佳未调优候选方案在前 20% —— 选择**一个**候选方案；不足 → 返回 `none`（有效的无操作）
   - Phase C：基于维度的方法选择（grid n_dims≤2 / bo=多元 TPE ≥3；cmaes 仅作后备；见 HPO 基准 `dev_plan/hpo-benchmark-report.md`）；注入 step 1 热启动试验作为先验
-  - Apply：从热启动 + Phase C 试验的全局最佳（select-best）→ 用 `apply_base_params` 原地写回 BASE_PARAMS；tuner **自己**调用 `record-run` + `set-tuning --mark-tuned` 原地更新 `final_best_score`（**无重新运行**——相同的 `config→score` 函数，select-best 保证无回归）
+  - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后确定热启动 + Phase C 的全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与 `tune:true`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
 
 **关键洞察**：没有单独的官方运行。有**一个全局 `config → score` 函数**（task.toml `[evaluation].score_fn`）。热启动评估和 Phase C 调优都调用它。调优后的最佳值就是候选方案的新分数。
 
@@ -173,7 +173,7 @@ step 0+1: tunable-contract-extractor
 管理一个完整的实验运行（一个 `task_name + tag + run_dir`）。
 
 职责：
-- 完全自包含地执行完整实验协议，不依赖 `program.md`
+- 完全自包含地执行完整实验协议，协议本身写在该 agent 的 prompt 中，无需额外的协议文档
 - 初始化新的 `runs/<task>/<tag>/`（先运行 `background-researcher`；若任务声明 provided entrypoint，则先登记并评估该基线，否则循环通过 `fresh` 自举）
 - 按**轮次**推进循环：一代 ≤B 个想法经过 step 0+1，然后一次解耦深度调优步骤
 - 调用 `idea-generator` 用于 SELECT + IDEATE
@@ -216,14 +216,14 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 外层搜索的 LLM 着陆点，通过三步产生下一代：
 
 - **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
-- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的有引用 signed adjustment 得到最终 predicted gain / uncertainty；cost（`gain_uncertainty_nocost` 不含）和确定性 coverage 继续分栏保存。schema-4 `policy_receipt` 固定 experience revision、引用 run/semantic edge 和调整理由，不冒充校准后验。
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的门控 adjustment 得到最终 predicted gain / uncertainty；自由文本经验不会进入 acquisition。schema-6 `policy_receipt` 固定 experience revision、目标与 proposal relation、比较覆盖、证据 id、机械 gain direction、配置的 LLM intelligence score 及实际权重；零调整始终合法，非零 gain 必须来自至少两个方向一致、同一份子代代码内只改变语义开关的 control/treatment 配对。仅继承父代超参数的 config 0 不足以隔离代码语义变化，只能增加 uncertainty，不能制造 signed gain。
 - **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。
 
 ### 5.4 experience-extractor
 
-每 N 轮运行一次，从 DAG 增量、Top/Bottom 锚点、机械语义点差异中提炼有界全局经验（schema 3）。除通用 promising regions / lessons / bottlenecks 外，还生成双层 `dimension_evidence` / `hypothesis_evidence` 信念；其引用边 id、逐边观测、评估状态与比较计数只取自 `background_contract.py target-evidence`，绝不从 Top/Bottom 窗口重建。信念只"建议"运行时状态：`set-experience` 成功后调用一次 `ledger.py apply-space-state`，由确定性 helper 拥有所有 append-only `search_space_state` 转移（两阶段剪枝、基线保护、重开即追加）。不把点成员关系当因果，永不改写 background、映射、策略收据或原始观测。
+每个已完成的非空轮次后运行一次，从 DAG 增量、Top/Bottom 锚点、机械语义点差异中提炼有界全局经验（schema 3）。除通用 promising regions / lessons / bottlenecks 外，还生成双层 `dimension_evidence` / `hypothesis_evidence` 信念；其引用边 id、逐边观测、评估状态与比较计数只取自 `background_contract.py target-evidence`，绝不从 Top/Bottom 窗口重建。信念只"建议"运行时状态：`set-experience` 成功后调用一次 `ledger.py apply-space-state`，由确定性 helper 拥有所有 append-only `search_space_state` 转移（两阶段剪枝、基线保护、重开即追加）。不把点成员关系当因果，永不改写 background、映射、策略收据或原始观测。
 
 ### 5.5 candidate-writer
 
@@ -251,8 +251,8 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 Step 0+1：在候选 `train.py` 准备好后运行，在一个子智能体中完成所有事情：
 
 ① 行为保持地将构造逻辑重构为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）并声明 `PARAM_SCHEMA`（仅列出可调参数 + 类型，无范围/默认值）
-② provided entrypoint 仅使用一个原始默认配置；其他候选结合**血统证据**（`lineage-evidence`）与数据一次性提出 K=5 个热启动配置 + 一个数据驱动的 `SEARCH_SPACE`，自运行 `check-search-space`（扩展边界以包含配置）+ `apply_search_space` 写回
-③ 评估这 K 个配置（`warmstart_eval`；顺序/可恢复/崩溃时停止）；**对每次崩溃内联调用 `crash-diagnosis` skill**（config-invalid → 修复配置 / code-incompatible → 最小化修复代码 ≤10 次）直到全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
+② provided entrypoint 仅使用一个原始默认配置；非 fresh 候选从 primary parent 的完整代码快照开始，并把其已应用 incumbent 精确投影为强制 warm config 0（记录 copied/reset/new/dropped、父代 durable applied snapshot 与 hash）；该控制保证 tuning win 可继承，但 receipt 明确标为 semantic `unverified`，不冒充语义因果比较；其余候选结合**血统证据**（`lineage-evidence`）与数据提出热启动配置及 `SEARCH_SPACE`
+③ 评估所选配置（`warmstart_eval`；强制先保留 inherited control、顺序/可恢复/崩溃时停止）；**对每次崩溃内联调用 `crash-diagnosis` skill**（config-invalid → 修复配置 / code-incompatible → 最小化修复代码 ≤10 次）直到通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，并把完整 transfer/control/score receipt 写入 ledger；无法修复 → 记录 `status:crash`
 
 主循环在 `candidate-writer` 返回后对每个新候选方案运行一次此操作。深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
 
@@ -264,7 +264,7 @@ Step 2（解耦深度调优，设计 §15）：**每轮在整个运行上运行�
 
 1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——门控：种群 ≥ `N_min=10` 且按 `best_warm_score` 的最佳未调优候选方案在前 20%（贪婪选择最佳未调优）→ 选择**一个**候选方案
 2. Phase C：所选候选方案的基于维度的方法选择（`grid`/`bo`/`cmaes`），使用 step 1 热试验作为先验
-3. Apply：从热试验 + Phase C 试验的全局最佳（select-best）→ 用 `apply_base_params` 原地写回 `BASE_PARAMS`，生成 `tune_report.json`；tuner 自己调用 `record-run` + `set-tuning --mark-tuned` 原地更新 `final_best_score`（**无重新运行**；原地回填）
+3. Finalize：运行 `tools/finalize_tuning.py`；它先验证 Phase C 已终止，再确定全局最佳、写回 `BASE_PARAMS`、关闭 `tune_report.json`，并一次性更新 ledger（**无重新运行**；可安全重试）。若搜索进程被杀死或 report 非终态，则不应用参数且不更新 ledger。
 
 资格不足（种群太小或顶层已调优）返回 `none`——有效的无操作。
 
@@ -286,7 +286,7 @@ Skills 是可复用的方法论描述，位于：
 - `code_incompatible`：配置合理，代码不兼容 → **最小化修复代码**以适应（首选）
 - `abandon`：需要编辑只读 / 添加禁止的依赖 / 根本不兼容 → 放弃
 
-> 注：外层想法生成从 `idea-proposer` skill 改为两个**智能体**（见上面的智能体部分）：`idea-generator`（S-GoT：每代首先调用 `got_select.py decide` 进行 SELECT，然后 IDEATE 每个行动）和 `experience-extractor`（每 N 轮将全局经验提炼到 ledger.json experience）。智能体转换通过用持久账本/经验替换对话上下文依赖实现。原始 `task-initializer` skill 也退役——无单独的种子阶段；循环通过 `fresh` 候选方案自举。
+> 注：外层想法生成从 `idea-proposer` skill 改为两个**智能体**（见上面的智能体部分）：`idea-generator`（S-GoT：每代首先调用 `got_select.py decide` 进行 SELECT，然后 IDEATE 每个行动）和 `experience-extractor`（每个已完成的非空轮次后将全局经验提炼到 ledger.json experience）。智能体转换通过用持久账本/经验替换对话上下文依赖实现。原始 `task-initializer` skill 也退役——无单独的种子阶段；循环通过 `fresh` 候选方案自举。
 
 ## 7. 工具
 
@@ -322,9 +322,10 @@ python tools/new_candidate.py <task-name> <tag> <run_id> --from-candidate <best_
 
 ```bash
 python tools/ledger.py add-record      ...   # idea-generator 创建记录 (带 --op)
-python tools/ledger.py set-tuning      ...   # 填充调优元数据 (extractor 无标记 / tuner --mark-tuned 设置 tune:true)
+python tools/ledger.py set-tuning      ...   # extractor 填充 Phase-A 调优元数据（无 --mark-tuned）
+python tools/finalize_tuning.py        ...   # 终态 Phase C 的唯一正常关闭路径：应用参数并统一更新 ledger
 python tools/ledger.py set-experience --background <background.md> ...   # 校验后写全局 experience 块
-python tools/ledger.py record-run      ...   # extractor/tuner 用 config-eval 最佳调用: 写 final_best_score + 计算 keep/discard/crash
+python tools/ledger.py record-run      ...   # extractor 用 warm config-eval 最佳调用: 写 final_best_score + 计算 keep/discard/crash
 python tools/ledger.py percentile      ...   # 按字段的跨记录百分位 (tuner 门控 / select-candidate 使用; 只读)
 python tools/ledger.py evaluations     ...   # 预算检查: 跨记录的 Σ trials_attempted（旧记录回退到 trials_completed）
 python tools/ledger.py loop-state      ...   # 从 ledger.json 重新生成 loop_state.md
@@ -402,6 +403,7 @@ python tools/validate_tasks.py
 - `grid_search.py`：低维搜索空间
 - `bo_search.py`：使用贝叶斯优化（通过 Optuna 的多元 TPE）的中维搜索空间
 - `cmaes_search.py`：使用 CMA-ES 的高维搜索空间
+- `../finalize_tuning.py`：验证 Phase C 终态并以 fail-closed 方式统一应用全局最佳、关闭报告和 ledger
 
 ## 8. 任务
 
@@ -543,12 +545,12 @@ runs/<task>/<tag>/framework_cfg.json
 - 任务特定的预算约束（例如，最大评估次数、单次评估时间限制）
 - 调整探索与利用的权衡
 
-**使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --max-evaluations 200 --timeout 60` 直接持久化维度策略、总评估预算和单次评估超时；恢复已有运行时也可更新后两项。
+**使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --llm-intelligence-score 61 --max-evaluations 200 --timeout 60` 直接持久化维度策略、LLM 判断可信度先验、总评估预算和单次评估超时；恢复已有运行时可更新预算和超时，但语义产物生成后不能改变维度策略或 intelligence score。
 
 主要配置包括：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
-- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认使用 `gain_uncertainty_nocost`（不预测成本），`coverage` 保留为确定性消融或失败回退策略
+- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；`llm_intelligence_score` 以固定 `score/100` 缩放 LLM 判断项（默认 100 保持旧行为，0 只保留已配置的 coverage 项，但仍收集原始预测）；默认使用 `gain_uncertainty_nocost`（不预测成本），`coverage` 保留为确定性消融或失败回退策略
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

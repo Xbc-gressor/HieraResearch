@@ -1,172 +1,139 @@
 # autoresearch-automl
 
-Claude Code-driven multi-task autoresearch harness. The repo runs autonomous
-experimentation loops where Claude Code edits run-local candidate `train.py`
-files and tracks the configured metric.
+Multi-task autoresearch harness. Autonomous loops edit run-local candidate
+`train.py` files and minimize the task's configured metric. Claude Code
+(`.claude/`) and OpenCode (`.opencode/`) are the supported interactive runtimes;
+deterministic state, graph search, evaluation, and tuning live in `tools/` and
+are shared.
+
+The loop's current bar is beating `autoresearch-hillclimb` — the deliberately
+simple edit→run→keep/revert baseline — at matched evaluation budget. It does not
+yet; see `docs/hillclimb-gap.md`. Until it does, prefer diagnosing and
+simplifying the loop over extending it.
+
+## Start an experiment
+
+```bash
+claude --agent autoresearch-experiment     # from this repo root
+```
+
+Then provide `task_name`, `tag`, and optionally `max_evaluations` and `timeout`
+(the hard per-evaluation limit in seconds). The same controls can be set
+deterministically beforehand:
+
+```bash
+python tools/init_run.py <task> <tag> --max-evaluations <n> --timeout <seconds>
+```
+
+They persist as `max_evaluations` and `per_runtime_limit` in the run's
+`framework_cfg.json`; explicit initialization values override the copied
+template. `autoresearch-hillclimb` is the comparison baseline and starts the
+same way with `--agent autoresearch-hillclimb`.
 
 ## Authoritative Documents
 
 Always read these in this order before doing experiment work:
 
-1. `program.md` — canonical experiment protocol (setup, loop, candidate
-   directories, ledger.json, loop_state.md, NEVER STOP rules). This is the
-   source of truth.
-2. `tasks/<task-name>/TASK.md` and `tasks/<task-name>/task.toml` — task brief
-   and machine-readable contract for whichever task is in scope.
-
-Exception: the `autoresearch-experiment` agent is self-contained and can run
-without reading `program.md` when it is started as the main thread with
-`claude --agent autoresearch-experiment`. Use `program.md` as the default
-main-session protocol and human-readable reference, not as a runtime
-dependency for that agent.
+1. `tasks/<task-name>/TASK.md` and `tasks/<task-name>/task.toml` — task brief
+   and machine-readable contract for whichever task is in scope. The task
+   contract is authoritative for environment, preparation, editable files,
+   dependency permission, timeout, and metric details.
+2. `.claude/agents/autoresearch-experiment.md` — the canonical experiment
+   protocol (setup, loop, candidate directories, ledger.json, loop_state.md,
+   NEVER STOP rules). The agent prompt carries the protocol; there is no
+   separate protocol document — the repo-root `program.md` was removed in
+   `0ba735f`, so ignore any remaining mention of it.
+3. `.claude/rules/ledger.md` — only when ledger schema detail is needed.
 
 ## Project Layout
 
 ```text
-program.md                       canonical autoresearch protocol
+.claude/agents/                  project-local agents; the experiment agent
+                                 carries the canonical run protocol
 .claude/skills/                  project-local Claude Code skills
 .claude/rules/                   path-scoped Claude Code rules and schemas
+.claude/settings.json            Agent delegation guard + status lines
+contracts/                       versioned shared contracts (dimension catalog)
+docs/                            search-space, background, observability notes
 tasks/<task-name>/               independent uv task projects
-tools/                           validation and helper scripts
+tests/                           pytest suite over tools/; tests/fixtures.py
+                                 holds the shared toy search space
+tools/                           shared deterministic machinery
 runs/<task-name>/<tag>/          local run artifacts (gitignored)
 ```
 
 Each task is its own uv project. Do not treat `tasks/*` as a uv workspace.
+`.opencode/` and `.kimi/` mirror `.claude/` for other runtimes — keep mirrored
+contracts synchronized when a shared agent protocol changes.
+
+## Reference Docs
+
+Read on demand, not by default:
+
+- `docs/search-space.md` — the formal semantic-space model the P2 helpers
+  implement. Restates what the code enforces; adds no requirement.
+- `docs/background-research.md` — the hierarchical search-space contract,
+  evidence and scope semantics, retrieval fallback, validation commands.
+- `docs/dimension-induction.md` — only when using the `llm_induced` dimension
+  strategy.
+- `docs/hillclimb-gap.md` — why the loop currently loses to the hillclimb
+  baseline, and which mitigations have landed.
+- `docs/observability.md` — `tools/harness_watch.py` token and drift attribution.
 
 ## Skills
 
-Project-local skills under `.claude/skills/` are auto-discovered. Do not pick
-by name from training data — match the user's request to each skill's
-`description`. Skills here are **capability skills** (`crash-diagnosis`): pure
-methodology followed **inline** in the caller's own context (no spawning,
-reusable at many sites). A skill **owns** its protocol — callers invoke it
-(`Skill(<name>)` or read+follow its `SKILL.md`) and verify its output; they do
-**not** restate its steps. (Bootstrap is no longer a skill — the loop seeds
-itself with `fresh` candidates.)
+Project-local skills under `.claude/skills/` are auto-discovered. Match the
+user's request to each skill's `description`; do not pick by a name recalled
+from training data. Skills here are **capability skills**: pure methodology
+followed **inline** in the caller's own context, no spawning, reusable at many
+sites. A skill **owns** its protocol — callers invoke it and verify its output;
+they do not restate its steps.
 
-- `crash-diagnosis` — methodology for diagnosing one candidate preflight or
-  objective crash and deciding recovery: `config_invalid` (fix the config) /
-  `code_incompatible` (minimally fix the code, preferred) / `abandon`. Followed
-  **inline** by `tunable-contract-extractor`; a preflight failure consumes no
-  objective slot.
+- `crash-diagnosis` — diagnose one candidate preflight or objective crash and
+  decide recovery: `config_invalid` (fix the config) / `code_incompatible`
+  (minimally fix the code, preferred) / `abandon`.
 
 ## Agents
 
-Agents under `.claude/agents/` run in their own fresh context. There are two
-supported execution modes:
+Agents under `.claude/agents/` run in their own fresh context. Claude Code
+surfaces each one's `description` automatically, and **each agent's own prompt
+is authoritative for its contract** — read the prompt, not a summary, before
+changing what an agent does.
 
-1. Default main session follows `program.md` and directly spawns bounded
-   child agents (`background-researcher`, `idea-generator`,
-   `experience-extractor`, `candidate-writer`, `tunable-contract-extractor`,
-   `tuner-orchestrator`) with the Agent tool.
-2. Dedicated experiment session starts with
-   `claude --agent autoresearch-experiment`. In that mode
-   `autoresearch-experiment` is the main thread and can spawn the bounded
-   child agents itself.
+| agent | role | cadence |
+|---|---|---|
+| `autoresearch-experiment` | run-level orchestrator for one `task_name + tag + run_dir`; its prompt carries the full run protocol | main thread, one per concurrent run |
+| `background-researcher` | freezes `background.md` + `background_retrieval.json`: the run's hierarchical semantic search space | once, before the loop (required) |
+| `idea-generator` | graph `SELECT` via `got_select`, then semantic point choice and record/receipt persistence | per round |
+| `candidate-writer` | implements one candidate's `train.py` from its own ledger record | per candidate |
+| `tunable-contract-extractor` | step 0+1: `PARAM_SCHEMA` refactor, warm configs, `SEARCH_SPACE`, screening evaluation | per candidate |
+| `tuner-orchestrator` | step 2: promotion gate, then deep-tune at most one selected candidate in place | once per round |
+| `experience-extractor` | regenerates the bounded belief snapshot and requests state transitions | per completed non-empty round |
 
-Do not spawn `autoresearch-experiment` as a child agent from another main
-session. Claude Code subagents cannot spawn other subagents, so that mode
-would remove the independent contexts required by this project.
+Orchestration rules that live in no single prompt:
 
-- `autoresearch-experiment` — self-contained run-level orchestrator for one
-  `task_name + tag + run_dir`. Start it as the main thread with
-  `claude --agent autoresearch-experiment`. It can execute without
-  `program.md`, initializes one new run directory, runs `background-researcher`,
-  and admits a declared provided entrypoint as the observed all-baselines root
-  (otherwise the loop bootstraps via `fresh`), then runs the loop in
-  **rounds** (a generation of ≤B ideas at step 0+1, then one **decoupled**
-  deep-tuning step), spawning `idea-generator`, `experience-extractor`,
-  `candidate-writer`, `tunable-contract-extractor`, and `tuner-orchestrator`
-  (crashes are diagnosed inline via the `crash-diagnosis` skill). Use one
-  instance per concurrent experiment.
-- `background-researcher` — setup-time evidence researcher for one task, used
-  **before the loop (required)** as the only setup step. It plans
-  multiple research questions, uses a frozen local corpus for the reproducible
-  condition or explicitly selected DeepXiv/Jina open-world modules, gracefully
-  tolerates backend failure, deduplicates and balances candidates across queries, progressively
-  reads them in explicit grounding/novelty budget lanes, and looks for
-  counterevidence. It writes `<run_dir>/background.md` plus the visited-source
-  trace `<run_dir>/background_retrieval.json`. The default strategy freezes a
-  task-relevant subset of `semantic-dimensions/v1`; the `llm_induced` strategy
-  first writes a final task-specific `<run_dir>/dimension_catalog.json` using
-  the on-demand guide in `docs/dimension-induction.md`. The background registers
-  an explicit baseline in every resolved dimension, task-specific stable
-  `hyp-*` values, and scoped activation/exclusion relations. Sources, structured
-  `g-*` guidance, and hypotheses use the same typed scope axes. The
-  contract derives containment mechanically: only directly matched guidance may
-  change a hypothesis's priority or eligibility, while free-text Pitfalls are
-  nonbinding. Weak or contested negatives can only caution; binding guidance
-  needs directly scoped primary empirical evidence and retains an out-of-scope
-  `scope_probe` instead of erasing adjacent mechanisms. Each hypothesis also carries a separate
-  literature-credibility stamp, required local comparisons, reopening
-  conditions, and traceable sources; an arXiv upload is not validation. The
-  registry is checked by `tools/background_contract.py`; legacy flat registries
-  are rejected rather than migrated.
-  See `docs/background-research.md` for the hierarchical search-space contract,
-  evidence and scope semantics, fallback behavior, and validation commands.
-- `idea-generator` — run structural **SELECT** with `got_select decide`, then use
-  `semantic_search.py` to enumerate valid complete points at the ledger's
-  current `search_space_state` revision (runtime-pruned hypotheses drop out, a
-  pruned dimension pins its explicit baseline) and apply the
-  replaceable coverage/gain/gain-plus-uncertainty acquisition policy within
-  deterministic active/deprioritized admission-budget lanes before **IDEATE**.
-  It persists numeric ancestry, the complete revisioned point, and a schema-4
-  policy receipt with background priors, signed experience adjustments, final
-  gain/uncertainty, cost, coverage, scheduled/selected lanes, and fallback kept
-  separate. The graph search still owns actions/parents; semantic policy owns
-  only point choice.
-- `experience-extractor` — periodically (every N generations) incrementally
-  revise a bounded global `experience` snapshot (schema 3) from the ledger's
-  DAG revision delta plus fixed Top/Bottom anchors and compact mechanical
-  point diffs. Beyond generic levers, dead ends, and bottlenecks, it authors
-  two-level `dimension_evidence`/`hypothesis_evidence` beliefs whose cited
-  edge ids, observations, evaluation states, and comparator counts come only
-  from `background_contract.py target-evidence` — never reconstructed from the
-  Top/Bottom window. A belief only recommends a runtime status: after a
-  successful `set-experience` it invokes `ledger.py apply-space-state` once,
-  and the deterministic helper owns every append-only `search_space_state`
-  transition (two-stage pruning, baseline protection, reopen-by-append). It
-  never rewrites background, mappings, policy receipts, or raw observations.
-- `candidate-writer` — implement one candidate's `train.py`. Receives **just
-  the target candidate dir**; reads its own ledger record (added by
-  `idea-generator`) for the full `idea` + `source_run_ids`, derives
-  `source_train_paths` from the **numeric** parent ids and `prepare.py` / task
-  contract from the dir, and keeps the implementation consistent with the
-  record's `semantic_point`. Empty `source_run_ids` → write from scratch;
-  numeric parents → write informed by their `train.py`; target
-  `train.py` with a helper-stamped provided-entrypoint receipt → leave
-  untouched. Returns the new `train.py`, a unified diff, the chosen
-  `CANDIDATE_NAME`, and risk flags. Does not own the tuner contract. Spawned by
-  the experiment loop.
-- `tunable-contract-extractor` — **step 0+1** for one candidate `train.py`:
-  ① behavior-preservingly refactor `make_model` + declare `PARAM_SCHEMA`;
-  ② use the exact single default for a provided entrypoint, otherwise propose
-  K = 5 warm configs, plus a data-driven `SEARCH_SPACE` (from `lineage-evidence`
-  + the schema), consistency pre-check, finalize via
-  `check-search-space` + `apply_search_space`; ③ evaluate the K configs
-  (`warmstart_eval.py`, sequential/resumable), first running any task-declared
-  isolated no-score preflight and **diagnosing each preflight/eval crash inline
-  via the `crash-diagnosis` skill** (config-invalid → fix config;
-  code-incompatible → minimally fix `train.py`, ≤ 10). Objective calls reserve
-  atomically from the strict run cap immediately before `score_fn`. It writes
-  `BASE_PARAMS` = best-of-K′ + `phase_a` and records `best_warm_score`; an
-  unrunnable candidate → it records `status: crash`. Spawned after
-  `candidate-writer` returns, for every candidate. Deep-tuning (step 2) is
-  decoupled, so every candidate stops at step 0+1 here.
-- `tuner-orchestrator` — **step 2, decoupled (design §15)**: run **once per
-  round** on the whole run, not per candidate. It runs
-  `tools/tuners/tune_tools.py select-candidate` (promotion gate + greedy
-  `best_warm_score`: population ≥ N_min and the best untuned candidate in the
-  top-20%) to pick **one** candidate, then Phase C single method by SEARCH_SPACE
-  dim via `select-method` (grid ≤ 2, bo=multivariate-TPE for ≥ 3, cmaes fallback only; step-1 warm trials as
-  priors), the Apply step (`select-best` → `apply_base_params`, AST rewrite, no
-  hand-edit), and `ledger.py set-tuning` (`tune: true`). It deep-tunes that
-  candidate **in place**; the best observed tuner score is the in-place score
-  update the graph reads next round, with no official re-run. Candidate
-  preflight rejections are feasibility evidence and do not consume objective
-  slots. **No warm-start** — `phase_a` is the extractor's step-0+1 output. A
-  `none` selection (early, top tier already tuned, or insufficient remaining
-  budget) is a valid no-op.
+- **Two execution modes.** A default main session follows the protocol in
+  `.claude/agents/autoresearch-experiment.md` and spawns the bounded children
+  itself; a dedicated session starts with
+  `claude --agent autoresearch-experiment`, making that agent the main thread.
+- **Never spawn `autoresearch-experiment` as a child agent.** Claude Code
+  subagents cannot spawn subagents, so that mode removes the independent
+  contexts the design depends on. `.claude/settings.json` enforces this with an
+  `Agent` PreToolUse guard (`tools/harness_guard.py`).
+- **Step 2 is decoupled from step 0+1** (design §15). Every candidate stops at
+  step 0+1; `tuner-orchestrator` then runs once for the whole round and picks at
+  most one candidate. A `none` selection is a valid no-op.
+- **Deterministic helpers own deterministic decisions.** Candidate promotion is
+  `tune_tools.py select-candidate`, tuner method choice is `select-method`,
+  search-space state transitions are `ledger.py apply-space-state`. An agent
+  proposes; the helper decides. Never hand-edit `ledger.json`.
+- **Preflight failures are not objective evaluations.** They are no-score
+  engineering checks, diagnosed inline via `crash-diagnosis`, and consume no
+  budget slot. Objective calls reserve against the run cap in
+  `evaluation_attempts.jsonl` immediately before `score_fn`.
+- **Children return receipts, not payloads.** Pass paths and compact ids; the
+  durable run artifact is the payload. Do not collapse role boundaries to save
+  time or budget.
 
 ## Running A Task
 
@@ -184,10 +151,17 @@ environment.
 ## Validation
 
 ```bash
-python tools/validate_tasks.py
-python tools/validate_background.py
+python -m pytest tests -q             # the suite; fast, no GPU, no network
+python tools/validate_tasks.py        # task contracts
+python tools/validate_background.py   # background round trip, shape
+                                      # neutrality, retrieval, lifecycle
+python tools/validate_got.py          # graph/ledger invariants
 python tools/validate_search_backends.py
 ```
+
+Keep checks minimal and implied by the touched contract. Do not add
+required-wording or forbidden-wording checks over agent prompts, rules, or
+docs.
 
 ## Adding A Task
 
@@ -202,16 +176,14 @@ python tools/validate_search_backends.py
    — the one `config → score` function — plus metric, parser, required patterns,
    optional candidate overrides, file constraints). The split is deliberate:
    the function name is config in `task.toml`; its semantics are prose in
-   `TASK.md`. Subagents read both before working; the tuner scripts resolve the
-   one evaluation function from `evaluation.score_fn` (signature
-   `score_fn(make_model, params) -> float`) — there is no separate official run,
-   so warm-start eval and Phase C tuning both call it and its return value is the
-   candidate's score.
+   `TASK.md`. There is no separate official run — warm-start eval and Phase C
+   tuning both call `score_fn(make_model, params) -> float`, and its return
+   value is the candidate's score.
    **Scores are always lower-is-better.** The framework minimizes everywhere
-   (keep/discard, percentile, every tuner) and no longer tracks a direction
-   flag — a higher-is-better metric must be negated/complemented inside the
-   task's own `score_fn` (see `tabular-model-search`, which reports
-   `neg_mean_test_accuracy`). A crash scores `+inf` (the worst).
+   (keep/discard, percentile, every tuner) and tracks no direction flag — a
+   higher-is-better metric must be negated or complemented inside the task's own
+   `score_fn` (see `tabular-model-search`, which reports
+   `neg_mean_test_accuracy`). A crash scores `+inf`, the worst.
 4. Run `python tools/validate_tasks.py`.
 
 ## Adding A Skill
@@ -226,27 +198,34 @@ python tools/validate_search_backends.py
 
 ## Shell Command Conventions
 
-- Do not prepend `cd <project-root> &&` to shell commands. The Claude Code
-  session is already at the project root, so the `cd` is redundant.
-- Redundant `cd` prefixes also defeat the project permission allowlist
-  (which matches by command prefix) and can trigger backslash-escape safety
-  prompts on absolute paths that contain whitespace.
-- Use relative paths from the project root, or quoted absolute paths,
-  without a leading `cd`.
+Do not prepend `cd <project-root> &&` to shell commands. The session is already
+at the project root, so it is redundant; it also defeats the project permission
+allowlist (which matches by command prefix) and can trigger backslash-escape
+safety prompts on absolute paths containing whitespace. Use relative paths from
+the project root, or quoted absolute paths, without a leading `cd`.
 
 ## Boundaries
 
-- `tasks/<task-name>/prepare.py` is the fixed evaluation surface — do not
-  modify during normal experiments.
-- `tasks/<task-name>/train.py` is the experiment surface, but experiments copy
-  it into `runs/<task-name>/<tag>/candidates/<run_id>/` and only the copy gets
-  edited. Most tasks omit a task-root `train.py`; `candidate-writer` generates
-  each candidate's `train.py` under `runs/` (a `fresh` candidate from scratch from
-  its `background.md` direction). The task author does **not** need to provide
+- `tasks/<task-name>/prepare.py` is the fixed evaluation surface — do not modify
+  during normal experiments.
+- `tasks/<task-name>/train.py` is the experiment surface, but experiments edit
+  only the copy under `runs/<task-name>/<tag>/candidates/<run_id>/`. Most tasks
+  omit a task-root `train.py`; `candidate-writer` generates each candidate's
+  `train.py` under `runs/`. The task author does **not** need to provide
   contract-compliant code — `tunable-contract-extractor` extracts the tuner
-  contract for every candidate (provided baselines included) at step 0+1, so all
-  candidates expose it before `tuner-orchestrator` may select them.
+  contract for every candidate, provided baselines included, at step 0+1.
+- A candidate entrypoint declared in `[seed].provided` is copied into run `000`
+  and evaluated first at the all-baselines point; seedless tasks bootstrap with
+  normal `fresh` candidates.
+- Never hand-edit `runs/**/ledger.json` — use `tools/ledger.py`.
 - Do not commit anything under `runs/`. Run logs, `ledger.json`, and
-  `loop_state.md` are local-only state.
-- Add task dependencies only when `constraints.allow_dependencies = true` in
-  the task's `task.toml`.
+  `loop_state.md` are local-only, disposable state.
+- Add task dependencies only when `constraints.allow_dependencies = true` in the
+  task's `task.toml`.
+- The outer loop searches semantic candidates; step 0+1 / step 2 tune numeric
+  parameters inside one candidate. Keep those two search levels distinct in
+  schemas, metrics, and experiments.
+- Keep context bounded. Experience refresh reads
+  `got_graph.py render --incremental` with fixed Top/Bottom anchors; never inject
+  the unbounded full ledger or global DAG. Retrieve a full record, source, or log
+  only when a compact view identifies a specific missing field or bottleneck.
