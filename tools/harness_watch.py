@@ -23,6 +23,7 @@ from typing import Any
 
 from evaluation_budget import ATTEMPT_LOG, budget_status
 from run_cfg import RunConfigError
+from semantic_evidence import LIFECYCLE_TERMINAL_STATUSES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -138,8 +139,34 @@ def _run_snapshot(run_dir: Path | None) -> dict[str, Any] | None:
         phase = "blocked"
         stop_condition = stored.get("active_stop_condition") or state.get("active_stop_condition")
     elif budget is not None and attempted >= budget:
-        phase = "completed"
-        stop_condition = "evaluation_budget_reached"
+        lifecycle_terminal = bool(records) and all(
+            isinstance(record, dict)
+            and record.get("status") in LIFECYCLE_TERMINAL_STATUSES
+            for record in records
+        )
+        dag_revision = ledger.get("dag_revision", 0)
+        experience = (
+            ledger.get("experience")
+            if isinstance(ledger.get("experience"), dict)
+            else {}
+        )
+        experience_cursor = experience.get("dag_revision", 0)
+        stale_experience = (
+            isinstance(dag_revision, int)
+            and not isinstance(dag_revision, bool)
+            and isinstance(experience_cursor, int)
+            and not isinstance(experience_cursor, bool)
+            and dag_revision > experience_cursor
+        )
+        if not lifecycle_terminal:
+            phase = "running"
+            stop_condition = "budget_reached_pending_resolution"
+        elif stale_experience:
+            phase = "running"
+            stop_condition = "final_experience_refresh_required"
+        else:
+            phase = "completed"
+            stop_condition = "evaluation_budget_reached"
     else:
         phase = "running"
         stop_condition = "none"

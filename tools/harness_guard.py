@@ -42,7 +42,10 @@ RECEIPT_FIELDS = {
 
 RECEIPT_ENUMS = {
     ("candidate-writer", "status"): {"written", "existing", "blocked"},
-    ("tunable-contract-extractor", "status"): {"ok", "crash"},
+    # `unevaluated` is the helper-resolved terminal state for a candidate that
+    # was admitted but never got an objective slot (ledger.py
+    # resolve-unevaluated). It is a legal end-of-budget receipt, not a failure.
+    ("tunable-contract-extractor", "status"): {"ok", "crash", "unevaluated"},
 }
 
 

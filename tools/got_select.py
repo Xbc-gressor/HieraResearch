@@ -241,7 +241,10 @@ def cmd_decide(args) -> int:
     remaining = strict_budget.get("remaining")
     tuner_cfg = load_run_cfg(path, "tuner")
     try:
-        k_eval = max(1, int(tuner_cfg.get("K_eval", 3)))
+        # Generated non-fresh candidates spend one slot on an inherited
+        # fidelity control that is not incumbent-eligible. Reserve at least one
+        # additional objective call for a selectable treatment/config.
+        k_eval = max(2, int(tuner_cfg.get("K_eval", 3)))
     except (TypeError, ValueError):
         k_eval = 3
     if isinstance(remaining, int):

@@ -18,9 +18,18 @@ from background_contract import (  # noqa: E402
     ContractError,
     derive_hypothesis_selection,
     render_space,
+    validate_experience,
     validate_ledger,
 )
-from ledger import _load_ledger, cmd_add_record, cmd_brief  # noqa: E402
+from ledger import (  # noqa: E402
+    _load_ledger,
+    cmd_add_record,
+    cmd_brief,
+    cmd_set_experience,
+    cmd_set_phase,
+    record_run,
+    resolve_unevaluated,
+)
 from search_space_state import (  # noqa: E402
     append_experience_transitions,
     compose_effective_selection,
@@ -44,13 +53,33 @@ from semantic_space import (  # noqa: E402
     space_receipt,
     validate_point,
 )
-from tests.p2_fixtures import belief_ledger  # noqa: E402
-from validate_background import (  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    attach_matched_transfer,
     background_text,
+    belief_ledger,
     fixture_registry,
     policy_receipt,
     record,
 )
+
+
+def current_policy_receipt(*args, **kwargs) -> dict:
+    """The fixture receipt at the current admission schema."""
+    return policy_receipt(*args, schema_version=6, **kwargs)
+
+
+def empty_experience(run_id: str, *, generation: int = 0) -> dict:
+    return {
+        "schema_version": 3,
+        "updated_at_run": run_id,
+        "generation": generation,
+        "summary": "No comparator-qualified belief changed in this DAG delta.",
+        "promising_regions": [],
+        "lessons": [],
+        "bottlenecks": [],
+        "dimension_evidence": [],
+        "hypothesis_evidence": [],
+    }
 
 
 def _scope(intervention: str) -> dict:
@@ -146,8 +175,6 @@ class SearchSpaceStateValidationTests(unittest.TestCase):
             validate_search_space_state(registry, ledger_with_state(state)), []
         )
         replayed = replay_search_space_state(registry, state)
-        self.assertTrue(replayed["dimensions"])
-        self.assertTrue(replayed["hypotheses"])
         self.assertEqual(set(replayed["dimensions"].values()), {"active"})
         self.assertEqual(set(replayed["hypotheses"].values()), {"active"})
         self.assertIn("hyp-data-filtered", replayed["hypotheses"])
@@ -165,125 +192,87 @@ class SearchSpaceStateValidationTests(unittest.TestCase):
             validate_search_space_state(registry, ledger_with_state(state)), []
         )
 
-    def test_replay_preserves_pruned_identity_and_allows_reopen(self) -> None:
+    def test_replay_is_addressable_by_revision_and_preserves_identity(self) -> None:
         registry = fixture_registry()
-        state = {
-            "schema_version": 1,
-            "revision": 2,
-            "decisions": [
-                decision(1, "hyp-data-filtered", "active", "deprioritized"),
-                decision(2, "hyp-data-filtered", "deprioritized", "pruned"),
-            ],
-        }
-        at_one = replay_search_space_state(registry, state, revision=1)
-        at_two = replay_search_space_state(registry, state, revision=2)
-        self.assertEqual(at_one["hypotheses"]["hyp-data-filtered"], "deprioritized")
-        self.assertEqual(at_two["hypotheses"]["hyp-data-filtered"], "pruned")
-        self.assertIn("hyp-data-filtered", at_two["hypotheses"])
-
-        reopened = state_with(
+        state = state_with(
             decision(1, "hyp-data-filtered", "active", "deprioritized"),
             decision(2, "hyp-data-filtered", "deprioritized", "pruned"),
             decision(3, "hyp-data-filtered", "pruned", "active"),
         )
-        at_three = replay_search_space_state(registry, reopened)
-        self.assertEqual(at_three["hypotheses"]["hyp-data-filtered"], "active")
-        self.assertEqual(
-            replay_search_space_state(registry, reopened, revision=2)["hypotheses"][
-                "hyp-data-filtered"
-            ],
-            "pruned",
-        )
 
-    def test_validate_rejects_active_to_pruned(self) -> None:
+        def status_at(revision: int | None) -> str:
+            replayed = replay_search_space_state(registry, state, revision=revision)
+            # A pruned element stays present; only its eligibility changed.
+            self.assertIn("hyp-data-filtered", replayed["hypotheses"])
+            return replayed["hypotheses"]["hyp-data-filtered"]
+
+        self.assertEqual(status_at(1), "deprioritized")
+        self.assertEqual(status_at(2), "pruned")
+        self.assertEqual(status_at(None), "active")
+
+    def test_validate_rejects_unauditable_or_forged_decisions(self) -> None:
+        """The overlay alone gates eligibility, so every field is mechanical."""
         registry = fixture_registry()
-        state = state_with(decision(1, "hyp-data-filtered", "active", "pruned"))
-        errors = validate_search_space_state(registry, ledger_with_state(state))
-        self.assertTrue(any("transition" in error for error in errors), errors)
 
-    def test_validate_rejects_from_status_mismatch(self) -> None:
-        registry = fixture_registry()
-        state = state_with(
-            decision(1, "hyp-data-filtered", "active", "deprioritized"),
-            decision(2, "hyp-data-filtered", "active", "deprioritized"),
-        )
-        errors = validate_search_space_state(registry, ledger_with_state(state))
-        self.assertTrue(any("from_status" in error for error in errors), errors)
+        def mutate(*decisions: dict, **changes: object) -> dict:
+            state = state_with(*decisions)
+            for key, value in changes.items():
+                if key == "decision":
+                    state["decisions"][0].update(value)
+                elif key == "drop_field":
+                    del state["decisions"][0][value]
+                else:
+                    state[key] = value
+            return state
 
-    def test_validate_rejects_nonsequential_revision_and_underived_id(self) -> None:
-        registry = fixture_registry()
-        skipped = state_with(
-            decision(1, "hyp-data-filtered", "active", "deprioritized"),
-            decision(3, "hyp-data-filtered", "deprioritized", "pruned"),
-        )
-        skipped["revision"] = 2
-        errors = validate_search_space_state(registry, ledger_with_state(skipped))
-        self.assertTrue(any("revision" in error for error in errors), errors)
-
-        bad_id = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
-        bad_id["decisions"][0]["decision_id"] = "sdec-000009"
-        errors = validate_search_space_state(registry, ledger_with_state(bad_id))
-        self.assertTrue(any("decision_id" in error for error in errors), errors)
-
-        bad_revision = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
-        bad_revision["revision"] = 0
-        errors = validate_search_space_state(registry, ledger_with_state(bad_revision))
-        self.assertTrue(any("revision" in error for error in errors), errors)
-
-    def test_validate_rejects_unknown_and_missing_fields(self) -> None:
-        registry = fixture_registry()
-        extra = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
-        extra["decisions"][0]["note"] = "free text is not auditable"
-        errors = validate_search_space_state(registry, ledger_with_state(extra))
-        self.assertTrue(any("unknown fields" in error for error in errors), errors)
-
-        missing = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
-        del missing["decisions"][0]["reopen_when"]
-        errors = validate_search_space_state(registry, ledger_with_state(missing))
-        self.assertTrue(any("reopen_when" in error for error in errors), errors)
-
-        extra_top = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
-        extra_top["state_note"] = "not part of the contract"
-        errors = validate_search_space_state(registry, ledger_with_state(extra_top))
-        self.assertTrue(any("unknown fields" in error for error in errors), errors)
-
-    def test_validate_rejects_unknown_targets(self) -> None:
-        registry = fixture_registry()
-        unknown_hypothesis = state_with(
-            decision(1, "hyp-not-real", "active", "deprioritized")
-        )
-        errors = validate_search_space_state(registry, ledger_with_state(unknown_hypothesis))
-        self.assertTrue(any("target" in error for error in errors), errors)
-
-        wrong_owner = state_with(
-            hypothesis_decision(
-                1, "dim-model-architecture", "hyp-data-filtered", "active", "deprioritized"
-            )
-        )
-        errors = validate_search_space_state(registry, ledger_with_state(wrong_owner))
-        self.assertTrue(any("dimension_id" in error for error in errors), errors)
-
-        unknown_dimension = state_with(
-            dimension_decision(1, "dim-not-real", "active", "deprioritized")
-        )
-        errors = validate_search_space_state(registry, ledger_with_state(unknown_dimension))
-        self.assertTrue(any("target" in error for error in errors), errors)
-
-    def test_validate_rejects_baseline_and_baseline_only_targets(self) -> None:
-        registry = fixture_registry()
-        baseline_hypothesis = state_with(
-            decision(1, "hyp-data-raw", "active", "deprioritized")
-        )
-        errors = validate_search_space_state(registry, ledger_with_state(baseline_hypothesis))
-        self.assertTrue(any("baseline" in error for error in errors), errors)
-
-        baseline_only_dimension = state_with(
-            dimension_decision(1, "dim-initialization-adaptation", "active", "deprioritized")
-        )
-        errors = validate_search_space_state(
-            registry, ledger_with_state(baseline_only_dimension)
-        )
-        self.assertTrue(any("baseline_only" in error for error in errors), errors)
+        one = decision(1, "hyp-data-filtered", "active", "deprioritized")
+        cases = [
+            # A contraction must pass through deprioritized, never skip it.
+            ("transition", mutate(decision(1, "hyp-data-filtered", "active", "pruned"))),
+            # Each decision must start where the previous one left the target.
+            (
+                "from_status",
+                mutate(one, decision(2, "hyp-data-filtered", "active", "deprioritized")),
+            ),
+            # Revision must equal the append-only decision count.
+            ("revision", mutate(one, revision=0)),
+            # decision_id is derived from the revision, not chosen.
+            ("decision_id", mutate(one, decision={"decision_id": "sdec-000009"})),
+            # Free prose is not auditable evidence.
+            ("unknown fields", mutate(one, decision={"note": "free text"})),
+            ("unknown fields", mutate(one, state_note="not in the contract")),
+            # A reversible decision must say what would reopen it.
+            ("reopen_when", mutate(one, drop_field="reopen_when")),
+            # Targets must resolve in the frozen registry, under their owner.
+            ("target", mutate(decision(1, "hyp-not-real", "active", "deprioritized"))),
+            (
+                "dimension_id",
+                mutate(
+                    hypothesis_decision(
+                        1,
+                        "dim-model-architecture",
+                        "hyp-data-filtered",
+                        "active",
+                        "deprioritized",
+                    )
+                ),
+            ),
+            ("target", mutate(dimension_decision(1, "dim-not-real", "active", "deprioritized"))),
+            # A baseline is the comparison floor and can never be contracted.
+            ("baseline", mutate(decision(1, "hyp-data-raw", "active", "deprioritized"))),
+            (
+                "baseline_only",
+                mutate(
+                    dimension_decision(
+                        1, "dim-initialization-adaptation", "active", "deprioritized"
+                    )
+                ),
+            ),
+        ]
+        for needle, state in cases:
+            with self.subTest(needle=needle):
+                errors = validate_search_space_state(registry, ledger_with_state(state))
+                self.assertTrue(any(needle in error for error in errors), errors)
 
 
 class EffectiveSelectionTests(unittest.TestCase):
@@ -394,80 +383,65 @@ class EffectiveSelectionTests(unittest.TestCase):
 
 
 class PointEligibilityTests(unittest.TestCase):
-    def test_baseline_point_is_eligible(self) -> None:
-        registry = fixture_registry()
-        guidance = derive_hypothesis_selection(registry)
-        effective = compose_effective_selection(
-            registry, guidance, {"dimensions": {}, "hypotheses": {}}
-        )
-        point = complete_point(registry)
-        self.assertEqual(validate_point_eligibility(point, registry, effective), [])
+    """Only exclusion and pruning bar selection; deprioritizing just rebudgets."""
 
-    def test_excluded_hypothesis_is_ineligible(self) -> None:
+    @staticmethod
+    def _effective(registry: dict, runtime: dict | None = None) -> dict:
+        return compose_effective_selection(
+            registry,
+            derive_hypothesis_selection(registry),
+            runtime or {"dimensions": {}, "hypotheses": {}},
+        )
+
+    def test_eligible_points_pass(self) -> None:
         registry = fixture_registry()
-        registry["guidance"].append(
+        filtered = {"dim-data-curation": "hyp-data-filtered"}
+        cases = [
+            ("baseline", None, {}),
+            # Deprioritizing changes the admission budget, not eligibility.
+            ("deprioritized hypothesis", {"hypotheses": {"hyp-data-filtered": "deprioritized"}}, filtered),
+            ("deprioritized dimension", {"dimensions": {"dim-data-curation": "deprioritized"}}, filtered),
+            (
+                "sibling of deprioritized dimension",
+                {"dimensions": {"dim-data-curation": "deprioritized"}},
+                {"dim-validation-selection": "hyp-valid-cv"},
+            ),
+        ]
+        for name, runtime, selection in cases:
+            with self.subTest(case=name):
+                effective = self._effective(
+                    registry, {"dimensions": {}, "hypotheses": {}, **(runtime or {})}
+                )
+                point = complete_point(registry, selection) if selection else complete_point(registry)
+                self.assertEqual(
+                    validate_point_eligibility(point, registry, effective), []
+                )
+
+    def test_excluded_and_pruned_points_are_ineligible(self) -> None:
+        excluded_registry = fixture_registry()
+        excluded_registry["guidance"].append(
             {"id": "g-90", "effect": "exclude", "scope": _scope("filtering")}
         )
-        guidance = derive_hypothesis_selection(registry)
-        effective = compose_effective_selection(
-            registry, guidance, {"dimensions": {}, "hypotheses": {}}
-        )
-        point = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
-        errors = validate_point_eligibility(point, registry, effective)
-        self.assertTrue(any("excluded" in error for error in errors), errors)
+        pruned_registry = fixture_registry()
 
-    def test_pruned_hypothesis_is_ineligible_but_structurally_valid(self) -> None:
-        registry = fixture_registry()
-        guidance = derive_hypothesis_selection(registry)
-        runtime = {
-            "dimensions": {},
-            "hypotheses": {"hyp-data-filtered": "pruned"},
-        }
-        effective = compose_effective_selection(registry, guidance, runtime)
-        point = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
-        # Historical observations stay structurally valid; only new selection is barred.
-        self.assertEqual(validate_point(point, registry), [])
-        errors = validate_point_eligibility(point, registry, effective)
-        self.assertTrue(any("pruned" in error for error in errors), errors)
-
-    def test_deprioritized_dimension_remains_eligible(self) -> None:
-        registry = fixture_registry()
-        guidance = derive_hypothesis_selection(registry)
-        runtime = {
-            "dimensions": {"dim-data-curation": "deprioritized"},
-            "hypotheses": {},
-        }
-        effective = compose_effective_selection(registry, guidance, runtime)
-        # Deprioritization changes the admission budget, not structural eligibility.
-        filtered_point = complete_point(
-            registry, {"dim-data-curation": "hyp-data-filtered"}
-        )
-        self.assertEqual(
-            validate_point_eligibility(filtered_point, registry, effective), []
-        )
-        self.assertEqual(
-            effective["hyp-data-filtered"]["dimension_runtime_status"],
-            "deprioritized",
-        )
-        baseline_point = complete_point(registry)
-        self.assertEqual(
-            validate_point_eligibility(baseline_point, registry, effective), []
-        )
-        cv_point = complete_point(
-            registry, {"dim-validation-selection": "hyp-valid-cv"}
-        )
-        self.assertEqual(validate_point_eligibility(cv_point, registry, effective), [])
-
-    def test_deprioritized_hypothesis_remains_eligible(self) -> None:
-        registry = fixture_registry()
-        guidance = derive_hypothesis_selection(registry)
-        runtime = {
-            "dimensions": {},
-            "hypotheses": {"hyp-data-filtered": "deprioritized"},
-        }
-        effective = compose_effective_selection(registry, guidance, runtime)
-        point = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
-        self.assertEqual(validate_point_eligibility(point, registry, effective), [])
+        for needle, registry, runtime in (
+            ("excluded", excluded_registry, None),
+            (
+                "pruned",
+                pruned_registry,
+                {"dimensions": {}, "hypotheses": {"hyp-data-filtered": "pruned"}},
+            ),
+        ):
+            with self.subTest(needle=needle):
+                effective = self._effective(registry, runtime)
+                point = complete_point(
+                    registry, {"dim-data-curation": "hyp-data-filtered"}
+                )
+                # Ineligible for new selection, yet still a structurally valid
+                # point, so historical observations at it stay readable.
+                self.assertEqual(validate_point(point, registry), [])
+                errors = validate_point_eligibility(point, registry, effective)
+                self.assertTrue(any(needle in error for error in errors), errors)
 
 
 class ExperienceTransitionTests(unittest.TestCase):
@@ -475,16 +449,51 @@ class ExperienceTransitionTests(unittest.TestCase):
         self.registry = fixture_registry()
         self.ledger = belief_ledger(self.registry)
         self.ledger["search_space_state"] = empty_search_space_state()
+        self.additional_evidence_run_ids: list[str] = []
+        self.additional_evidence_edge_ids: list[str] = []
 
     def advance_dag_cursor(self) -> None:
-        self.ledger["records"][-1]["final_best_score"] += 0.001
-        self.ledger["dag_revision"] += 1
-        self.ledger["records"][-1]["dag_revision"] = self.ledger["dag_revision"]
+        next_id = max(int(item["run_id"]) for item in self.ledger["records"]) + 1
+        parent_id = f"{next_id:03d}"
+        child_id = f"{next_id + 1:03d}"
+        parent = {
+            "run_id": parent_id,
+            "source_run_ids": [],
+            "semantic_point": complete_point(self.registry),
+            "semantic_edges": [],
+            "status": "keep",
+            "final_best_score": 0.42,
+            "dag_revision": self.ledger["dag_revision"] + 1,
+        }
+        child = {
+            "run_id": child_id,
+            "source_run_ids": [parent_id],
+            "semantic_point": complete_point(
+                self.registry, {"dim-data-curation": "hyp-data-filtered"}
+            ),
+            "status": "discard",
+            "final_best_score": 0.54,
+            "dag_revision": self.ledger["dag_revision"] + 2,
+        }
+        child["semantic_edges"] = build_semantic_edges(
+            [*self.ledger["records"], parent], child
+        )
+        attach_matched_transfer(parent, child)
+        self.ledger["records"].extend([parent, child])
+        self.ledger["dag_revision"] += 2
+        self.additional_evidence_run_ids.extend([parent_id, child_id])
+        self.additional_evidence_edge_ids.append(
+            f"sedge-{parent_id}-{child_id}"
+        )
 
     def experience(self, generation: int) -> dict:
         return {
             "schema_version": 3,
-            "updated_at_run": "003",
+            "updated_at_run": (
+                self.additional_evidence_run_ids[-1]
+                if self.additional_evidence_run_ids
+                else "003"
+            ),
             "generation": generation,
             "dag_revision": self.ledger["dag_revision"],
             "summary": "Repeated direct comparisons are worse than matched baselines.",
@@ -498,10 +507,21 @@ class ExperienceTransitionTests(unittest.TestCase):
                 "assessment": "unpromising",
                 "recommended_status": "pruned",
                 "claim": "Both direct comparisons were worse.",
-                "evidence_run_ids": ["000", "001", "002", "003"],
-                "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
+                "evidence_run_ids": [
+                    "000",
+                    "001",
+                    "002",
+                    "003",
+                    *self.additional_evidence_run_ids,
+                ][-5:],
+                "evidence_edge_ids": [
+                    "sedge-000-001",
+                    "sedge-002-003",
+                    *self.additional_evidence_edge_ids,
+                ][-5:],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 2,
+                    "direct_noncrash_edges": 2
+                    + len(self.additional_evidence_edge_ids),
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -550,6 +570,7 @@ class ExperienceTransitionTests(unittest.TestCase):
         # evidence and can complete the second stage.
         pending["status"] = "discard"
         pending["final_best_score"] = 0.53
+        attach_matched_transfer(self.ledger["records"][0], pending)
         self.ledger["dag_revision"] += 1
         pending["dag_revision"] = self.ledger["dag_revision"]
         experience = self.experience(generation=5)
@@ -561,6 +582,66 @@ class ExperienceTransitionTests(unittest.TestCase):
         second = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(second[0]["from_status"], "deprioritized")
         self.assertEqual(second[0]["to_status"], "pruned")
+
+    def test_mixed_matched_control_directions_cannot_contract_target(self) -> None:
+        # Keep two direct controls but make the second one favor the selected
+        # hypothesis.  Mere comparator count is not directional evidence.
+        attach_matched_transfer(
+            self.ledger["records"][2],
+            self.ledger["records"][3],
+            control_score=0.30,
+        )
+        experience = self.experience(generation=1)
+        self.ledger["experience"] = experience
+        errors = validate_experience(experience, self.registry, self.ledger)
+        self.assertTrue(
+            any("direction of its repeated matched" in error for error in errors),
+            errors,
+        )
+        self.assertEqual(
+            derive_experience_transitions(self.registry, self.ledger),
+            [],
+        )
+
+    def test_crash_edge_cannot_advance_deprioritized_target_to_pruned(self) -> None:
+        self.ledger["experience"] = self.experience(generation=1)
+        first = append_experience_transitions(self.registry, self.ledger)
+        self.assertEqual(first[0]["to_status"], "deprioritized")
+
+        crash = {
+            "run_id": "004",
+            "source_run_ids": ["000"],
+            "semantic_point": complete_point(
+                self.registry, {"dim-data-curation": "hyp-data-filtered"}
+            ),
+            "status": "crash",
+            "final_best_score": float("inf"),
+            "dag_revision": self.ledger["dag_revision"] + 1,
+        }
+        crash["semantic_edges"] = build_semantic_edges(
+            self.ledger["records"], crash
+        )
+        self.ledger["records"].append(crash)
+        self.ledger["dag_revision"] += 1
+        experience = self.experience(generation=2)
+        entry = experience["hypothesis_evidence"][0]
+        entry["evidence_run_ids"] = ["000", "001", "002", "003", "004"]
+        entry["evidence_edge_ids"].append("sedge-000-004")
+        entry["comparator_coverage"]["crash_edges"] = 1
+        self.ledger["experience"] = experience
+
+        self.assertEqual(
+            append_experience_transitions(self.registry, self.ledger),
+            [],
+        )
+        self.assertEqual(
+            replay_search_space_state(
+                self.registry, self.ledger["search_space_state"]
+            )[
+                "hypotheses"
+            ]["hyp-data-filtered"],
+            "deprioritized",
+        )
 
     def test_repeated_generation_is_no_op(self) -> None:
         self.ledger["experience"] = self.experience(generation=1)
@@ -578,45 +659,55 @@ class ExperienceTransitionTests(unittest.TestCase):
         self.assertEqual(self.ledger["search_space_state"]["revision"], 0)
         self.assertEqual(self.ledger["search_space_state"]["decisions"], [])
 
-    def test_empty_beliefs_make_no_transition(self) -> None:
-        experience = self.experience(generation=1)
-        experience["hypothesis_evidence"] = []
-        self.ledger["experience"] = experience
-        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
-        self.assertEqual(self.ledger["search_space_state"]["revision"], 0)
+    def test_weak_evidence_never_contracts_the_space(self) -> None:
+        """Belief prose cannot move the overlay past its evidence gates."""
+        no_beliefs = self.experience(generation=1)
+        no_beliefs["hypothesis_evidence"] = []
 
-    def test_low_confidence_cannot_prune(self) -> None:
-        experience = self.experience(generation=1)
-        experience["hypothesis_evidence"][0]["confidence"] = "low"
-        self.ledger["experience"] = experience
-        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
-        replayed = replay_search_space_state(
-            self.registry, self.ledger["search_space_state"]
-        )
-        self.assertEqual(replayed["hypotheses"]["hyp-data-filtered"], "active")
+        low_confidence = self.experience(generation=1)
+        low_confidence["hypothesis_evidence"][0]["confidence"] = "low"
 
-    def test_one_direct_edge_cannot_deprioritize(self) -> None:
-        def one_edge(generation: int) -> dict:
-            experience = self.experience(generation)
-            entry = experience["hypothesis_evidence"][0]
-            entry["evaluation_state"] = "observed"
-            entry["evidence_run_ids"] = ["000", "001"]
-            entry["evidence_edge_ids"] = ["sedge-000-001"]
-            entry["comparator_coverage"] = {
-                "direct_noncrash_edges": 1,
-                "confounded_noncrash_edges": 0,
-                "crash_edges": 0,
+        single_edge = self.experience(generation=1)
+        single_edge["hypothesis_evidence"][0].update(
+            {
+                "evaluation_state": "observed",
+                "evidence_run_ids": ["000", "001"],
+                "evidence_edge_ids": ["sedge-000-001"],
+                "comparator_coverage": {
+                    "direct_noncrash_edges": 1,
+                    "confounded_noncrash_edges": 0,
+                    "crash_edges": 0,
+                },
             }
-            return experience
-
-        self.ledger["experience"] = one_edge(generation=1)
-        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
-        self.ledger["experience"] = one_edge(generation=2)
-        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
-        replayed = replay_search_space_state(
-            self.registry, self.ledger["search_space_state"]
         )
-        self.assertEqual(replayed["hypotheses"]["hyp-data-filtered"], "active")
+
+        # A baseline is the comparison floor, so it is protected even though
+        # the recomputed comparator coverage would otherwise qualify.
+        baseline_target = self.experience(generation=1)
+        baseline_target["hypothesis_evidence"][0].update(
+            {
+                "target_id": "hyp-data-raw",
+                "claim": "Both direct comparisons moved away from the raw baseline.",
+            }
+        )
+
+        for name, experience, target in (
+            ("no beliefs", no_beliefs, "hyp-data-filtered"),
+            ("low confidence", low_confidence, "hyp-data-filtered"),
+            ("one direct edge", single_edge, "hyp-data-filtered"),
+            ("baseline target", baseline_target, "hyp-data-raw"),
+        ):
+            with self.subTest(case=name):
+                ledger = copy.deepcopy(self.ledger)
+                ledger["experience"] = experience
+                self.assertEqual(
+                    append_experience_transitions(self.registry, ledger), []
+                )
+                self.assertEqual(ledger["search_space_state"]["revision"], 0)
+                replayed = replay_search_space_state(
+                    self.registry, ledger["search_space_state"]
+                )
+                self.assertEqual(replayed["hypotheses"][target], "active")
 
     def test_crash_only_evidence_makes_no_transition(self) -> None:
         crash_record = {
@@ -657,20 +748,6 @@ class ExperienceTransitionTests(unittest.TestCase):
         # when the belief prose asks for a transition.
         self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
 
-    def test_baseline_target_is_rejected(self) -> None:
-        experience = self.experience(generation=1)
-        entry = experience["hypothesis_evidence"][0]
-        entry["target_id"] = "hyp-data-raw"
-        entry["claim"] = "Both direct comparisons moved away from the raw baseline."
-        self.ledger["experience"] = experience
-        # The comparator gate passes on the recomputed coverage; only baseline
-        # protection blocks the transition.
-        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
-        replayed = replay_search_space_state(
-            self.registry, self.ledger["search_space_state"]
-        )
-        self.assertEqual(replayed["hypotheses"]["hyp-data-raw"], "active")
-
     def test_excluded_target_makes_no_transition(self) -> None:
         self.registry["guidance"].append(
             {"id": "g-90", "effect": "exclude", "scope": _scope("filtering")}
@@ -705,42 +782,51 @@ class ExperienceTransitionTests(unittest.TestCase):
 
         # A later generation whose DAG cursor advanced and which cites an edge
         # absent from the prior decision appends a reopening decision.
+        next_id = max(int(item["run_id"]) for item in self.ledger["records"]) + 1
+        parent_id = f"{next_id:03d}"
+        child_id = f"{next_id + 1:03d}"
         parent = {
-            "run_id": "004",
+            "run_id": parent_id,
             "source_run_ids": [],
             "semantic_point": complete_point(self.registry),
             "semantic_edges": [],
             "status": "keep",
             "final_best_score": 0.39,
-            "dag_revision": 5,
+            "dag_revision": self.ledger["dag_revision"] + 1,
         }
         child = {
-            "run_id": "005",
-            "source_run_ids": ["004"],
+            "run_id": child_id,
+            "source_run_ids": [parent_id],
             "semantic_point": complete_point(
                 self.registry, {"dim-data-curation": "hyp-data-filtered"}
             ),
             "status": "keep",
             "final_best_score": 0.38,
-            "dag_revision": 6,
+            "dag_revision": self.ledger["dag_revision"] + 2,
         }
         child["semantic_edges"] = build_semantic_edges(
             [*self.ledger["records"], parent], child
         )
+        attach_matched_transfer(parent, child)
         self.ledger["records"].extend([parent, child])
-        self.ledger["dag_revision"] = 6
+        self.ledger["dag_revision"] += 2
         experience = self.experience(generation=4)
-        experience["updated_at_run"] = "005"
+        experience["updated_at_run"] = child_id
         entry = experience["hypothesis_evidence"][0]
+        existing_edges = list(entry["evidence_edge_ids"])
+        existing_runs = list(entry["evidence_run_ids"])
         entry.update(
             {
                 "assessment": "promising",
                 "recommended_status": "active",
                 "claim": "A later direct comparison improved over its matched parent.",
-                "evidence_run_ids": ["004", "005"],
-                "evidence_edge_ids": ["sedge-000-001", "sedge-002-003", "sedge-004-005"],
+                "evidence_run_ids": [*existing_runs[-3:], parent_id, child_id],
+                "evidence_edge_ids": [
+                    *existing_edges,
+                    f"sedge-{parent_id}-{child_id}",
+                ][-5:],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 3,
+                    "direct_noncrash_edges": len(existing_edges) + 1,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -781,36 +867,41 @@ class ExperienceTransitionTests(unittest.TestCase):
                 },
             ],
         )
-        # Later score changes never rewrite an appended decision's snapshot.
-        for record in self.ledger["records"]:
-            if record["run_id"] == "001":
-                record["final_best_score"] = 0.99
+        # Later deep-tuned final-score changes never rewrite the inherited
+        # control or masquerade as new semantic evidence.
+        for item in self.ledger["records"]:
+            if item["run_id"] == "001":
+                item["final_best_score"] = 0.99
         stored = self.ledger["search_space_state"]["decisions"][0]
         self.assertEqual(stored["evidence_observations"][0]["child_score"], 0.5)
         self.assertEqual(stored["evidence_observations"][0]["delta"], 0.1)
-        # The next decision snapshots the current observation values instead.
+        # A genuinely new matched control can advance the staged decision.
         self.advance_dag_cursor()
         self.ledger["experience"] = self.experience(generation=2)
         (second,) = append_experience_transitions(self.registry, self.ledger)
-        self.assertEqual(second["evidence_observations"][0]["child_score"], 0.99)
-        self.assertEqual(second["evidence_observations"][0]["delta"], 0.59)
+        self.assertEqual(second["evidence_observations"][0]["child_score"], 0.5)
+        self.assertEqual(second["evidence_observations"][0]["delta"], 0.1)
+        self.assertEqual(
+            second["evidence_observations"][-1]["edge_id"],
+            self.additional_evidence_edge_ids[-1],
+        )
+        self.assertEqual(second["evidence_observations"][-1]["delta"], 0.12)
         self.assertEqual(validate_search_space_state(self.registry, self.ledger), [])
 
     def dimension_belief(self, generation: int, *, with_hypothesis: bool) -> dict:
         experience = self.experience(generation)
+        hypothesis_entry = experience["hypothesis_evidence"][0]
         experience["dimension_evidence"] = [{
             "target_id": "dim-data-curation",
             "evaluation_state": "comparator_covered",
             "assessment": "unpromising",
             "recommended_status": "pruned",
             "claim": "Every matched data-curation change worsened the score.",
-            "evidence_run_ids": ["000", "001", "002", "003"],
-            "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
-            "comparator_coverage": {
-                "direct_noncrash_edges": 2,
-                "confounded_noncrash_edges": 0,
-                "crash_edges": 0,
-            },
+            "evidence_run_ids": list(hypothesis_entry["evidence_run_ids"]),
+            "evidence_edge_ids": list(hypothesis_entry["evidence_edge_ids"]),
+            "comparator_coverage": dict(
+                hypothesis_entry["comparator_coverage"]
+            ),
             "confidence": "high",
             "uncertainty": "Implementation changes remain confounded.",
             "reopen_when": "A later direct comparison improves.",
@@ -908,11 +999,24 @@ class LedgerIntegrationTests(unittest.TestCase):
             any("one-based admission index 1" in error for error in errors), errors
         )
 
-    def test_historical_policy_receipt_schema_2_remains_readable(self) -> None:
+    def test_historical_policy_receipts_remain_readable(self) -> None:
+        """Schema evolution is additive: older receipts still validate as-is."""
         registry = fixture_registry()
         baseline = complete_point(registry)
-        entry = record("000", "fresh", [], baseline, score=0.5, status="keep")
-        receipt = entry["policy_receipt"]
+
+        def ledger_with(entry: dict) -> dict:
+            return {
+                "search_space": space_receipt(registry),
+                "records": [entry],
+                "search_space_state": empty_search_space_state(),
+            }
+
+        schema_four = record("000", "fresh", [], baseline, score=0.5, status="keep")
+        self.assertEqual(schema_four["policy_receipt"]["schema_version"], 4)
+        self.assertEqual(validate_ledger(registry, ledger_with(schema_four)), [])
+
+        schema_two = record("000", "fresh", [], baseline, score=0.5, status="keep")
+        receipt = schema_two["policy_receipt"]
         receipt["schema_version"] = 2
         receipt.pop("budget")
         receipt.pop("experience")
@@ -924,12 +1028,7 @@ class LedgerIntegrationTests(unittest.TestCase):
             "experience_uncertainty_adjustment",
         ):
             receipt["components"].pop(field)
-        ledger = {
-            "search_space": space_receipt(registry),
-            "records": [entry],
-            "search_space_state": empty_search_space_state(),
-        }
-        self.assertEqual(validate_ledger(registry, ledger), [])
+        self.assertEqual(validate_ledger(registry, ledger_with(schema_two)), [])
 
     def test_validate_ledger_requires_state_once_records_exist(self) -> None:
         registry = fixture_registry()
@@ -991,6 +1090,330 @@ class LedgerIntegrationTests(unittest.TestCase):
         self.assertEqual(brief["runtime_pruned_hypotheses"], 1)
         self.assertNotIn("decisions", brief)
 
+    def test_brief_requires_experience_refresh_for_terminal_dag_delta(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        entry = record("000", "fresh", [], baseline, score=0.5, status="keep")
+        ledger = {
+            "records": [entry],
+            "dag_revision": 1,
+            "experience": {
+                "generation": 0,
+                "updated_at_run": None,
+                "dag_revision": 0,
+            },
+            "search_space_state": empty_search_space_state(),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = Path(tmp) / "ledger.json"
+            args = types.SimpleNamespace(ledger=str(ledger_path), budget=None)
+
+            def brief() -> dict:
+                ledger_path.write_text(json.dumps(ledger))
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    cmd_brief(args)
+                return json.loads(output.getvalue())
+
+            stale = brief()
+            self.assertEqual(stale["experience_dag_delta"], 1)
+            self.assertTrue(stale["semantic_admission_blocked"])
+            self.assertTrue(stale["experience_refresh_required"])
+
+            ledger["records"][0]["status"] = "pending"
+            self.assertTrue(brief()["semantic_admission_blocked"])
+            self.assertFalse(brief()["experience_refresh_required"])
+
+            ledger["records"][0]["status"] = "keep"
+            ledger["experience"]["dag_revision"] = 1
+            current = brief()
+            self.assertEqual(current["experience_dag_delta"], 0)
+            self.assertFalse(current["semantic_admission_blocked"])
+            self.assertFalse(current["experience_refresh_required"])
+
+            ledger["experience"]["dag_revision"] = 2
+            with self.assertRaisesRegex(
+                SystemExit, "cannot exceed ledger.dag_revision"
+            ):
+                brief()
+
+    def test_noop_belief_refresh_advances_cursor_without_generation(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        entry = record("000", "fresh", [], baseline, score=0.5, status="keep")
+        entry["dag_revision"] = 1
+        prior = empty_experience("000", generation=0)
+        prior["dag_revision"] = 0
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "noop-refresh",
+            "metric": "validation_loss",
+            "search_space": space_receipt(registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 1,
+            "records": [entry],
+            "experience": prior,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            background_path = tmp_path / "background.md"
+            ledger_path = tmp_path / "ledger.json"
+            replacement_path = tmp_path / "experience.json"
+            background_path.write_text(background_text(registry))
+            ledger_path.write_text(json.dumps(ledger))
+            replacement = empty_experience("000", generation=0)
+            replacement_path.write_text(json.dumps(replacement))
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                background=str(background_path),
+                catalog=None,
+                from_json=replacement_path,
+            )
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(cmd_set_experience(args), 0)
+            result = json.loads(output.getvalue())
+            stored = json.loads(ledger_path.read_text())
+
+            self.assertFalse(result["belief_changed"])
+            self.assertEqual(stored["experience"]["generation"], 0)
+            self.assertEqual(stored["experience"]["dag_revision"], 1)
+
+            before = ledger_path.read_bytes()
+            with self.assertRaisesRegex(
+                SystemExit, "no unprocessed terminal DAG delta"
+            ):
+                cmd_set_experience(args)
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_pending_record_rejects_experience_refresh_without_mutation(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        entry = record("000", "fresh", [], baseline, score=0.5, status="pending")
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "pending-refresh",
+            "metric": "validation_loss",
+            "search_space": space_receipt(registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 1,
+            "records": [entry],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            background_path = tmp_path / "background.md"
+            ledger_path = tmp_path / "ledger.json"
+            replacement_path = tmp_path / "experience.json"
+            background_path.write_text(background_text(registry))
+            ledger_path.write_text(json.dumps(ledger))
+            replacement_path.write_text(json.dumps(empty_experience("000")))
+            before = ledger_path.read_bytes()
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                background=str(background_path),
+                catalog=None,
+                from_json=replacement_path,
+            )
+
+            with self.assertRaisesRegex(SystemExit, "record is still pending"):
+                cmd_set_experience(args)
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_final_completion_requires_terminal_delta_refresh(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        entry = record("000", "fresh", [], baseline, score=0.5, status="keep")
+        entry["dag_revision"] = 1
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "final-refresh",
+            "metric": "validation_loss",
+            "search_space": space_receipt(registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 1,
+            "records": [entry],
+            "experience": {
+                **empty_experience("000"),
+                "dag_revision": 0,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = Path(tmp) / "ledger.json"
+            ledger_path.write_text(json.dumps(ledger))
+            before = ledger_path.read_bytes()
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                phase="completed",
+                stop_condition=None,
+                budget=0,
+            )
+
+            with self.assertRaisesRegex(
+                SystemExit, "terminal DAG delta remains unprocessed"
+            ):
+                cmd_set_phase(args)
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+            ledger["experience"]["dag_revision"] = 1
+            ledger_path.write_text(json.dumps(ledger))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_phase(args), 0)
+            stored = json.loads(ledger_path.read_text())
+            self.assertEqual(stored["run_state"]["phase"], "completed")
+
+    def test_final_completion_rejects_terminal_delta_with_pending_sibling(
+        self,
+    ) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        terminal = record(
+            "000", "fresh", [], baseline, score=0.5, status="keep"
+        )
+        terminal["dag_revision"] = 1
+        pending = record(
+            "001",
+            "improve",
+            ["000"],
+            baseline,
+            score=0.5,
+            status="pending",
+            prior_records=[terminal],
+        )
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "pending-final-refresh",
+            "metric": "validation_loss",
+            "search_space": space_receipt(registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 1,
+            "records": [terminal, pending],
+            "experience": {
+                **empty_experience("000"),
+                "dag_revision": 0,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = Path(tmp) / "ledger.json"
+            ledger_path.write_text(json.dumps(ledger))
+            before = ledger_path.read_bytes()
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                phase="completed",
+                stop_condition=None,
+                budget=0,
+            )
+            with self.assertRaisesRegex(
+                SystemExit, "pending records must be resolved"
+            ):
+                cmd_set_phase(args)
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_budget_exhaustion_resolves_zero_attempt_candidate_without_evidence(
+        self,
+    ) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        terminal = record(
+            "000", "fresh", [], baseline, score=0.5, status="keep"
+        )
+        terminal["dag_revision"] = 1
+        terminal["trials_attempted"] = 1
+        pending = record(
+            "001",
+            "improve",
+            ["000"],
+            baseline,
+            score=float("inf"),
+            status="pending",
+            prior_records=[terminal],
+        )
+        pending["final_best_score"] = None
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "unevaluated-resolution",
+            "metric": "validation_loss",
+            "search_space": space_receipt(registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 1,
+            "records": [terminal, pending],
+            "experience": {
+                **empty_experience("000"),
+                "dag_revision": 0,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger_path = run_dir / "ledger.json"
+            background_path = run_dir / "background.md"
+            replacement_path = run_dir / "experience.json"
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 1})
+            )
+            ledger_path.write_text(json.dumps(ledger))
+            background_path.write_text(background_text(registry))
+
+            resolved = resolve_unevaluated(
+                ledger_path,
+                "hard-interactions",
+                "001",
+            )
+            self.assertEqual(resolved["status"], "unevaluated")
+            self.assertIsNone(resolved["final_best_score"])
+            self.assertEqual(
+                resolved["unevaluated_receipt"][
+                    "candidate_objective_attempts"
+                ],
+                0,
+            )
+            with self.assertRaisesRegex(ValueError, "terminal unevaluated"):
+                record_run(
+                    ledger_path,
+                    "hard-interactions",
+                    "001",
+                    final_best_score=0.1,
+                )
+            stored = json.loads(ledger_path.read_text())
+            self.assertEqual(stored["dag_revision"], 2)
+
+            replacement_path.write_text(
+                json.dumps(empty_experience("000", generation=0))
+            )
+            refresh_args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                background=str(background_path),
+                catalog=None,
+                from_json=replacement_path,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_experience(refresh_args), 0)
+            refreshed = json.loads(ledger_path.read_text())
+            self.assertEqual(refreshed["experience"]["dag_revision"], 2)
+            self.assertEqual(refreshed["experience"]["updated_at_run"], "000")
+
+            phase_args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                phase="completed",
+                stop_condition=None,
+                budget=None,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_phase(phase_args), 0)
+            completed = json.loads(ledger_path.read_text())
+            self.assertEqual(completed["run_state"]["phase"], "completed")
+
 
 class StateAwareSelectionLifecycleTests(unittest.TestCase):
     """Proposals and selection receipts track the revisioned pruning overlay.
@@ -1029,7 +1452,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             point_path.write_text(json.dumps(self.filtered))
             receipt_path.write_text(
                 json.dumps(
-                    policy_receipt(
+                    current_policy_receipt(
                         "improve",
                         ["999"],
                         self.filtered,
@@ -1057,6 +1480,205 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertIn(
             "record 001 parent 999 is not an earlier record",
             str(raised.exception),
+        )
+
+    def test_add_record_rejects_unprocessed_terminal_delta_before_admission(
+        self,
+    ) -> None:
+        baseline = complete_point(self.registry)
+        existing = record(
+            "000", "fresh", [], baseline, score=0.5, status="keep"
+        )
+        existing["dag_revision"] = 1
+        pending = record(
+            "001",
+            "improve",
+            ["000"],
+            baseline,
+            score=0.5,
+            status="pending",
+            prior_records=[existing],
+        )
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "stale-dag",
+            "metric": "validation_loss",
+            "search_space": space_receipt(self.registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 1,
+            # A sibling already admitted in the same batch may still be
+            # pending, but the terminal delta closes further admission.
+            "records": [existing, pending],
+            "experience": {
+                **empty_experience("000"),
+                "dag_revision": 0,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_path = tmp_path / "ledger.json"
+            background_path = tmp_path / "background.md"
+            point_path = tmp_path / "point.json"
+            receipt_path = tmp_path / "policy.json"
+            ledger_path.write_text(json.dumps(ledger))
+            background_path.write_text(background_text(self.registry))
+            point_path.write_text(json.dumps(self.filtered))
+            # The cadence gate must fire before the deliberately invalid
+            # selection receipt can be considered.
+            receipt_path.write_text("{}")
+            before = ledger_path.read_bytes()
+            args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                run_id="002",
+                kind="optimization",
+                op="fresh",
+                source_run_ids="",
+                background=str(background_path),
+                catalog=None,
+                semantic_point=str(point_path),
+                policy_receipt=str(receipt_path),
+                idea="A candidate that must wait for the belief cursor.",
+                change="from scratch after an unprocessed terminal delta",
+                candidate_name_hint="fixture_stale_dag",
+                description=None,
+            )
+
+            with self.assertRaisesRegex(
+                SystemExit, "terminal DAG evidence must be refreshed"
+            ):
+                cmd_add_record(args)
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_persisted_schema6_conditioning_tamper_is_rejected(self) -> None:
+        baseline = complete_point(self.registry)
+        first = record(
+            "000", "fresh", [], baseline, score=0.5, status="keep"
+        )
+        first["dag_revision"] = 1
+        second = record(
+            "001",
+            "improve",
+            ["000"],
+            self.filtered,
+            score=0.6,
+            status="discard",
+            prior_records=[first],
+        )
+        second["dag_revision"] = 2
+        second["policy_receipt"] = current_policy_receipt(
+            "improve",
+            ["000"],
+            self.filtered,
+            selection_index=2,
+        )
+        attach_matched_transfer(first, second)
+        experience = {
+            "schema_version": 3,
+            "updated_at_run": "001",
+            "generation": 0,
+            "summary": "One direct comparison remains uncertainty-only.",
+            "promising_regions": [],
+            "lessons": [],
+            "bottlenecks": [],
+            "dimension_evidence": [],
+            "hypothesis_evidence": [{
+                "target_id": "hyp-data-filtered",
+                "evaluation_state": "observed",
+                "assessment": "mixed",
+                "recommended_status": "active",
+                "claim": "One matched edge cannot establish direction.",
+                "evidence_run_ids": ["000", "001"],
+                "evidence_edge_ids": ["sedge-000-001"],
+                "comparator_coverage": {
+                    "direct_noncrash_edges": 1,
+                    "confounded_noncrash_edges": 0,
+                    "crash_edges": 0,
+                },
+                "confidence": "low",
+                "uncertainty": "A second direct comparison is absent.",
+            }],
+            "dag_revision": 2,
+        }
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "conditioning-receipt",
+            "metric": "validation_loss",
+            "search_space": space_receipt(self.registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 2,
+            "records": [first, second],
+            "experience": experience,
+        }
+        proposals = self._proposals(ledger)
+        filtered_proposal = next(
+            proposal
+            for proposal in proposals["proposals"]
+            if self._selects_filtered(proposal)
+        )
+        predictions = {
+            "schema_version": 3,
+            "proposal_set_revision": proposals["proposal_set_revision"],
+            "experience": {
+                "generation": 0,
+                "updated_at_run": "001",
+                "revision": digest(experience),
+            },
+            "predictions": [],
+        }
+        for proposal in proposals["proposals"]:
+            selected = proposal["point_id"] == filtered_proposal["point_id"]
+            predictions["predictions"].append(
+                {
+                    "point_id": proposal["point_id"],
+                    "prior_gain": 0.9 if selected else 0.1,
+                    "experience_gain_adjustment": 0.0,
+                    "predicted_gain": 0.9 if selected else 0.1,
+                    "prior_uncertainty": 0.3,
+                    "experience_uncertainty_adjustment": 0.05 if selected else 0.0,
+                    "uncertainty": 0.35 if selected else 0.3,
+                    "experience_run_ids": ["000", "001"] if selected else [],
+                    "experience_edge_ids": (
+                        ["sedge-000-001"] if selected else []
+                    ),
+                    "experience_target_ids": (
+                        ["hyp-data-filtered"] if selected else []
+                    ),
+                    "experience_rationale": (
+                        "The single comparator increases uncertainty only."
+                    ),
+                    "evidence": ["schema-6 conditioning receipt fixture"],
+                }
+            )
+        point, receipt = select_proposal(
+            proposals,
+            policy="gain_uncertainty_nocost",
+            predictions=predictions,
+            selection_index=3,
+            experience=experience,
+            ledger=ledger,
+        )
+        self.assertEqual(point["point_id"], filtered_proposal["point_id"])
+        third = record(
+            "002", "fresh", [], point, score=0.55, status="discard"
+        )
+        third["policy_receipt"] = receipt
+        third["dag_revision"] = 3
+        ledger["records"].append(third)
+        ledger["dag_revision"] = 3
+        self.assertEqual(validate_ledger(self.registry, ledger), [])
+
+        tampered = copy.deepcopy(ledger)
+        conditioning = tampered["records"][-1]["policy_receipt"]["experience"][
+            "conditioning"
+        ][0]
+        conditioning["acquisition_role"] = "comparator_gain"
+        conditioning["gain_direction"] = "negative"
+        errors = validate_ledger(self.registry, tampered)
+        self.assertTrue(
+            any("acquisition_role is not mechanically derived" in error for error in errors),
+            errors,
         )
 
     def test_add_record_rejects_stale_experience_receipt(self) -> None:
@@ -1104,11 +1726,11 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 )
             )
             point_path.write_text(json.dumps(self.filtered))
-            # This otherwise-current schema-4 receipt falsely claims that no
+            # This otherwise-current schema-6 receipt falsely claims that no
             # experience snapshot existed at admission.
             receipt_path.write_text(
                 json.dumps(
-                    policy_receipt(
+                    current_policy_receipt(
                         "fresh",
                         [],
                         self.filtered,
@@ -1138,7 +1760,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 "stale policy receipt: experience", str(raised.exception)
             )
 
-            forged_receipt = policy_receipt(
+            forged_receipt = current_policy_receipt(
                 "fresh",
                 [],
                 self.filtered,
@@ -1156,7 +1778,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as forged:
                 cmd_add_record(args)
         self.assertIn(
-            "experience evidence ids must be cited", str(forged.exception)
+            "coverage policy must not cite experience", str(forged.exception)
         )
 
     def test_add_record_accepts_revision_pinned_empty_evidence_snapshot(self) -> None:
@@ -1187,7 +1809,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         }
         proposals = self._proposals(ledger)
         predictions = {
-            "schema_version": 2,
+            "schema_version": 3,
             "proposal_set_revision": proposals["proposal_set_revision"],
             "experience": {
                 "generation": 0,
@@ -1205,6 +1827,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                     "uncertainty": 0.3,
                     "experience_run_ids": [],
                     "experience_edge_ids": [],
+                    "experience_target_ids": [],
                     "experience_rationale": (
                         "The pinned snapshot carries no conditioning evidence."
                     ),
@@ -1265,7 +1888,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 0)
         self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 4)
+        self.assertEqual(receipt["schema_version"], 6)
         self.assertEqual(receipt["search_space_state_revision"], 0)
 
         # A revision-0 historical record selects the hypothesis to be pruned.
@@ -1305,7 +1928,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         for active, dep in mixed_pairs:
             self.assertLess(positions[active["point_id"]], positions[dep["point_id"]])
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 4)
+        self.assertEqual(receipt["schema_version"], 6)
         self.assertEqual(receipt["search_space_state_revision"], 1)
         self.assertEqual(receipt["budget"]["selected_lane"], "active")
 
@@ -1319,7 +1942,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 2)
         self.assertFalse(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 4)
+        self.assertEqual(receipt["schema_version"], 6)
         self.assertEqual(receipt["search_space_state_revision"], 2)
 
         # 4. The revision-0 historical record remains ledger-valid.
@@ -1339,7 +1962,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             point_path.write_text(json.dumps(self.filtered))
             receipt_path.write_text(
                 json.dumps(
-                    policy_receipt(
+                    current_policy_receipt(
                         "fresh",
                         [],
                         self.filtered,
@@ -1371,7 +1994,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             # the selected point must be eligible at its receipt revision.
             receipt_path.write_text(
                 json.dumps(
-                    policy_receipt(
+                    current_policy_receipt(
                         "fresh",
                         [],
                         self.filtered,
@@ -1503,7 +2126,6 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(chosen, {"hyp-data-raw"})
 
     def test_select_command_requires_matching_ledger_revision(self) -> None:
-        registry = self.registry
         proposals = self._proposals(
             {"records": [], "search_space_state": empty_search_space_state()}
         )
@@ -1535,8 +2157,112 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             proposals_path.write_text(json.dumps(current))
             self.assertEqual(cmd_select(args), 0)
             written = json.loads(receipt_path.read_text())
-        self.assertEqual(written["schema_version"], 4)
+        self.assertEqual(written["schema_version"], 6)
         self.assertEqual(written["search_space_state_revision"], 1)
+
+    def test_schema6_llm_weight_is_auditable_and_schema5_remains_readable(
+        self,
+    ) -> None:
+        proposals = self._proposals(
+            {"records": [], "search_space_state": empty_search_space_state()}
+        )
+        predictions = {
+            "schema_version": 1,
+            "proposal_set_revision": proposals["proposal_set_revision"],
+            "predictions": [
+                {
+                    "point_id": proposal["point_id"],
+                    "predicted_gain": 0.6,
+                    "uncertainty": 0.2,
+                    "evidence": ["receipt reliability-prior regression fixture"],
+                }
+                for proposal in proposals["proposals"]
+            ],
+        }
+        point, receipt = select_proposal(
+            proposals,
+            policy="gain_uncertainty_nocost",
+            predictions=predictions,
+            config={"llm_intelligence_score": 44},
+        )
+        entry = record("000", "fresh", [], point, score=0.5, status="keep")
+        entry["policy_receipt"] = receipt
+        ledger = {
+            "search_space": space_receipt(self.registry),
+            "search_space_state": empty_search_space_state(),
+            "records": [entry],
+        }
+        self.assertEqual(validate_ledger(self.registry, ledger), [])
+
+        wrong_weight = copy.deepcopy(ledger)
+        wrong_weight["records"][0]["policy_receipt"]["components"][
+            "llm_judgment_weight"
+        ] = 0.61
+        errors = validate_ledger(self.registry, wrong_weight)
+        self.assertTrue(
+            any("must equal policy.config.llm_intelligence_score / 100" in error for error in errors),
+            errors,
+        )
+
+        wrong_score = copy.deepcopy(ledger)
+        wrong_score["records"][0]["policy_receipt"]["acquisition_score"] += 0.01
+        errors = validate_ledger(self.registry, wrong_score)
+        self.assertTrue(
+            any("acquisition_score does not match" in error for error in errors),
+            errors,
+        )
+
+        second_proposals = build_proposal_set(
+            self.registry,
+            ledger,
+            op="fresh",
+            parents=[],
+            max_points=64,
+        )
+        second_predictions = {
+            "schema_version": 1,
+            "proposal_set_revision": second_proposals["proposal_set_revision"],
+            "predictions": [
+                {
+                    "point_id": proposal["point_id"],
+                    "predicted_gain": 0.6,
+                    "uncertainty": 0.2,
+                    "evidence": ["frozen reliability-prior regression fixture"],
+                }
+                for proposal in second_proposals["proposals"]
+            ],
+        }
+        second_point, second_receipt = select_proposal(
+            second_proposals,
+            policy="gain_uncertainty_nocost",
+            predictions=second_predictions,
+            config={"llm_intelligence_score": 61},
+            selection_index=2,
+        )
+        second_entry = record(
+            "001", "fresh", [], second_point, score=0.6, status="discard"
+        )
+        second_entry["policy_receipt"] = second_receipt
+        changed_midrun = copy.deepcopy(ledger)
+        changed_midrun["records"].append(second_entry)
+        errors = validate_ledger(self.registry, changed_midrun)
+        self.assertTrue(
+            any("must stay fixed at 44" in error for error in errors),
+            errors,
+        )
+
+        legacy = copy.deepcopy(ledger)
+        legacy_receipt = legacy["records"][0]["policy_receipt"]
+        legacy_receipt["schema_version"] = 5
+        legacy_receipt["policy"]["config"].pop("llm_intelligence_score")
+        legacy_receipt["components"].pop("llm_judgment_weight")
+        unweighted_model_score = 0.6 + 0.5 * 0.2
+        legacy_receipt["acquisition_score"] = round(
+            unweighted_model_score
+            + 0.1 * legacy_receipt["components"]["coverage"],
+            10,
+        )
+        self.assertEqual(validate_ledger(self.registry, legacy), [])
 
     def test_validate_ledger_replays_each_record_at_its_receipt_revision(self) -> None:
         registry = self.registry

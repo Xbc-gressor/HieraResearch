@@ -18,8 +18,8 @@ metric. It is the **simple baseline** to compare against `autoresearch-experimen
 (the GoT + decoupled-tuner framework) on the *same* task harness.
 
 It runs as the main thread (`claude --agent autoresearch-hillclimb`), uses no
-`Agent` tool, and spawns nothing, so it also works as a plain subagent. It does
-**not** need `program.md`.
+`Agent` tool, and spawns nothing, so it also works as a plain subagent. This
+prompt plus the task contract are all it needs.
 
 ### Stay simple — that is the experiment
 

@@ -4,9 +4,9 @@
     "USAGE: copy this to  runs/<task>/<tag>/framework_cfg.json  and keep ONLY the keys you want to override",
     "       (delete the rest — any omitted key uses the code default). Copying it verbatim = all defaults = no-op.",
     "INVALID JSON IS A HARD ERROR: every reader goes through tools/run_cfg.py; a file that exists but does not parse raises RunConfigError (budget/timeout guards fail fast) instead of silently reverting to defaults. A missing file or omitted key is fine — malformed JSON is not.",
-    "READ BY (tracked code):  semantic_space.py -> the 'space_initialization' section  ·  got_select.py decide -> the 'got' section  ·  semantic_search.py select -> the 'semantic_search' section  ·  tune_tools.py select-candidate -> tuner.n_min/top_percentile  ·  bo_search.py -> tuner.bo_n_trials + bo_patience_cap/bo_patience_floor (adaptive) or bo_patience (fixed override).",
+    "READ BY (tracked code):  semantic_space.py -> the 'space_initialization' section  ·  got_select.py decide -> the 'got' section  ·  semantic_search.py select -> the 'semantic_search' section  ·  tune_tools.py select-candidate -> tuner.n_min/top_percentile plus deep-tune allocation  ·  evaluation_budget.py -> deep-tune objective share/per-candidate cap  ·  tuner search scripts -> cumulative deep-tune time cap and BO trial/patience controls.",
     "PRIORITY: explicit CLI flag (--catalog / --cfg / --n-min / --top-percentile / --n-trials / --patience) > this file > module default. NOTE: BO patience is adaptive by default = min(bo_patience_cap, max(bo_patience_floor, round(1.5*n_dims))); set tuner.bo_patience to force a fixed value.",
-    "SETUP: tools/init_run.py persists --dimension-strategy, --max-evaluations, and --timeout here. For a new run without --timeout it seeds per_runtime_limit from the task.toml run.timeout_seconds value. Evaluation budget and timeout may change on resume; dimension strategy cannot change after semantic artifacts exist.",
+    "SETUP: tools/init_run.py persists --dimension-strategy, --llm-intelligence-score, --max-evaluations, and --timeout here. For a new run without --timeout it seeds per_runtime_limit from the task.toml run.timeout_seconds value. Evaluation budget and timeout may change on resume; dimension strategy and LLM intelligence score cannot change after semantic artifacts exist.",
     "NOTE: the sections below hold the CURRENT DEFAULTS so this doubles as a reference; '_keys' documents each. 'tuner.K' (warm-config count) is read by the tunable-contract-extractor AGENT (not a deterministic tool), but is injectable here too.",
     "runs/ is gitignored, so the copied file is local-only (not committed)."
   ],
@@ -29,7 +29,8 @@
     "coverage_weight": 0.1,
     "cost_weight": 0.2,
     "uncertainty_weight": 0.5,
-    "deprioritized_budget_interval": 5
+    "deprioritized_budget_interval": 5,
+    "llm_intelligence_score": 100
   },
   "tuner": {
     "K": 5,
@@ -37,7 +38,10 @@
     "n_min": 5,
     "top_percentile": 80,
     "bo_n_trials": 40,
-    "bo_patience_cap": 20
+    "bo_patience_cap": 20,
+    "deep_tune_budget_fraction": 0.4,
+    "deep_tune_per_candidate_cap": 20,
+    "deep_tune_time_limit_seconds": 3600
   },
   "max_evaluations": 200,
   "per_runtime_limit": 60,
@@ -58,6 +62,7 @@
     "semantic_search.cost_weight": "semantic acquisition: subtractive predicted implementation/evaluation cost contribution (default 0.2).",
     "semantic_search.uncertainty_weight": "semantic acquisition: exploration bonus used only by gain_uncertainty and gain_uncertainty_nocost (default 0.5); uncertainty is a rubric score, not a calibrated posterior.",
     "semantic_search.deprioritized_budget_interval": "real outer-search budget allocation: every Nth one-based semantic admission is reserved for the best deprioritized proposal when one exists (default 5 = 20%); other slots select only active proposals unless that lane is empty. Must be an integer in [2,1000].",
+    "semantic_search.llm_intelligence_score": "pre-run heuristic reliability prior for LLM-authored gain, uncertainty, and cost judgments, on a fixed [0,100] scale (default 100 preserves legacy acquisition exactly; e.g. 44 applies weight 0.44). It is not a calibrated probability or a leaderboard-relative percentile. Deterministic coverage is not scaled, raw forecasts remain unchanged, and score 0 leaves only the configured coverage term even though forecasts are still collected. The applied weight is recorded in policy_receipt. Freeze this value before semantic artifacts exist.",
     "tuner.K": "inner: number of warm-start configs the tunable-contract-extractor PROPOSES per candidate (default 5; read by the AGENT). OFAT {3,5,8} — highest-impact inner knob.",
     "tuner.K_eval": "inner: how many of the K proposed warm configs are uniformly sampled without replacement and EVALUATED at step 0+1 (default 3; best-of-K_eval = screening score). The sampled permutation is persisted in tune_report.phase_a.warm_config_selection for exact resume; list order has no screening priority. The remaining K−K_eval are DEFERRED — stored params-only in tune_report.phase_a.deferred_configs and evaluated by the deep-tuner FIRST (bo enqueue / grid prepend) ONLY if the candidate is promoted. Saves (K−K_eval) evals on every un-promoted candidate; budget-neutral for promoted ones (deferred are extra initial trials). K_eval>=K disables deferral (evaluate all).",
     "tuner.n_min": "inner: min population before deep-tune fires. NOW DERIVED from top_percentile = ceil(100/(100-P)) (P=80→5); this key is only an explicit OVERRIDE.",
@@ -66,6 +71,9 @@
     "tuner.bo_patience_cap": "inner: cap for the ADAPTIVE BO patience = min(cap, max(12, round(1.5*n_dims))) (default cap 20). low/mid-dim save budget, high-dim ramps to cap. benchmark: ~94% of fixed-20's gain at ~64% cost.",
     "tuner.bo_patience": "inner: OPTIONAL fixed-patience override; if set, disables the adaptive rule above. omit for adaptive. (patience=6 was the main HPO suppressor — don't go below ~12.)",
     "tuner.bo_patience_floor": "inner: floor for adaptive patience (default 12 — must clear the ~startup random period or HPO gets 0).",
+    "tuner.deep_tune_budget_fraction": "inner budget policy: maximum fraction of max_evaluations that Phase C may reserve across the run (default 0.4). The atomic evaluation ledger enforces it; 0 disables deep tuning.",
+    "tuner.deep_tune_per_candidate_cap": "inner budget policy: maximum admitted Phase-C objective calls for one candidate across retries (default 20).",
+    "tuner.deep_tune_time_limit_seconds": "inner wall-clock policy: cumulative Phase-C seconds for one candidate across method fallback and retries (default 3600). Tuners stop between objective calls; per_runtime_limit still bounds the final in-flight call.",
     "max_evaluations": "OPTIONAL strict global objective budget = max calls admitted into the task config->score fn. Every tuner atomically reserves one slot in evaluation_attempts.jsonl immediately before score_fn; once the cap is reached no further score call starts, even mid-round or mid-tuner. trials_attempted includes successful and failed admitted score calls; preflight attempts/rejections are reported separately and never consume objective slots. Legacy records without trials_attempted fall back to trials_completed and then warm_start_K.",
     "per_runtime_limit": "OPTIONAL per-evaluation wall-clock limit in SECONDS (one evaluate_config / one train.py run). A config/run exceeding it is hard-killed and recorded as a failed/crashed trial. Enforced by the eval callers, not prepare.py: framework tuners (warmstart_eval/bo/cmaes) run each eval in a timed subprocess; hillclimb uses timed_run.py. The template fallback is 60, but init_run seeds a new real task run from task.toml run.timeout_seconds unless --timeout explicitly overrides it. null/absent = no limit. THIS VALUE IS TASK-SPECIFIC — set it after measuring the task's heaviest legitimate candidate.",
     "preflight_runtime_limit": "OPTIONAL per-config no-score preflight timeout in seconds. Preflight may import/construct a candidate and execute the task-owned smoke hook, but it never calls score_fn or consumes max_evaluations. Defaults to min(180, per_runtime_limit) when omitted."

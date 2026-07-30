@@ -23,8 +23,9 @@ The caller passes **one** thing:
 
 - **`target_candidate_dir`** — absolute path to the candidate directory the
   `train.py` goes in (e.g. `runs/<task>/<tag>/candidates/007`). The caller has
-  already copied `prepare.py` here; `train.py` is pre-copied only for
-  provided-baseline seeds.
+  already copied `prepare.py` here. For a non-fresh candidate, `train.py` is an
+  exact helper-pinned copy of its primary parent; for a provided-baseline seed,
+  it is the exact task-provided entrypoint.
 
 Derive everything else from `target_candidate_dir` (do not ask the caller):
 
@@ -54,6 +55,11 @@ and selection context:
   crossover → two, e.g. `["003","005"]`); for a `fresh` candidate it is empty.
   Never infer or rewrite parentage from the `idea` or `change` prose. Derive
   **`source_train_paths` = `[<run_dir>/candidates/<sid>/train.py` for each parent]`**.
+- **`primary_parent`** — for a non-fresh schema-4 brief, the helper-authored
+  path/hash receipt for `source_run_ids[0]`. The candidate's existing
+  `train.py` was copied byte-for-byte from this snapshot before you started.
+  Edit that local file in place; do not reconstruct the primary parent from
+  prose or copy a different parent over it.
 - **`change`** — parent-relative implementation guidance: which components or
   behaviors to retain, add, remove, replace, or reconcile. For a `crossover` it
   is written per parent (`vs <p1>: …; vs <p2>: …`); for an `improve` it
@@ -70,8 +76,9 @@ and selection context:
   not an instruction to rewrite ancestry or optimize a different point.
 - **`candidate_name`** — the name hint to prefer for `CANDIDATE_NAME`.
 - **`implementation_source`** — helper-authored source receipt. `kind:
-  provided_entrypoint` carries the copied task path/hash; `kind: generated`
-  means normal writer-owned implementation.
+  provided_entrypoint` carries the copied task path/hash; `kind:
+  primary_parent_snapshot` identifies the editable local copy for non-fresh
+  candidates; `kind: generated` means a fresh writer-owned implementation.
 
 If the brief is missing, has the wrong `run_id`, lacks `idea`, or has no complete
 `semantic_point` / `policy_receipt`, stop and report that the upstream pipeline
@@ -94,14 +101,17 @@ Decide what to do from the file system, in this order:
    return the verdict with `wrote: false`. Never "improve" it. An existing file
    without that helper receipt is an invalid upstream collision; block rather
    than guessing.
-2. **No parents → write from scratch.** This is a `fresh` candidate: implement
+2. **Primary-parent snapshot → edit the existing copy.** Require
+   `source_run_ids[0]`, `primary_parent`, and `implementation_source` to agree,
+   and require `<target_candidate_dir>/train.py` to exist. Preserve the parent's
+   working strategy and tuner structure, then implement only the requested
+   semantic delta. This existing file is expected, not an upstream collision.
+   For crossover, consult secondary parents as references without replacing the
+   primary snapshot wholesale.
+3. **No parents → write from scratch.** This is a `fresh` candidate: implement
    the complete idea at its selected semantic point directly against the APIs
    exposed by `prepare.py`. Keep it runnable and within constraints; do not
    silently replace a selected mechanism with a simpler point.
-3. **Otherwise → write with references.** Read every derived
-   `source_train_paths`. Use the first (the primary parent) as the structural
-   reference and implement the idea on top of it; borrow from the others only
-   where the idea calls for it.
 
 ## What You Do
 
@@ -160,8 +170,9 @@ confidence:           <high | medium | low>
 
 Rules for fields:
 
-- `wrote` is `false` only in write-mode 1 (the file already existed and was left
-  untouched).
+- `wrote` is `false` only in write-mode 1 (the provided entrypoint already
+  existed and was left untouched). Editing a primary-parent snapshot is
+  `wrote: true`.
 - `status: blocked` is only for a missing/invalid input or a scope conflict. In
   that case keep `risk_flags` to one concise blocker.
 - `risk_flags` should call out things to watch when running: `slow_fit`,

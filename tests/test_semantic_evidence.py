@@ -10,20 +10,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from got_graph import render_incremental  # noqa: E402
+import ledger as ledger_tools  # noqa: E402
 from semantic_evidence import (  # noqa: E402
+    DIRECT_COMPARATOR_CAPABILITY,
     SemanticEvidenceError,
+    _json_sha256,
     build_semantic_edges,
     comparator_coverage,
     edge_index,
     edge_observation,
     experience_cited_ids,
+    mechanical_gain_direction,
     render_target_evidence,
     target_evaluation_state,
+    validate_parameter_transfer_binding,
+    validate_parameter_transfer_evidence,
+    validate_lineage_snapshots,
     validate_semantic_edges,
 )
 from semantic_space import complete_point, space_revision  # noqa: E402
-from tests.p2_fixtures import belief_ledger  # noqa: E402
-from validate_background import fixture_registry  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    attach_matched_transfer,
+    belief_ledger,
+    fixture_registry,
+)
 
 
 def _append(
@@ -46,6 +56,9 @@ def _append(
     }
     record["semantic_edges"] = build_semantic_edges(records, record)
     records.append(record)
+    if parents and status in {"keep", "discard"} and score is not None:
+        parent = next(item for item in records[:-1] if item["run_id"] == parents[0])
+        attach_matched_transfer(parent, record)
     return record
 
 
@@ -349,34 +362,24 @@ class SemanticEdgeObservationTests(unittest.TestCase):
     def test_edge_observation_reports_terminal_delta(self) -> None:
         registry = fixture_registry()
         ledger = belief_ledger(registry)
+        first = edge_observation(ledger, "sedge-000-001")
+        self.assertEqual(first["score_basis"], "paired_semantic_control")
+        self.assertEqual(first["parent_score"], 0.4)
+        self.assertEqual(first["child_score"], 0.5)
+        self.assertEqual(first["semantic_delta"], 0.1)
+        self.assertEqual(first["tuning_delta"], 0.0)
+        self.assertEqual(first["total_delta"], 0.1)
         self.assertEqual(
-            edge_observation(ledger, "sedge-000-001"),
-            {
-                "edge_id": "sedge-000-001",
-                "change_class": "single_dimension",
-                "parent_run_id": "000",
-                "child_run_id": "001",
-                "parent_status": "keep",
-                "child_status": "discard",
-                "parent_score": 0.4,
-                "child_score": 0.5,
-                "delta": 0.1,
-            },
+            first["parameter_transfer_receipt_sha256"],
+            ledger["records"][1]["parameter_transfer"]["receipt"][
+                "receipt_sha256"
+            ],
         )
-        self.assertEqual(
-            edge_observation(ledger, "sedge-002-003"),
-            {
-                "edge_id": "sedge-002-003",
-                "change_class": "single_dimension",
-                "parent_run_id": "002",
-                "child_run_id": "003",
-                "parent_status": "keep",
-                "child_status": "discard",
-                "parent_score": 0.41,
-                "child_score": 0.52,
-                "delta": 0.11,
-            },
-        )
+        second = edge_observation(ledger, "sedge-002-003")
+        self.assertEqual(second["score_basis"], "paired_semantic_control")
+        self.assertEqual(second["parent_score"], 0.41)
+        self.assertEqual(second["child_score"], 0.52)
+        self.assertEqual(second["delta"], 0.11)
         self.assertEqual(edge_observation(ledger, "sedge-000-999"), {})
 
     def test_edge_observation_nulls_crash_delta(self) -> None:
@@ -399,7 +402,53 @@ class SemanticEdgeObservationTests(unittest.TestCase):
                 "parent_score": 0.4,
                 "child_score": None,
                 "delta": None,
+                "score_basis": "independently_tuned_final",
             },
+        )
+
+    def test_legacy_single_dimension_edge_is_confounded(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        _append(
+            records,
+            "000",
+            [],
+            baseline,
+            status="keep",
+            score=0.40,
+            dag_revision=1,
+        )
+        child = {
+            "run_id": "001",
+            "source_run_ids": ["000"],
+            "semantic_point": filtered,
+            "status": "discard",
+            "final_best_score": 0.50,
+            "dag_revision": 2,
+        }
+        child["semantic_edges"] = build_semantic_edges(records, child)
+        records.append(child)
+        ledger = {"records": records}
+        self.assertEqual(
+            comparator_coverage(
+                ledger,
+                ["sedge-000-001"],
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+            ),
+            {
+                "direct_noncrash_edges": 0,
+                "confounded_noncrash_edges": 1,
+                "crash_edges": 0,
+            },
+        )
+        self.assertEqual(
+            edge_observation(ledger, "sedge-000-001")["score_basis"],
+            "independently_tuned_final",
         )
 
     def test_comparator_coverage_counts_only_cited_touching_receipts(self) -> None:
@@ -447,6 +496,359 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             ),
             {"direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
+
+    def test_gain_direction_uses_repeated_control_scores_not_final_tuning(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        _append(
+            records,
+            "000",
+            [],
+            baseline,
+            status="keep",
+            score=0.40,
+            dag_revision=1,
+        )
+        _append(
+            records,
+            "001",
+            ["000"],
+            filtered,
+            status="keep",
+            score=0.30,
+            dag_revision=2,
+        )
+        _append(
+            records,
+            "002",
+            [],
+            baseline,
+            status="keep",
+            score=0.41,
+            dag_revision=3,
+        )
+        _append(
+            records,
+            "003",
+            ["002"],
+            filtered,
+            status="keep",
+            score=0.31,
+            dag_revision=4,
+        )
+        ledger = {"records": records}
+        edges = ["sedge-000-001", "sedge-002-003"]
+        self.assertEqual(
+            mechanical_gain_direction(
+                ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_edge_ids=edges,
+            ),
+            "positive",
+        )
+
+        # A later tuning win belongs to the inner loop; it cannot rewrite the
+        # fixed semantic-control deltas or their direction.
+        records[1]["final_best_score"] = 0.10
+        records[3]["final_best_score"] = 0.60
+        self.assertEqual(
+            mechanical_gain_direction(
+                ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_edge_ids=edges,
+            ),
+            "positive",
+        )
+        self.assertEqual(
+            edge_observation(ledger, edges[1])["semantic_delta"],
+            -0.1,
+        )
+        self.assertEqual(
+            edge_observation(ledger, edges[1])["tuning_delta"],
+            0.29,
+        )
+
+    def test_reset_or_tampered_transfer_is_never_a_direct_comparator(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        parent = _append(
+            records,
+            "000",
+            [],
+            baseline,
+            status="keep",
+            score=0.40,
+            dag_revision=1,
+        )
+        child = {
+            "run_id": "001",
+            "source_run_ids": ["000"],
+            "semantic_point": filtered,
+            "status": "discard",
+            "final_best_score": 0.50,
+            "dag_revision": 2,
+        }
+        child["semantic_edges"] = build_semantic_edges(records, child)
+        records.append(child)
+        attach_matched_transfer(parent, child, reset=True)
+        ledger = {"records": records}
+        edge_ids = ["sedge-000-001"]
+        self.assertEqual(validate_parameter_transfer_evidence(child), [])
+        self.assertEqual(
+            comparator_coverage(
+                ledger,
+                edge_ids,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+            )["confounded_noncrash_edges"],
+            1,
+        )
+
+        attach_matched_transfer(parent, child)
+        child["parameter_transfer"]["warm_start_observations"][0]["params"][
+            "shared"
+        ] = 9.0
+        self.assertTrue(validate_parameter_transfer_evidence(child))
+        self.assertEqual(
+            comparator_coverage(
+                ledger,
+                edge_ids,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+            )["direct_noncrash_edges"],
+            0,
+        )
+
+    def test_rehashed_parent_claim_must_match_durable_ledger_snapshot(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        parent = _append(
+            records,
+            "000",
+            [],
+            baseline,
+            status="keep",
+            score=0.40,
+            dag_revision=1,
+        )
+        child = _append(
+            records,
+            "001",
+            ["000"],
+            filtered,
+            status="discard",
+            score=0.50,
+            dag_revision=2,
+        )
+        ledger = {"records": records}
+        self.assertEqual(validate_parameter_transfer_binding(ledger, child), [])
+
+        forged = copy.deepcopy(child)
+        transfer = forged["parameter_transfer"]
+        receipt = transfer["receipt"]
+        receipt["primary_parent"]["incumbent_score"] = 0.10
+        receipt["primary_parent"]["ledger_record_sha256"] = "sha256:" + "f" * 64
+        unhashed = dict(receipt)
+        unhashed.pop("receipt_sha256")
+        receipt["receipt_sha256"] = _json_sha256(unhashed)
+        transfer["inherited_control"]["parent_incumbent_score"] = 0.10
+        transfer["inherited_control"]["receipt_sha256"] = receipt["receipt_sha256"]
+        for observation in transfer["warm_start_observations"]:
+            observation[
+                "parameter_transfer_receipt_sha256"
+            ] = receipt["receipt_sha256"]
+
+        # The forged receipt is internally complete and self-hashed, but it
+        # cannot become semantic evidence because its parent snapshot is false.
+        self.assertEqual(validate_parameter_transfer_evidence(forged), [])
+        binding_errors = validate_parameter_transfer_binding(
+            {"records": [parent, forged]}, forged
+        )
+        self.assertTrue(
+            any("durable lineage snapshot" in error for error in binding_errors),
+            binding_errors,
+        )
+        self.assertEqual(
+            comparator_coverage(
+                {"records": [parent, forged]},
+                ["sedge-000-001"],
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+            )["direct_noncrash_edges"],
+            0,
+        )
+
+    def test_snapshotted_parent_revision_survives_later_tuning(self) -> None:
+        registry = fixture_registry()
+        ledger = belief_ledger(registry)
+        parent = ledger["records"][0]
+        child = ledger["records"][1]
+        self.assertEqual(validate_parameter_transfer_binding(ledger, child), [])
+
+        ledger_tools._capture_transfer_parent_snapshot(ledger, child)
+        old_record_hash = child["parameter_transfer"]["receipt"][
+            "primary_parent"
+        ]["ledger_record_sha256"]
+        parent["final_best_score"] = 0.35
+        parent["applied_incumbent"]["score"] = 0.35
+
+        self.assertNotEqual(_json_sha256(parent), old_record_hash)
+        self.assertEqual(validate_lineage_snapshots(ledger), [])
+        self.assertEqual(validate_parameter_transfer_binding(ledger, child), [])
+
+    def test_unpaired_parent_parameter_control_is_uncertainty_only(self) -> None:
+        registry = fixture_registry()
+        ledger = belief_ledger(registry)
+        child = ledger["records"][1]
+        transfer = child["parameter_transfer"]
+        receipt = transfer["receipt"]
+        receipt["semantic_control"] = {
+            "status": "unverified",
+            "reason": "no_same_child_code_control_treatment_pair",
+        }
+        transfer["warm_start_observations"] = [
+            transfer["warm_start_observations"][0]
+        ]
+        unhashed = dict(receipt)
+        unhashed.pop("receipt_sha256")
+        receipt["receipt_sha256"] = _json_sha256(unhashed)
+        transfer["inherited_control"]["receipt_sha256"] = receipt["receipt_sha256"]
+        transfer["warm_start_observations"][0][
+            "parameter_transfer_receipt_sha256"
+        ] = receipt["receipt_sha256"]
+
+        self.assertEqual(validate_parameter_transfer_binding(ledger, child), [])
+        coverage = comparator_coverage(
+            ledger,
+            ["sedge-000-001"],
+            target_kind="hypothesis",
+            target_id="hyp-data-filtered",
+        )
+        self.assertEqual(coverage["direct_noncrash_edges"], 0)
+        self.assertEqual(coverage["confounded_noncrash_edges"], 1)
+
+    def test_production_capability_gate_keeps_synthetic_pairs_confounded(
+        self,
+    ) -> None:
+        registry = fixture_registry()
+        ledger = belief_ledger(registry)
+        ledger["direct_comparator_capability"] = dict(
+            DIRECT_COMPARATOR_CAPABILITY
+        )
+        edge_ids = ["sedge-000-001", "sedge-002-003"]
+
+        coverage = comparator_coverage(
+            ledger,
+            edge_ids,
+            target_kind="hypothesis",
+            target_id="hyp-data-filtered",
+        )
+
+        self.assertEqual(coverage["direct_noncrash_edges"], 0)
+        self.assertEqual(coverage["confounded_noncrash_edges"], 2)
+        self.assertEqual(
+            target_evaluation_state(
+                ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_run_ids=["000", "001", "002", "003"],
+                evidence_edge_ids=edge_ids,
+            ),
+            "observed",
+        )
+        self.assertEqual(
+            mechanical_gain_direction(
+                ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_edge_ids=edge_ids,
+            ),
+            "none",
+        )
+        self.assertEqual(
+            render_target_evidence(
+                registry,
+                ledger,
+                target_ids=["hyp-data-filtered"],
+            )["direct_comparator_capability"],
+            DIRECT_COMPARATOR_CAPABILITY,
+        )
+
+    def test_rehashed_parent_params_cannot_replace_applied_snapshot(self) -> None:
+        registry = fixture_registry()
+        ledger = belief_ledger(registry)
+        child = copy.deepcopy(ledger["records"][1])
+        transfer = child["parameter_transfer"]
+        receipt = transfer["receipt"]
+        primary = receipt["primary_parent"]
+        projection = receipt["projection"]
+        semantic_control = receipt["semantic_control"]
+        primary["incumbent_params"] = {"shared": 999.0}
+        primary["incumbent_params_sha256"] = _json_sha256(
+            primary["incumbent_params"]
+        )
+        projection["params"] = {"shared": 999.0}
+        projection["params_sha256"] = _json_sha256(projection["params"])
+        projection["copied"] = [{"key": "shared", "value": 999.0}]
+        treatment = {"shared": 1000.0}
+        semantic_control["control_params_sha256"] = projection["params_sha256"]
+        semantic_control["treatment_params_sha256"] = _json_sha256(treatment)
+        observations = transfer["warm_start_observations"]
+        observations[0]["params"] = projection["params"]
+        observations[0]["params_sha256"] = projection["params_sha256"]
+        observations[1]["params"] = treatment
+        observations[1]["params_sha256"] = semantic_control[
+            "treatment_params_sha256"
+        ]
+        transfer["inherited_control"]["params_sha256"] = projection[
+            "params_sha256"
+        ]
+        unhashed = dict(receipt)
+        unhashed.pop("receipt_sha256")
+        receipt["receipt_sha256"] = _json_sha256(unhashed)
+        transfer["inherited_control"]["receipt_sha256"] = receipt["receipt_sha256"]
+        for observation in observations:
+            observation[
+                "parameter_transfer_receipt_sha256"
+            ] = receipt["receipt_sha256"]
+
+        forged_ledger = {"records": [ledger["records"][0], child]}
+        self.assertEqual(validate_parameter_transfer_evidence(child), [])
+        errors = validate_parameter_transfer_binding(forged_ledger, child)
+        self.assertTrue(
+            any("incumbent_params" in error for error in errors),
+            errors,
+        )
+
+    def test_legacy_policy_cannot_gain_direct_comparator_status(self) -> None:
+        registry = fixture_registry()
+        for version in (4, 5):
+            with self.subTest(version=version):
+                ledger = belief_ledger(registry)
+                child = ledger["records"][1]
+                child["policy_receipt"]["schema_version"] = version
+                coverage = comparator_coverage(
+                    ledger,
+                    ["sedge-000-001"],
+                    target_kind="hypothesis",
+                    target_id="hyp-data-filtered",
+                )
+                self.assertEqual(coverage["direct_noncrash_edges"], 0)
+                self.assertEqual(coverage["confounded_noncrash_edges"], 1)
 
     def test_pending_edge_is_not_noncrash_comparator_coverage(self) -> None:
         registry = fixture_registry()
@@ -622,7 +1024,7 @@ class TargetEvidenceViewTests(unittest.TestCase):
         self.assertNotIn(("002", "003"), graph_edges)
 
         view = render_target_evidence(registry, ledger, target_ids=["hyp-data-filtered"])
-        self.assertEqual(view["schema_version"], 1)
+        self.assertEqual(view["schema_version"], 2)
         self.assertEqual(view["space_revision"], space_revision(registry))
         self.assertEqual(view["dag_revision"], 10)
         self.assertEqual(view["experience_dag_revision"], 9)

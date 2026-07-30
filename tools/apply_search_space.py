@@ -31,7 +31,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tuners"))
-from tune_tools import valid_space_entry  # noqa: E402  (pure stdlib helper)
+from tune_tools import (  # noqa: E402  (pure stdlib helpers)
+    _read_param_schema,
+    _space_schema_mismatch,
+    valid_space_entry,
+)
 
 
 def _line_starts(source: str) -> list[int]:
@@ -44,17 +48,8 @@ def _line_starts(source: str) -> list[int]:
 
 def _find_search_space(tree: ast.Module):
     """Return the ast.Dict value node of the module-level SEARCH_SPACE, or None."""
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-        else:
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name) and target.id == "SEARCH_SPACE":
-                return node.value
-    return None
+    assignment = _find_assignment(tree, "SEARCH_SPACE")
+    return assignment.value if assignment is not None else None
 
 
 def _as_entry(value):
@@ -73,16 +68,35 @@ def _format_space(space: dict, key_order: list[str]) -> str:
 
 
 def _find_assignment(tree: ast.Module, name: str):
-    """Return the module-level Assign/AnnAssign *node* for `name = ...`, or None."""
+    """Return the unique module-level assignment for ``name``, or None."""
+    matches = []
     for node in tree.body:
         if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == name:
-                    return node
+            bound_names = {
+                child.id
+                for target in node.targets
+                for child in ast.walk(target)
+                if isinstance(child, ast.Name)
+            }
+            if name in bound_names:
+                if (
+                    len(node.targets) != 1
+                    or not isinstance(node.targets[0], ast.Name)
+                    or node.targets[0].id != name
+                ):
+                    raise SystemExit(
+                        f"{name} must use one simple module-level assignment target"
+                    )
+                matches.append(node)
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and node.target.id == name:
-                return node
-    return None
+                matches.append(node)
+    if len(matches) > 1:
+        raise SystemExit(
+            f"{name} must have exactly one module-level assignment; found "
+            f"{len(matches)} at lines {[node.lineno for node in matches]}"
+        )
+    return matches[0] if matches else None
 
 
 def _insertion_anchor(tree: ast.Module):
@@ -101,9 +115,32 @@ def _insertion_anchor(tree: ast.Module):
 
 
 def apply(candidate_path: Path, space: dict) -> dict:
-    bad = [k for k, v in space.items() if not valid_space_entry(_as_entry(v))]
+    if not isinstance(space, dict):
+        raise SystemExit("SEARCH_SPACE input must be an object")
+    bad = [
+        key
+        for key, value in space.items()
+        if not valid_space_entry(
+            _as_entry(value)
+            if isinstance(value, (tuple, list))
+            else value
+        )
+    ]
     if bad:
         raise SystemExit(f"invalid SEARCH_SPACE entries for keys: {sorted(bad)}")
+    schema = _read_param_schema(candidate_path)
+    if set(schema) != set(space):
+        raise SystemExit(
+            f"key mismatch vs PARAM_SCHEMA: schema {sorted(schema)}, "
+            f"space {sorted(space)}"
+        )
+    mismatches = {
+        key: _space_schema_mismatch(schema[key], _as_entry(space[key]))
+        for key in schema
+    }
+    mismatches = {key: reason for key, reason in mismatches.items() if reason}
+    if mismatches:
+        raise SystemExit(f"SEARCH_SPACE disagrees with PARAM_SCHEMA: {mismatches}")
 
     source = candidate_path.read_text()
     tree = ast.parse(source)
@@ -152,7 +189,9 @@ def apply(candidate_path: Path, space: dict) -> dict:
         mode = "created"
 
     ast.parse(new_source)  # guarantee the result still parses before writing
-    candidate_path.write_text(new_source)
+    tmp_path = candidate_path.with_suffix(candidate_path.suffix + ".tmp")
+    tmp_path.write_text(new_source)
+    tmp_path.replace(candidate_path)
     return {"applied": True, "mode": mode, "keys": sorted(space),
             "candidate_path": str(candidate_path)}
 

@@ -66,6 +66,9 @@ def summarize(data: dict, records: list[dict], threshold: Optional[float] = None
     scored = [r for r in records if _is_num(r.get("final_best_score")) and r.get("status") != "crash"]
     tuned = [r for r in records if r.get("tune")]
     crashes = [r for r in records if r.get("status") == "crash"]
+    # Admitted after the objective budget was already exhausted: no score, and
+    # no evidence about the semantic point either way.
+    unevaluated = [r for r in records if r.get("status") == "unevaluated"]
     best = min(scored, key=lambda r: r["final_best_score"]) if scored else None
 
     # Eval budget counts every score_fn call, including failures. Keep the
@@ -151,6 +154,7 @@ def summarize(data: dict, records: list[dict], threshold: Optional[float] = None
         "op_counts": dict(op_counts),
         "status_counts": dict(status_counts),
         "n_crashes": len(crashes),
+        "n_unevaluated": len(unevaluated),
         "n_hpo": len(tuned),
         "hpo_methods": dict(method_counts),
         "n_hpo_improved": improved,
@@ -189,6 +193,8 @@ def print_report(s: dict) -> None:
     p(f"  by op:               {s['op_counts']}")
     p(f"  by status:           {s['status_counts']}")
     p(f"  crashes:             {s['n_crashes']}")
+    if s.get("n_unevaluated"):
+        p(f"  unevaluated:         {s['n_unevaluated']}  (admitted, never scored)")
     p(f"  keeps by op:         {s['op_keep_counts']}")
     p(f"\ndeep-tuning (HPO):     {s['n_hpo']} candidates tuned")
     p(f"  methods:             {s['hpo_methods']}")
@@ -208,19 +214,36 @@ def print_report(s: dict) -> None:
     for t in s["tuned_detail"]:
         bw = f"{t['best_warm_score']:.4f}" if _is_num(t["best_warm_score"]) else "—"
         fb = f"{t['final_best_score']:.4f}" if _is_num(t["final_best_score"]) else "—"
-        p(f"  {t['run_id']} {str(t['candidate_name'])[:34]:34s} {t['method']:5s}"
-          f" {t['n_dims']:>3}d  warm={bw} final={fb} improved={t['improved']}")
+        # A finalized candidate legitimately has no Phase-C method: a failed
+        # final stage, a fixed space (no_search_needed), or a fully rejected
+        # method chain all close to the proven warm incumbent with method null.
+        method = t["method"] if isinstance(t["method"], str) else "—"
+        n_dims = f"{t['n_dims']:>3}" if _is_num(t["n_dims"]) else "  —"
+        p(f"  {t['run_id']} {str(t['candidate_name'])[:34]:34s} {method:5s}"
+          f" {n_dims}d  warm={bw} final={fb} improved={t['improved']}")
     p("\nper-candidate:")
-    p(f"  {'id':>3} {'op':>9} {'parents':>10} {'score':>9} {'stat':>7} {'hpo':>4}  name")
+    p(f"  {'id':>3} {'op':>9} {'parents':>10} {'score':>9} {'stat':>11} {'hpo':>4}  name")
     for r in s["records"]:
         sc = f"{r['final_best_score']:.4f}" if _is_num(r["final_best_score"]) else "—"
         par = ",".join(_numeric_parents(r)) or "·"
         p(f"  {str(r['run_id']):>3} {str(r['op']):>9} {par:>10} {sc:>9}"
-          f" {str(r['status']):>7} {'★' if r['tune'] else ' ':>4}  {r['candidate_name']}")
+          f" {str(r['status']):>11} {'★' if r['tune'] else ' ':>4}  {r['candidate_name']}")
     p("")
 
 
-_STATUS_FILL = {"keep": "#bfe3b6", "discard": "#e8e8e8", "crash": "#f3b6b6", "pending": "#fff2b6"}
+_STATUS_FILL = {
+    "keep": "#bfe3b6",
+    "discard": "#e8e8e8",
+    "crash": "#f3b6b6",
+    "pending": "#fff2b6",
+    # Admitted but never given an objective slot: no score and no failure.
+    "unevaluated": "#dcd6ef",
+}
+
+# Statuses that legitimately carry no score. A crash scored +inf; an
+# unevaluated record was never run at all. Rendering both as "crash" would
+# collapse two different pieces of evidence into one.
+_NO_SCORE_LABEL = {"crash": "crash", "unevaluated": "unevaluated"}
 
 
 def write_dot(records: list[dict], path: Path) -> None:
@@ -230,8 +253,13 @@ def write_dot(records: list[dict], path: Path) -> None:
     for r in records:
         rid = r.get("run_id")
         fb = r.get("final_best_score")
-        sc = f"{fb:.4f}" if _is_num(fb) and r.get("status") != "crash" else "crash"
-        fill = _STATUS_FILL.get(r.get("status"), "#ffffff")
+        status = r.get("status")
+        sc = (
+            f"{fb:.4f}"
+            if _is_num(fb) and status != "crash"
+            else _NO_SCORE_LABEL.get(status, "crash")
+        )
+        fill = _STATUS_FILL.get(status, "#ffffff")
         is_best = _is_num(fb) and best_v is not None and abs(fb - best_v) < 1e-12 and r.get("status") != "crash"
         attrs = [f'fillcolor="{fill}"', f'label="{rid}\\n{r.get("candidate_name","")}\\n{sc}"']
         if r.get("tune"):
@@ -266,11 +294,13 @@ def render_png(records: list[dict], path: Path) -> bool:
     scored = [r for r in records if _is_num(r.get("final_best_score")) and r.get("status") != "crash"]
     ymin = min(r["final_best_score"] for r in scored) if scored else -1.0
     ymax = max(r["final_best_score"] for r in scored) if scored else 0.0
-    crash_y = ymax + 0.02 * (ymax - ymin + 1e-9) + 0.005
+    # One "no score" row above the scored range, shared by crashes and
+    # unevaluated records. Marker and colour keep the two distinguishable.
+    no_score_y = ymax + 0.02 * (ymax - ymin + 1e-9) + 0.005
     for r in records:
         x = int(r["run_id"])
         y = r.get("final_best_score")
-        y = y if (_is_num(y) and r.get("status") != "crash") else crash_y
+        y = y if (_is_num(y) and r.get("status") != "crash") else no_score_y
         pos[r["run_id"]] = (x, y)
 
     # lineage edges (parent -> child)
@@ -294,13 +324,27 @@ def render_png(records: list[dict], path: Path) -> bool:
     if fx:
         ax.step(fx, fy, where="post", color="#d4a017", lw=1.6, alpha=0.9, label="running best", zorder=1)
 
-    colors = {"keep": "#3a9d23", "discard": "#9a9a9a", "crash": "#cc3333", "pending": "#caa800"}
+    colors = {
+        "keep": "#3a9d23",
+        "discard": "#9a9a9a",
+        "crash": "#cc3333",
+        "pending": "#caa800",
+        "unevaluated": "#8d7fc0",
+    }
     best_v = min((r["final_best_score"] for r in scored), default=None)
     for r in records:
         x, y = pos[r["run_id"]]
         st = r.get("status")
+        if st == "crash":
+            marker = "X"
+        elif st == "unevaluated":
+            marker = "P"
+        elif not _numeric_parents(r):
+            marker = "s"
+        else:
+            marker = "o"
         ax.scatter([x], [y], s=130, c=colors.get(st, "#444"),
-                   marker="X" if st == "crash" else ("s" if not _numeric_parents(r) else "o"),
+                   marker=marker,
                    edgecolors="black", linewidths=0.6, zorder=3)
         if r.get("tune"):  # HPO'd: ring
             ax.scatter([x], [y], s=320, facecolors="none", edgecolors="#1f4ed8", linewidths=2.0, zorder=2)
@@ -316,6 +360,7 @@ def render_png(records: list[dict], path: Path) -> bool:
         Line2D([0], [0], marker="o", color="w", markerfacecolor="#3a9d23", markeredgecolor="k", markersize=10, label="keep"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="#9a9a9a", markeredgecolor="k", markersize=10, label="discard"),
         Line2D([0], [0], marker="X", color="w", markerfacecolor="#cc3333", markeredgecolor="k", markersize=10, label="crash"),
+        Line2D([0], [0], marker="P", color="w", markerfacecolor="#8d7fc0", markeredgecolor="k", markersize=10, label="unevaluated"),
         Line2D([0], [0], marker="s", color="w", markerfacecolor="#9a9a9a", markeredgecolor="k", markersize=10, label="fresh (root)"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="none", markeredgecolor="#1f4ed8", markersize=14, markeredgewidth=2, label="HPO'd (deep-tuned)"),
         Line2D([0], [0], marker="*", color="w", markerfacecolor="#ffd400", markeredgecolor="k", markersize=16, label="best"),

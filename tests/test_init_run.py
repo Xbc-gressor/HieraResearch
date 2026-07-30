@@ -150,6 +150,135 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(config["max_evaluations"], 37)
             self.assertEqual(config["per_runtime_limit"], 12.5)
 
+    def test_llm_intelligence_score_is_persisted_without_clobbering_section(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+
+            run_dir = initialize_run(
+                repo_root,
+                "toy",
+                "intelligence",
+                llm_intelligence_score=72.5,
+            )
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            semantic_search = config["semantic_search"]
+            self.assertEqual(semantic_search["llm_intelligence_score"], 72.5)
+            self.assertEqual(
+                semantic_search["policy"],
+                "gain_uncertainty_nocost",
+            )
+            self.assertEqual(semantic_search["uncertainty_weight"], 0.5)
+
+    def test_llm_intelligence_score_can_change_before_semantic_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+            run_dir = initialize_run(
+                repo_root,
+                "toy",
+                "intelligence-unfrozen",
+                llm_intelligence_score=25,
+            )
+
+            initialize_run(
+                repo_root,
+                "toy",
+                "intelligence-unfrozen",
+                llm_intelligence_score=80,
+            )
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(
+                config["semantic_search"]["llm_intelligence_score"],
+                80,
+            )
+
+    def test_llm_intelligence_score_is_frozen_with_semantic_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+            run_dir = initialize_run(
+                repo_root,
+                "toy",
+                "intelligence-frozen",
+                llm_intelligence_score=60,
+            )
+            (run_dir / "ledger.json").write_text("{}")
+
+            initialize_run(
+                repo_root,
+                "toy",
+                "intelligence-frozen",
+                llm_intelligence_score=60,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "cannot change llm intelligence score",
+            ):
+                initialize_run(
+                    repo_root,
+                    "toy",
+                    "intelligence-frozen",
+                    llm_intelligence_score=61,
+                )
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(
+                config["semantic_search"]["llm_intelligence_score"],
+                60,
+            )
+
+    def test_llm_intelligence_score_must_be_finite_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+
+            for index, value in enumerate((-0.1, 100.1, float("nan"), float("inf"))):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"finite number in \[0, 100\]",
+                    ):
+                        initialize_run(
+                            repo_root,
+                            "toy",
+                            f"bad-intelligence-{index}",
+                            llm_intelligence_score=value,
+                        )
+
+            low = initialize_run(
+                repo_root,
+                "toy",
+                "intelligence-low",
+                llm_intelligence_score=0,
+            )
+            high = initialize_run(
+                repo_root,
+                "toy",
+                "intelligence-high",
+                llm_intelligence_score=100,
+            )
+            self.assertEqual(
+                json.loads((low / "framework_cfg.json").read_text())[
+                    "semantic_search"
+                ]["llm_intelligence_score"],
+                0,
+            )
+            self.assertEqual(
+                json.loads((high / "framework_cfg.json").read_text())[
+                    "semantic_search"
+                ]["llm_intelligence_score"],
+                100,
+            )
+
     def test_run_limits_can_change_when_resuming(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

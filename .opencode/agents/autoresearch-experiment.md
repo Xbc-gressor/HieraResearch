@@ -95,8 +95,8 @@ Before setup actions, read the target task's `TASK.md`, `task.toml`, `prepare.py
 and provided `train.py`. OpenCode already injects this prompt and repository
 `AGENTS.md`; do not reread them. The task contract and configuration are
 authoritative for environment, preparation, editable files, dependency
-permission, timeout, and metric details. `program.md` is not required for this
-dedicated agent.
+permission, timeout, and metric details. This prompt carries the run protocol;
+no separate protocol document is required.
 
 Use progressive disclosure after setup:
 
@@ -119,6 +119,7 @@ Initialize or resume the run first:
 ```bash
 python tools/init_run.py <task_name> <tag> \
   [--dimension-strategy <catalog_subset|llm_induced>] \
+  [--llm-intelligence-score <0..100>] \
   [--max-evaluations <count>] [--timeout <seconds>]
 ```
 
@@ -126,8 +127,8 @@ Pass every control supplied by the caller. The helper creates the run directory
 and copies `tasks/framework_cfg.example.json` to
 `<run_dir>/framework_cfg.json`, then persists explicit controls there so they
 cannot be shadowed by template values. On resume, evaluation budget and timeout
-may change; the dimension strategy may not change after semantic artifacts
-exist.
+may change; the dimension strategy and LLM intelligence score may not change
+after semantic artifacts exist.
 
 For a new run:
 
@@ -181,7 +182,7 @@ After background validation and before the experiment loop, inspect `[seed]` in
 `train.py`), that file is the run's observed control:
 
 1. On an empty run, build only the complete all-baselines point and its ordinary
-   schema-4 coverage receipt:
+   schema-6 coverage receipt:
 
    ```bash
    python tools/semantic_search.py propose \
@@ -260,8 +261,10 @@ reached, including mid-round and mid-tuner. Failed admitted score calls count;
 preflight attempts/rejections do not. `ledger.py brief` reconciles that strict
 log with backward-readable record aggregates.
 
-If a configured budget is exhausted, persist normal completion and return the
-compact status:
+If a configured budget is exhausted, do not admit or evaluate more candidates.
+At a quiescent boundary, first perform the final belief refresh in step 1 when
+the brief reports `experience_refresh_required: true`; then persist normal
+completion and return the compact status:
 
 ```bash
 python tools/ledger.py set-phase --ledger <run_dir>/ledger.json \
@@ -273,13 +276,14 @@ it disagrees with the brief.
 
 ### 1. Refresh bounded belief at a refresh boundary
 
-After the first completed record and then every five rounds, a scheduled
-refresh may run only at a refresh boundary: every record from the prior
-generation is terminal, the decoupled tuning step for that round has returned
-or no-op'd, and no idea-generator, candidate-writer, experience-extractor, or
-tuner child is active. Skip it on empty or non-refresh rounds. A newer
-`ledger.dag_revision` than `experience.dag_revision` is a normal pending delta,
-not a reason for an unscheduled refresh.
+After the first completed record, and thereafter after every completed
+non-empty round, refresh whenever `ledger.py brief` reports
+`experience_refresh_required: true`. A refresh may run only at a refresh
+boundary: every record from the prior generation is terminal, the decoupled
+tuning step for that round has returned or no-op'd, and no idea-generator,
+candidate-writer, experience-extractor, or tuner child is active. A false
+refresh flag is the only normal no-op; do not defer a terminal DAG delta across
+another semantic admission.
 
 Only at that boundary, spawn `experience-extractor` with the run directory. It
 regenerates the bounded two-level belief snapshot from the DAG delta, fixed
@@ -315,8 +319,9 @@ without an intervening extractor. Treat its receipt as the authority for each
 silently drop an action. Never create a candidate directory or spawn candidate
 implementation for a `run_id` whose record is not yet admitted to the ledger.
 `got_select decide` caps returned actions by
-`floor(remaining_objective_slots / K_eval)`; an empty action list is valid and
-leaves the remaining slots for deep tuning.
+`floor(remaining_objective_slots / max(2, K_eval))`; generated non-fresh
+candidates need one fidelity-control call plus at least one selectable row. An
+empty action list is valid and leaves the remaining slots for deep tuning.
 
 For each returned action, in order:
 
@@ -334,11 +339,12 @@ For each returned action, in order:
 3. Spawn `tunable-contract-extractor` with the candidate path and numeric
    parents. It owns step 0+1: tunable contract, warm configurations, no-score
    preflight, eval-K, inline crash diagnosis, `BASE_PARAMS`, and ledger recording. A valid receipt
-   ends in keep, discard, or crash and states that the ledger was updated. There
-   is no coordinator evaluation afterward. The sole exception is an exit-4
-   receipt with zero prior objective attempts: when the strict cap is reached,
-   leave that record `pending` as explicitly unevaluated and complete the
-   budget-bound run; do not fabricate a score or convert it to a crash.
+   ends in keep, discard, crash, or helper-resolved unevaluated and states that
+   the ledger was updated. There is no coordinator evaluation afterward. On
+   exit 4 with zero candidate objective attempts, require the extractor to call
+   `ledger.py resolve-unevaluated`; never leave a budget-bound record pending,
+   fabricate a score, or convert it to a crash. Refresh the resulting DAG delta
+   before persisting completion.
 
 Resolve every candidate recorded by this generation. Recheck the budget before
 deep tuning; if it is exhausted, return to step 0 without spawning the tuner.
@@ -353,6 +359,9 @@ a valid no-op.
 When tuning occurs, require a consistent receipt, an applied Phase C result,
 and `tune: true` plus concrete tuning fields in the ledger. The tuner owns score
 and parameter updates; the coordinator does not rerun the candidate.
+An interrupted/nonterminal Phase C is also a valid no-op receipt only when it
+reports `ledger_updated: false` and the ledger still has `tune: false`; never
+promote partial trials or repair the tuning close in the coordinator.
 
 Return to step 0. Discards, crashes, weak ideas, and stagnation are search
 evidence, not reasons to exit. Keep every record; graph selection, rather than

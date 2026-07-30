@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -17,11 +18,16 @@ import evaluation_budget  # noqa: E402
 import preflight_env  # noqa: E402
 import run_cfg  # noqa: E402
 import _common  # noqa: E402
+import warmstart_eval  # noqa: E402
 from _common import timed_eval, timed_preflight  # noqa: E402
 from warmstart_eval import (  # noqa: E402
     select_warm_config_indices,
     validate_provided_baseline_configs,
 )
+
+
+def _plain_make_model(*args, **kwargs):
+    return None
 
 
 def _run_dir(root: Path, *, budget: int) -> tuple[Path, Path]:
@@ -91,6 +97,34 @@ class EvaluationBudgetTests(unittest.TestCase):
                 {"warm_config_selection": selection},
             )
 
+    def test_schema4_selection_always_includes_and_replays_control_zero(self) -> None:
+        for seed in range(20):
+            selection = select_warm_config_indices(
+                7,
+                3,
+                {},
+                seed=seed,
+                mandatory_indices=(0,),
+            )
+            self.assertEqual(selection["schema_version"], 2)
+            self.assertEqual(
+                selection["method"],
+                "mandatory_then_uniform_without_replacement",
+            )
+            self.assertEqual(selection["mandatory_indices"], [0])
+            self.assertEqual(selection["selected_indices"][0], 0)
+            self.assertNotIn(0, selection["deferred_indices"])
+            self.assertEqual(
+                select_warm_config_indices(
+                    7,
+                    3,
+                    {"warm_config_selection": selection},
+                    seed=seed + 100,
+                    mandatory_indices=(0,),
+                ),
+                selection,
+            )
+
     def test_provided_baseline_allows_only_its_exact_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             candidate = Path(tmp) / "candidate" / "train.py"
@@ -154,9 +188,69 @@ class EvaluationBudgetTests(unittest.TestCase):
                 2,
             )
 
+    def test_schema4_nonfresh_missing_transfer_fails_before_candidate_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "candidates" / "002" / "train.py"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text("# unchanged\n")
+            (candidate.parent / "_candidate_brief.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 4,
+                        "run_id": "002",
+                        "source_run_ids": ["001"],
+                        "primary_parent": {"schema_version": 1},
+                        "implementation_source": {
+                            "kind": "primary_parent_snapshot",
+                        },
+                    }
+                )
+            )
+            configs = candidate.parent / "_warm_configs.json"
+            configs.write_text(json.dumps([{"x": 1}]))
+            report = candidate.parent / "tune_report.json"
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs),
+                "--tune-report-json",
+                str(report),
+                "--k-eval",
+                "1",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    warmstart_eval.apply_base_params,
+                    "apply",
+                ) as apply_mock,
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                warmstart_eval.main()
+
+            self.assertEqual(raised.exception.code, 2)
+            apply_mock.assert_not_called()
+            self.assertEqual(candidate.read_text(), "# unchanged\n")
+
     def test_reservation_refuses_before_score_fn_at_hard_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir, candidate = _run_dir(Path(tmp), budget=2)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": 2,
+                        "tuner": {
+                            "deep_tune_budget_fraction": 1.0,
+                            "deep_tune_per_candidate_cap": 2,
+                        },
+                    }
+                )
+            )
             calls: list[dict] = []
 
             def score(_make_model, params):
@@ -166,7 +260,7 @@ class EvaluationBudgetTests(unittest.TestCase):
             self.assertEqual(
                 timed_eval(
                     score,
-                    object(),
+                    _plain_make_model,
                     {"x": 1},
                     candidate,
                     phase="phase_a",
@@ -177,7 +271,7 @@ class EvaluationBudgetTests(unittest.TestCase):
             self.assertEqual(
                 timed_eval(
                     score,
-                    object(),
+                    _plain_make_model,
                     {"x": 2},
                     candidate,
                     phase="phase_c",
@@ -188,7 +282,7 @@ class EvaluationBudgetTests(unittest.TestCase):
             with self.assertRaises(evaluation_budget.EvaluationBudgetExhausted):
                 timed_eval(
                     score,
-                    object(),
+                    _plain_make_model,
                     {"x": 3},
                     candidate,
                     phase="phase_c",
@@ -225,6 +319,171 @@ class EvaluationBudgetTests(unittest.TestCase):
                 [row["kind"] for row in rows],
                 ["baseline", "score_attempt", "score_attempt"],
             )
+
+    def test_deep_tune_total_and_per_candidate_caps_are_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = _run_dir(Path(tmp), budget=10)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": 10,
+                        "tuner": {
+                            "deep_tune_budget_fraction": 0.2,
+                            "deep_tune_per_candidate_cap": 1,
+                        },
+                    }
+                )
+            )
+            other = run_dir / "candidates" / "002" / "train.py"
+            other.parent.mkdir(parents=True)
+            other.write_text("# candidate\n")
+
+            evaluation_budget.reserve_evaluation(
+                candidate,
+                params={"x": 1},
+                phase="phase_c",
+                method="grid",
+            )
+            with self.assertRaises(
+                evaluation_budget.EvaluationBudgetExhausted
+            ) as candidate_cap:
+                evaluation_budget.reserve_evaluation(
+                    candidate,
+                    params={"x": 2},
+                    phase="phase_c",
+                    method="grid",
+                )
+            self.assertTrue(
+                candidate_cap.exception.scope.startswith("deep_tune_candidate")
+            )
+
+            evaluation_budget.reserve_evaluation(
+                other,
+                params={"x": 3},
+                phase="phase_c",
+                method="grid",
+            )
+            with self.assertRaises(
+                evaluation_budget.EvaluationBudgetExhausted
+            ) as total_cap:
+                evaluation_budget.reserve_evaluation(
+                    run_dir / "candidates" / "003" / "train.py",
+                    params={"x": 4},
+                    phase="phase_c",
+                    method="grid",
+                )
+            self.assertEqual(total_cap.exception.scope, "deep_tune_total")
+
+            status = evaluation_budget.budget_status(run_dir)
+            self.assertEqual(status["deep_tune"]["attempts"], 2)
+            self.assertEqual(status["deep_tune"]["remaining"], 0)
+
+    def test_deep_tune_fraction_uses_strict_floor_for_small_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = _run_dir(Path(tmp), budget=1)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": 1,
+                        "tuner": {
+                            "deep_tune_budget_fraction": 0.4,
+                            "deep_tune_per_candidate_cap": 1,
+                        },
+                    }
+                )
+            )
+
+            status = evaluation_budget.budget_status(run_dir)
+            self.assertEqual(status["deep_tune"]["total_cap"], 0)
+            with self.assertRaises(
+                evaluation_budget.EvaluationBudgetExhausted
+            ) as exhausted:
+                evaluation_budget.reserve_evaluation(
+                    candidate,
+                    params={"x": 1},
+                    phase="phase_c",
+                    method="grid",
+                )
+            self.assertEqual(exhausted.exception.scope, "deep_tune_total")
+            self.assertEqual(
+                evaluation_budget.budget_status(run_dir)["evaluations_done"],
+                0,
+            )
+
+    def test_zero_fraction_disables_phase_c_without_global_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = _run_dir(Path(tmp), budget=10)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "tuner": {
+                            "deep_tune_budget_fraction": 0,
+                            "deep_tune_per_candidate_cap": 1,
+                        }
+                    }
+                )
+            )
+
+            status = evaluation_budget.budget_status(run_dir)
+            self.assertIsNone(status["budget"])
+            self.assertEqual(status["deep_tune"]["total_cap"], 0)
+            with self.assertRaises(
+                evaluation_budget.EvaluationBudgetExhausted
+            ) as exhausted:
+                evaluation_budget.reserve_evaluation(
+                    candidate,
+                    params={"x": 1},
+                    phase="phase_c",
+                    method="grid",
+                )
+            self.assertEqual(exhausted.exception.scope, "deep_tune_total")
+
+    def test_legacy_reports_seed_phase_c_allocation_before_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = _run_dir(Path(tmp), budget=10)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": 10,
+                        "tuner": {
+                            "deep_tune_budget_fraction": 0.2,
+                            "deep_tune_per_candidate_cap": 5,
+                        },
+                    }
+                )
+            )
+            (candidate.parent / "tune_report.json").write_text(
+                json.dumps(
+                    {
+                        "phase_a": {"warm_start_configs": []},
+                        "phase_c": {
+                            "stages": [
+                                {
+                                    "method": "bo",
+                                    "trials": [
+                                        {"params": {"x": 1}, "score": 0.5},
+                                        {"params": {"x": 2}, "score": 0.4},
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+
+            status = evaluation_budget.budget_status(run_dir)
+            self.assertEqual(status["deep_tune"]["attempts"], 2)
+            self.assertEqual(status["deep_tune"]["remaining"], 0)
+            with self.assertRaises(
+                evaluation_budget.EvaluationBudgetExhausted
+            ) as exhausted:
+                evaluation_budget.reserve_evaluation(
+                    candidate,
+                    params={"x": 3},
+                    phase="phase_c",
+                    method="bo",
+                )
+            self.assertEqual(exhausted.exception.scope, "deep_tune_total")
 
     def test_corrupt_framework_cfg_fails_fast_instead_of_lifting_guards(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -334,6 +593,17 @@ class EvaluationBudgetTests(unittest.TestCase):
     def test_concurrent_reservations_cannot_overshoot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir, candidate = _run_dir(Path(tmp), budget=3)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": 3,
+                        "tuner": {
+                            "deep_tune_budget_fraction": 1.0,
+                            "deep_tune_per_candidate_cap": 3,
+                        },
+                    }
+                )
+            )
             script = (
                 "import sys\n"
                 f"sys.path.insert(0, {str(ROOT / 'tools')!r})\n"
@@ -508,7 +778,7 @@ def make_model(env, params):
             self.assertEqual(
                 timed_eval(
                     lambda _make_model, params: float(params["x"]),
-                    object(),
+                    _plain_make_model,
                     {"x": 2},
                     candidate,
                     phase="phase_a",

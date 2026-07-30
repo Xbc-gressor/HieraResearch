@@ -100,7 +100,9 @@ uv --project tasks/hard-interactions run python tools/tuners/warmstart_eval.py \
   --tune-report-json runs/hard-interactions/<tag>/candidates/<run_id>/tune_report.json
 ```
 
-Normally the experiment loop drives this through its agents; see `program.md`.
+Normally the experiment loop drives this through its agents
+(`tunable-contract-extractor` for step 0+1, `tuner-orchestrator` for the
+decoupled deep-tuning), not by hand.
 
 ## Scoring And Recording
 

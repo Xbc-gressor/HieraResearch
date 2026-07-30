@@ -14,15 +14,17 @@ color: pink
 
 You are the **decoupled tuning step** of the loop (design §15). Once per round you
 pick **one** candidate from the whole population and deep-tune it **in place**.
-Every idea was proposed and evaluated at step 0+1 only (warm-start best-of-K);
-step 2 — the expensive search — is not inline, it is your job, and you spend it on
-the single most promising untuned candidate. **One invocation = at most one
-candidate tuned** (often zero — a valid no-op).
+Every idea was proposed and evaluated at step 0+1 only (best selectable warm
+row); step 2 — the expensive search — is not inline, it is your job, and you
+spend it on the single most promising untuned candidate. **One invocation = at
+most one candidate tuned** (often zero — a valid no-op).
 
 **Warm-start is already done** — step 0 (`tunable-contract-extractor`) proposed K
 configs and step 1 (eval-K) evaluated them, writing each candidate's `phase_a`
 (warm trials + `best_warm_score`) into its `tune_report.json` and the ledger, and
-`BASE_PARAMS = best-of-K′`. You read that; you never re-evaluate warm configs.
+`BASE_PARAMS = best selectable warm row`; an inherited config-0 fidelity
+control remains an observation, never the incumbent. You read that; you never
+re-evaluate warm configs.
 All evaluation goes through the **one global `config → score` function** via the
 tuner scripts (Phase C search) — there is no separate official surface and no
 end-to-end `train.py` run.
@@ -44,8 +46,11 @@ The tuner scripts and `ledger.py` infer the **task** from these paths themselves
 (via `task.toml`), so you never pass a task name. Scores are **always
 lower-is-better** (minimize) — there is no direction flag. Override a method's
 trial cap by passing its own flag (e.g. `--n-trials 50`); the scripts have sane
-defaults. There is no time-budget early-stop — tuners stop only on patience (or
-CMA-ES's `es.stop()`), or on running out of their trial cap.
+defaults. Phase C is additionally bounded by deterministic allocation: at most
+`tuner.deep_tune_budget_fraction` of the global objective budget, at most
+`tuner.deep_tune_per_candidate_cap` attempts for one candidate, and
+`tuner.deep_tune_time_limit_seconds` cumulative wall-clock seconds. Atomic
+reservation and the search scripts enforce these limits.
 
 ## Pipeline
 
@@ -58,15 +63,20 @@ candidate:
 python tools/tuners/tune_tools.py select-candidate --ledger <run_dir>/ledger.json
 ```
 
-It prints `{run_id, reason, best_warm_score, percentile, n_candidates}`. This is
+It prints `{run_id, reason, best_warm_score, percentile, n_candidates,
+budget_allocation}`. This is
 the promotion gate **and** the greedy `best_warm_score` selection (design §15.4):
-eligible iff the population (non-crash, has `best_warm_score`) is ≥ `N_min` (10)
+eligible iff the population (non-crash, has `best_warm_score`) is ≥ `N_min`
+(derived as 5 for the default P=80)
 **and** the best untuned candidate ranks in the top (100−`P`)% (P = 80, i.e.
-top-20%). No headroom term — warm configs come from heterogeneous historical
+top-20%). A candidate with an unresolved primary descendant is temporarily
+ineligible, so tuning cannot race a child still building its inheritance
+binding. No headroom term — warm configs come from heterogeneous historical
 references, so their spread is not comparable across methods.
 
 - **`run_id` is `null`** → no candidate is eligible this round (early: below
-  `N_min`; or the top tier is already tuned). Emit the Output Format with
+  `N_min`; the top tier is already tuned; or untuned parents are temporarily
+  blocked by unresolved primary descendants). Emit the Output Format with
   `tuned_run_id: none` and `selection_reason` = the printed `reason`, then
   **stop**. This is a valid no-op — the loop keeps
   generating; tuning resumes when a new top-tier idea appears.
@@ -77,7 +87,7 @@ references, so their spread is not comparable across methods.
 | `run_id` | from select-candidate |
 | `candidate_dir` | `<run_dir>/candidates/<run_id>` |
 | `candidate_path` | `<candidate_dir>/train.py` |
-| `<candidate_dir>/tune_report.json` | already has `phase_a` (warm trials + `best_warm_score`) and `BASE_PARAMS = best-of-K′` |
+| `<candidate_dir>/tune_report.json` | already has `phase_a` (warm trials + `best_warm_score`) and `BASE_PARAMS = best selectable warm row` |
 
 There is **no Phase B** here — the percentile gate moved into `select-candidate`,
 which judges the whole population once, instead of gating each candidate
@@ -95,19 +105,30 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
 
 ### Phase C — Single-method search
 
-1. Choose the method deterministically — do **not** map `n_dims` by hand:
+1. Ask the deterministic state machine what to do — do **not** infer a method
+   or resume point from prose/stdout:
    ```
-   python tools/tuners/tune_tools.py select-method --candidate-path <candidate_path>
+   python tools/tuners/tune_tools.py phase-c-action \
+     --candidate-path <candidate_path> \
+     --tune-report-json <candidate_dir>/tune_report.json
    ```
-   Pure stdlib, **no uv env** — it counts the `SEARCH_SPACE` dict by AST. It
-   prints `{n_dims, method, fallback}` using the data-driven thresholds — grid ≤ 2
-   / **bo (multivariate TPE) for ≥ 3** (cmaes is fallback only) — and the rejection-fallback chain.
-2. The chosen method's search script takes these **default trial-cap args, which
+   Pure stdlib, **no uv env**. It validates Phase A, the candidate execution
+   revision, `SEARCH_SPACE`, `BASE_PARAMS`, and the existing Phase-C method
+   chain, then prints `{action, method, n_dims, method_chain, reason}`.
+   `action: stop` means return `tuned_run_id: none` with the printed reason;
+   `action: finalize` means skip directly to Finalize; `action: run` names the
+   only legal primary, interrupted-stage resume, or fallback method.
+2. The returned method's search script takes these **default trial-cap args, which
    you MAY override**:
    - `grid` → `--resolution 5 --max-trials 100 --patience 6`
    - `bo` → `--n-trials 40` + **adaptive patience** `min(20, max(12, round(1.5·n_dims)))` by default
      (benchmark-tuned; patience=6 suppressed HPO). `--patience N` forces a fixed value.
    - `cmaes` → `--popsize 8 --max-evals 64 --patience 20`
+
+   Clamp the chosen method's trial/eval cap to
+   `budget_allocation.trial_cap` from Phase S. The atomic reservation layer is
+   still authoritative because deferred configs are evaluated before the
+   optimizer's own nominal cap.
 
    All three stop early via the shared `PatienceMonitor`. Grid shuffles combos
    with `--seed`; CMA-ES also keeps its `es.stop()` σ-convergence. No direction
@@ -117,8 +138,13 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    initial mean — AND the **deferred** warm configs (`phase_a.deferred_configs`,
    proposed but not evaluated at step 0+1), which it evaluates FIRST — BO enqueues
    them, grid prepends them — then appends all its trials to
-   `phase_c.stages[0].trials`. Successful deferred evaluations contribute to
-   `trials_completed`; every deferred call contributes to `trials_attempted`):
+   the active `phase_c.stages[*].trials`. Successful deferred evaluations contribute to
+   `trials_completed`; every deferred call contributes to `trials_attempted`.
+   Before searching, each tuner may clamp the numeric search space to the
+   preflight-feasible region (`tune_report.json` → `search_space_clamp`);
+   deferred configs outside the clamped box are skipped — never attempted, no
+   budget, no patience effect — and accounted via
+   `deferred_skipped_outside_space` in the stage receipt):
    ```
    uv --directory <env.project> run python \
      <repo_root>/tools/tuners/<method>_search.py \
@@ -134,79 +160,57 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    evidence but do not reserve an objective slot. Immediately before `score_fn`,
    the tuner atomically reserves from the strict run cap; it cannot overshoot
    the configured budget.
-4. Parse the stdout JSON and branch on `status`:
-   - `rejected` — the method **could not run** (grid combos exceed max_trials, or
-     optuna/cma not installed); the search space is fine. Run the `fallback`
-     method from select-method (`grid`→`bo`, `cmaes`→`bo`). If the fallback also
-     rejects, finish with `applied: false` and the reason.
-   - `failed` — the method **ran but every trial errored** (the candidate's
-     `make_model` / evaluation crashes on configs inside its own `SEARCH_SPACE`).
-     Do **not** run the fallback. Proceed to the Apply step — `select-best` falls
-     back to the best warm-start config and `phase_c_method` lands `null`. Add a
-     risk note that the candidate crashes within its own search space.
-   - `budget_exhausted` — no objective slot remained and no new Phase-C score
-     was produced. Do not mark the candidate tuned or run a fallback; return
-     `tuned_run_id: none` with `selection_reason: evaluation_budget_reached`.
-   - `ok` — proceed to the Apply step normally.
+4. Parse the stdout JSON:
+   - **interrupted / nonzero exit / no single terminal JSON object** — the
+     search did not prove completion. Its already-written trials are partial
+     evidence only. Do not select or apply them and do not update the ledger.
+     Return `tuned_run_id: none`,
+     `selection_reason: phase_c_interrupted`, `ledger_updated: false`, and one
+     short risk naming the interruption. The candidate stays untuned and the
+     stage remains nonterminal (`running` or absent), so a later invocation's
+     `phase-c-action` can resume it.
+   - **one terminal JSON object** — run `phase-c-action` again against the
+     persisted report. Obey only its result: `action: run` runs the returned
+     deterministic fallback and repeats this step; `action: finalize` proceeds
+     to Finalize; `action: stop` returns `tuned_run_id: none` with the printed
+     reason. A `failed` terminal status finalizes to the proven warm incumbent
+     and should add a short crash risk; `time_exhausted` may finalize finite
+     trials produced before the deadline. Never hand-construct a fallback or
+     close decision from the search script's status.
 
-### Apply step
+### Finalize (apply + ledger close, in place — there is no re-run)
 
-Two deterministic tools — do **not** pick the best by eye or hand-edit
-`train.py`. Run them in order:
+Run exactly one deterministic close command:
 
-1. **Select the global best** across warm-start + every Phase C trial (all
-   minimized; no direction passed):
-   ```
-   python tools/tuners/tune_tools.py select-best \
-     --tune-report-json <candidate_dir>/tune_report.json
-   ```
-   It prints `{best_params, best_score, source}`. Write `best_params` to
-   `<candidate_dir>/_final_params.json`. `final_best_score = best_score` — the
-   tuned best; this **is** the candidate's new score (you record it below, no re-run).
-2. **Write into `BASE_PARAMS`** — an AST-located rewrite that cannot clobber
-   `SEARCH_SPACE` / `make_model`:
-   ```
-   python tools/apply_base_params.py \
-     --candidate-path <candidate_path> --params-json <candidate_dir>/_final_params.json
-   ```
-   It hard-rejects (nonzero exit, no partial write) if `BASE_PARAMS` is not a
-   pure literal dict or the keys don't match. Never hand-edit `train.py`. Delete
-   `<candidate_dir>/_final_params.json` afterward.
-3. Write the closing fields into `tune_report.json`:
-   ```json
-   "final_best_params": {...},
-   "final_best_score": <float>,
-   "applied_to_base_params": true
-   ```
-
-### Record to ledger (in place — there is no re-run)
-
-Tuning used the **same one global `config → score` function** as step 0+1, so the
-tuned best you just found **is** the candidate's new score — there is no separate
-official re-run. Write it with two commands (do not hand-count trials or
-transcribe any number):
 ```
-# 1. updated score + recomputed keep/discard status (record-run OWNS these).
-#    <tuned_best> = select-best's best_score (the value you wrote to _final_params.json).
-python tools/ledger.py record-run --ledger <run_dir>/ledger.json \
-  --run-id <run_id> --final-best-score <tuned_best>
-
-# 2. tuning metadata + mark the candidate deep-tuned (so select-candidate drops it).
-python tools/ledger.py set-tuning --ledger <run_dir>/ledger.json \
-  --run-id <run_id> --from-report <candidate_dir>/tune_report.json --mark-tuned
+python tools/finalize_tuning.py \
+  --candidate-path <candidate_path> \
+  --tune-report-json <candidate_dir>/tune_report.json \
+  --ledger <run_dir>/ledger.json \
+  --run-id <run_id>
 ```
-`record-run` updates `final_best_score` (the score the graph reads next round) +
-status; `set-tuning --mark-tuned` writes `phase_c_method`, `trials_completed`,
-`trials_attempted`, `preflight_attempts`, `preflight_failures`,
-`feasibility_rejections`, `elapsed_seconds`, `applied`, `warm_percentile` and
-sets `tune: true`. Both regenerate `loop_state.md`; take the Output Format
-values from these. Never hand-edit `ledger.json`.
+
+This command first proves that Phase A succeeded and every Phase-C stage is
+terminal, with the final stage `ok`, `failed`, `time_exhausted`, or
+`no_search_needed`, or with every method in the deterministic chain rejected.
+Only then does it select the
+global warm/Phase-C best, AST-rewrite `BASE_PARAMS`, close the report, and write
+the score, keep/discard status, tuning metadata, strict attempt count, and
+`tune: true` together through the ledger helper. It is idempotent and prints the
+receipt fields below.
+
+If it rejects the report, stop. Do not recover manually with `select-best`,
+`apply_base_params.py`, `record-run`, `set-tuning --mark-tuned`, or direct file
+edits. Return `tuned_run_id: none`, `selection_reason:
+phase_c_not_finalizable`, `ledger_updated: false`, and the concise rejection as
+the risk. A partial report must leave the candidate untuned.
 
 > `phase_b_decision` stays `null` (the gate is `select-candidate` / Phase S, not a
 > per-candidate Phase B). The tuned score is **never worse** than
-> `best_warm_score`: `select-best` ranks over warm + Phase C trials, so worst case
-> it returns the warm best and `apply` is a no-op — so no "keep the better"
-> bookkeeping is needed.
+> `best_warm_score`: finalization ranks the proven Phase-A incumbent together
+> with finite trials from a successful or time-bounded final Phase-C stage.
+> A failed final stage falls back to the warm best, so no "keep the better"
+> bookkeeping is needed and partial failed-stage rows cannot leak into `BASE_PARAMS`.
 
 ## Output Format (back to caller)
 
@@ -215,7 +219,7 @@ tuned_run_id:         <run_id | none>
 selection_reason:     <select-candidate's reason>
 phase_c_method:       grid | bo | cmaes | null
 best_warm_score:      <float | n/a>
-final_best_score:     <float | n/a>     # tuned best (= select-best); recorded in place, no re-run
+final_best_score:     <float | n/a>     # finalizer-approved best; recorded in place, no re-run
 trials_completed:     <int | 0>
 trials_attempted:     <int | 0>
 preflight_attempts:   <int | 0>
@@ -228,8 +232,8 @@ ledger_updated:       true | false
 risks:                <one short line; "none notable" allowed>
 ```
 
-All trial/preflight counts and `elapsed_seconds` come from the
-`set-tuning --from-report` output — do not recompute them. On a no-op
+All trial/preflight counts and `elapsed_seconds` come from the finalizer output
+— do not recompute them. On a no-op
 (`tuned_run_id: none`), the numeric fields are `n/a`/`0` and `applied` is
 `false`.
 
@@ -237,6 +241,9 @@ All trial/preflight counts and `elapsed_seconds` come from the
 
 - **One candidate per round, chosen by `select-candidate`.** Never override its
   choice, tune a candidate it did not pick, or tune a second one. `null` → no-op.
+  An ancestor remains eligible after child bindings are captured: its old
+  revision stays in `lineage_snapshots`, and future children inherit its newly
+  applied incumbent.
 - **No warm-start here.** You do not propose or evaluate warm configs and do not
   write `phase_a` — step 0/1 did. You read it.
 - **All evaluation goes through the tuner scripts** (the one global
@@ -244,13 +251,12 @@ All trial/preflight counts and `elapsed_seconds` come from the
   you tune through `make_model` + the search scripts only.
 - **Never edit `prepare.py`** or any file in `constraints.readonly_files`.
 - **Never edit `SEARCH_SPACE` or `make_model`.** Only `BASE_PARAMS` (via the
-  tool).
+  finalizer).
 - **Single-writer discipline.** The search scripts (subprocesses) write to
   `tune_report.json` while they run; you do not write to it during their
-  execution. You write `final_*` / `applied_*` only after the search script
-  returns. Never have two processes write at once.
-- **Cleanup.** Delete `<candidate_dir>/_final_params.json` after applying.
-  `_warm_configs.json` / `_search_space.json` belong to step 0/1 — leave them.
-  `tune_report.json` is durable output and stays.
+  execution. Only `finalize_tuning.py` writes the closing fields after a
+  terminal result. Never have two processes write at once.
+- **Cleanup.** `_warm_configs.json` / `_search_space.json` belong to step 0/1 —
+  leave them. `tune_report.json` is durable output and stays.
 - **Compact return.** Never paste trials, configs, reports, tracebacks, source,
   diffs, or command output; return only the receipt fields above.

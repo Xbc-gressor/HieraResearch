@@ -8,12 +8,14 @@ hyperparameters documented inline.
 Usage:
     python tools/init_run.py <task_name> <tag>
       [--dimension-strategy <strategy>]
+      [--llm-intelligence-score <score>]
       [--max-evaluations <count>]
       [--timeout <seconds>]
 
 Example:
     python tools/init_run.py tabular-model-search exp-20260630 \
       --dimension-strategy llm_induced \
+      --llm-intelligence-score 70 \
       --max-evaluations 200 \
       --timeout 60
 """
@@ -70,6 +72,7 @@ def initialize_run(
     tag: str,
     *,
     dimension_strategy: str | None = None,
+    llm_intelligence_score: float | None = None,
     max_evaluations: int | None = None,
     per_runtime_limit: float | None = None,
 ) -> Path:
@@ -112,6 +115,18 @@ def initialize_run(
             f"dimension strategy must be one of {sorted(DIMENSION_STRATEGIES)}"
         )
     if (
+        llm_intelligence_score is not None
+        and (
+            isinstance(llm_intelligence_score, bool)
+            or not isinstance(llm_intelligence_score, (int, float))
+            or not math.isfinite(float(llm_intelligence_score))
+            or not 0 <= float(llm_intelligence_score) <= 100
+        )
+    ):
+        raise ValueError(
+            "llm intelligence score must be a finite number in [0, 100]"
+        )
+    if (
         max_evaluations is not None
         and (
             not isinstance(max_evaluations, int)
@@ -133,6 +148,7 @@ def initialize_run(
 
     if (
         dimension_strategy is None
+        and llm_intelligence_score is None
         and max_evaluations is None
         and per_runtime_limit is None
     ):
@@ -167,6 +183,51 @@ def initialize_run(
             updates.append(f"dimension_strategy={dimension_strategy}")
         else:
             print(f"Dimension strategy already set to {dimension_strategy}.")
+
+    if llm_intelligence_score is not None:
+        section = config.get("semantic_search", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: semantic_search must be an object")
+        current = section.get("llm_intelligence_score")
+        if current is not None and (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or not 0 <= float(current) <= 100
+        ):
+            raise ValueError(
+                f"{target}: semantic_search.llm_intelligence_score must be "
+                "a finite number in [0, 100]"
+            )
+        normalized_score: int | float = llm_intelligence_score
+        if (
+            isinstance(normalized_score, float)
+            and normalized_score.is_integer()
+        ):
+            normalized_score = int(normalized_score)
+        existing_artifacts = [
+            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
+        ]
+        if (
+            (current is None or float(current) != float(normalized_score))
+            and existing_artifacts
+        ):
+            raise ValueError(
+                "cannot change llm intelligence score after semantic artifacts "
+                "exist: "
+                + ", ".join(existing_artifacts)
+            )
+        if current is None or float(current) != float(normalized_score):
+            config["semantic_search"] = {
+                **section,
+                "llm_intelligence_score": normalized_score,
+            }
+            updates.append(f"llm_intelligence_score={normalized_score}")
+        else:
+            print(
+                "LLM intelligence score already set to "
+                f"{normalized_score}."
+            )
 
     if max_evaluations is not None:
         config["max_evaluations"] = max_evaluations
@@ -203,6 +264,15 @@ def main() -> int:
         help="global experiment evaluation budget (must be positive)",
     )
     parser.add_argument(
+        "--llm-intelligence-score",
+        type=float,
+        metavar="SCORE",
+        help=(
+            "LLM intelligence score used by semantic prediction calibration "
+            "(finite number in [0, 100])"
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         "--per-runtime-limit",
         dest="per_runtime_limit",
@@ -217,6 +287,7 @@ def main() -> int:
             args.task_name,
             args.tag,
             dimension_strategy=args.dimension_strategy,
+            llm_intelligence_score=args.llm_intelligence_score,
             max_evaluations=args.max_evaluations,
             per_runtime_limit=args.per_runtime_limit,
         )

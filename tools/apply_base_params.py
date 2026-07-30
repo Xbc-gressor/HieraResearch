@@ -24,13 +24,10 @@ Guards (hard-reject with nonzero exit, never a partial write):
 - Key-match as described per mode.
 - The rewritten file must still parse (re-checked before writing).
 
-This tool intentionally does NOT bound-check the incoming values. A tuned best
-can land outside the current SEARCH_SPACE range (e.g. a warm-start config the
-LLM proposed beyond it that scored best) — that value is kept. The key-match
-guard keeps the contract's key set consistent; the range is reconciled by
-`check-search-space`, which widens SEARCH_SPACE to bracket the configs (so
-lint-contract's out-of-bounds check, still a hard error, is satisfied by
-construction, not by clamping the value).
+This tool bound-checks the incoming values against the unique literal
+SEARCH_SPACE. Warm proposals are widened first by `check-search-space`, so a
+valid best remains applicable without clamping; bypassing that reconciliation
+is a hard error rather than an internally inconsistent candidate.
 Inline comments *inside* the BASE_PARAMS literal are not preserved (only that
 block is written); surrounding code and comments are untouched.
 """
@@ -41,6 +38,15 @@ import argparse
 import ast
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tuners"))
+from tune_tools import (  # noqa: E402
+    _bounds_violations,
+    _read_param_schema,
+    _read_search_space,
+    _validate_schema_values,
+)
 
 
 def _line_starts(source: str) -> list[int]:
@@ -53,30 +59,40 @@ def _line_starts(source: str) -> list[int]:
 
 def _find_base_params(tree: ast.Module):
     """Return the ast.Dict value node of the module-level BASE_PARAMS, or None."""
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-        else:
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name) and target.id == "BASE_PARAMS":
-                return node.value
-    return None
+    assignment = _find_assignment(tree, "BASE_PARAMS")
+    return assignment.value if assignment is not None else None
 
 
 def _find_assignment(tree: ast.Module, name: str):
-    """Return the module-level Assign/AnnAssign *node* for `name = ...`, or None."""
+    """Return the unique module-level assignment for ``name``, or None."""
+    matches = []
     for node in tree.body:
         if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == name:
-                    return node
+            bound_names = {
+                child.id
+                for target in node.targets
+                for child in ast.walk(target)
+                if isinstance(child, ast.Name)
+            }
+            if name in bound_names:
+                if (
+                    len(node.targets) != 1
+                    or not isinstance(node.targets[0], ast.Name)
+                    or node.targets[0].id != name
+                ):
+                    raise SystemExit(
+                        f"{name} must use one simple module-level assignment target"
+                    )
+                matches.append(node)
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and node.target.id == name:
-                return node
-    return None
+                matches.append(node)
+    if len(matches) > 1:
+        raise SystemExit(
+            f"{name} must have exactly one module-level assignment; found "
+            f"{len(matches)} at lines {[node.lineno for node in matches]}"
+        )
+    return matches[0] if matches else None
 
 
 def _insertion_anchor(tree: ast.Module):
@@ -105,7 +121,29 @@ def _format_dict(params: dict, key_order: list[str]) -> str:
     return "\n".join(lines)
 
 
-def apply(candidate_path: Path, params: dict) -> dict:
+def render(candidate_path: Path, params: dict) -> tuple[str, dict]:
+    """Render the exact candidate source after applying ``params``.
+
+    This is the pure half of :func:`apply`.  The tuning finalizer uses it to
+    validate the complete prospective ledger record before mutating the
+    durable candidate or report.
+    """
+    search_space = _read_search_space(candidate_path)
+    try:
+        _validate_schema_values(
+            params,
+            _read_param_schema(candidate_path),
+            label="BASE_PARAMS",
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    violations = _bounds_violations(params, search_space)
+    if violations:
+        raise SystemExit(
+            "params violate SEARCH_SPACE: "
+            + json.dumps(violations, ensure_ascii=False)
+        )
+
     source = candidate_path.read_text()
     tree = ast.parse(source)
     starts = _line_starts(source)
@@ -152,9 +190,26 @@ def apply(candidate_path: Path, params: dict) -> dict:
         mode = "created"
 
     ast.parse(new_source)  # guarantee the result still parses before writing
-    candidate_path.write_text(new_source)
-    return {"applied": True, "mode": mode, "keys": sorted(params),
-            "candidate_path": str(candidate_path)}
+    return new_source, {
+        "applied": True,
+        "mode": mode,
+        "keys": sorted(params),
+        "candidate_path": str(candidate_path),
+    }
+
+
+def commit_rendered(candidate_path: Path, new_source: str, receipt: dict) -> dict:
+    """Atomically persist a source rendering already validated by ``render``."""
+    ast.parse(new_source)
+    tmp_path = candidate_path.with_suffix(candidate_path.suffix + ".tmp")
+    tmp_path.write_text(new_source)
+    tmp_path.replace(candidate_path)
+    return receipt
+
+
+def apply(candidate_path: Path, params: dict) -> dict:
+    new_source, receipt = render(candidate_path, params)
+    return commit_rendered(candidate_path, new_source, receipt)
 
 
 def main() -> int:

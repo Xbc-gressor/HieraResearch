@@ -100,20 +100,37 @@ Every enumerated point passes `validate_point` — admissibility under
 `semantic_search.py select` then applies a replaceable acquisition policy
 (`coverage`, `gain`, `gain_uncertainty`, `gain_uncertainty_nocost`) over
 fibers. For model-scored policies, `gain-context` pins the bounded experience
-generation and its cited terminal/semantic-edge observations. Prediction schema 2 separates
-the background/mechanism prior from signed experience adjustments for both
-gain and uncertainty; the helper verifies the arithmetic and requires a
-snapshot carrying cited evidence to affect at least one final number by 0.01
-or more. A valid snapshot whose bounded collections cite no run or edge stays
-revision-pinned but is prediction-empty: citations and adjustments are zero.
-Policy receipt schema 4 persists those inputs separately from `coverage` and
-`cost`, so the history update is auditable rather than implied by evidence prose. Before
+generation but exposes no generic prose, raw scores, or signed legacy deltas.
+Prediction schema 3 separates the background/mechanism prior from signed
+experience adjustments for gain and uncertainty. Exact-zero abstention is
+always valid. Weak/confounded evidence can only preserve or raise uncertainty;
+signed gain requires proposal-relevant, repeated, directionally consistent
+same-child-code semantic control/treatment pairs. An inherited
+parent-parameter control without that pair is uncertainty-only.
+Production ledgers currently carry
+`direct_comparator_capability.status: unavailable`, so this signed branch is
+explicitly dormant rather than inferred to exist from its downstream schema.
+`semantic_search.llm_intelligence_score` supplies a fixed pre-run heuristic
+reliability prior `w = score / 100`. For model-scored policies, `w` multiplies
+the complete LLM-authored gain/uncertainty/cost term; deterministic coverage
+is added without scaling, and raw forecasts are preserved. Thus `100` is exact
+legacy behavior and `0` leaves only the configured coverage term even though
+forecasts are still collected. The score is neither a calibrated probability
+nor normalized to a changing leaderboard. The first schema-6 admission freezes
+it for the run; selection and ledger validation reject later changes.
+
+Policy receipt schema 6 persists the exact
+helper-derived target, proposal relation, comparator coverage, evidence ids,
+acquisition role, gain direction, configured score, and applied weight
+separately from `coverage` and `cost`;
+the cited run/edge ids must be the complete union of the named target receipts,
+not a model-selected subset. Before
 acquisition, proposals are partitioned into active and deprioritized budget
 lanes. With interval `N` (default 5), every
 Nth one-based semantic admission selects within the deprioritized lane and
 all other admissions select within the active lane; acquisition scores never
 move a point across lanes. If a scheduled lane is empty, the other lane fills
-the slot and the schema-4 receipt records the fallback and both lanes.
+the slot and the schema-6 receipt records the fallback and both lanes.
 Hypotheses are coordinates, not consumable resources: one `hyp-*` may
 participate in many points.
 
@@ -132,6 +149,50 @@ codomains: `source_run_ids` (ancestry — which concrete candidates informed
 generation, valued in `X`) and `semantic_point` (attribution — `π(x)`,
 valued in `S`). `point_diff` reconstructs the semantic difference between a
 child and its parents mechanically; it makes no causal claim about scores.
+
+Non-fresh candidates also carry a `parameter_transfer` observation contract.
+The candidate begins from the first (primary) parent's exact code snapshot.
+The tuner pins only an applied Phase-A incumbent or a finalized-and-applied
+Phase-C incumbent, projects every compatible shared parameter exactly, records
+copied/reset/new/dropped keys, and evaluates that projection as mandatory warm
+config 0. Config 0 is retained as a fidelity observation and objective-budget
+event but excluded from `best_warm_params`, `best_warm_score`,
+`final_best_score`, and `BASE_PARAMS`, even if Phase C later duplicates its
+exact parameter vector; non-fresh screens therefore require at least one
+additional evaluated row (`K_eval >= 2`). The parent record also
+stores its exact applied params/schema and
+candidate/report hashes, so a child binds to durable parent state. The
+ledger captures that exact parent record in an append-only
+`lineage_snapshots` receipt. A parent cannot change while a primary child is
+still in flight or a scored child's binding is invalid. A terminal
+`crash`/`unevaluated` child with no transfer has no parent revision to preserve.
+Otherwise the parent may be tuned after the child's transfer is captured: old
+children continue to validate against their historical revision, while future
+children inherit the new applied incumbent. The
+inherited control preserves tuning quality but cannot isolate arbitrary child
+code changes: production schema-2 receipts stamp
+`semantic_control.status: unverified`. A single-dimension edge becomes direct
+only with a validated same-child-code control/treatment pair whose configs
+differ in exactly the declared semantic switch and have no shared-key reset.
+Its semantic delta is treatment minus control; later child tuning is a separate
+tuning delta. Legacy, unpaired, and final-vs-final edges remain confounded.
+Deep-tuning closure has one path, `finalize_tuning.py`, which renders and
+validates the exact prospective candidate/report/ledger state before changing
+any durable target. Before its first write the wrapper persists a small recovery
+journal: a retry restores the prior candidate/report bytes when the ledger did
+not commit, or keeps the consistent forward state when the ledger commit landed
+but later bookkeeping failed. The old `set-tuning --mark-tuned` path is disabled.
+Report-authored paired semantic controls are rejected because no deterministic
+paired evaluator exists yet. The ledger and bounded target-evidence view expose
+that fact through the helper-owned `direct_comparator_capability` receipt;
+runtime evidence therefore abstains rather than manufacturing a signed
+semantic delta.
+
+At a strict budget boundary, `ledger.py resolve-unevaluated` resolves a pending
+candidate with zero objective attempts. It proves global exhaustion and zero
+candidate attempts, stores a hashed `unevaluated_receipt`, and advances the
+lifecycle DAG cursor without creating score evidence. Final completion still
+waits for the resulting per-round experience refresh.
 
 ## Persisted edges are attribution deltas
 
@@ -186,7 +247,7 @@ are independent by construction.
 ## Bounded evidence and round-serial admission
 
 The extractor's belief inputs come from `background_contract.py
-target-evidence`, a deterministic scan over the persisted receipts that
+target-evidence` (view schema 2), a deterministic scan over the persisted receipts that
 returns, per target, exact cited edge ids, per-edge score/status observations,
 the mechanical `evaluation_state`, and cited comparator counts — never a
 reconstruction from the bounded Top/Bottom graph window. Belief claims are

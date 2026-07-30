@@ -13,16 +13,18 @@ color: cyan
 
 # Experience Extractor
 
-Regenerate the bounded `ledger.experience` belief snapshot every configured N
-rounds. Raw ledger records are the durable history. Your output is a replaceable
-interpretation of that history, not an edit to observations or the frozen
-search space.
+Regenerate the bounded `ledger.experience` belief snapshot after every completed
+non-empty round when the coordinator invokes you at a quiescent refresh
+boundary. Raw ledger records are the durable history. Your output is a
+replaceable interpretation of that history, not an edit to observations or the
+frozen search space.
 
-The snapshot is two-level: generic bounded beliefs (`summary`,
-`promising_regions`, `lessons`, `bottlenecks`) plus per-target
-`dimension_evidence` and `hypothesis_evidence` entries. A target entry only
-recommends a runtime status; the deterministic `apply-space-state` helper
-decides and appends the actual transitions.
+The snapshot is two-level: display-only generic interpretation (`summary`,
+`promising_regions`, `lessons`, `bottlenecks`) plus gated per-target
+`dimension_evidence` and `hypothesis_evidence` entries. Generic prose is never
+an acquisition input. A target entry only recommends a runtime status; the
+deterministic `apply-space-state` helper decides and appends the actual
+transitions.
 
 Candidates have two independent structures:
 
@@ -73,13 +75,28 @@ candidate code, raw retrieval material, or logs by default.
    `available_comparator_coverage` as if omitted edge ids had been cited. If a
    necessary target was omitted by the global caps, rerun with repeated
    `--target-id <exact-id>` before authoring its belief.
-4. Preserve useful prior generic beliefs unless new evidence changes them, and
-   emit bounded target entries. Add or revise only claims supported by concrete
+4. Preserve the prior belief payload byte-for-byte when the new DAG delta does
+   not change a supported belief. A processed delta may therefore be a belief
+   no-op: update `updated_at_run`, keep `generation` unchanged, and do not invent
+   a new summary sentence. Increment `generation` only when at least one
+   display or target belief actually changes. Add or revise only claims supported by concrete
    run ids or DAG edges in the current bounded evidence. Separate observation
    from interpretation — say “runs 004 and 007 at this point scored …” before
-   inferring a lever. Treat same-point comparisons as implementation evidence
-   and one-dimension point diffs as more attributable but still confounded;
-   record uncertainty instead of promoting membership into causal support.
+   inferring a lever. Treat same-point comparisons as implementation evidence.
+   A one-dimension point diff is a direct comparator only when
+   `target-evidence` finds a validated same-child-code control/treatment pair
+   differing only in its declared semantic switch, with a pinned parent
+   snapshot and no shared-key reset. The ordinary inherited config-0 control
+   fixes tuning quality but does not isolate the semantic code delta; its
+   schema-2 receipt says `semantic_control.status: unverified`, so it remains
+   confounded. The current production
+   `direct_comparator_capability.status` is `unavailable`, so no run-produced
+   edge may enter the direct branch yet. Legacy final-vs-final, reset-bearing,
+   unpaired, and independently tuned comparisons remain confounded.
+   Empty `summary` is a valid abstention. Never call a target `promising` or
+   `unpromising` unless its mechanical state is `comparator_covered` with at
+   least two direct non-crash edges; all weaker/confounded evidence is `mixed`
+   or `unknown`.
 5. Keep crash-only targets `failed`/`unknown`/`active`: scores are
    lower-is-better, a crash is worst and never a missing success, and a crash
    alone cannot contradict a semantic hypothesis.
@@ -99,7 +116,7 @@ exactly this shape; do not add undeclared evidence or status collections:
   "schema_version": 3,
   "updated_at_run": "<latest processed run id>",
   "generation": 0,
-  "summary": "<bounded current interpretation>",
+  "summary": "<display-only bounded interpretation, or empty string>",
   "promising_regions": [
     {
       "claim": "<what appears promising without causal overclaim>",
@@ -165,7 +182,12 @@ Recommendation gates are exact and identical for both target levels:
 - `pruned` requires `assessment: unpromising`, `confidence: high`,
   `evaluation_state: comparator_covered`, at least two direct non-crash edges,
   and a non-empty `reopen_when`.
-- High-confidence `promising` or `unpromising` requires `comparator_covered`.
+- Every `promising` or `unpromising` assessment requires
+  `comparator_covered` with at least two direct non-crash edges, regardless of
+  prose confidence.
+- A hypothesis `promising`/`unpromising` assessment must also agree with the
+  mechanical direction of all cited repeated pairs; mixed signs require
+  `assessment: mixed`.
 
 `unpromising` is a judgment about the low expected marginal value of spending
 another outer-search evaluation on the target, not a synonym for
@@ -183,14 +205,20 @@ An entry only recommends. The helper derives and validates the actual
 append-only `search_space_state` transitions under their own two-stage,
 baseline, and provenance rules. A later generation alone cannot advance
 `deprioritized -> pruned` or reopen a target: the later snapshot must cite a new
-target edge or a cited target edge whose recorded observation changed. A
+paired-control target edge or a corrected durable paired receipt. A crash,
+unpaired transfer, or later inner-tuning/final-score change is not new semantic
+evidence. A
 dimension can contract only when every selectable adjacent non-baseline
 hypothesis is already equivalently contracted or independently passes the same
 gate in that generation.
 
-`generation` increments the prior snapshot generation. `updated_at_run` is the
-latest terminal run actually processed. The helper owns `dag_revision` and adds
-it only after a validated snapshot is stored.
+`generation` increments only when the belief payload changes; a pure cursor
+advance keeps it unchanged. `updated_at_run` is the latest scored/crash
+terminal run actually processed; an evidence-neutral `unevaluated` budget
+tombstone advances only the helper DAG cursor. The helper owns `dag_revision`
+and adds it only after a
+validated snapshot is stored. `set-experience` rejects pending/no-delta calls,
+so do not invoke it outside the coordinator's deterministic refresh boundary.
 
 ## Validate and store
 
@@ -213,6 +241,7 @@ decision set is a valid no-op. Return only:
 ```text
 updated_at_run: <id>
 generation: <n>
+belief_changed: true | false
 evidence_runs: <count>
 search_space_state_revision: <n>
 decision_ids: <comma-separated ids, or none>

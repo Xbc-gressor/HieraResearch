@@ -87,12 +87,12 @@ Do not replace its parents with the current best and do not fold semantic
 acquisition into PUCB.
 
 The helper also applies the strict objective-admission cap:
-`floor(remaining_objective_slots / K_eval)`. It may therefore return
+`floor(remaining_objective_slots / max(2, K_eval))`. It may therefore return
 `actions: []` even when the graph policy had proposals. This is a valid
 budget-boundary no-op; persist no record and return exactly
 `generation_run_ids: none`, `selection_reason: objective_budget_admission_cap`,
-and `ledger: <run_dir>/ledger.json` so the coordinator may spend any
-sub-`K_eval` remainder on deep tuning.
+and `ledger: <run_dir>/ledger.json` so the coordinator may spend any remainder
+below that reservation on deep tuning.
 
 ## Step 2 — Build valid semantic proposals
 
@@ -141,6 +141,14 @@ Supported policies are:
   prediction—pre-implementation cost estimates are usually noise, so the
   schema omits the `cost` field entirely.
 
+`semantic_search.llm_intelligence_score` is a pre-run heuristic reliability
+prior in `[0,100]`. Continue to emit the raw rubric judgments below—never
+pre-scale them. The deterministic selector maps the score to
+`llm_judgment_weight = score / 100` and applies it to the complete LLM-authored
+gain/uncertainty/cost term while leaving deterministic coverage unscaled.
+This is not a calibrated probability or a leaderboard-relative percentile.
+The `coverage` policy ignores it.
+
 For `coverage`, select directly:
 
 ```bash
@@ -160,17 +168,22 @@ python tools/semantic_search.py gain-context \
 ```
 
 Read the bounded background render, action-local parent records, proposals,
-and `gain-context.json`. Write schema-2 `predictions.json` with one entry for
-every proposal:
+and schema-3 `gain-context.json`. Write schema-3 `predictions.json` with one
+entry for every proposal.
 
-`gain-context.json` is the sole bounded source for experience adjustments.
-Action-local parents are separate inputs to the background/mechanism prior;
-never treat an uncited parent as experience. Use live warm/final/tuning fields
-only for cited runs or endpoints of cited semantic edges.
+`gain-context.json` intentionally contains no experience summary, generic
+belief prose, raw candidate scores, or signed edge deltas. Its
+`conditioning_by_point[point_id]` entries are the sole experience inputs:
+helper-normalized, proposal-relevant target receipts. Each receipt names the
+mechanical `proposal_relation` (`selected_fresh`, `introduced`, `removed`,
+`changed_dimension`, or `ambiguous`); gain direction is already oriented to
+that move, so never invert or reinterpret it yourself. Action-local parents are
+separate inputs to the background/mechanism prior; never turn them into an
+experience adjustment.
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "proposal_set_revision": "<copy exactly>",
   "experience": {
     "generation": 3,
@@ -184,12 +197,13 @@ only for cited runs or endpoints of cited semantic edges.
       "experience_gain_adjustment": -0.08,
       "predicted_gain": 0.22,
       "prior_uncertainty": 0.40,
-      "experience_uncertainty_adjustment": 0.15,
-      "uncertainty": 0.55,
+      "experience_uncertainty_adjustment": 0.10,
+      "uncertainty": 0.50,
       "cost": 0.0,
+      "experience_target_ids": ["hyp-..."],
       "experience_run_ids": ["004", "011"],
       "experience_edge_ids": ["sedge-004-011"],
-      "experience_rationale": "Repeated implementation-sensitive outcomes reduce gain and raise uncertainty.",
+      "experience_rationale": "Repeated same-code semantic pairs reduce gain and raise uncertainty.",
       "evidence": ["hyp-... literature prior", "experience runs 004/011", "coverage gap"]
     }
   ]
@@ -209,30 +223,36 @@ Use a consistent `[0,1]` rubric:
 - `cost`: relative implementation, runtime, memory, and dependency burden —
   required for `gain` and `gain_uncertainty`; omit the field entirely for
   `gain_uncertainty_nocost` (its schema rejects a `cost` field);
-- `experience_run_ids` / `experience_edge_ids`: cite up to five terminal runs
-  and five semantic edges carried by the current experience; when the context
-  carries conditioning evidence, at least one run or edge is required and
-  `experience_rationale` briefly explains its numerical effect;
+- `experience_target_ids`: cite only targets present in this proposal's
+  `conditioning_by_point` block. `experience_run_ids` /
+  `experience_edge_ids` must equal the complete helper-derived union from
+  those exact target receipts—never cherry-pick a subset;
+  `experience_rationale` briefly explains the numerical effect or the decision
+  to abstain;
 - `evidence`: concrete hypothesis ids, parent/run ids, or bounded belief
   receipts. Use 1–5 short strings (at most 240 characters each).
 
-When the snapshot carries conditioning evidence, it must change at least one
-of gain or uncertainty for every proposal by at least `0.01`. Weak, indirect,
-or confounded history may justify the minimum adjustment, but must not be
-acknowledged without changing either number. Same-point implementation
-failures primarily raise uncertainty unless comparator-covered semantic edges
-support a gain revision. Use `tuned`, `warm_to_final_delta`, and
-`same_point_parent_run_ids` in cited records to distinguish tuning gains from
-semantic evidence; `warm_to_final_delta` is final minus warm, so a negative
-value is an inner-tuning improvement. Promising, mixed/unpromising,
-feasibility, and bottleneck beliefs must be interpreted according to their
-confidence and attribution limits; do not cherry-pick only the current best
-run.
+Exact-zero abstention is always valid, including when a relevant conditioning
+entry exists. Never manufacture a minimum update merely because evidence is
+present.
 
-When both `experience_evidence_run_ids` and `experience_evidence_edge_ids` in
-`gain-context.json` are empty, copy its exact experience receipt (which may
-still identify a valid snapshot), use empty per-prediction citation lists, and
-set both adjustments to exactly `0.0`; prior and final values are then equal.
+- `uncertainty_only` entries cannot change gain. They may preserve uncertainty
+  or increase it by at most `0.10`; they can never reduce uncertainty.
+- `comparator_gain` entries are backed by repeated same-child-code semantic
+  control/treatment pairs; inherited parameter controls alone are
+  uncertainty-only. The current production direct-comparator capability is
+  unavailable, so this role cannot appear until a future deterministic
+  evaluator changes that ledger gate.
+  A nonzero gain adjustment must follow their mechanical `gain_direction` and
+  has magnitude at most `0.15`. Conflicting directions require gain `0.0`.
+- A negative uncertainty adjustment requires comparator-gain evidence.
+- A proposal with an empty conditioning block, including a same-point improve,
+  must use empty target/run/edge citations and both adjustments exactly `0.0`.
+
+`prior_gain` and `prior_uncertainty` come only from the frozen background,
+proposal mechanism, and action-local parents. Do not fold the conditioning
+block into either prior; its only numeric route is the separately validated
+experience adjustments.
 
 These are auditable rubric estimates, not calibrated Bayesian posteriors. Run:
 
@@ -252,7 +272,8 @@ deprioritized lane, while all other admissions select only from the active
 lane. Acquisition scores rank proposals only within the scheduled lane; a high
 gain estimate cannot move a deprioritized proposal into an active slot. If the
 scheduled lane has no proposal, the other lane may fill the slot and the
-schema-4 policy receipt records the deterministic fallback, selection index,
+schema-6 policy receipt records the reliability prior and applied weight plus
+the deterministic fallback, selection index,
 scheduled/selected lanes, interval, and pre-lane base rank.
 
 `select` also checks that the proposal set's `search_space_state_revision`

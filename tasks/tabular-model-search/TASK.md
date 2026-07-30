@@ -57,8 +57,9 @@ Rules:
 
 ## Program Mapping
 
-This task follows the repository-level `program.md` protocol with these
-task-specific file roles:
+This task follows the repository-level experiment protocol (see
+`.claude/agents/autoresearch-experiment.md`) with these task-specific file
+roles:
 
 - Editable experiment surface: `runs/tabular-model-search/<tag>/candidates/<run_id>/train.py`
 - Fixed data split + the one `config → score` function: `prepare.py`
@@ -150,7 +151,7 @@ uv --project tasks/tabular-model-search run python tools/tuners/warmstart_eval.p
 
 Normally the experiment loop drives this through its agents
 (`tunable-contract-extractor` for step 0+1, `tuner-orchestrator` for the decoupled
-deep-tuning), not by hand; see `program.md`. Candidate files under `runs/` are
+deep-tuning), not by hand. Candidate files under `runs/` are
 intentionally outside git.
 
 ## Scoring And Recording
@@ -162,8 +163,11 @@ Phase C) and the score is written straight to `ledger.json` via `tools/ledger.py
 - `tunable-contract-extractor` (step 0+1) records the warm-start best as the
   candidate's `final_best_score` (= `best_warm_score`) with `ledger.py record-run`,
   and the warm metadata with `set-tuning` (no `--mark-tuned`).
-- `tuner-orchestrator`, if it selects the candidate, lowers `final_best_score` in
-  place with the tuned best (`record-run` + `set-tuning --mark-tuned`).
+- `tuner-orchestrator`, if it selects the candidate, calls
+  `tools/finalize_tuning.py`. The helper accepts only a terminal Phase-C report,
+  applies the global best, and updates `final_best_score`, status, tuning
+  metadata, and `tune: true` together. An interrupted search leaves all of
+  those downstream fields unchanged.
 
 The candidate's result lives in `runs/tabular-model-search/<tag>/ledger.json`
 (one record per run; see `.claude/rules/ledger.md`). `ledger.py record-run`

@@ -33,8 +33,8 @@ metric. It is the **simple baseline** to compare against `autoresearch-experimen
 (the GoT + decoupled-tuner framework) on the *same* task harness.
 
 It runs as the main thread (`opencode --agent autoresearch-hillclimb`), uses no
-`Task` tool, and spawns nothing. It does
-**not** need `program.md`.
+`Task` tool, and spawns nothing. This prompt plus the task contract are all it
+needs.
 
 ### Stay simple — that is the experiment
 

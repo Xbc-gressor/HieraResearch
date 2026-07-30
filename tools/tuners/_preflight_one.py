@@ -13,10 +13,17 @@ from _common import load_candidate_modules, resolve_preflight_fn  # noqa: E402
 def main() -> int:
     candidate_path = Path(sys.argv[1])
     params = json.loads(sys.argv[2])
-    train_module, prepare_module = load_candidate_modules(
-        candidate_path,
-        required_symbols=("make_model",),
-    )
+    expected_revision = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None
+    if expected_revision is None:
+        train_module, prepare_module = load_candidate_modules(
+            candidate_path,
+            required_symbols=("make_model",),
+        )
+    else:
+        train_module, prepare_module = load_candidate_modules(
+            candidate_path,
+            expected_execution_revision=expected_revision,
+        )
     preflight = resolve_preflight_fn(prepare_module, candidate_path)
     if preflight is None:
         print("PREFLIGHT:null")

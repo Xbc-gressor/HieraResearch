@@ -113,6 +113,27 @@ dimension. This makes the complete all-baselines point a faithful attribution
 for the concrete control without allowing one implementation to determine the
 space decomposition. Its scalar defaults remain inner-HPO settings.
 
+That attribution is enforced through `<run_dir>/baseline_mechanisms.json`, a
+schema-1 `baseline_mechanism_inventory` written alongside `background.md`: per
+resolved dimension, the mechanism tags the entrypoint actually applies plus
+`<file>:<line>` citations, and the entrypoint's sha256. Two checks then run in
+`background_contract.py`:
+
+- **Baseline completeness** (inventory supplied): a dimension's baseline
+  `scope.interventions` must contain every mechanism its inventory lists.
+- **Alternative disjointness** (always): a non-baseline hypothesis's
+  `scope.interventions` must not intersect any baseline's, in its own dimension
+  or another.
+
+The second check is the operative one; the first exists so an omitted baseline
+mechanism cannot hide a collision. A hypothesis proposing a mechanism the
+control already applies is not a contrast: candidates attributed to it
+re-implement the baseline, so their observations measure implementation noise
+while the ledger records a clean single-dimension edge, and the derived belief
+argues about a difference that does not exist. A variant that changes only the
+*placement* or *degree* of a baseline mechanism is a distinct mechanism tag and
+a distinct claim, not presence-versus-absence.
+
 Each hypothesis preserves:
 
 - stable id, title, claim, `status: active`, and provenance receipts;
@@ -243,18 +264,36 @@ For model-scored policies, each proposal receives separate `[0,1]` background
 priors for gain and uncertainty, signed experience adjustments, final
 `predicted_gain`/`uncertainty`, and `cost`, plus evidence strings
 (`gain_uncertainty_nocost` omits `cost`). `semantic_search.py gain-context`
-pins the exact bounded experience generation. Prediction schema 2 must cite
-terminal runs or semantic edges carried by that experience whenever such
-evidence exists, and must change gain or uncertainty by at least 0.01. A valid
-snapshot with no cited run or edge stays revision-pinned but requires empty
-citations and zero adjustments. The deterministic helper verifies that each
-final number equals its prior plus the signed adjustment.
+pins the exact bounded experience generation while excluding generic prose,
+raw scores, and signed legacy deltas. Prediction schema 3 cites exact
+proposal-relevant structured targets, with run/edge ids derived as the complete
+union of those target receipts rather than cherry-picked independently.
+Exact-zero abstention is always valid;
+weak/confounded evidence can only preserve or raise uncertainty, while
+nonzero gain must follow repeated same-child-code paired-control direction.
+Inherited parent-parameter controls without a verified semantic pair are
+confounded and may affect uncertainty only. Production ledgers currently
+declare `direct_comparator_capability.status: unavailable`, so the paired
+branch cannot fire until a deterministic evaluator replaces that gate. The
+deterministic helper verifies both arithmetic and evidence qualification.
 
 They remain auditable rubric estimates, not calibrated Bayesian posteriors.
-Policy receipt schema 4 preserves the prior, adjustment, final score,
-experience revision/run citations, `coverage`, weights, proposal-set digest,
-action, ranking, and evidence. These values stay in `policy_receipt`; they do
-not become observations or beliefs. Historical schema-2/3 receipts remain
+The run-local `llm_intelligence_score` is a fixed `[0,100]` heuristic
+reliability prior: `score / 100` scales the complete LLM-authored
+gain/uncertainty/cost contribution while deterministic coverage stays
+unscaled. Raw forecasts remain unchanged. A score of `100` preserves legacy
+selection exactly; `0` leaves only the configured coverage term even though
+forecasts are still collected. It is not normalized against a changing
+leaderboard and must not be described as a calibrated probability. The first
+schema-6 admission freezes it for the run; selection and ledger validation
+reject later changes.
+
+Policy receipt schema 6 preserves the prior, adjustment, final score,
+experience revision, exact target/proposal relation, comparator coverage,
+evidence ids, acquisition role/direction, `coverage`, configured intelligence
+score, applied judgment weight, other weights, proposal-set digest, action,
+ranking, and evidence. These values stay in `policy_receipt`; they do not
+become observations or beliefs. Historical schema-2/3/4/5 receipts remain
 readable.
 
 Runtime-deprioritized proposals occupy a separate, deterministic
@@ -263,7 +302,7 @@ every Nth one-based outer admission for that lane (default `N=5`, or 20%);
 ordinary slots select only active proposals. Acquisition scores rank within
 the scheduled lane and cannot buy a deprioritized point an active slot. When
 the scheduled lane is empty, the other lane fills the slot and policy receipt
-schema 4 records the selection index, interval, scheduled/selected lanes,
+schema 6 records the selection index, interval, scheduled/selected lanes,
 fallback reason, and the selected point's pre-lane acquisition rank.
 
 Run-local configuration lives under `framework_cfg.json.semantic_search`.
@@ -313,10 +352,11 @@ is two-stage (`active -> deprioritized`, then `deprioritized -> pruned` in a
 later experience generation with changed evidence for the same target), and
 every recommendation is gated on mechanically recomputed evidence:
 deprioritization and pruning both require `comparator_covered` with at least
-two direct non-crash edges; deprioritization requires med/high confidence and
-pruning requires high confidence. A later generation or unrelated DAG update
-alone cannot complete the second stage or reopen a target: a new cited target
-edge or changed observation on a cited target edge is required.
+two direct non-crash edges; deprioritization requires med/high confidence,
+pruning requires high confidence, and a hypothesis direction must agree across
+all cited pairs. A later generation, crash, unpaired transfer, or unrelated
+DAG update alone cannot complete the second stage or reopen a target: a new or
+corrected cited paired observation is required.
 
 `unpromising` means the expected marginal value of another outer-search
 evaluation is low after considering attribution, consistency across
@@ -355,17 +395,40 @@ python tools/background_contract.py target-evidence \
   --max-dimensions 16 --max-hypotheses 32 --max-edges-per-target 5
 ```
 
+View schema 2 adds the run's explicit direct-comparator capability receipt.
 For each target it returns the exact cited `evidence_edge_ids`, per-edge
 score/status observations, the mechanical `evaluation_state`, and the cited
 `comparator_coverage`, disclosing bounded-view loss through
 `available_comparator_coverage` and `omitted_edge_counts`. Repeated
 `--target-id` selects exact known targets for a smaller follow-up view.
 
-Admission is strictly round-serial: experience extraction and
-`apply-space-state` run only at quiescent round boundaries, and
-propose -> select -> `add-record` completes before any candidate
-implementation starts. No extractor overlaps an in-flight candidate action;
-concurrent admission is deferred until it has an explicit revision contract.
+“Direct” has a strict control meaning. A non-fresh candidate inherits the
+first parent's exact code snapshot, projects its pinned applied incumbent onto
+the child's compatible parameter schema, and must evaluate that projection at
+warm config 0. That row proves tuning continuity, not semantic isolation, and
+its normal receipt is therefore `semantic_control.status: unverified`. It also
+cannot become `best_warm_params`, `best_warm_score`, `final_best_score`, or
+`BASE_PARAMS`, including through a Phase-C duplicate; it remains only an
+observation and budget event, and non-fresh screening requires `K_eval >= 2`. A
+single-dimension edge is direct only when the receipt additionally contains a
+validated same-child-code control/treatment pair whose configs differ exactly
+in the declared semantic switch and have no shared-key reset. Its semantic
+delta is treatment minus control; the child's later tuned improvement is
+stored separately. Legacy final-vs-final, multi-dimension, reset-bearing,
+unpaired, and independently tuned comparisons remain confounded and cannot
+authorize signed gain or directional belief. The current runtime has no
+deterministic paired evaluator, so report-authored `paired` receipts are
+rejected and production observations remain `unverified`. The ledger and this
+view expose a helper-owned `direct_comparator_capability: unavailable` receipt;
+the paired contract is downstream semantics for a future helper-owned
+evaluator, not a prose escape hatch today.
+
+Admission is strictly round-serial: after every completed non-empty round,
+experience extraction and `apply-space-state` run at the next quiescent round
+boundary before another semantic admission, and propose -> select ->
+`add-record` completes before any candidate implementation starts. No extractor
+overlaps an in-flight candidate action; concurrent admission is deferred until
+it has an explicit revision contract.
 
 ## Evidence-aware background research
 
@@ -498,7 +561,8 @@ python tools/background_contract.py catalog \
 
 python tools/background_contract.py validate \
   --background <run_dir>/background.md \
-  --retrieval-manifest <run_dir>/background_retrieval.json
+  --retrieval-manifest <run_dir>/background_retrieval.json \
+  [--baseline-mechanisms <run_dir>/baseline_mechanisms.json]  # provided entrypoint
 
 python tools/background_contract.py preflight \
   --background <run_dir>/background.md [--ledger <run_dir>/ledger.json]

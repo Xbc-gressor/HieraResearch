@@ -76,6 +76,39 @@ def _implementation_source(path: Path | None) -> dict:
     }
 
 
+def _content_sha256(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _display_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def _primary_parent_receipt(
+    ledger_path: Path,
+    source_run_ids: list[str],
+    *,
+    entrypoint: str = DEFAULT_ENTRYPOINT,
+) -> dict | None:
+    """Pin the first numeric parent as the child's structural/tuning base."""
+    if not source_run_ids:
+        return None
+    parent_run_id = source_run_ids[0]
+    parent_train = ledger_path.parent / "candidates" / parent_run_id / entrypoint
+    if not parent_train.is_file():
+        return None
+    return {
+        "schema_version": 1,
+        "run_id": parent_run_id,
+        "path": _display_path(parent_train),
+        "sha256": _content_sha256(parent_train),
+    }
+
+
 def resolve_source_candidate(
     template: str,
     task_name: str,
@@ -97,6 +130,7 @@ def candidate_brief(
     run_id: str,
     *,
     implementation_source: dict | None = None,
+    entrypoint: str = DEFAULT_ENTRYPOINT,
 ) -> dict | None:
     """Return the immutable implementation fields for one persisted record."""
     if not ledger_path.is_file():
@@ -125,8 +159,15 @@ def candidate_brief(
                 or not isinstance(record.get("policy_receipt"), dict)
             ):
                 return None
+            primary_parent = _primary_parent_receipt(
+                ledger_path,
+                parents,
+                entrypoint=entrypoint,
+            )
+            if parents and primary_parent is None:
+                return None
             return {
-                "schema_version": 3,
+                "schema_version": 4,
                 "run_id": run_id,
                 "op": record.get("op"),
                 "idea": record.get("idea"),
@@ -135,8 +176,19 @@ def candidate_brief(
                 "semantic_point": record.get("semantic_point"),
                 "policy_receipt": record.get("policy_receipt"),
                 "candidate_name": record.get("candidate_name"),
+                "primary_parent": primary_parent,
                 "implementation_source": (
-                    implementation_source or _implementation_source(None)
+                    implementation_source
+                    or (
+                        {
+                            "kind": "primary_parent_snapshot",
+                            "parent_run_id": primary_parent["run_id"],
+                            "path": primary_parent["path"],
+                            "sha256": primary_parent["sha256"],
+                        }
+                        if primary_parent is not None
+                        else _implementation_source(None)
+                    )
                 ),
             }
     return None
@@ -155,9 +207,10 @@ def main() -> int:
         "--skip-entrypoint",
         action="store_true",
         help=(
-            "Do not copy the entrypoint; require its ledger record and write "
-            f"{BRIEF_FILENAME} for candidate-writer. Mutually exclusive with "
-            "--from-candidate."
+            "Require its ledger record and write the candidate-writer brief; "
+            "non-fresh candidates start from an exact primary-parent entrypoint "
+            "snapshot, while fresh candidates start without an entrypoint. "
+            "Mutually exclusive with --from-candidate."
         ),
     )
     parser.add_argument(
@@ -249,7 +302,12 @@ def main() -> int:
         candidate_brief(
             ledger_path,
             args.run_id,
-            implementation_source=_implementation_source(provided_entrypoint),
+            implementation_source=(
+                _implementation_source(provided_entrypoint)
+                if args.provided_baseline
+                else None
+            ),
+            entrypoint=entrypoint,
         )
         if needs_brief
         else None
@@ -293,6 +351,27 @@ def main() -> int:
     brief_path = dest / BRIEF_FILENAME
     if brief is not None and not args.dry_run:
         brief_path.write_text(json.dumps(brief, indent=2) + "\n")
+
+    # Normal non-fresh generation starts from an exact, helper-pinned snapshot
+    # of the primary parent.  candidate-writer edits this local copy in place;
+    # it no longer reconstructs a parent program from prose and references.
+    if (
+        args.skip_entrypoint
+        and brief is not None
+        and isinstance(brief.get("primary_parent"), dict)
+    ):
+        parent_path = Path(brief["primary_parent"]["path"])
+        if not parent_path.is_absolute():
+            parent_path = ROOT / parent_path
+        if not parent_path.is_file():
+            parser.error(f"missing primary-parent entrypoint: {parent_path}")
+        if _content_sha256(parent_path) != brief["primary_parent"]["sha256"]:
+            parser.error("primary-parent entrypoint changed while materializing candidate")
+        target = dest / entrypoint
+        if not args.dry_run:
+            if target.exists() and not args.force:
+                parser.error(f"target file already exists: {target}")
+            shutil.copy2(parent_path, target)
 
     entrypoint_path = dest / entrypoint
     task_project = config.get("env", {}).get("project", f"tasks/{args.task_name}")

@@ -155,14 +155,16 @@ trial sweep `K` per run with no code edits (mirrors how
 Over the `PARAM_SCHEMA` keys, propose together:
 
 **K warm configs** — `[{key: value, ...}]`, each key present, kinds respected.
-**Diversity matters more than raw quality** (they seed the deep-tuner's percentile,
-BO's priors, CMA-ES's mean). Cover distinct numeric regimes — for K=5: ① baseline
-(segment ①'s originals), ② capacity-up, ③ capacity-down, ④ rate/scale extreme,
-⑤ categorical pivot. **Scale the count to K**: K<5 → keep baseline + the most
-informative spread; K>5 → add finer variations around the promising (low-score)
-region. With only 2–3 keys, spread maximally instead. No duplicates; aim every
-config *low*, informed by lineage. List order has no screening priority:
-`warmstart_eval.py` samples the evaluated subset uniformly without replacement.
+For a non-fresh schema-4 candidate, config 0 initially contains child-local
+fallback values; the deterministic inheritance helper below replaces compatible
+keys with the primary parent's exact applied incumbent. The remaining configs
+provide diversity: for K=5, cover capacity-up, capacity-down, a rate/scale
+extreme, and a categorical pivot around the inherited control. **Scale the count
+to K**: K<5 → keep config 0 plus the most informative spread; K>5 → add finer
+variations around the promising region. With only 2–3 keys, spread maximally.
+No duplicates; aim every config *low*, informed by lineage. Index 0 has semantic
+meaning and is always evaluated; priority among the remaining configs is
+randomized.
 
 **A proposed `SEARCH_SPACE`** — one entry per key, **same kind** as the schema:
 `("float", lo, hi)` / `("float", lo, hi, "log")` / `("int", lo, hi)` /
@@ -198,6 +200,32 @@ Reconcile any mismatch **now** — usually align the configs/space to what
 value the schema legitimately declares. This front-loads the obvious catches so
 segment ③ has fewer runtime crashes to diagnose.
 
+### 2b-ter. Materialize primary-parent inheritance (non-fresh only)
+
+When `source_run_ids` is non-empty, run:
+
+```bash
+python tools/tuners/tune_tools.py build-inheritance \
+  --candidate-path <train_py> \
+  --configs-json <candidate_dir>/_warm_configs.json
+```
+
+This helper—not you—selects the authoritative parent state. It ignores partial
+Phase-C trials, accepts a deep-tuned incumbent only after finalization and
+application, projects `source_run_ids[0]` onto exactly compatible child keys,
+writes that projection at config 0, and persists `_parameter_transfer.json`
+with copied/reset/new/dropped fields and revision hashes. Do not hand-edit the
+inherited config 0 or its receipt. A failure is a contract/lineage blocker to
+fix, not permission to approximate the parent parameters.
+This control makes tuning state inheritable; it does not prove that the child
+code isolated one semantic mechanism. The helper therefore stamps
+`semantic_control.status: unverified`. Do not describe config 0 as causal
+semantic evidence or upgrade that status by hand.
+
+Re-run this command after every edit to `train.py`, `PARAM_SCHEMA`, or config
+materialization. `warmstart_eval.py` rejects a stale or missing receipt before
+`BASE_PARAMS`, import, preflight, or `score_fn`.
+
 ### 2c. Validate + expand (self-fix loop)
 
 ```bash
@@ -208,9 +236,10 @@ python tools/tuners/tune_tools.py check-search-space \
 
 - **exit 0** — it overwrote `_search_space.json` with the finalized (expanded)
   space; `expansions[]` says what it widened. Proceed to 2d.
-- **exit 1** — fix per `errors[]` (`kind_mismatch` / `missing_key` / `extra_key`
-  / `bad_tuple`; rarely a categorical config value outside the schema's options →
-  fix `_warm_configs.json`) and re-run until ok.
+- **exit 1** — fix per `errors[]` (`schema_mismatch` / `missing_key` /
+  `extra_key` / `bad_tuple` / `config_key_mismatch` /
+  `config_value_invalid`). A config value outside the schema is never added to
+  the search space—fix `_warm_configs.json` and re-run until ok.
 
 ### 2d. Write the finalized space into the candidate
 
@@ -229,14 +258,17 @@ Now you DO run the candidate (segments ①② did not). For tasks declaring
 isolated subprocess. It may construct and smoke-test the candidate but never
 calls `score_fn` or validation; only a passed config may reserve an objective
 slot and enter evaluation. You proposed **K** configs in
-②, but only a uniform sample of **`K_eval`** configs (without replacement) is
-evaluated now (best-of-`K_eval` = the screening score); the rest are **deferred**
+②. Schema-4 config 0 is always evaluated; the other **`K_eval - 1`** slots are
+sampled uniformly without replacement. For a non-fresh candidate config 0 is a
+fidelity observation, never an incumbent: the best of the other evaluated rows
+is the screening score. The rest are **deferred**
 (stored params-only, evaluated later by the deep-tuner only if this candidate is
 promoted). Diagnose + fix every crash in the sampled set inline, until they all
 score or you abandon.
 
-`K_eval` comes from `framework_cfg.json` `tuner.K_eval` (default **3**); pass it as
-`--k-eval`. Do not encode evaluation priority in list order. `K_eval ≥ K`
+`K_eval` comes from `framework_cfg.json` `tuner.K_eval` (default **3**, minimum
+**2**); pass it as `--k-eval`. Do not encode priority in indices 1..K-1.
+`K_eval ≥ K`
 disables deferral. For a provided entrypoint, pass `--k-eval 1`; its only warm
 trial is the exact supplied default. The finalized `SEARCH_SPACE` remains
 available if the decoupled tuner later promotes this semantic point.
@@ -256,16 +288,20 @@ working directory, so repo-relative paths (`tools/...`, `runs/...`) keep
 resolving. Under `--directory` uv chdirs into the task dir first and those
 relative paths break.
 
-It creates `BASE_PARAMS`, samples `K_eval` configs uniformly without replacement,
-and persists the seed, permutation, and selected/deferred indices in
+It creates `BASE_PARAMS`, pins schema-4 config 0, samples the remaining slots
+uniformly without replacement, and persists the mandatory indices, seed,
+permutation, and selected/deferred indices in
 `phase_a.warm_config_selection`. It then preflights and evaluates the sampled
 configs **reusing any already scored**; a re-run reuses the same sampled set and
 only re-evaluates what changed. It stores the rest in
-`phase_a.deferred_configs` and writes `phase_a` (best-of-`K_eval`). The deep-tuner
-later evaluates the deferred configs FIRST (bo enqueue / grid prepend).
+`phase_a.deferred_configs` and writes `phase_a`. An `inherited_control` row
+remains in the report and budget counts but is excluded from
+`best_warm_params`, `best_warm_score`, and every final-best minimum. The
+deep-tuner later evaluates the deferred configs FIRST (bo enqueue / grid
+prepend).
 
-- **exit 0** — every config scored; `BASE_PARAMS` = best-of-K′; `phase_a`
-  finalized. Go to 3c.
+- **exit 0** — every config scored; `BASE_PARAMS` = best selectable row;
+  `phase_a` finalized. Go to 3c.
 - **exit 3 (CRASHED)** — the config at `crash_index` in the original
   `_warm_configs.json` raised. Replace a config-invalid value in that same slot;
   do not reorder or resize the list after sampling. Stdout contains its
@@ -274,10 +310,14 @@ later evaluates the deferred configs FIRST (bo enqueue / grid prepend).
   was consumed; `phase: a` means an admitted `score_fn` call failed. Go to 3b.
 - **exit 4 (BUDGET EXHAUSTED)** — the strict reservation helper refused entry
   before `score_fn`. Do not diagnose this refusal. If the report contains prior
-  objective attempts but no finite score, persist tuning metadata and record the
-  candidate as `crash`; otherwise return `ledger_recorded: no` so the coordinator
-  leaves the record `pending` (unevaluated) and completes only because the
-  objective cap is reached. Never convert an unstarted candidate into a crash.
+  objective attempts but no finite selectable score (an inherited control alone
+  does not qualify), persist tuning metadata and record the candidate as
+  `crash`; otherwise run
+  `python tools/ledger.py resolve-unevaluated --ledger <ledger> --task <task> --run-id <id>`.
+  The helper proves that the global cap is exhausted and this candidate owns
+  zero attempts, then stores an evidence-neutral terminal receipt. Return
+  `ledger_recorded: yes`, `status: unevaluated`. Never leave it pending or
+  convert an unstarted candidate into a crash.
   This path should be rare because `got_select` reserves `K_eval` admission
   capacity.
 
@@ -294,8 +334,12 @@ tool is unavailable, read `.opencode/skills/crash-diagnosis/SKILL.md` and follow
 — on the failing preflight/eval config + its `failure_receipt`. Retrieve full or ranged source
 through `tune_tools.py render-failure` only when the receipt is insufficient:
 
-- **`config_invalid`** → Edit `<candidate_dir>/_warm_configs.json`, replacing that
-  config's bad value with a valid one (config fixes are unbounded).
+- **`config_invalid`** → For indices 1..K-1, edit
+  `<candidate_dir>/_warm_configs.json`, replacing that config's bad value with a
+  valid one (config fixes are unbounded). Never substitute an easier value for
+  inherited config 0: fix child code while preserving the semantic delta and
+  re-run `build-inheritance`, or abandon the candidate if the inherited control
+  is genuinely incompatible.
 - **`code_incompatible`** → **minimally** Edit `train.py` so it handles this value
   (a guard / branch / clamp — **without** changing what already-working configs
   do). Increment `code_fix_count`. **This is preferred** when the value is a
@@ -310,19 +354,20 @@ it and configs still crash, treat it as `abandon`.
 ### 3c. Success → record the candidate's score + warm metadata
 
 Step 0+1 **is** the candidate's evaluation — there is **one global `config → score`
-function and no separate official run**, so the best-of-K config's score is the
-candidate's score. Write **both** its score and its warm metadata:
+function and no separate official run**, so the best selectable warm config's
+score is the candidate's score. Write **both** its score and its warm metadata:
 
 ```bash
-# 1. score + keep/discard status. record-run OWNS final_best_score + status.
+# 1. Persist warm metadata and the helper-authored parameter-transfer/control
+#    receipt before the record becomes terminal. NO --mark-tuned — tune stays
+#    false so the decoupled tuner (step 2) can still select this candidate.
+python tools/ledger.py set-tuning --ledger <run_dir>/ledger.json --run-id <run_id> \
+  --from-report <candidate_dir>/tune_report.json
+
+# 2. score + keep/discard status. record-run OWNS final_best_score + status.
 #    At step 0+1, final_best_score = best_warm_score (= phase_a.best_warm_score).
 python tools/ledger.py record-run --ledger <run_dir>/ledger.json --run-id <run_id> \
   --final-best-score <best_warm_score>
-
-# 2. warm metadata (best_warm_score / n_dims / warm_start_K). NO --mark-tuned —
-#    tune stays false so the decoupled tuner (step 2) can still select this candidate.
-python tools/ledger.py set-tuning --ledger <run_dir>/ledger.json --run-id <run_id> \
-  --from-report <candidate_dir>/tune_report.json
 ```
 
 `<best_warm_score>` is `phase_a.best_warm_score` from your `tune_report.json`.
@@ -372,12 +417,15 @@ confidence: <high | medium | low>
 - **You run the candidate only in segment ③** (via `warmstart_eval.py` in the uv
   env). Segments ①② never import or run it.
 - **You write `BASE_PARAMS`** — but only via `warmstart_eval.py` (which AST-writes
-  it = best-of-K′). Never hand-edit `BASE_PARAMS` or `SEARCH_SPACE`.
+  the best selectable warm row and excludes an inherited fidelity control).
+  Never hand-edit `BASE_PARAMS` or `SEARCH_SPACE`.
 - **You write this candidate's ledger record** — only via `tools/ledger.py`
   (`set-tuning` / `record-run`), never by hand. Never touch other candidates,
   `loop_state.md`, or the task dir.
 - **Edit only `train_py`, `_warm_configs.json`, `_search_space.json`** (in this
-  candidate dir). Never edit `prepare.py` or any `readonly_files`. If the only way
+  candidate dir). `_parameter_transfer.json` is helper-owned: let
+  `build-inheritance` create or refresh it, never edit it by hand. Never edit
+  `prepare.py` or any `readonly_files`. If the only way
   to fix a crash is a forbidden edit (readonly file / new dependency), that crash
   is `abandon`.
 - **Compact return.** Never return code, diffs, schemas, configs, search spaces,

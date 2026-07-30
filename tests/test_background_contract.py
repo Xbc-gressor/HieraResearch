@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from background_contract import (  # noqa: E402
     derive_hypothesis_selection,
     validate_experience,
+    validate_experience_replacement,
     validate_registry,
 )
 from semantic_evidence import build_semantic_edges  # noqa: E402
@@ -30,8 +31,7 @@ from semantic_space import (  # noqa: E402
     resolve_dimension_strategy,
     validate_catalog,
 )
-from tests.p2_fixtures import belief_ledger  # noqa: E402
-from validate_background import fixture_registry  # noqa: E402
+from tests.fixtures import belief_ledger, fixture_registry  # noqa: E402
 
 
 def _hypothesis(registry: dict, hypothesis_id: str) -> dict:
@@ -260,86 +260,120 @@ class ProbeReferenceTests(unittest.TestCase):
         self.assertTrue(any("only valid for a scope_probe" in error for error in errors), errors)
 
 
-class GuidanceGateTests(unittest.TestCase):
-    def test_binding_guidance_requires_out_of_scope_probe(self) -> None:
-        errors = validate_registry(_binding_registry(with_probe=False))
-        self.assertTrue(any("requires an out-of-scope scope_probe" in error for error in errors), errors)
+class BaselineMechanismTests(unittest.TestCase):
+    """A mechanism the baseline already applies is not a searchable contrast."""
 
-    def test_unverified_negative_may_only_caution(self) -> None:
-        registry = _binding_registry()
-        registry["guidance"][0]["literature_credibility"] = "unverified"
-        errors = validate_registry(registry)
-        self.assertTrue(any("may only caution" in error for error in errors), errors)
-
-    def test_binding_guidance_requires_primary_empirical_source(self) -> None:
-        registry = _binding_registry()
-        registry["sources"][0]["type"] = "web_lead"
-        errors = validate_registry(registry)
-        self.assertTrue(any("primary empirical source" in error for error in errors), errors)
-
-    def test_withdrawn_source_cannot_bind(self) -> None:
-        registry = _binding_registry()
-        registry["sources"][0]["publication_status"] = "withdrawn_or_retracted"
-        errors = validate_registry(registry)
-        self.assertTrue(any("primary empirical source" in error for error in errors), errors)
-
-    def test_duplicate_canonical_source_is_rejected(self) -> None:
-        registry = fixture_registry()
-        duplicate = copy.deepcopy(registry["sources"][0])
-        duplicate["id"] = "src-02"
-        registry["sources"].append(duplicate)
-        errors = validate_registry(registry)
-        self.assertTrue(any("duplicate canonical work" in error for error in errors), errors)
-
-    def test_overbroad_guidance_must_be_contained_by_source(self) -> None:
-        registry = _binding_registry()
-        registry["guidance"][0]["scope"]["model_families"] = ["*"]
-        errors = validate_registry(registry)
-        self.assertTrue(any("directly contains the guidance scope" in error for error in errors), errors)
-
-    def test_exclusion_requires_corroborated_or_replicated_evidence(self) -> None:
-        registry = _binding_registry()
-        registry["guidance"][0]["effect"] = "exclude"
-        errors = validate_registry(registry)
-        self.assertTrue(any("requires corroborated or replicated" in error for error in errors), errors)
-
-    def test_exclusion_requires_two_direct_sources(self) -> None:
-        registry = _binding_registry()
-        registry["guidance"][0].update(
-            {"effect": "exclude", "literature_credibility": "corroborated"}
-        )
-        errors = validate_registry(registry)
-        self.assertTrue(any("requires two directly scoped" in error for error in errors), errors)
-
-    def test_exclusion_requires_independent_reproduction(self) -> None:
-        registry = _binding_registry()
-        second = copy.deepcopy(registry["sources"][0])
-        second.update({"id": "src-02", "url": "https://example.test/second-study"})
-        registry["sources"].append(second)
-        registry["guidance"][0].update(
-            {
-                "effect": "exclude",
-                "literature_credibility": "corroborated",
-                "evidence": [
-                    {"source_id": "src-01", "role": "supports"},
-                    {"source_id": "src-02", "role": "supports"},
-                ],
+    @staticmethod
+    def _inventory(registry: dict, **overrides: object) -> dict:
+        dimensions = {}
+        for dimension in registry["dimensions"]:
+            baseline = _hypothesis(registry, dimension["baseline_hypothesis_id"])
+            dimensions[dimension["id"]] = {
+                "interventions": list(baseline["scope"]["interventions"]),
+                "citations": ["train.py:1"],
             }
-        )
-        errors = validate_registry(registry)
-        self.assertTrue(any("independent reproduction" in error for error in errors), errors)
+        inventory = {
+            "schema_version": 1,
+            "kind": "baseline_mechanism_inventory",
+            "entrypoint": {"path": "tasks/toy/train.py", "sha256": "sha256:" + "a" * 64},
+            "dimensions": dimensions,
+        }
+        inventory.update(overrides)
+        return inventory
 
-    def test_replicated_hypothesis_requires_reproduced_support(self) -> None:
+    def test_alternative_sharing_a_baseline_mechanism_is_rejected(self) -> None:
         registry = fixture_registry()
-        _hypothesis(registry, "hyp-data-filtered")["literature_credibility"] = "replicated"
+        baseline = _hypothesis(registry, "hyp-data-raw")
+        alternative = _hypothesis(registry, "hyp-data-filtered")
+        alternative["scope"]["interventions"] = list(baseline["scope"]["interventions"])
+
         errors = validate_registry(registry)
-        self.assertTrue(any("no independently reproduced" in error for error in errors), errors)
+
+        self.assertTrue(
+            any(
+                "hyp-data-filtered" in error and "is not a contrast" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_cross_dimension_baseline_collision_is_rejected(self) -> None:
+        registry = fixture_registry()
+        owner = registry["dimensions"][0]
+        baseline = _hypothesis(registry, owner["baseline_hypothesis_id"])
+        stolen = baseline["scope"]["interventions"][0]
+        alternative = _hypothesis(registry, "hyp-model-multibranch")
+        alternative["scope"]["interventions"] = [stolen]
+
+        errors = validate_registry(registry)
+
+        self.assertTrue(
+            any(
+                f"the {owner['id']} baseline" in error and stolen in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_registry_without_an_inventory_is_unaffected(self) -> None:
+        self.assertEqual(validate_registry(fixture_registry()), [])
+
+    def test_consistent_inventory_validates(self) -> None:
+        registry = fixture_registry()
+
+        self.assertEqual(
+            validate_registry(registry, baseline_mechanisms=self._inventory(registry)),
+            [],
+        )
+
+    def test_inventory_must_agree_with_the_registry_and_cite_lines(self) -> None:
+        registry = fixture_registry()
+        dimension_id = registry["dimensions"][0]["id"]
+
+        undeclared = self._inventory(registry)
+        undeclared["dimensions"][dimension_id]["interventions"].append("qk-layernorm")
+        uncovered = self._inventory(registry)
+        uncovered["dimensions"].pop(dimension_id)
+        uncited = self._inventory(registry)
+        uncited["dimensions"][dimension_id]["citations"] = ["train.py"]
+        unknown = self._inventory(registry)
+        unknown["dimensions"]["dim-not-real"] = {
+            "interventions": ["whatever"],
+            "citations": ["train.py:1"],
+        }
+
+        cases = [
+            # Every mechanism the entrypoint already applies must be declared,
+            # or a "new" hypothesis could silently restate the baseline.
+            ("does not declare interventions ['qk-layernorm']", undeclared),
+            ("does not cover dimensions", uncovered),
+            ("<file>:<line>", uncited),
+            ("unknown dimensions ['dim-not-real']", unknown),
+            ("schema_version must be 1", self._inventory(registry, schema_version=2)),
+            ("kind must be", self._inventory(registry, kind="something_else")),
+            (
+                "entrypoint.sha256 must be a sha256 digest",
+                self._inventory(
+                    registry,
+                    entrypoint={"path": "tasks/toy/train.py", "sha256": "nope"},
+                ),
+            ),
+        ]
+        for needle, inventory in cases:
+            with self.subTest(needle=needle):
+                errors = validate_registry(registry, baseline_mechanisms=inventory)
+                self.assertTrue(any(needle in error for error in errors), errors)
+
+
+class GuidanceGateTests(unittest.TestCase):
+    """Literature may only bind selection when its evidence actually earns it."""
 
     def test_valid_binding_only_deprioritizes_direct_match(self) -> None:
         registry = _binding_registry()
         self.assertEqual(validate_registry(registry), [])
         selection = derive_hypothesis_selection(registry)
         self.assertEqual(selection["hyp-data-filtered"]["selection_status"], "deprioritized")
+        # Binding is scoped: an adjacent mechanism is untouched.
         self.assertEqual(selection["hyp-model-multibranch"]["selection_status"], "active")
 
     def test_caution_does_not_create_binding_guidance(self) -> None:
@@ -352,6 +386,83 @@ class GuidanceGateTests(unittest.TestCase):
         self.assertEqual(selection["selection_status"], "active")
         self.assertEqual(selection["binding_guidance"], [])
         self.assertEqual(selection["matched_guidance"], [{"id": "g-01", "effect": "caution"}])
+
+    def test_binding_requires_probe_credibility_and_contained_scope(self) -> None:
+        def build(**changes: object) -> dict:
+            registry = _binding_registry(with_probe=changes.pop("with_probe", True))
+            registry["guidance"][0].update(changes.pop("guidance", {}))
+            registry["sources"][0].update(changes.pop("source", {}))
+            for key, value in changes.items():
+                registry[key] = value
+            return registry
+
+        overbroad = build()
+        overbroad["guidance"][0]["scope"]["model_families"] = ["*"]
+        cases = [
+            # A binding claim must stay falsifiable via an out-of-scope probe.
+            ("requires an out-of-scope scope_probe", build(with_probe=False)),
+            # Unverified evidence may warn, never restrict.
+            (
+                "may only caution",
+                build(guidance={"literature_credibility": "unverified"}),
+            ),
+            # Only inspected primary empirical work can bind.
+            ("primary empirical source", build(source={"type": "web_lead"})),
+            (
+                "primary empirical source",
+                build(source={"publication_status": "withdrawn_or_retracted"}),
+            ),
+            # Guidance may not claim more scope than its source studied.
+            ("directly contains the guidance scope", overbroad),
+        ]
+        for needle, registry in cases:
+            with self.subTest(needle=needle):
+                errors = validate_registry(registry)
+                self.assertTrue(any(needle in error for error in errors), errors)
+
+    def test_exclusion_requires_independently_reproduced_evidence(self) -> None:
+        """Excluding a mechanism outright is the strongest claim available."""
+        corroborated = _binding_registry()
+        corroborated["guidance"][0].update(
+            {"effect": "exclude", "literature_credibility": "corroborated"}
+        )
+        two_sources = copy.deepcopy(corroborated)
+        second = copy.deepcopy(two_sources["sources"][0])
+        second.update({"id": "src-02", "url": "https://example.test/second-study"})
+        two_sources["sources"].append(second)
+        two_sources["guidance"][0]["evidence"] = [
+            {"source_id": "src-01", "role": "supports"},
+            {"source_id": "src-02", "role": "supports"},
+        ]
+        preliminary = _binding_registry()
+        preliminary["guidance"][0]["effect"] = "exclude"
+
+        cases = [
+            ("requires corroborated or replicated", preliminary),
+            ("requires two directly scoped", corroborated),
+            ("independent reproduction", two_sources),
+        ]
+        for needle, registry in cases:
+            with self.subTest(needle=needle):
+                errors = validate_registry(registry)
+                self.assertTrue(any(needle in error for error in errors), errors)
+
+    def test_credibility_claims_must_be_backed_by_sources(self) -> None:
+        duplicate = fixture_registry()
+        second = copy.deepcopy(duplicate["sources"][0])
+        second["id"] = "src-02"
+        duplicate["sources"].append(second)
+
+        replicated = fixture_registry()
+        _hypothesis(replicated, "hyp-data-filtered")["literature_credibility"] = "replicated"
+
+        for needle, registry in (
+            ("duplicate canonical work", duplicate),
+            ("no independently reproduced", replicated),
+        ):
+            with self.subTest(needle=needle):
+                errors = validate_registry(registry)
+                self.assertTrue(any(needle in error for error in errors), errors)
 
 
 def _base_experience() -> dict:
@@ -392,9 +503,9 @@ def _observed_entry() -> dict:
     return {
         "target_id": "hyp-data-filtered",
         "evaluation_state": "observed",
-        "assessment": "unpromising",
+        "assessment": "mixed",
         "recommended_status": "active",
-        "claim": "One direct comparison was worse than its matched baseline parent.",
+        "claim": "One comparison is insufficient for a directional belief.",
         "evidence_run_ids": ["000", "001"],
         "evidence_edge_ids": ["sedge-000-001"],
         "comparator_coverage": {
@@ -445,37 +556,26 @@ def _failed_entry() -> dict:
 
 
 class ExperienceSchema3Tests(unittest.TestCase):
-    def test_accepts_comparator_covered_hypothesis_belief(self) -> None:
+    """A belief may claim only as much as its comparator receipts support."""
+
+    def _reject(
+        self,
+        entry: dict,
+        needle: str,
+        *,
+        ledger: dict | None = None,
+        field: str = "hypothesis_evidence",
+        updated_at_run: str | None = None,
+    ) -> None:
         registry = fixture_registry()
-        ledger = belief_ledger(registry)
-        experience = {
-            "schema_version": 3,
-            "updated_at_run": "003",
-            "generation": 0,
-            "summary": "Two direct comparisons make the filtered hypothesis eligible for a conservative recommendation.",
-            "promising_regions": [],
-            "lessons": [],
-            "bottlenecks": [],
-            "dimension_evidence": [],
-            "hypothesis_evidence": [{
-                "target_id": "hyp-data-filtered",
-                "evaluation_state": "comparator_covered",
-                "assessment": "unpromising",
-                "recommended_status": "pruned",
-                "claim": "Both direct comparisons were worse than their matched baseline parents.",
-                "evidence_run_ids": ["000", "001", "002", "003"],
-                "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
-                "comparator_coverage": {
-                    "direct_noncrash_edges": 2,
-                    "confounded_noncrash_edges": 0,
-                    "crash_edges": 0,
-                },
-                "confidence": "high",
-                "uncertainty": "Implementation differences remain confounded with each semantic change.",
-                "reopen_when": "A later direct comparison improves over its parent.",
-            }],
-        }
-        self.assertEqual(validate_experience(experience, registry, ledger), [])
+        experience = _base_experience()
+        experience[field] = [entry]
+        if updated_at_run is not None:
+            experience["updated_at_run"] = updated_at_run
+        errors = validate_experience(
+            experience, registry, ledger if ledger is not None else belief_ledger(registry)
+        )
+        self.assertTrue(any(needle in error for error in errors), errors)
 
     def test_accepts_valid_entries_for_each_evaluation_state(self) -> None:
         registry = fixture_registry()
@@ -498,15 +598,25 @@ class ExperienceSchema3Tests(unittest.TestCase):
         dimension = _comparator_covered_entry()
         dimension["target_id"] = "dim-data-curation"
         dimension["claim"] = "Both matched data-curation changes worsened the score."
+        deprioritized = _comparator_covered_entry()
+        deprioritized["recommended_status"] = "deprioritized"
+
         cases = [
-            ("unevaluated hypothesis", belief_ledger(registry), "hypothesis_evidence", unevaluated, "003"),
-            ("failed hypothesis", _crash_ledger(registry), "hypothesis_evidence", _failed_entry(), "004"),
-            ("observed hypothesis", belief_ledger(registry), "hypothesis_evidence", _observed_entry(), "003"),
+            ("unevaluated", belief_ledger(registry), "hypothesis_evidence", unevaluated, "003"),
+            ("failed", _crash_ledger(registry), "hypothesis_evidence", _failed_entry(), "004"),
+            ("observed", belief_ledger(registry), "hypothesis_evidence", _observed_entry(), "003"),
             (
-                "comparator_covered hypothesis",
+                "comparator_covered pruned",
                 belief_ledger(registry),
                 "hypothesis_evidence",
                 _comparator_covered_entry(),
+                "003",
+            ),
+            (
+                "comparator_covered deprioritized",
+                belief_ledger(registry),
+                "hypothesis_evidence",
+                deprioritized,
                 "003",
             ),
             (
@@ -524,55 +634,13 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 experience[field] = [entry]
                 self.assertEqual(validate_experience(experience, registry, ledger), [])
 
-    def test_accepts_comparator_covered_deprioritized_entry(self) -> None:
-        registry = fixture_registry()
-        ledger = belief_ledger(registry)
-        entry = _comparator_covered_entry()
-        entry.update(
-            {
-                "recommended_status": "deprioritized",
-                "reopen_when": "A later direct comparison improves over its parent.",
-            }
-        )
-        experience = _base_experience()
-        experience["hypothesis_evidence"] = [entry]
-        self.assertEqual(validate_experience(experience, registry, ledger), [])
+    def test_rejects_claims_beyond_their_cited_receipts(self) -> None:
+        """Citations must resolve, touch the target, and match recomputation."""
+        unknown_target = _comparator_covered_entry()
+        unknown_target["target_id"] = "hyp-unknown"
 
-    def test_rejects_single_direct_edge_deprioritized_entry(self) -> None:
-        entry = _observed_entry()
-        entry.update(
-            {
-                "recommended_status": "deprioritized",
-                "reopen_when": "A later direct comparison improves over its parent.",
-            }
-        )
-        self._reject(entry, "comparator_covered")
-
-    def _reject(self, entry: dict, needle: str, *, ledger: dict | None = None, field: str = "hypothesis_evidence") -> None:
-        registry = fixture_registry()
-        experience = _base_experience()
-        experience[field] = [entry]
-        errors = validate_experience(
-            experience, registry, ledger if ledger is not None else belief_ledger(registry)
-        )
-        self.assertTrue(any(needle in error for error in errors), errors)
-
-    def test_rejects_schema_version_2(self) -> None:
-        registry = fixture_registry()
-        ledger = belief_ledger(registry)
-        experience = _base_experience()
-        experience["schema_version"] = 2
-        errors = validate_experience(experience, registry, ledger)
-        self.assertTrue(any("schema_version must be 3" in error for error in errors), errors)
-
-    def test_rejects_unknown_target(self) -> None:
-        entry = _comparator_covered_entry()
-        entry["target_id"] = "hyp-unknown"
-        self._reject(entry, "is not a known hypothesis id")
-
-    def test_rejects_edge_that_does_not_touch_target(self) -> None:
-        entry = _failed_entry()
-        entry.update(
+        wrong_edge = _failed_entry()
+        wrong_edge.update(
             {
                 "target_id": "hyp-valid-cv",
                 "evidence_run_ids": [],
@@ -584,18 +652,33 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 },
             }
         )
-        self._reject(entry, "does not touch the target")
 
-    def test_rejects_forged_comparator_counts(self) -> None:
-        entry = _comparator_covered_entry()
-        entry["comparator_coverage"] = {
+        forged_counts = _comparator_covered_entry()
+        forged_counts["comparator_coverage"] = {
             "direct_noncrash_edges": 1,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
         }
-        self._reject(entry, "must equal the recomputed coverage")
+
+        for needle, entry in (
+            ("is not a known hypothesis id", unknown_target),
+            ("does not touch the target", wrong_edge),
+            ("must equal the recomputed coverage", forged_counts),
+        ):
+            with self.subTest(needle=needle):
+                self._reject(entry, needle)
+
+    def test_direction_requires_comparator_coverage(self) -> None:
+        """A single or confounded observation cannot establish a direction."""
+        for assessment in ("promising", "unpromising"):
+            for confidence in ("low", "med", "high"):
+                with self.subTest(assessment=assessment, confidence=confidence):
+                    entry = _observed_entry()
+                    entry.update({"assessment": assessment, "confidence": confidence})
+                    self._reject(entry, "requires comparator_covered")
 
     def test_rejects_crash_only_contradiction(self) -> None:
+        """A crash informs feasibility; it never contradicts a hypothesis."""
         registry = fixture_registry()
         ledger = _crash_ledger(registry)
         for mutate in (
@@ -605,111 +688,133 @@ class ExperienceSchema3Tests(unittest.TestCase):
             with self.subTest(mutate=mutate):
                 entry = _failed_entry()
                 entry.update(mutate)
-                experience = _base_experience()
-                experience["updated_at_run"] = "004"
-                experience["hypothesis_evidence"] = [entry]
-                errors = validate_experience(experience, registry, ledger)
-                self.assertTrue(
-                    any("must keep assessment unknown" in error for error in errors),
-                    errors,
+                self._reject(
+                    entry,
+                    "must keep assessment unknown",
+                    ledger=ledger,
+                    updated_at_run="004",
                 )
 
-    def test_rejects_high_confidence_without_comparator_coverage(self) -> None:
-        for assessment in ("promising", "unpromising"):
-            with self.subTest(assessment=assessment):
-                entry = _observed_entry()
-                entry.update({"assessment": assessment, "confidence": "high"})
-                self._reject(entry, "requires comparator_covered")
+    def test_rejects_contraction_gate_violations(self) -> None:
+        """Deprioritizing and pruning each need their own evidence threshold."""
+        deprioritized = _comparator_covered_entry()
+        deprioritized["recommended_status"] = "deprioritized"
 
-    def test_rejects_deprioritized_without_direct_edge(self) -> None:
-        entry = _observed_entry()
-        entry.update(
-            {
-                "evidence_run_ids": ["001"],
-                "evidence_edge_ids": [],
-                "comparator_coverage": {
-                    "direct_noncrash_edges": 0,
-                    "confounded_noncrash_edges": 0,
-                    "crash_edges": 0,
+        def variant(base: dict, **changes: object) -> dict:
+            entry = copy.deepcopy(base)
+            for key, value in changes.items():
+                if value is None:
+                    del entry[key]
+                else:
+                    entry[key] = value
+            return entry
+
+        single_edge = variant(
+            _observed_entry(),
+            recommended_status="deprioritized",
+            reopen_when="A later direct comparison improves over its parent.",
+        )
+        no_edge = variant(
+            single_edge,
+            evidence_run_ids=["001"],
+            evidence_edge_ids=[],
+            comparator_coverage={
+                "direct_noncrash_edges": 0,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+        )
+
+        cases = [
+            # Contraction needs two direct non-crash edges, not one.
+            ("comparator_covered", single_edge),
+            ("at least two direct non-crash edges", no_edge),
+            ("deprioritized requires", variant(deprioritized, assessment="mixed")),
+            ("deprioritized requires", variant(deprioritized, confidence="low")),
+            ("deprioritized requires", variant(deprioritized, reopen_when=None)),
+            # Pruning is stricter: high confidence and a covered state.
+            ("pruned requires", variant(_comparator_covered_entry(), confidence="med")),
+            ("pruned requires", variant(_comparator_covered_entry(), assessment="mixed")),
+            (
+                "pruned requires",
+                variant(_comparator_covered_entry(), evaluation_state="observed"),
+            ),
+            # Every contraction must remain reversible.
+            ("reopen_when", variant(_comparator_covered_entry(), reopen_when=None)),
+        ]
+        for needle, entry in cases:
+            with self.subTest(needle=needle, status=entry.get("recommended_status")):
+                self._reject(entry, needle)
+
+    def test_rejects_unbounded_or_malformed_snapshots(self) -> None:
+        """The snapshot stays bounded and schema-3; P1 needs a migration."""
+        registry = fixture_registry()
+        ledger = belief_ledger(registry)
+        cases = [
+            ("schema_version must be 3", {"schema_version": 2}),
+            (
+                "duplicates an earlier",
+                {
+                    "hypothesis_evidence": [
+                        _comparator_covered_entry(),
+                        _comparator_covered_entry(),
+                    ]
                 },
-                "recommended_status": "deprioritized",
-                "reopen_when": "A later direct comparison improves over its parent.",
-            }
+            ),
+            (
+                "at most 16",
+                {
+                    "dimension_evidence": [
+                        {"target_id": f"dim-extra-{index}"} for index in range(17)
+                    ]
+                },
+            ),
+            (
+                "at most 32",
+                {
+                    "hypothesis_evidence": [
+                        {"target_id": f"hyp-extra-{index}"} for index in range(33)
+                    ]
+                },
+            ),
+        ]
+        for needle, changes in cases:
+            with self.subTest(needle=needle):
+                experience = _base_experience()
+                experience.update(changes)
+                errors = validate_experience(experience, registry, ledger)
+                self.assertTrue(any(needle in error for error in errors), errors)
+
+    def test_replacement_generation_changes_only_when_belief_payload_changes(
+        self,
+    ) -> None:
+        registry = fixture_registry()
+        ledger = belief_ledger(registry)
+        prior = _base_experience()
+        prior.update({"generation": 7, "dag_revision": ledger["dag_revision"]})
+        ledger["experience"] = copy.deepcopy(prior)
+
+        # Processing another DAG cursor with the same bounded belief is an
+        # epistemic no-op: run/cursor metadata may advance, but generation does
+        # not pretend that a new belief was learned.
+        same_belief = copy.deepcopy(prior)
+        same_belief.pop("dag_revision")
+        self.assertEqual(
+            validate_experience_replacement(same_belief, ledger),
+            [],
         )
-        self._reject(entry, "at least two direct non-crash edges")
 
-    def test_rejects_deprioritized_gate_violations(self) -> None:
-        base = _comparator_covered_entry()
-        base.update(
-            {
-                "recommended_status": "deprioritized",
-                "reopen_when": "A later direct comparison improves over its parent.",
-            }
+        changed_belief = copy.deepcopy(same_belief)
+        changed_belief["summary"] = "The structured bounded belief changed."
+        errors = validate_experience_replacement(changed_belief, ledger)
+        self.assertTrue(
+            any("generation must be 8" in error for error in errors), errors
         )
-        mutations = []
-        mixed = copy.deepcopy(base)
-        mixed["assessment"] = "mixed"
-        mutations.append(("assessment not unpromising", mixed))
-        low = copy.deepcopy(base)
-        low["confidence"] = "low"
-        mutations.append(("confidence not med or high", low))
-        no_reopen = copy.deepcopy(base)
-        del no_reopen["reopen_when"]
-        mutations.append(("missing reopen_when", no_reopen))
-        for name, entry in mutations:
-            with self.subTest(case=name):
-                self._reject(entry, "deprioritized requires")
-
-    def test_rejects_pruned_gate_violations(self) -> None:
-        mutations = []
-        med = _comparator_covered_entry()
-        med["confidence"] = "med"
-        mutations.append(("confidence not high", med))
-        mixed = _comparator_covered_entry()
-        mixed["assessment"] = "mixed"
-        mutations.append(("assessment not unpromising", mixed))
-        observed = _comparator_covered_entry()
-        observed["evaluation_state"] = "observed"
-        mutations.append(("state not comparator_covered", observed))
-        for name, entry in mutations:
-            with self.subTest(case=name):
-                self._reject(entry, "pruned requires")
-
-    def test_rejects_duplicate_target(self) -> None:
-        registry = fixture_registry()
-        ledger = belief_ledger(registry)
-        experience = _base_experience()
-        experience["hypothesis_evidence"] = [
-            _comparator_covered_entry(),
-            _comparator_covered_entry(),
-        ]
-        errors = validate_experience(experience, registry, ledger)
-        self.assertTrue(any("duplicates an earlier" in error for error in errors), errors)
-
-    def test_rejects_pruned_without_reopen_condition(self) -> None:
-        entry = _comparator_covered_entry()
-        del entry["reopen_when"]
-        self._reject(entry, "reopen_when")
-
-    def test_rejects_more_than_16_dimension_entries(self) -> None:
-        registry = fixture_registry()
-        ledger = belief_ledger(registry)
-        experience = _base_experience()
-        experience["dimension_evidence"] = [
-            {"target_id": f"dim-extra-{index}"} for index in range(17)
-        ]
-        errors = validate_experience(experience, registry, ledger)
-        self.assertTrue(any("at most 16" in error for error in errors), errors)
-
-    def test_rejects_more_than_32_hypothesis_entries(self) -> None:
-        registry = fixture_registry()
-        ledger = belief_ledger(registry)
-        experience = _base_experience()
-        experience["hypothesis_evidence"] = [
-            {"target_id": f"hyp-extra-{index}"} for index in range(33)
-        ]
-        errors = validate_experience(experience, registry, ledger)
-        self.assertTrue(any("at most 32" in error for error in errors), errors)
+        changed_belief["generation"] = 8
+        self.assertEqual(
+            validate_experience_replacement(changed_belief, ledger),
+            [],
+        )
 
 
 if __name__ == "__main__":

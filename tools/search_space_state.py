@@ -33,6 +33,7 @@ from semantic_evidence import (
     TERMINAL_STATUSES,
     comparator_coverage,
     edge_observation,
+    mechanical_gain_direction,
     target_evaluation_state,
 )
 from semantic_space import dimension_map, hypothesis_map, selected_assignments
@@ -462,7 +463,12 @@ def validate_point_eligibility(
 
 
 def _effective_recommendation(
-    belief: dict[str, Any], evaluation_state: str, coverage: dict[str, int]
+    belief: dict[str, Any],
+    evaluation_state: str,
+    coverage: dict[str, int],
+    *,
+    target_kind: str,
+    mechanical_direction: str,
 ) -> str | None:
     """Gate the authored recommendation on mechanically recomputed evidence.
 
@@ -480,6 +486,10 @@ def _effective_recommendation(
         and belief.get("confidence") in {"med", "high"}
         and evaluation_state == "comparator_covered"
         and coverage["direct_noncrash_edges"] >= 2
+        and (
+            target_kind != "hypothesis"
+            or mechanical_direction == "negative"
+        )
         and _nonempty(belief.get("reopen_when"))
     )
     if not deprioritize_ok:
@@ -533,6 +543,9 @@ def _normalized_beliefs(
             coverage = comparator_coverage(
                 ledger, edge_ids, target_kind=target_kind, target_id=target_id
             )
+            raw_observations = [
+                edge_observation(ledger, edge_id) for edge_id in edge_ids
+            ]
             observations = [
                 {
                     key: observation.get(key)
@@ -545,14 +558,19 @@ def _normalized_beliefs(
                         "delta",
                     )
                 }
-                for edge_id in edge_ids
-                for observation in (edge_observation(ledger, edge_id),)
+                for observation in raw_observations
             ]
             evaluation_state = target_evaluation_state(
                 ledger,
                 target_kind=target_kind,
                 target_id=target_id,
                 evidence_run_ids=run_ids,
+                evidence_edge_ids=edge_ids,
+            )
+            direction = mechanical_gain_direction(
+                ledger,
+                target_kind=target_kind,
+                target_id=target_id,
                 evidence_edge_ids=edge_ids,
             )
             beliefs[(target_kind, target_id)] = {
@@ -563,10 +581,22 @@ def _normalized_beliefs(
                 "reopen_when": item.get("reopen_when"),
                 "evidence_edge_ids": edge_ids,
                 "evidence_observations": observations,
+                # Internal-only full observations let the staged transition
+                # gate distinguish a new/corrected inherited control from a
+                # crash, a legacy final-score edge, or inner-tuning movement.
+                "_direct_observations": [
+                    basic
+                    for basic, raw in zip(observations, raw_observations)
+                    if raw.get("score_basis") == "paired_semantic_control"
+                ],
                 "comparator_coverage": coverage,
                 "evaluation_state": evaluation_state,
                 "recommended_status": _effective_recommendation(
-                    item, evaluation_state, coverage
+                    item,
+                    evaluation_state,
+                    coverage,
+                    target_kind=target_kind,
+                    mechanical_direction=direction,
                 ),
                 "experience_generation": generation,
                 "experience_dag_revision": dag_revision,
@@ -591,16 +621,16 @@ def _has_advancing_evidence(belief: dict[str, Any], last: dict | None) -> bool:
         current_observations, list
     ):
         return False
-    terminal_current = [
+    direct_current = [
         item
-        for item in current_observations
+        for item in belief.get("_direct_observations", [])
         if isinstance(item, dict)
         and {
             item.get("parent_status"),
             item.get("child_status"),
         }.issubset(TERMINAL_STATUSES)
     ]
-    if any(item.get("edge_id") not in prior_edge_ids for item in terminal_current):
+    if any(item.get("edge_id") not in prior_edge_ids for item in direct_current):
         return True
     prior_by_edge = {
         item.get("edge_id"): item
@@ -611,7 +641,7 @@ def _has_advancing_evidence(belief: dict[str, Any], last: dict | None) -> bool:
         isinstance(item, dict)
         and isinstance(item.get("edge_id"), str)
         and prior_by_edge.get(item["edge_id"]) != item
-        for item in terminal_current
+        for item in direct_current
     )
 
 

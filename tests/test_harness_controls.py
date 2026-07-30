@@ -230,6 +230,9 @@ class UsageAndLifecycleTests(unittest.TestCase):
     def test_candidate_brief_contains_only_implementation_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger_path = Path(tmp) / "ledger.json"
+            primary = Path(tmp) / "candidates" / "003" / "train.py"
+            primary.parent.mkdir(parents=True)
+            primary.write_text("PRIMARY = True\n")
             ledger_path.write_text(json.dumps({"records": [{
                 "run_id": "007", "op": "crossover", "idea": "combined result",
                 "change": "vs 003: keep core; vs 005: use features",
@@ -243,7 +246,16 @@ class UsageAndLifecycleTests(unittest.TestCase):
             self.assertEqual(brief["idea"], "combined result")
             self.assertEqual(brief["semantic_point"]["point_id"], "point-abc")
             self.assertEqual(brief["policy_receipt"]["policy"]["name"], "coverage")
-            self.assertEqual(brief["implementation_source"], {"kind": "generated"})
+            self.assertEqual(brief["schema_version"], 4)
+            self.assertEqual(brief["primary_parent"]["run_id"], "003")
+            self.assertRegex(
+                brief["primary_parent"]["sha256"],
+                r"^sha256:[0-9a-f]{64}$",
+            )
+            self.assertEqual(
+                brief["implementation_source"]["kind"],
+                "primary_parent_snapshot",
+            )
             self.assertNotIn("final_best_score", brief)
             self.assertNotIn("tuning", brief)
 
@@ -304,10 +316,76 @@ entrypoint = "train.py"
             self.assertEqual((candidate_dir / "train.py").read_text(), source.read_text())
             brief = json.loads((candidate_dir / "_candidate_brief.json").read_text())
             implementation = brief["implementation_source"]
-            self.assertEqual(brief["schema_version"], 3)
+            self.assertEqual(brief["schema_version"], 4)
             self.assertEqual(implementation["kind"], "provided_entrypoint")
             self.assertEqual(implementation["path"], "tasks/unit/train.py")
             self.assertRegex(implementation["sha256"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_nonfresh_candidate_starts_as_exact_primary_parent_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            task_dir = repo_root / "tasks" / "unit"
+            task_dir.mkdir(parents=True)
+            (task_dir / "prepare.py").write_text("VALUE = 1\n")
+            (task_dir / "train.py").write_text("TASK_TEMPLATE = True\n")
+            (task_dir / "task.toml").write_text(
+                """
+[candidate]
+copy_files = ["prepare.py", "train.py"]
+entrypoint = "train.py"
+""".strip()
+                + "\n"
+            )
+            run_dir = repo_root / "runs" / "unit" / "tag"
+            parent = run_dir / "candidates" / "001" / "train.py"
+            parent.parent.mkdir(parents=True)
+            parent.write_text("PARENT_STRATEGY = {'depth': 9}\n")
+            (run_dir / "ledger.json").write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "run_id": "002",
+                                "op": "improve",
+                                "idea": "Preserve and extend the parent.",
+                                "change": "Add one isolated mechanism.",
+                                "source_run_ids": ["001"],
+                                "candidate_name": "child",
+                                "semantic_point": {"point_id": "point-child"},
+                                "policy_receipt": {
+                                    "policy": {"name": "gain_uncertainty_nocost"}
+                                },
+                            }
+                        ]
+                    }
+                )
+            )
+
+            argv = [
+                "new_candidate.py",
+                "unit",
+                "tag",
+                "002",
+                "--skip-entrypoint",
+            ]
+            with (
+                mock.patch.object(new_candidate, "ROOT", repo_root),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(new_candidate.main(), 0)
+
+            child_dir = run_dir / "candidates" / "002"
+            self.assertEqual(
+                (child_dir / "train.py").read_bytes(),
+                parent.read_bytes(),
+            )
+            brief = json.loads((child_dir / "_candidate_brief.json").read_text())
+            self.assertEqual(brief["primary_parent"]["run_id"], "001")
+            self.assertEqual(
+                brief["implementation_source"]["sha256"],
+                brief["primary_parent"]["sha256"],
+            )
 
     def test_claude_usage_deduplicates_stream_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

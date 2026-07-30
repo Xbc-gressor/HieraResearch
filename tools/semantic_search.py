@@ -52,10 +52,10 @@ from search_space_state import (
     validate_point_eligibility,
 )
 from semantic_evidence import (
-    MIN_EXPERIENCE_ADJUSTMENT,
-    edge_index,
-    edge_observation,
-    experience_cited_ids,
+    acquisition_conditioning,
+    conditioning_cited_ids,
+    mechanical_gain_directions,
+    validate_conditioned_adjustment,
 )
 from semantic_space import (
     SemanticSpaceError,
@@ -75,22 +75,22 @@ from semantic_space import (
 
 
 PROPOSAL_SCHEMA_VERSION = 3
-GAIN_CONTEXT_SCHEMA_VERSION = 2
-PREDICTION_SCHEMA_VERSION = 2
+GAIN_CONTEXT_SCHEMA_VERSION = 3
+PREDICTION_SCHEMA_VERSION = 3
+CONDITIONED_PREDICTION_SCHEMA_VERSION = 2
 LEGACY_PREDICTION_SCHEMA_VERSION = 1
-POLICY_RECEIPT_SCHEMA_VERSION = 4
+POLICY_RECEIPT_SCHEMA_VERSION = 6
 POLICIES = {"coverage", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
 DEFAULT_POLICY_CONFIG = {
     "coverage_weight": 0.10,
     "cost_weight": 0.20,
     "uncertainty_weight": 0.50,
     "deprioritized_budget_interval": 5,
+    "llm_intelligence_score": 100.0,
 }
 MAX_PROPOSALS = 128
 MAX_EXPERIENCE_RUN_IDS = 5
 MAX_EXPERIENCE_EDGE_IDS = 5
-MAX_GAIN_CONTEXT_RECORDS = 32
-MAX_GAIN_CONTEXT_EDGES = 32
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -144,117 +144,110 @@ def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
     }
 
 
+def _proposal_acquisition_target_relations(
+    proposal: dict[str, Any],
+) -> dict[str, str]:
+    """Targets and exact move relations relevant to one proposal."""
+    parent_diffs = proposal.get("parent_diffs")
+    if isinstance(parent_diffs, list) and parent_diffs:
+        relation_sets: dict[str, set[str]] = {}
+        for parent_diff in parent_diffs:
+            changes = (
+                parent_diff.get("changes")
+                if isinstance(parent_diff, dict)
+                else None
+            )
+            for change in changes if isinstance(changes, list) else []:
+                if not isinstance(change, dict):
+                    continue
+                dimension_id = change.get("dimension_id")
+                from_hypothesis_id = change.get("from_hypothesis_id")
+                to_hypothesis_id = change.get("to_hypothesis_id")
+                if isinstance(dimension_id, str):
+                    relation_sets.setdefault(dimension_id, set()).add(
+                        "changed_dimension"
+                    )
+                if isinstance(from_hypothesis_id, str):
+                    relation_sets.setdefault(from_hypothesis_id, set()).add(
+                        "removed"
+                    )
+                if isinstance(to_hypothesis_id, str):
+                    relation_sets.setdefault(to_hypothesis_id, set()).add(
+                        "introduced"
+                    )
+        return {
+            target_id: (
+                next(iter(relations))
+                if len(relations) == 1
+                else "ambiguous"
+            )
+            for target_id, relations in relation_sets.items()
+        }
+    point = proposal.get("point")
+    if not isinstance(point, dict):
+        return {}
+    # A fresh proposal has no relative move.  Hypothesis-level evidence about
+    # the concrete selected mechanisms is relevant; broad dimension narratives
+    # are not allowed to condition every complete point.
+    try:
+        return {
+            target_id: "selected_fresh"
+            for target_id in selected_assignments(point).values()
+        }
+    except Exception:
+        return {}
+
+
 def build_gain_context(
     proposal_set: dict[str, Any], ledger: dict[str, Any]
 ) -> dict[str, Any]:
-    """Build the bounded, revisioned experience input for model gain scoring."""
+    """Build the bounded, revisioned and prose-free experience scoring input."""
+    # Import lazily to keep the helper dependency one-way at module load time.
+    from ledger import _experience_refresh_status
+
+    try:
+        refresh = _experience_refresh_status(ledger)
+    except ValueError as exc:
+        raise ContractError(f"invalid experience refresh state: {exc}") from None
+    if refresh["semantic_admission_blocked"]:
+        raise ContractError(
+            "stale experience: process the terminal DAG delta before building "
+            "another semantic acquisition context"
+        )
     errors = validate_proposal_set(proposal_set)
     if errors:
         raise ContractError("invalid proposal set: " + "; ".join(errors))
     experience = ledger.get("experience")
     receipt = _experience_snapshot_receipt(experience)
-    cited_ids, cited_edge_ids = experience_cited_ids(experience)
-    indexed_edges = edge_index(ledger)
-    record_citation_roles: dict[str, set[str]] = {
-        run_id: {"run"} for run_id in cited_ids
+    gain_directions = mechanical_gain_directions(ledger, experience)
+    conditioning_by_point = {
+        proposal["point_id"]: acquisition_conditioning(
+            experience,
+            proposal.get("point"),
+            target_relations=_proposal_acquisition_target_relations(proposal),
+            gain_directions=gain_directions,
+        )
+        for proposal in proposal_set["proposals"]
     }
-    cited_edges: list[dict[str, Any]] = []
-    for edge_id in sorted(cited_edge_ids):
-        edge = indexed_edges.get(edge_id)
-        if edge is None:
-            continue
-        parent_run_id = edge.get("parent_run_id")
-        child_run_id = edge.get("child_run_id")
-        if isinstance(parent_run_id, str):
-            record_citation_roles.setdefault(parent_run_id, set()).add(
-                f"edge_parent:{edge_id}"
-            )
-        if isinstance(child_run_id, str):
-            record_citation_roles.setdefault(child_run_id, set()).add(
-                f"edge_child:{edge_id}"
-            )
-        observation = edge_observation(ledger, edge_id)
-        if observation:
-            cited_edges.append(observation)
-    cited_records: list[dict[str, Any]] = []
-    for record in ledger.get("records", []):
-        if (
-            not isinstance(record, dict)
-            or str(record.get("run_id")) not in record_citation_roles
-            or record.get("status") not in {"keep", "discard", "crash"}
-        ):
-            continue
-        policy_receipt = record.get("policy_receipt")
-        components = (
-            policy_receipt.get("components")
-            if isinstance(policy_receipt, dict)
-            and isinstance(policy_receipt.get("components"), dict)
-            else {}
-        )
-        point = record.get("semantic_point")
-        warm_score = record.get("best_warm_score")
-        final_score = record.get("final_best_score")
-        warm_to_final_delta = (
-            round(float(final_score) - float(warm_score), 12)
-            if all(
-                isinstance(score, (int, float))
-                and not isinstance(score, bool)
-                and math.isfinite(float(score))
-                for score in (warm_score, final_score)
-            )
-            else None
-        )
-        semantic_edges = record.get("semantic_edges")
-        same_point_parent_run_ids = (
-            [
-                str(edge["parent_run_id"])
-                for edge in semantic_edges
-                if isinstance(edge, dict)
-                and edge.get("change_class") == "same_point"
-                and isinstance(edge.get("parent_run_id"), str)
-            ]
-            if isinstance(semantic_edges, list)
-            else []
-        )
-        cited_records.append(
-            {
-                "run_id": str(record.get("run_id")),
-                "citation_roles": sorted(
-                    record_citation_roles[str(record.get("run_id"))]
-                ),
-                "point_id": point.get("point_id") if isinstance(point, dict) else None,
-                "status": record.get("status"),
-                "source_run_ids": (
-                    list(record["source_run_ids"])
-                    if isinstance(record.get("source_run_ids"), list)
-                    else []
-                ),
-                "same_point_parent_run_ids": same_point_parent_run_ids,
-                "tuned": record.get("tune") is True,
-                "best_warm_score": warm_score,
-                "final_best_score": final_score,
-                "warm_to_final_delta": warm_to_final_delta,
-                "predicted_gain": components.get("predicted_gain"),
-                "uncertainty": components.get("uncertainty"),
-            }
-        )
-    omitted = max(0, len(cited_records) - MAX_GAIN_CONTEXT_RECORDS)
-    if omitted:
-        cited_records = cited_records[-MAX_GAIN_CONTEXT_RECORDS:]
-    omitted_edges = max(0, len(cited_edges) - MAX_GAIN_CONTEXT_EDGES)
-    if omitted_edges:
-        cited_edges = cited_edges[-MAX_GAIN_CONTEXT_EDGES:]
+    cited_ids: set[str] = set()
+    cited_edge_ids: set[str] = set()
+    for conditioning in conditioning_by_point.values():
+        run_ids, edge_ids = conditioning_cited_ids(conditioning)
+        cited_ids.update(run_ids)
+        cited_edge_ids.update(edge_ids)
     return {
         "schema_version": GAIN_CONTEXT_SCHEMA_VERSION,
         "proposal_set_revision": proposal_set["proposal_set_revision"],
         "experience_receipt": receipt,
-        "experience": experience if isinstance(experience, dict) else None,
+        # Deliberately omit summary/promising_regions/lessons/bottlenecks and
+        # target-entry prose.  Only helper-normalized structured receipts may
+        # condition acquisition.
+        "conditioning_by_point": conditioning_by_point,
+        # IDs are audit handles only.  Scores and signed edge deltas are omitted
+        # so uncertainty-only/confounded evidence cannot be laundered into the
+        # model-authored background prior.
         "experience_evidence_run_ids": sorted(cited_ids),
         "experience_evidence_edge_ids": sorted(cited_edge_ids),
-        "cited_records": cited_records,
-        "omitted_cited_records": omitted,
-        "cited_edges": cited_edges,
-        "omitted_cited_edges": omitted_edges,
     }
 
 
@@ -827,6 +820,7 @@ def _prediction_map(
     policy: str,
     *,
     experience: Any = None,
+    ledger: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     if value is None:
         return {}, ["gain policies require a predictions JSON object"]
@@ -834,10 +828,11 @@ def _prediction_map(
     schema_version = value.get("schema_version")
     if schema_version not in {
         LEGACY_PREDICTION_SCHEMA_VERSION,
+        CONDITIONED_PREDICTION_SCHEMA_VERSION,
         PREDICTION_SCHEMA_VERSION,
     }:
         errors.append(
-            "predictions.schema_version must be 1 (legacy bootstrap only) or 2"
+            "predictions.schema_version must be 1/2 (legacy bootstrap only) or 3"
         )
     if value.get("proposal_set_revision") != proposal_set.get("proposal_set_revision"):
         errors.append("predictions.proposal_set_revision does not match proposals")
@@ -851,23 +846,18 @@ def _prediction_map(
             "revision": None,
         }
     has_experience_snapshot = expected_experience["revision"] is not None
-    (
-        allowed_experience_run_ids,
-        allowed_experience_edge_ids,
-    ) = experience_cited_ids(experience)
-    has_conditioning_evidence = bool(
-        allowed_experience_run_ids or allowed_experience_edge_ids
-    )
+    gain_directions = mechanical_gain_directions(ledger or {}, experience)
     if schema_version == LEGACY_PREDICTION_SCHEMA_VERSION:
         if set(value) != {"schema_version", "proposal_set_revision", "predictions"}:
             errors.append("legacy predictions must contain only schema, proposal revision, and predictions")
         if has_experience_snapshot:
             errors.append(
-                "schema-2 predictions are required when ledger.experience exists; "
-                "the snapshot revision must be pinned even when it carries no "
-                "conditioning evidence"
+                "schema-3 predictions are required when ledger.experience exists"
             )
-    elif schema_version == PREDICTION_SCHEMA_VERSION:
+    elif schema_version in {
+        CONDITIONED_PREDICTION_SCHEMA_VERSION,
+        PREDICTION_SCHEMA_VERSION,
+    }:
         if set(value) != {
             "schema_version",
             "proposal_set_revision",
@@ -875,7 +865,7 @@ def _prediction_map(
             "predictions",
         }:
             errors.append(
-                "schema-2 predictions must contain exactly schema_version, "
+                "conditioned predictions must contain exactly schema_version, "
                 "proposal_set_revision, experience, and predictions"
             )
         if value.get("experience") != expected_experience:
@@ -883,11 +873,22 @@ def _prediction_map(
                 "predictions.experience must match the current gain-context "
                 "experience receipt"
             )
+        if (
+            schema_version == CONDITIONED_PREDICTION_SCHEMA_VERSION
+            and has_experience_snapshot
+        ):
+            errors.append(
+                "schema-2 experience conditioning is no longer admissible; "
+                "regenerate schema-3 predictions from the gated gain-context"
+            )
     predictions = value.get("predictions")
     if not isinstance(predictions, list):
         return {}, errors + ["predictions.predictions must be a list"]
     result: dict[str, dict[str, Any]] = {}
-    proposal_ids = {item["point_id"] for item in proposal_set["proposals"]}
+    proposal_by_id = {
+        item["point_id"]: item for item in proposal_set["proposals"]
+    }
+    proposal_ids = set(proposal_by_id)
     for index, prediction in enumerate(predictions):
         where = f"predictions[{index}]"
         if not isinstance(prediction, dict):
@@ -900,7 +901,10 @@ def _prediction_map(
         if point_id_value in result:
             errors.append(f"duplicate prediction for {point_id_value}")
             continue
-        if schema_version == PREDICTION_SCHEMA_VERSION:
+        if schema_version in {
+            CONDITIONED_PREDICTION_SCHEMA_VERSION,
+            PREDICTION_SCHEMA_VERSION,
+        }:
             score_fields = (
                 "prior_gain",
                 "predicted_gain",
@@ -920,6 +924,8 @@ def _prediction_map(
                 "experience_rationale",
                 "evidence",
             }
+            if schema_version == PREDICTION_SCHEMA_VERSION:
+                allowed_fields.add("experience_target_ids")
         else:
             score_fields = ("predicted_gain", "uncertainty")
             adjustment_fields = ()
@@ -945,7 +951,10 @@ def _prediction_map(
                 or not -1.0 <= float(score) <= 1.0
             ):
                 errors.append(f"{where}.{field} must be a number in [-1, 1]")
-        if schema_version == PREDICTION_SCHEMA_VERSION:
+        if schema_version in {
+            CONDITIONED_PREDICTION_SCHEMA_VERSION,
+            PREDICTION_SCHEMA_VERSION,
+        }:
             gain_parts = (
                 prediction.get("prior_gain"),
                 prediction.get("experience_gain_adjustment"),
@@ -985,14 +994,10 @@ def _prediction_map(
                 not isinstance(raw_run_ids, list)
                 or len(experience_run_ids) > MAX_EXPERIENCE_RUN_IDS
                 or len(experience_run_ids) != len(set(experience_run_ids))
-                or any(
-                    run_id not in allowed_experience_run_ids
-                    for run_id in experience_run_ids
-                )
             ):
                 errors.append(
                     f"{where}.experience_run_ids must contain 0–"
-                    f"{MAX_EXPERIENCE_RUN_IDS} unique runs cited by current experience"
+                    f"{MAX_EXPERIENCE_RUN_IDS} unique run ids"
                 )
             raw_edge_ids = prediction.get("experience_edge_ids")
             experience_edge_ids = (
@@ -1005,14 +1010,10 @@ def _prediction_map(
                 not isinstance(raw_edge_ids, list)
                 or len(experience_edge_ids) > MAX_EXPERIENCE_EDGE_IDS
                 or len(experience_edge_ids) != len(set(experience_edge_ids))
-                or any(
-                    edge_id not in allowed_experience_edge_ids
-                    for edge_id in experience_edge_ids
-                )
             ):
                 errors.append(
                     f"{where}.experience_edge_ids must contain 0–"
-                    f"{MAX_EXPERIENCE_EDGE_IDS} unique edges cited by current experience"
+                    f"{MAX_EXPERIENCE_EDGE_IDS} unique edge ids"
                 )
             rationale = prediction.get("experience_rationale")
             if (
@@ -1028,47 +1029,79 @@ def _prediction_map(
             uncertainty_adjustment = prediction.get(
                 "experience_uncertainty_adjustment"
             )
-            adjustments_are_zero = all(
-                isinstance(item, (int, float))
-                and not isinstance(item, bool)
-                and math.isclose(float(item), 0.0, rel_tol=0.0, abs_tol=1e-12)
-                for item in (gain_adjustment, uncertainty_adjustment)
-            )
-            if has_conditioning_evidence:
-                if not experience_run_ids and not experience_edge_ids:
+            if schema_version == PREDICTION_SCHEMA_VERSION:
+                raw_target_ids = prediction.get("experience_target_ids")
+                target_ids = (
+                    raw_target_ids
+                    if isinstance(raw_target_ids, list)
+                    and all(isinstance(item, str) for item in raw_target_ids)
+                    else []
+                )
+                if (
+                    not isinstance(raw_target_ids, list)
+                    or len(target_ids) != len(set(target_ids))
+                ):
                     errors.append(
-                        f"{where} must cite experience run or edge ids when "
-                        "conditioning evidence exists"
+                        f"{where}.experience_target_ids must be a unique string list"
                     )
-                if adjustments_are_zero:
+                available = acquisition_conditioning(
+                    experience,
+                    proposal_by_id[point_id_value].get("point"),
+                    target_relations=_proposal_acquisition_target_relations(
+                        proposal_by_id[point_id_value]
+                    ),
+                    gain_directions=gain_directions,
+                )
+                by_target = {item["target_id"]: item for item in available}
+                unknown_targets = sorted(set(target_ids) - set(by_target))
+                if unknown_targets:
                     errors.append(
-                        f"{where} must let current experience change gain or uncertainty"
+                        f"{where}.experience_target_ids are not relevant gated "
+                        f"targets {unknown_targets}"
                     )
-                elif all(
-                    not isinstance(item, (int, float))
-                    or isinstance(item, bool)
-                    or abs(float(item)) < MIN_EXPERIENCE_ADJUSTMENT
+                selected_conditioning = [
+                    by_target[target_id]
+                    for target_id in target_ids
+                    if target_id in by_target
+                ]
+                expected_run_ids, expected_edge_ids = conditioning_cited_ids(
+                    selected_conditioning
+                )
+                if set(experience_run_ids) != expected_run_ids:
+                    errors.append(
+                        f"{where}.experience_run_ids must equal the helper-derived "
+                        "union for experience_target_ids"
+                    )
+                if set(experience_edge_ids) != expected_edge_ids:
+                    errors.append(
+                        f"{where}.experience_edge_ids must equal the helper-derived "
+                        "union for experience_target_ids"
+                    )
+                errors.extend(
+                    f"{where}: {error}"
+                    for error in validate_conditioned_adjustment(
+                        selected_conditioning,
+                        proposal_by_id[point_id_value].get("point"),
+                        evidence_run_ids=experience_run_ids,
+                        evidence_edge_ids=experience_edge_ids,
+                        gain_adjustment=gain_adjustment,
+                        uncertainty_adjustment=uncertainty_adjustment,
+                    )
+                )
+            else:
+                selected_conditioning = []
+                if experience_run_ids or experience_edge_ids:
+                    errors.append(
+                        f"{where} legacy schema-2 predictions cannot cite experience"
+                    )
+                if any(
+                    isinstance(item, (int, float))
+                    and not isinstance(item, bool)
+                    and not math.isclose(float(item), 0.0, abs_tol=1e-12)
                     for item in (gain_adjustment, uncertainty_adjustment)
                 ):
                     errors.append(
-                        f"{where} experience must change gain or uncertainty by "
-                        f"at least {MIN_EXPERIENCE_ADJUSTMENT:.2f}"
-                    )
-            else:
-                if experience_run_ids:
-                    errors.append(
-                        f"{where}.experience_run_ids must be empty without "
-                        "conditioning evidence"
-                    )
-                if experience_edge_ids:
-                    errors.append(
-                        f"{where}.experience_edge_ids must be empty without "
-                        "conditioning evidence"
-                    )
-                if not adjustments_are_zero:
-                    errors.append(
-                        f"{where} experience adjustments must be zero without "
-                        "conditioning evidence"
+                        f"{where} legacy schema-2 experience adjustments must be zero"
                     )
         evidence = prediction.get("evidence")
         if (
@@ -1097,11 +1130,22 @@ def _prediction_map(
                     "experience_uncertainty_adjustment": 0.0,
                     "experience_run_ids": [],
                     "experience_edge_ids": [],
+                    "experience_target_ids": [],
+                    "_experience_conditioning": [],
                     "experience_rationale": (
                         "legacy bootstrap prediction without an experience snapshot"
                     ),
                 }
             )
+        elif schema_version == CONDITIONED_PREDICTION_SCHEMA_VERSION:
+            normalized.update(
+                {
+                    "experience_target_ids": [],
+                    "_experience_conditioning": [],
+                }
+            )
+        else:
+            normalized["_experience_conditioning"] = selected_conditioning
         result[point_id_value] = normalized
     missing = sorted(proposal_ids - set(result))
     if missing:
@@ -1117,6 +1161,7 @@ def select_proposal(
     config: dict[str, float | int] | None = None,
     selection_index: int = 1,
     experience: Any = None,
+    ledger: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     errors = validate_proposal_set(proposal_set)
     if errors:
@@ -1147,6 +1192,19 @@ def select_proposal(
                     )
                 cfg[key] = value
                 continue
+            if key == "llm_intelligence_score":
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    or not 0.0 <= float(value) <= 100.0
+                ):
+                    raise ContractError(
+                        "semantic policy config llm_intelligence_score "
+                        "must be a finite number in [0, 100]"
+                    )
+                cfg[key] = float(value)
+                continue
             if (
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
@@ -1159,12 +1217,17 @@ def select_proposal(
     prediction_by_id: dict[str, dict[str, Any]] = {}
     if policy != "coverage":
         prediction_by_id, prediction_errors = _prediction_map(
-            predictions, proposal_set, policy, experience=experience
+            predictions,
+            proposal_set,
+            policy,
+            experience=experience,
+            ledger=ledger,
         )
         if prediction_errors:
             raise ContractError("invalid policy predictions: " + "; ".join(prediction_errors))
 
     ranked: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
+    llm_judgment_weight = float(cfg["llm_intelligence_score"]) / 100.0
     for proposal in proposal_set["proposals"]:
         point_id_value = proposal["point_id"]
         prediction = prediction_by_id.get(point_id_value)
@@ -1180,25 +1243,34 @@ def select_proposal(
             score = coverage
         elif policy == "gain":
             score = (
-                predicted_gain
+                llm_judgment_weight
+                * (predicted_gain - cfg["cost_weight"] * cost)
                 + cfg["coverage_weight"] * coverage
-                - cfg["cost_weight"] * cost
             )
         elif policy == "gain_uncertainty":
             score = (
-                predicted_gain
-                + cfg["uncertainty_weight"] * uncertainty
+                llm_judgment_weight
+                * (
+                    predicted_gain
+                    + cfg["uncertainty_weight"] * uncertainty
+                    - cfg["cost_weight"] * cost
+                )
                 + cfg["coverage_weight"] * coverage
-                - cfg["cost_weight"] * cost
             )
         else:
             score = (
-                predicted_gain
-                + cfg["uncertainty_weight"] * uncertainty
+                llm_judgment_weight
+                * (
+                    predicted_gain
+                    + cfg["uncertainty_weight"] * uncertainty
+                )
                 + cfg["coverage_weight"] * coverage
             )
         components = {
             "coverage": coverage,
+            "llm_judgment_weight": (
+                None if prediction is None else llm_judgment_weight
+            ),
             "prior_gain": (
                 None if prediction is None else float(prediction["prior_gain"])
             ),
@@ -1253,6 +1325,9 @@ def select_proposal(
     snapshot = _experience_snapshot_receipt(experience)
     experience_receipt = {
         **snapshot,
+        "conditioning": (
+            [] if prediction is None else prediction["_experience_conditioning"]
+        ),
         "evidence_run_ids": (
             [] if prediction is None else prediction["experience_run_ids"]
         ),
@@ -1385,10 +1460,14 @@ def cmd_gain_context(args: argparse.Namespace) -> int:
                 "ok": True,
                 "output": str(args.output),
                 "experience_receipt": context["experience_receipt"],
-                "n_cited_records": len(context["cited_records"]),
-                "omitted_cited_records": context["omitted_cited_records"],
-                "n_cited_edges": len(context["cited_edges"]),
-                "omitted_cited_edges": context["omitted_cited_edges"],
+                "n_conditioned_points": sum(
+                    bool(entries)
+                    for entries in context["conditioning_by_point"].values()
+                ),
+                "n_conditioning_entries": sum(
+                    len(entries)
+                    for entries in context["conditioning_by_point"].values()
+                ),
             },
             separators=(",", ":"),
         )
@@ -1408,6 +1487,66 @@ def cmd_select(args: argparse.Namespace) -> int:
             raise ContractError("--cfg must be a JSON object")
         config.update(override)
     ledger = _load_object(args.ledger) if args.ledger and args.ledger.exists() else {}
+    configured_llm_score = config.get(
+        "llm_intelligence_score",
+        DEFAULT_POLICY_CONFIG["llm_intelligence_score"],
+    )
+    if (
+        isinstance(configured_llm_score, (int, float))
+        and not isinstance(configured_llm_score, bool)
+        and math.isfinite(float(configured_llm_score))
+    ):
+        prior_records = ledger.get("records", [])
+        for prior_record in prior_records if isinstance(prior_records, list) else []:
+            prior_receipt = (
+                prior_record.get("policy_receipt")
+                if isinstance(prior_record, dict)
+                else None
+            )
+            prior_policy = (
+                prior_receipt.get("policy")
+                if isinstance(prior_receipt, dict)
+                and prior_receipt.get("schema_version") == 6
+                else None
+            )
+            prior_config = (
+                prior_policy.get("config")
+                if isinstance(prior_policy, dict)
+                else None
+            )
+            prior_score = (
+                prior_config.get("llm_intelligence_score")
+                if isinstance(prior_config, dict)
+                else None
+            )
+            prior_score_valid = (
+                isinstance(prior_score, (int, float))
+                and not isinstance(prior_score, bool)
+                and math.isfinite(float(prior_score))
+            )
+            if prior_score_valid and not math.isclose(
+                float(configured_llm_score),
+                float(prior_score),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ContractError(
+                    "semantic_search.llm_intelligence_score is frozen at "
+                    f"{float(prior_score):g} after the first schema-6 admission"
+                )
+            if prior_score_valid:
+                break
+    from ledger import _experience_refresh_status
+
+    try:
+        refresh = _experience_refresh_status(ledger)
+    except ValueError as exc:
+        raise ContractError(f"invalid experience refresh state: {exc}") from None
+    if refresh["semantic_admission_blocked"]:
+        raise ContractError(
+            "stale experience: process the terminal DAG delta before selecting "
+            "another semantic point"
+        )
     records = ledger.get("records", [])
     if not isinstance(records, list):
         raise ContractError("ledger.records must be a list")
@@ -1435,6 +1574,7 @@ def cmd_select(args: argparse.Namespace) -> int:
         config=config,
         selection_index=len(records) + 1,
         experience=ledger.get("experience"),
+        ledger=ledger,
     )
     _write_object(args.point_output, point)
     _write_object(args.receipt_output, receipt)

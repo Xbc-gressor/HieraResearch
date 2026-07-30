@@ -16,6 +16,7 @@ and disposable, so there is no implicit migration or mixed-mode behavior.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -36,18 +37,24 @@ from search_space_state import (
     validate_search_space_state,
 )
 from semantic_evidence import (
+    acquisition_target_relations,
     COVERAGE_KEYS,
     EVALUATION_STATES,
+    LIFECYCLE_TERMINAL_STATUSES,
     MAX_DIMENSION_TARGETS,
     MAX_EDGES_PER_TARGET,
     MAX_HYPOTHESIS_TARGETS,
     MAX_RUNS_PER_TARGET,
-    MIN_EXPERIENCE_ADJUSTMENT,
     SemanticEvidenceError,
     comparator_coverage,
     edge_index,
+    mechanical_gain_direction,
     render_target_evidence,
     target_evaluation_state,
+    validate_conditioning_against_ledger,
+    validate_conditioned_adjustment,
+    validate_lineage_snapshots,
+    validate_parameter_transfer_binding,
     validate_semantic_edges,
 )
 from semantic_space import (
@@ -74,6 +81,10 @@ from semantic_space import (
 SOURCE_RE = re.compile(r"^src-(\d{2,})$")
 GUIDANCE_RE = re.compile(r"^g-(\d{2,})$")
 SCOPE_TAG_RE = re.compile(r"^(?:\*|[a-z0-9][a-z0-9._-]*)$")
+# Every lifecycle-terminal status, plus the one non-terminal state a record can
+# legitimately sit in. Derived so a new terminal status cannot be accepted here
+# while the terminal-state helpers still reject it.
+RECORD_STATUSES = {"pending"} | LIFECYCLE_TERMINAL_STATUSES
 
 LITERATURE_CREDIBILITY = {
     "unverified",
@@ -116,8 +127,13 @@ SCOPE_FACETS = (
 GUIDANCE_SECTIONS = {"pitfall", "deprioritize"}
 GUIDANCE_EFFECTS = {"caution", "deprioritize", "exclude"}
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+BASELINE_INVENTORY_SCHEMA_VERSION = 1
+BASELINE_INVENTORY_KIND = "baseline_mechanism_inventory"
+BASELINE_CITATION_RE = re.compile(r"^[^\s:]+:[0-9]+$")
 POLICY_CONFIG_KEYS_V2 = {"coverage_weight", "cost_weight", "uncertainty_weight"}
 POLICY_CONFIG_KEYS_V3 = POLICY_CONFIG_KEYS_V2 | {"deprioritized_budget_interval"}
+POLICY_CONFIG_KEYS_V6 = POLICY_CONFIG_KEYS_V3 | {"llm_intelligence_score"}
+LEGACY_EXPERIENCE_ADJUSTMENT_FLOOR = 0.01
 
 
 class ContractError(ValueError):
@@ -433,6 +449,168 @@ def _validate_hypotheses(
     return errors
 
 
+def _baseline_interventions(registry: dict[str, Any]) -> dict[str, tuple[str, set[str]]]:
+    """Map each dimension id to its baseline hypothesis id and declared mechanisms."""
+    baselines: dict[str, tuple[str, set[str]]] = {}
+    for dimension in registry.get("dimensions", []):
+        if not isinstance(dimension, dict):
+            continue
+        dimension_id = dimension.get("id")
+        baseline_id = dimension.get("baseline_hypothesis_id")
+        for hypothesis in dimension.get("hypotheses", []):
+            if not isinstance(hypothesis, dict) or hypothesis.get("id") != baseline_id:
+                continue
+            scope = hypothesis.get("scope")
+            if not isinstance(scope, dict):
+                continue
+            values = scope.get("interventions")
+            if isinstance(values, list) and all(isinstance(v, str) for v in values):
+                baselines[str(dimension_id)] = (str(baseline_id), set(values))
+    return baselines
+
+
+def _validate_baseline_mechanism_disjointness(
+    registry: dict[str, Any],
+    inventory: dict[str, Any] | None = None,
+) -> list[str]:
+    """Keep alternative hypotheses mechanically distinct from every baseline.
+
+    A non-baseline hypothesis that names a mechanism a baseline already applies
+    is not a contrast: candidates attributed to it re-implement the control, so
+    their observations measure implementation noise while the ledger records a
+    clean single-dimension edge.  ``interventions`` is the declared mechanism
+    set, so overlap with any baseline is a frozen-space defect.
+
+    When a baseline mechanism inventory is supplied, each dimension's baseline
+    must also *declare* everything the provided entrypoint already does; that
+    closes the gap where an omitted baseline mechanism hides the collision.
+    """
+    errors: list[str] = []
+    baselines = _baseline_interventions(registry)
+    if inventory is not None:
+        errors.extend(_validate_baseline_inventory(registry, inventory, baselines))
+    baseline_ids = {baseline_id for baseline_id, _ in baselines.values()}
+    for dimension in registry.get("dimensions", []):
+        if not isinstance(dimension, dict):
+            continue
+        for hypothesis in dimension.get("hypotheses", []):
+            if not isinstance(hypothesis, dict):
+                continue
+            hypothesis_id = hypothesis.get("id")
+            if hypothesis.get("kind") == "baseline" or hypothesis_id in baseline_ids:
+                continue
+            scope = hypothesis.get("scope")
+            if not isinstance(scope, dict):
+                continue
+            values = scope.get("interventions")
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                continue
+            mechanisms = set(values)
+            for owner_dimension, (baseline_id, baseline_mechanisms) in sorted(
+                baselines.items()
+            ):
+                overlap = mechanisms & baseline_mechanisms
+                if not overlap:
+                    continue
+                errors.append(
+                    f"hypothesis {hypothesis_id} in {dimension.get('id')} shares "
+                    f"interventions {sorted(overlap)} with the {owner_dimension} "
+                    f"baseline {baseline_id}; a mechanism the baseline already "
+                    "applies is not a contrast"
+                )
+    return errors
+
+
+def _validate_baseline_inventory(
+    registry: dict[str, Any],
+    inventory: Any,
+    baselines: dict[str, tuple[str, set[str]]],
+) -> list[str]:
+    """Require every provided-entrypoint mechanism to be declared by its baseline."""
+    errors: list[str] = []
+    if not isinstance(inventory, dict):
+        return ["baseline mechanism inventory must be a JSON object"]
+    if inventory.get("schema_version") != BASELINE_INVENTORY_SCHEMA_VERSION:
+        errors.append(
+            "baseline mechanism inventory schema_version must be "
+            f"{BASELINE_INVENTORY_SCHEMA_VERSION}"
+        )
+    if inventory.get("kind") != BASELINE_INVENTORY_KIND:
+        errors.append(
+            f"baseline mechanism inventory kind must be {BASELINE_INVENTORY_KIND!r}"
+        )
+    entrypoint = inventory.get("entrypoint")
+    if not isinstance(entrypoint, dict) or not _nonempty(entrypoint.get("path")):
+        errors.append("baseline mechanism inventory requires entrypoint.path")
+    elif DIGEST_RE.fullmatch(str(entrypoint.get("sha256", ""))) is None:
+        errors.append(
+            "baseline mechanism inventory entrypoint.sha256 must be a sha256 digest"
+        )
+    dimensions = inventory.get("dimensions")
+    if not isinstance(dimensions, dict) or not dimensions:
+        return errors + ["baseline mechanism inventory requires a non-empty dimensions map"]
+    known = {
+        str(dimension.get("id"))
+        for dimension in registry.get("dimensions", [])
+        if isinstance(dimension, dict)
+    }
+    unknown = sorted(set(dimensions) - known)
+    if unknown:
+        errors.append(f"baseline mechanism inventory references unknown dimensions {unknown}")
+    missing = sorted(known - set(dimensions))
+    if missing:
+        errors.append(
+            f"baseline mechanism inventory does not cover dimensions {missing}; "
+            "every resolved dimension needs its baseline mechanisms"
+        )
+    for dimension_id in sorted(set(dimensions) & known):
+        entry = dimensions[dimension_id]
+        where = f"baseline mechanism inventory {dimension_id}"
+        if not isinstance(entry, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        values = entry.get("interventions")
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(
+                not isinstance(value, str) or SCOPE_TAG_RE.fullmatch(value) is None
+                for value in values
+            )
+        ):
+            errors.append(f"{where}.interventions must be a non-empty list of scope tags")
+            continue
+        if len(values) != len(set(values)):
+            errors.append(f"{where}.interventions must not contain duplicate tags")
+            continue
+        citations = entry.get("citations")
+        if (
+            not isinstance(citations, list)
+            or not citations
+            or any(
+                not isinstance(citation, str)
+                or BASELINE_CITATION_RE.fullmatch(citation) is None
+                for citation in citations
+            )
+        ):
+            errors.append(
+                f"{where}.citations must be a non-empty list of '<file>:<line>' receipts"
+            )
+        declared = baselines.get(dimension_id)
+        if declared is None:
+            errors.append(f"{where} has no resolvable baseline hypothesis to check")
+            continue
+        baseline_id, baseline_mechanisms = declared
+        undeclared = sorted(set(values) - baseline_mechanisms)
+        if undeclared:
+            errors.append(
+                f"{where} baseline {baseline_id} does not declare interventions "
+                f"{undeclared} that the provided entrypoint already applies; add "
+                "them to its scope.interventions so alternatives stay distinct"
+            )
+    return errors
+
+
 def _validate_relations_evidence(
     registry: dict[str, Any], source_by_id: dict[str, dict[str, Any]]
 ) -> list[str]:
@@ -668,8 +846,10 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     point_object = point if isinstance(point, dict) else {}
     errors: list[str] = []
     receipt_schema = receipt.get("schema_version")
-    if receipt_schema not in {2, 3, 4}:
-        errors.append(f"{where}.policy_receipt.schema_version must be 2, 3, or 4")
+    if receipt_schema not in {2, 3, 4, 5, 6}:
+        errors.append(
+            f"{where}.policy_receipt.schema_version must be 2, 3, 4, 5, or 6"
+        )
     state_revision = receipt.get("search_space_state_revision")
     if (
         not isinstance(state_revision, int)
@@ -713,7 +893,13 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     config = policy.get("config") if isinstance(policy, dict) else None
     config_valid = True
     expected_config_keys = (
-        POLICY_CONFIG_KEYS_V3 if receipt_schema in {3, 4} else POLICY_CONFIG_KEYS_V2
+        POLICY_CONFIG_KEYS_V6
+        if receipt_schema == 6
+        else (
+            POLICY_CONFIG_KEYS_V3
+            if receipt_schema in {3, 4, 5}
+            else POLICY_CONFIG_KEYS_V2
+        )
     )
     if not isinstance(config, dict) or set(config) != expected_config_keys:
         errors.append(
@@ -736,6 +922,19 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                         "an integer in [2, 1000]"
                     )
                 continue
+            if key == "llm_intelligence_score":
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    or not 0.0 <= float(value) <= 100.0
+                ):
+                    config_valid = False
+                    errors.append(
+                        f"{where}.policy_receipt.policy.config.{key} must be "
+                        "a finite number in [0, 100]"
+                    )
+                continue
             if (
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
@@ -751,13 +950,15 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     coverage_valid = False
     model_components_valid = False
     required_components = {"coverage", "predicted_gain", "uncertainty", "cost"}
-    if receipt_schema == 4:
+    if receipt_schema in {4, 5, 6}:
         required_components |= {
             "prior_gain",
             "experience_gain_adjustment",
             "prior_uncertainty",
             "experience_uncertainty_adjustment",
         }
+    if receipt_schema == 6:
+        required_components.add("llm_judgment_weight")
     if not isinstance(components, dict) or set(components) != required_components:
         errors.append(
             f"{where}.policy_receipt.components must keep {sorted(required_components)} separate"
@@ -782,11 +983,16 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             components.get("prior_uncertainty"),
             components.get("experience_uncertainty_adjustment"),
         ]
+        llm_judgment_weight = components.get("llm_judgment_weight")
         if policy_name == "coverage":
             model_components_valid = all(value is None for value in model_components)
-            if receipt_schema == 4:
+            if receipt_schema in {4, 5, 6}:
                 model_components_valid = model_components_valid and all(
                     value is None for value in conditioned_components
+                )
+            if receipt_schema == 6:
+                model_components_valid = (
+                    model_components_valid and llm_judgment_weight is None
                 )
             if not model_components_valid:
                 errors.append(
@@ -818,7 +1024,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     f"{where}.policy_receipt gain policies require separate finite "
                     "predicted_gain, uncertainty, and cost values in [0, 1]"
                 )
-        if receipt_schema == 4 and policy_name != "coverage":
+        if receipt_schema in {4, 5, 6} and policy_name != "coverage":
             prior_values = (
                 components.get("prior_gain"),
                 components.get("prior_uncertainty"),
@@ -836,7 +1042,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             ):
                 model_components_valid = False
                 errors.append(
-                    f"{where}.policy_receipt schema 4 prior gain and uncertainty "
+                    f"{where}.policy_receipt schema {receipt_schema} prior gain and uncertainty "
                     "must be finite values in [0, 1]"
                 )
             if not all(
@@ -848,7 +1054,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             ):
                 model_components_valid = False
                 errors.append(
-                    f"{where}.policy_receipt schema 4 experience adjustments "
+                    f"{where}.policy_receipt schema {receipt_schema} experience adjustments "
                     "must be finite values in [-1, 1]"
                 )
             arithmetic = (
@@ -882,6 +1088,34 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                         f"{where}.policy_receipt {label} must equal its prior "
                         "plus experience adjustment"
                     )
+        if receipt_schema == 6 and policy_name != "coverage":
+            expected_llm_weight = (
+                float(config["llm_intelligence_score"]) / 100.0
+                if config_valid
+                else None
+            )
+            if (
+                not isinstance(llm_judgment_weight, (int, float))
+                or isinstance(llm_judgment_weight, bool)
+                or not math.isfinite(float(llm_judgment_weight))
+                or not 0.0 <= float(llm_judgment_weight) <= 1.0
+            ):
+                model_components_valid = False
+                errors.append(
+                    f"{where}.policy_receipt.components.llm_judgment_weight "
+                    "must be a finite number in [0, 1]"
+                )
+            elif expected_llm_weight is not None and not math.isclose(
+                float(llm_judgment_weight),
+                expected_llm_weight,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                model_components_valid = False
+                errors.append(
+                    f"{where}.policy_receipt.components.llm_judgment_weight "
+                    "must equal policy.config.llm_intelligence_score / 100"
+                )
     evidence = receipt.get("evidence")
     if (
         not isinstance(evidence, list)
@@ -898,7 +1132,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         errors.append(f"{where}.policy_receipt gain policies require selection evidence")
 
     experience_receipt = receipt.get("experience")
-    if receipt_schema == 4:
+    if receipt_schema in {4, 5, 6}:
         experience_fields = {
             "generation",
             "updated_at_run",
@@ -907,6 +1141,8 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             "evidence_edge_ids",
             "rationale",
         }
+        if receipt_schema in {5, 6}:
+            experience_fields.add("conditioning")
         if (
             not isinstance(experience_receipt, dict)
             or set(experience_receipt) != experience_fields
@@ -968,10 +1204,37 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     "non-empty and at most 240 characters"
                 )
             if policy_name == "coverage":
-                if run_ids or edge_ids:
+                if run_ids or edge_ids or (
+                    receipt_schema in {5, 6}
+                    and experience_receipt.get("conditioning") != []
+                ):
                     errors.append(
                         f"{where}.policy_receipt coverage policy must not cite "
                         "experience as a model-score input"
+                    )
+            elif receipt_schema in {5, 6}:
+                conditioning = experience_receipt.get("conditioning")
+                errors.extend(
+                    f"{where}.policy_receipt.experience: {error}"
+                    for error in validate_conditioned_adjustment(
+                        conditioning,
+                        point_object,
+                        evidence_run_ids=run_ids,
+                        evidence_edge_ids=edge_ids,
+                        gain_adjustment=components.get(
+                            "experience_gain_adjustment"
+                        ),
+                        uncertainty_adjustment=components.get(
+                            "experience_uncertainty_adjustment"
+                        ),
+                    )
+                )
+                if not snapshot_present and (
+                    conditioning or run_ids or edge_ids
+                ):
+                    errors.append(
+                        f"{where}.policy_receipt cannot condition on experience "
+                        "without an experience snapshot"
                     )
             elif snapshot_present:
                 adjustments = (
@@ -992,13 +1255,13 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 elif (run_ids or edge_ids) and all(
                     not isinstance(value, (int, float))
                     or isinstance(value, bool)
-                    or abs(float(value)) < MIN_EXPERIENCE_ADJUSTMENT
+                    or abs(float(value)) < LEGACY_EXPERIENCE_ADJUSTMENT_FLOOR
                     for value in adjustments
                 ):
                     errors.append(
                         f"{where}.policy_receipt cited experience must change gain "
                         "or uncertainty by at least "
-                        f"{MIN_EXPERIENCE_ADJUSTMENT:.2f}"
+                        f"{LEGACY_EXPERIENCE_ADJUSTMENT_FLOOR:.2f}"
                     )
                 if not run_ids and not edge_ids and not adjustments_are_zero:
                     errors.append(
@@ -1033,7 +1296,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         )
 
     budget = receipt.get("budget")
-    if receipt_schema in {3, 4}:
+    if receipt_schema in {3, 4, 5, 6}:
         budget_fields = {
             "selection_index",
             "deprioritized_interval",
@@ -1146,21 +1409,25 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         if policy_name == "coverage":
             expected_score = coverage
         elif policy_name == "gain_uncertainty_nocost":
-            expected_score = (
+            model_score = (
                 float(components["predicted_gain"])
                 + float(config["uncertainty_weight"]) * float(components["uncertainty"])
-                + float(config["coverage_weight"]) * coverage
             )
+            if receipt_schema == 6:
+                model_score *= float(components["llm_judgment_weight"])
+            expected_score = model_score + float(config["coverage_weight"]) * coverage
         elif all(components[key] is not None for key in ("predicted_gain", "uncertainty", "cost")):
-            expected_score = (
+            model_score = (
                 float(components["predicted_gain"])
-                + float(config["coverage_weight"]) * coverage
                 - float(config["cost_weight"]) * float(components["cost"])
             )
             if policy_name == "gain_uncertainty":
-                expected_score += float(config["uncertainty_weight"]) * float(
+                model_score += float(config["uncertainty_weight"]) * float(
                     components["uncertainty"]
                 )
+            if receipt_schema == 6:
+                model_score *= float(components["llm_judgment_weight"])
+            expected_score = model_score + float(config["coverage_weight"]) * coverage
         else:
             expected_score = None
         if expected_score is not None and not math.isclose(
@@ -1182,7 +1449,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             f"{where}.policy_receipt.ranked_point_ids must be unique and start with the selected point"
         )
     elif (
-        receipt_schema in {3, 4}
+        receipt_schema in {3, 4, 5, 6}
         and isinstance(budget, dict)
         and isinstance(budget.get("base_rank"), int)
         and budget["base_rank"] > len(ranked)
@@ -1203,9 +1470,9 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         "evidence",
         "ranked_point_ids",
     }
-    if receipt_schema in {3, 4}:
+    if receipt_schema in {3, 4, 5, 6}:
         allowed.add("budget")
-    if receipt_schema == 4:
+    if receipt_schema in {4, 5, 6}:
         allowed.add("experience")
     unknown = sorted(set(receipt) - allowed)
     if unknown:
@@ -1215,6 +1482,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
 
 def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    errors.extend(validate_lineage_snapshots(ledger))
     records = ledger.get("records")
     if not isinstance(records, list):
         return ["ledger.records must be a list"]
@@ -1234,6 +1502,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
     )
     guidance = derive_hypothesis_selection(registry)
     known: set[str] = set()
+    frozen_llm_intelligence_score: float | None = None
     for index, record in enumerate(records):
         where = f"ledger.records[{index}]"
         if not isinstance(record, dict):
@@ -1248,6 +1517,78 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
             errors.append(f"{where}.run_id duplicates an earlier record")
         if record.get("kind") != "optimization":
             errors.append(f"{where}.kind must be optimization")
+        status = record.get("status")
+        if status not in RECORD_STATUSES:
+            errors.append(
+                f"{where}.status must be one of {sorted(RECORD_STATUSES)}"
+            )
+        unevaluated_receipt = record.get("unevaluated_receipt")
+        if status == "unevaluated":
+            receipt_fields = {
+                "schema_version",
+                "kind",
+                "budget",
+                "evaluations_done",
+                "candidate_objective_attempts",
+                "attempt_log",
+                "attempt_log_sha256",
+                "receipt_sha256",
+            }
+            if (
+                not isinstance(unevaluated_receipt, dict)
+                or set(unevaluated_receipt) != receipt_fields
+            ):
+                errors.append(
+                    f"{where}.unevaluated_receipt has an invalid shape"
+                )
+            else:
+                unhashed = dict(unevaluated_receipt)
+                receipt_hash = unhashed.pop("receipt_sha256")
+                encoded = json.dumps(
+                    unhashed,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode()
+                expected_hash = (
+                    "sha256:" + hashlib.sha256(encoded).hexdigest()
+                )
+                receipt_budget = unevaluated_receipt.get("budget")
+                receipt_done = unevaluated_receipt.get("evaluations_done")
+                if (
+                    unevaluated_receipt.get("schema_version") != 1
+                    or unevaluated_receipt.get("kind")
+                    != "budget_exhausted_before_candidate_attempt"
+                    or unevaluated_receipt.get("candidate_objective_attempts") != 0
+                    or not isinstance(receipt_budget, int)
+                    or isinstance(receipt_budget, bool)
+                    or receipt_budget <= 0
+                    or not isinstance(receipt_done, int)
+                    or isinstance(receipt_done, bool)
+                    or receipt_done < receipt_budget
+                    or unevaluated_receipt.get("attempt_log")
+                    != "evaluation_attempts.jsonl"
+                    or not isinstance(
+                        unevaluated_receipt.get("attempt_log_sha256"), str
+                    )
+                    or receipt_hash != expected_hash
+                ):
+                    errors.append(
+                        f"{where}.unevaluated_receipt is not a valid exhausted-"
+                        "budget zero-attempt receipt"
+                    )
+            if record.get("final_best_score") is not None or int(
+                record.get("trials_attempted") or 0
+            ) != 0:
+                errors.append(
+                    f"{where} unevaluated records must have no score and zero "
+                    "objective attempts"
+                )
+        elif unevaluated_receipt is not None:
+            errors.append(
+                f"{where}.unevaluated_receipt is only legal for status unevaluated"
+            )
         for field in ("idea", "change", "candidate_name", "description"):
             if not _nonempty(record.get(field)):
                 errors.append(f"{where}.{field} must be a non-empty candidate field")
@@ -1276,6 +1617,34 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         # Replay the overlay at the record's historical selection revision, so
         # later pruning never invalidates an earlier admitted record.
         receipt = record.get("policy_receipt")
+        if isinstance(receipt, dict) and receipt.get("schema_version") == 6:
+            policy = receipt.get("policy")
+            config = policy.get("config") if isinstance(policy, dict) else None
+            score = (
+                config.get("llm_intelligence_score")
+                if isinstance(config, dict)
+                else None
+            )
+            if (
+                isinstance(score, (int, float))
+                and not isinstance(score, bool)
+                and math.isfinite(float(score))
+                and 0.0 <= float(score) <= 100.0
+            ):
+                if frozen_llm_intelligence_score is None:
+                    frozen_llm_intelligence_score = float(score)
+                elif not math.isclose(
+                    float(score),
+                    frozen_llm_intelligence_score,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    errors.append(
+                        f"{where}.policy_receipt.policy.config."
+                        "llm_intelligence_score must stay fixed at "
+                        f"{frozen_llm_intelligence_score:g} after the first "
+                        "schema-6 admission"
+                    )
         record_revision = (
             receipt.get("search_space_state_revision")
             if isinstance(receipt, dict)
@@ -1298,7 +1667,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     record.get("semantic_point"), registry, effective
                 )
                 errors.extend(f"{where}: {error}" for error in eligibility)
-                if isinstance(receipt, dict) and receipt.get("schema_version") in {3, 4}:
+                if isinstance(receipt, dict) and receipt.get("schema_version") in {3, 4, 5, 6}:
                     budget = receipt.get("budget")
                     point = record.get("semantic_point")
                     if isinstance(point, dict):
@@ -1328,7 +1697,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                             f"{where}.policy_receipt.budget.selection_index must "
                             f"equal the one-based admission index {index + 1}"
                         )
-                    if receipt.get("schema_version") == 4:
+                    if receipt.get("schema_version") in {4, 5, 6}:
                         experience_receipt = receipt.get("experience")
                         if isinstance(experience_receipt, dict):
                             updated_at_run = experience_receipt.get("updated_at_run")
@@ -1373,6 +1742,49 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                                         f"must reference earlier edges {unknown_edges}"
                                     )
         errors.extend(validate_semantic_edges(records[:index], record, registry))
+        errors.extend(
+            f"{where}: {error}"
+            for error in validate_parameter_transfer_binding(ledger, record)
+        )
+        if isinstance(receipt, dict) and receipt.get("schema_version") in {5, 6}:
+            experience_receipt = receipt.get("experience")
+            conditioning = (
+                experience_receipt.get("conditioning")
+                if isinstance(experience_receipt, dict)
+                else None
+            )
+            prior_by_id = {
+                str(prior.get("run_id")): prior
+                for prior in records[:index]
+                if isinstance(prior, dict)
+            }
+            parent_points = [
+                prior_by_id[parent].get("semantic_point")
+                for parent in parents
+                if parent in prior_by_id
+                and isinstance(prior_by_id[parent].get("semantic_point"), dict)
+            ]
+            expected_relations = acquisition_target_relations(
+                record.get("semantic_point"),
+                None if op == "fresh" else parent_points,
+            )
+            for item in conditioning if isinstance(conditioning, list) else []:
+                if (
+                    not isinstance(item, dict)
+                    or expected_relations.get(item.get("target_id"))
+                    != item.get("proposal_relation")
+                ):
+                    errors.append(
+                        f"{where}.policy_receipt.experience conditioning "
+                        "does not match the admitted parent-to-child move"
+                    )
+            errors.extend(
+                f"{where}.policy_receipt.experience: {error}"
+                for error in validate_conditioning_against_ledger(
+                    conditioning,
+                    {"records": records[:index]},
+                )
+            )
         if valid_run_id:
             known.add(run_id)
     errors.extend(validate_search_space_state(registry, ledger))
@@ -1389,6 +1801,7 @@ def validate_registry(
     retrieval_manifest: dict[str, Any] | None = None,
     catalog: dict[str, Any] | None = None,
     dimension_strategy: str = DEFAULT_DIMENSION_STRATEGY,
+    baseline_mechanisms: dict[str, Any] | None = None,
 ) -> list[str]:
     errors = validate_space_core(
         registry, catalog=catalog, dimension_strategy=dimension_strategy
@@ -1397,6 +1810,9 @@ def validate_registry(
     errors.extend(source_errors)
     errors.extend(_validate_query_dimension_coverage(registry, retrieval_manifest))
     errors.extend(_validate_hypotheses(registry, source_by_id))
+    errors.extend(
+        _validate_baseline_mechanism_disjointness(registry, baseline_mechanisms)
+    )
     errors.extend(_validate_relations_evidence(registry, source_by_id))
     errors.extend(_validate_provenance_refs(registry, source_by_id))
     errors.extend(_validate_guidance(registry, source_by_id))
@@ -1859,6 +2275,12 @@ def _validate_target_evidence(
             errors.append(f"{target}.confidence must be low, med, or high")
 
         direct_edges = expected_coverage["direct_noncrash_edges"]
+        mechanical_direction = mechanical_gain_direction(
+            ledger,
+            target_kind=target_kind,
+            target_id=target_id,
+            evidence_edge_ids=edge_ids,
+        )
         if state in {"unevaluated", "failed"} and (
             recommended != "active" or assessment != "unknown" or confidence != "low"
         ):
@@ -1892,15 +2314,26 @@ def _validate_target_evidence(
                 "comparator_covered, at least two direct non-crash edges, "
                 "and a non-empty reopen_when"
             )
-        if (
-            confidence == "high"
-            and assessment in {"promising", "unpromising"}
-            and state != "comparator_covered"
+        if assessment in {"promising", "unpromising"} and not (
+            state == "comparator_covered" and direct_edges >= 2
         ):
             errors.append(
-                f"{target} confidence high with assessment promising or "
-                "unpromising requires comparator_covered evaluation_state"
+                f"{target} assessment promising or unpromising requires "
+                "comparator_covered evaluation_state with at least two direct "
+                "non-crash edges"
             )
+        if target_kind == "hypothesis" and assessment in {
+            "promising",
+            "unpromising",
+        }:
+            required_direction = (
+                "positive" if assessment == "promising" else "negative"
+            )
+            if mechanical_direction != required_direction:
+                errors.append(
+                    f"{target} assessment {assessment} conflicts with the "
+                    "direction of its repeated matched semantic-control pairs"
+                )
     return errors
 
 
@@ -1935,9 +2368,12 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
     generation = experience.get("generation")
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
         errors.append("experience.generation must be a non-negative integer")
-    if not _nonempty(experience.get("summary")) or len(experience.get("summary", "")) > 2000:
+    if (
+        not isinstance(experience.get("summary"), str)
+        or len(experience.get("summary", "")) > 2000
+    ):
         errors.append(
-            "experience.summary must be a non-empty interpretation of at most 2000 characters"
+            "experience.summary must be a display-only string of at most 2000 characters"
         )
 
     terminal_records = [
@@ -2093,8 +2529,24 @@ def validate_experience_replacement(experience: Any, ledger: dict[str, Any]) -> 
         errors.append("replacement experience.updated_at_run must be the latest terminal ledger run")
     prior = ledger.get("experience")
     prior_generation = prior.get("generation") if isinstance(prior, dict) and prior else None
+    metadata_fields = {"generation", "updated_at_run", "dag_revision"}
+    prior_payload = (
+        {
+            key: value
+            for key, value in prior.items()
+            if key not in metadata_fields
+        }
+        if isinstance(prior, dict) and prior
+        else None
+    )
+    replacement_payload = {
+        key: value
+        for key, value in experience.items()
+        if key not in metadata_fields
+    }
+    belief_changed = prior_payload is None or replacement_payload != prior_payload
     expected_generation = (
-        prior_generation + 1
+        prior_generation + (1 if belief_changed else 0)
         if isinstance(prior_generation, int) and not isinstance(prior_generation, bool)
         else 0
     )
@@ -2117,12 +2569,18 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         if getattr(args, "retrieval_manifest", None)
         else None
     )
+    baseline_mechanisms = (
+        _load_json(args.baseline_mechanisms)
+        if getattr(args, "baseline_mechanisms", None)
+        else None
+    )
     errors = validate_registry(
         registry,
         ledger=ledger,
         retrieval_manifest=manifest,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
+        baseline_mechanisms=baseline_mechanisms,
     )
     errors.extend(validate_background_markdown(args.background, registry))
     return registry, ledger, errors
@@ -2274,6 +2732,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     validate.add_argument("--ledger", type=Path)
     validate.add_argument("--retrieval-manifest", type=Path)
+    validate.add_argument(
+        "--baseline-mechanisms",
+        type=Path,
+        help="baseline mechanism inventory for a task with a provided entrypoint; "
+        "required whenever [seed].provided resolves",
+    )
     validate.set_defaults(func=cmd_validate)
 
     render = sub.add_parser("render", help="bounded dimension/hypothesis/coverage view")

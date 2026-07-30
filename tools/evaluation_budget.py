@@ -17,6 +17,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -36,12 +37,20 @@ ATTEMPT_LOG = "evaluation_attempts.jsonl"
 class EvaluationBudgetExhausted(RuntimeError):
     """Raised before ``score_fn`` when no objective slot remains."""
 
-    def __init__(self, *, used: int, budget: int, run_dir: Path):
+    def __init__(
+        self,
+        *,
+        used: int,
+        budget: int,
+        run_dir: Path,
+        scope: str = "global",
+    ):
         self.used = used
         self.budget = budget
         self.run_dir = Path(run_dir)
+        self.scope = scope
         super().__init__(
-            f"evaluation budget exhausted before score_fn "
+            f"{scope} evaluation budget exhausted before score_fn "
             f"(used={used}, budget={budget}, run_dir={run_dir})"
         )
 
@@ -66,6 +75,71 @@ def _framework_budget(run_dir: Path) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
+
+
+def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
+    path = Path(run_dir) / "framework_cfg.json"
+    config = read_framework_cfg(path) if path.is_file() else {}
+    tuner = config.get("tuner", {})
+    tuner = tuner if isinstance(tuner, dict) else {}
+    fraction = float(tuner.get("deep_tune_budget_fraction", 0.4))
+    return {
+        "fraction": fraction,
+        "total_cap": (
+            0
+            if fraction == 0
+            else (
+                None
+                if budget is None
+                else int(math.floor(budget * fraction))
+            )
+        ),
+        "per_candidate_cap": int(
+            tuner.get("deep_tune_per_candidate_cap", 20)
+        ),
+        "time_limit_seconds": float(
+            tuner.get("deep_tune_time_limit_seconds", 3600)
+        ),
+    }
+
+
+def _legacy_phase_c_per_candidate(run_dir: Path) -> dict[str, int]:
+    per_candidate: dict[str, int] = {}
+    for report_path in sorted(
+        (Path(run_dir) / "candidates").glob("*/tune_report.json")
+    ):
+        try:
+            report = json.loads(report_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(report, dict):
+            per_candidate[report_path.parent.name] = _phase_c_objective_attempts(
+                report
+            )
+    return per_candidate
+
+
+def _deep_tune_usage(
+    rows: list[dict],
+    run_dir: Path,
+) -> tuple[int, dict[str, int]]:
+    logged: Counter[str] = Counter()
+    for row in rows:
+        if row.get("kind") != "score_attempt" or row.get("phase") != "phase_c":
+            continue
+        run_id = row.get("run_id")
+        if isinstance(run_id, str):
+            logged[run_id] += 1
+    # Old reservation logs migrated only aggregate/per-candidate totals. Reports
+    # are the best phase-specific receipt for those runs. For current runs the
+    # append-only log can be ahead of a report after interruption, so take the
+    # per-candidate maximum rather than summing two views of the same calls.
+    legacy = _legacy_phase_c_per_candidate(run_dir)
+    per_candidate = {
+        run_id: max(logged.get(run_id, 0), legacy.get(run_id, 0))
+        for run_id in set(logged) | set(legacy)
+    }
+    return sum(per_candidate.values()), per_candidate
 
 
 def _phase_c_objective_attempts(report: dict) -> int:
@@ -271,6 +345,7 @@ def reserve_evaluation(
     if run_dir is None:
         return None
     budget = _framework_budget(run_dir)
+    run_id = Path(ref_path).resolve().parent.name
     with _locked_log(run_dir) as handle:
         rows, used, _ = _initialize_or_sync(handle, run_dir)
         if budget is not None and used >= budget:
@@ -279,7 +354,26 @@ def reserve_evaluation(
                 budget=budget,
                 run_dir=run_dir,
             )
-        run_id = Path(ref_path).resolve().parent.name
+        if str(phase) == "phase_c":
+            limits = _deep_tune_limits(run_dir, budget)
+            deep_used, deep_per_candidate = _deep_tune_usage(rows, run_dir)
+            total_cap = limits["total_cap"]
+            if total_cap is not None and deep_used >= total_cap:
+                raise EvaluationBudgetExhausted(
+                    used=deep_used,
+                    budget=total_cap,
+                    run_dir=run_dir,
+                    scope="deep_tune_total",
+                )
+            candidate_used = deep_per_candidate.get(run_id, 0)
+            candidate_cap = limits["per_candidate_cap"]
+            if candidate_used >= candidate_cap:
+                raise EvaluationBudgetExhausted(
+                    used=candidate_used,
+                    budget=candidate_cap,
+                    run_dir=run_dir,
+                    scope=f"deep_tune_candidate:{run_id}",
+                )
         receipt = {
             "schema_version": SCHEMA_VERSION,
             "kind": "score_attempt",
@@ -299,13 +393,14 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
     run_dir = Path(run_dir)
     path = run_dir / ATTEMPT_LOG
     legacy = _legacy_per_candidate(run_dir)
+    rows: list[dict] = []
     if not path.exists() and not create:
         total = sum(legacy.values())
         per_candidate = legacy
     else:
         with _locked_log(run_dir) as handle:
             if create:
-                _, total, per_candidate = _initialize_or_sync(handle, run_dir)
+                rows, total, per_candidate = _initialize_or_sync(handle, run_dir)
             else:
                 rows = _read_rows(handle)
                 total, per_candidate = _summarize_rows(rows)
@@ -315,6 +410,9 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
                         total += value - logged
                         per_candidate[run_id] = value
     budget = _framework_budget(run_dir)
+    limits = _deep_tune_limits(run_dir, budget)
+    deep_used, deep_per_candidate = _deep_tune_usage(rows, run_dir)
+    deep_total_cap = limits["total_cap"]
     return {
         "schema_version": SCHEMA_VERSION,
         "evaluations_done": total,
@@ -326,6 +424,19 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
             {"run_id": run_id, "evals": value}
             for run_id, value in sorted(per_candidate.items())
         ],
+        "deep_tune": {
+            **limits,
+            "attempts": deep_used,
+            "remaining": (
+                None
+                if deep_total_cap is None
+                else max(0, deep_total_cap - deep_used)
+            ),
+            "per_candidate": [
+                {"run_id": run_id, "evals": value}
+                for run_id, value in sorted(deep_per_candidate.items())
+            ],
+        },
         "attempt_log": str(path),
     }
 

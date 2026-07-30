@@ -106,6 +106,43 @@ all-baselines point must therefore attribute that concrete provided candidate
 faithfully. Do not turn scalar default parameters into semantic hypotheses; they
 remain inner-HPO coordinates.
 
+Record what you read in `<run_dir>/baseline_mechanisms.json` — the mechanism
+inventory the contract checks the registry against:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "baseline_mechanism_inventory",
+  "entrypoint": {"path": "tasks/<task>/train.py", "sha256": "sha256:<digest>"},
+  "dimensions": {
+    "dim-model-architecture": {
+      "interventions": ["gqa", "value-embeddings", "qk-layernorm"],
+      "citations": ["train.py:147"]
+    }
+  }
+}
+```
+
+Every resolved dimension needs an entry, each `interventions` tag must be a
+mechanism the entrypoint actually applies, and each citation is a
+`<file>:<line>` receipt you verified. The digest is the entrypoint's sha256.
+
+Two rules follow, and the contract enforces both:
+
+- A dimension's baseline must **declare** every mechanism its inventory lists.
+- A non-baseline hypothesis must **not** name any mechanism a baseline already
+  applies — in its own dimension or any other. Presence/absence of a mechanism
+  the control already has is not a contrast.
+
+Worked failure: a run registered `hyp-qk-layernorm` as an alternative in
+`dim-model-architecture` while the provided entrypoint already ran
+`q, k = norm(q), norm(k)`. Six candidates and 49 of 100 evaluations went to an
+axis that did not exist; two belief generations argued over the non-difference,
+and a relation gated a whole dimension behind it. If a variant differs only in
+*placement* or *degree* of a baseline mechanism (there, normalizing before RoPE
+rather than after), that is a distinct mechanism tag and a distinct claim — say
+so explicitly, or leave it out of the space.
+
 ### Step 3 — Plan the evidence search
 
 Decompose the task into bounded research questions before consulting the
@@ -211,17 +248,22 @@ python tools/search_backends.py validate \
 python tools/background_contract.py validate \
   --background <run_dir>/background.md \
   --retrieval-manifest <run_dir>/background_retrieval.json
+# Add this flag whenever the task declares a provided entrypoint:
+#   --baseline-mechanisms <run_dir>/baseline_mechanisms.json
 ```
 
 The final background validation joins the retrieval plan to the completed
-registry and rejects unknown targets or uncovered searchable dimensions. Fix
-every contract error before returning.
+registry and rejects unknown targets or uncovered searchable dimensions. With
+`--baseline-mechanisms` it also rejects a baseline that under-declares what the
+entrypoint does, and any alternative hypothesis colliding with a baseline
+mechanism. Fix every contract error before returning.
 
 ### Step 7 — Return a short summary
 
 Report `dimension_strategy`, catalog id and revision, and point at
 `background.md`, `background_retrieval.json`, plus `dimension_catalog.json`
-under `llm_induced`. State `frozen` or `open_world`, list active/failed backends,
+under `llm_induced` and `baseline_mechanisms.json` when the task declares a
+provided entrypoint. State `frozen` or `open_world`, list active/failed backends,
 and report dimensions plus per-dimension hypothesis counts. Do not paste the
 whole brief.
 
@@ -229,7 +271,9 @@ whole brief.
 
 - **Strategy-scoped research artifacts.** Always write
   `<run_dir>/background.md` and `<run_dir>/background_retrieval.json`; under
-  `llm_induced`, also write `<run_dir>/dimension_catalog.json`. Do not write the
+  `llm_induced`, also write `<run_dir>/dimension_catalog.json`; when the task
+  declares a provided entrypoint, also write
+  `<run_dir>/baseline_mechanisms.json`. Do not write the
   catalog under `catalog_subset`. The manifest is written through
   `tools/search_backends.py`; never hand-edit it. The DeepXiv CLI may create its
   one-time token state in `~/.env`; never copy that token into the run. Do not
