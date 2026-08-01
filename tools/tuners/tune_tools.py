@@ -2462,6 +2462,15 @@ def tuning_record(report: dict) -> dict:
         # ledger tuning fields
         "best_warm_score": summary["best_warm_score"],
         "final_best_score": summary["final_best_score"],
+        # Depth of the evaluation behind this record's scores. "tuned" requires
+        # a successful Phase-C stage with a finite trial observation (same
+        # criterion as phase_c_method); everything else is "screening". Only
+        # tuned children ground contradiction-grade semantic findings: a
+        # screening rejection measures the hypothesis at one parameter point
+        # and must not prune a space element (run 0730-ds-ex100-1: MTP rejected
+        # twice at screening while 011, worse than its own control at
+        # screening, won only after Phase C).
+        "evaluation_depth": "tuned" if phase_c_method is not None else "screening",
         "n_dims": len(search_space) if search_space else None,
         "warm_start_K": len(warm_configs) if warm_configs else None,
         "warm_percentile": None,   # Phase B retired; gate moved to select-candidate

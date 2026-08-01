@@ -97,9 +97,9 @@ def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
         "per_candidate_cap": int(
             tuner.get("deep_tune_per_candidate_cap", 20)
         ),
-        "time_limit_seconds": float(
-            tuner.get("deep_tune_time_limit_seconds", 3600)
-        ),
+        # Phase-C wall clock removed: trials (patience/n_trials/caps above)
+        # denominate the budget. Kept as null so receipt shape is stable.
+        "time_limit_seconds": None,
     }
 
 

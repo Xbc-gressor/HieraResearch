@@ -40,8 +40,7 @@
     "bo_n_trials": 40,
     "bo_patience_cap": 20,
     "deep_tune_budget_fraction": 0.4,
-    "deep_tune_per_candidate_cap": 20,
-    "deep_tune_time_limit_seconds": 3600
+    "deep_tune_per_candidate_cap": 20
   },
   "max_evaluations": 200,
   "per_runtime_limit": 60,
@@ -73,7 +72,7 @@
     "tuner.bo_patience_floor": "inner: floor for adaptive patience (default 12 — must clear the ~startup random period or HPO gets 0).",
     "tuner.deep_tune_budget_fraction": "inner budget policy: maximum fraction of max_evaluations that Phase C may reserve across the run (default 0.4). The atomic evaluation ledger enforces it; 0 disables deep tuning.",
     "tuner.deep_tune_per_candidate_cap": "inner budget policy: maximum admitted Phase-C objective calls for one candidate across retries (default 20).",
-    "tuner.deep_tune_time_limit_seconds": "inner wall-clock policy: cumulative Phase-C seconds for one candidate across method fallback and retries (default 3600). Tuners stop between objective calls; per_runtime_limit still bounds the final in-flight call.",
+    "tuner.deep_tune_time_limit_seconds": "REMOVED — accepted for backward compatibility but ignored. A cumulative Phase-C wall-clock cap (former default 3600) silently degraded BO to random search whenever the cap afforded fewer trials than the sampler's startup regime (3600s at ~450s/eval < TPE's 10 startup trials). Phase-C budget is now trial-denominated: tuner.bo_n_trials, adaptive patience, tuner.deep_tune_per_candidate_cap, and tuner.deep_tune_budget_fraction; per_runtime_limit still bounds each single evaluation.",
     "max_evaluations": "OPTIONAL strict global objective budget = max calls admitted into the task config->score fn. Every tuner atomically reserves one slot in evaluation_attempts.jsonl immediately before score_fn; once the cap is reached no further score call starts, even mid-round or mid-tuner. trials_attempted includes successful and failed admitted score calls; preflight attempts/rejections are reported separately and never consume objective slots. Legacy records without trials_attempted fall back to trials_completed and then warm_start_K.",
     "per_runtime_limit": "OPTIONAL per-evaluation wall-clock limit in SECONDS (one evaluate_config / one train.py run). A config/run exceeding it is hard-killed and recorded as a failed/crashed trial. Enforced by the eval callers, not prepare.py: framework tuners (warmstart_eval/bo/cmaes) run each eval in a timed subprocess; hillclimb uses timed_run.py. The template fallback is 60, but init_run seeds a new real task run from task.toml run.timeout_seconds unless --timeout explicitly overrides it. null/absent = no limit. THIS VALUE IS TASK-SPECIFIC — set it after measuring the task's heaviest legitimate candidate.",
     "preflight_runtime_limit": "OPTIONAL per-config no-score preflight timeout in seconds. Preflight may import/construct a candidate and execute the task-owned smoke hook, but it never calls score_fn or consumes max_evaluations. Defaults to min(180, per_runtime_limit) when omitted."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -114,23 +115,28 @@ class DeepTuneGovernanceTest(unittest.TestCase):
                 resumed = deep_tune_time_budget(candidate, report_path, "grid")
 
             self.assertEqual(resumed["stage_used_seconds"], 4.0)
-            self.assertEqual(resumed["remaining_seconds"], 6.0)
+            # No wall-clock limit exists (the fixture's legacy
+            # deep_tune_time_limit_seconds key must parse but be ignored):
+            # remaining is unbounded and the receipt value is null.
+            self.assertEqual(resumed["remaining_seconds"], math.inf)
+            self.assertIsNone(resumed["limit_seconds"])
             stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
             self.assertEqual(stage["recovered_interrupted_invocations"], 1)
             self.assertEqual(stage["elapsed_seconds"], 4.0)
             self.assertEqual(stage[DEEP_TUNE_INVOCATION_STARTED_AT], 104.0)
             resumed["_phase_c_lock_handle"].close()
 
-    def test_elapsed_is_full_precision_and_guard_expires_before_work(self):
+    def test_elapsed_is_full_precision_and_never_blocks_work(self):
         with tempfile.TemporaryDirectory() as tmp:
+            # The tiny legacy cap must not stop anything: elapsed accounting is
+            # informational only since the wall clock was removed.
             candidate, report_path = self._fixture(Path(tmp), limit=0.05)
             with mock.patch.object(
                 _common.time, "monotonic", side_effect=[10.0, 10.037, 10.051]
             ), mock.patch.object(_common.time, "time", return_value=100.0):
                 budget = deep_tune_time_budget(candidate, report_path, "grid")
                 self.assertAlmostEqual(deep_tune_stage_elapsed(budget), 0.037)
-                with self.assertRaises(DeepTuneTimeExhausted):
-                    ensure_deep_tune_time_remaining(budget)
+                ensure_deep_tune_time_remaining(budget)
 
             budget["_phase_c_lock_handle"].close()
             set_stage_meta(
@@ -394,7 +400,7 @@ class DeepTuneGovernanceTest(unittest.TestCase):
                     ):
                         phase_c_action(report, candidate)
 
-    def test_zero_remaining_still_persists_resumable_running_journal(self):
+    def test_running_journal_survives_interruption_and_stays_admissible(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidate, report_path = self._fixture(Path(tmp), limit=1.0)
             report = json.loads(report_path.read_text())
@@ -410,8 +416,9 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             }
             report_path.write_text(json.dumps(report))
 
+            # Past any legacy cap, admission and journaling must be unaffected.
             first = deep_tune_time_budget(candidate, report_path, "grid")
-            self.assertEqual(first["remaining_seconds"], 0.0)
+            self.assertEqual(first["remaining_seconds"], math.inf)
             stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
             self.assertEqual(stage["status"], "running")
             self.assertIn(DEEP_TUNE_INVOCATION_STARTED_AT, stage)
@@ -420,7 +427,7 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             # journal remains. The next invocation must be admissible and recover it.
             first["_phase_c_lock_handle"].close()
             resumed = deep_tune_time_budget(candidate, report_path, "grid")
-            self.assertEqual(resumed["remaining_seconds"], 0.0)
+            self.assertEqual(resumed["remaining_seconds"], math.inf)
             resumed["_phase_c_lock_handle"].close()
 
     def test_candidate_phase_c_lock_rejects_concurrent_tuner(self):

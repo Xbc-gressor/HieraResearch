@@ -817,6 +817,31 @@ def main() -> int:
         early_stopped["flag"] = True
         early_stopped["reason"] = "time_budget"
 
+    # TPE startup accounting. Optuna's sampler silently falls back to random
+    # draws until the study holds n_startup_trials COMPLETE/PRUNED trials, so a
+    # stage can report method "bo" while never engaging TPE (run 0730-ds-ex100-1:
+    # every stage ended below startup). Reconstruct the split from the trial
+    # sequence so the receipt shows it. Order in study.trials: injected score
+    # priors, injected infeasible priors, enqueued deferred, then sampler draws;
+    # injected trials are all COMPLETE (feasible with scores, infeasible with
+    # the penalty value) and count toward startup. Exact for one invocation;
+    # across a crash resume it describes the final invocation only.
+    n_startup = sampler_kwargs["n_startup_trials"]
+    completes = n_priors_injected + n_infeasible_injected
+    model_driven_trials = 0
+    random_fallback_trials = 0
+    for index, run_trial in enumerate(study.trials[completes:]):
+        if index >= n_enqueued:  # enqueued deferred are not sampler draws
+            if completes >= n_startup:
+                model_driven_trials += 1
+            else:
+                random_fallback_trials += 1
+        # COMPLETE/PRUNED count toward TPE startup. Here that is exactly the
+        # finite-value trials: no pruner is configured, crashes leave value
+        # None, and infeasible completions carry the finite penalty value.
+        if run_trial.value is not None and math.isfinite(float(run_trial.value)):
+            completes += 1
+
     if counters["objective_completed"] == 0 and counters["budget_exhausted"]:
         set_stage_meta(
             args.tune_report_json,
@@ -924,6 +949,9 @@ def main() -> int:
         duplicates_skipped=counters["duplicates_skipped"],
         budget_exhausted=counters["budget_exhausted"],
         time_limit_seconds=time_budget["limit_seconds"],
+        n_startup_trials=n_startup,
+        model_driven_trials=model_driven_trials,
+        random_fallback_trials=random_fallback_trials,
     )
 
     # Rank feasible trials only: infeasible ones (preflight-rejected or
@@ -955,6 +983,9 @@ def main() -> int:
         "deferred_skipped_outside_space": len(deferred_outside),
         "n_dims": n_dims,
         "patience": patience,
+        "n_startup_trials": n_startup,
+        "model_driven_trials": model_driven_trials,
+        "random_fallback_trials": random_fallback_trials,
         "early_stopped": early_stopped["flag"],
         "early_stop_reason": early_stopped["reason"],
         "elapsed_seconds": round(stage_elapsed, 1),

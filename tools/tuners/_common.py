@@ -64,7 +64,6 @@ from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 REQUIRED_SYMBOLS = ("BASE_PARAMS", "SEARCH_SPACE", "make_model")
 DEFAULT_SCORE_FN = "evaluate_config"
 DEFAULT_PREFLIGHT_LIMIT = 180.0
-DEFAULT_DEEP_TUNE_TIME_LIMIT = 3600.0
 DEEP_TUNE_INVOCATION_STARTED_AT = "invocation_started_at_epoch_seconds"
 PHASE_C_LOCK_FILENAME = ".phase_c.lock"
 
@@ -440,13 +439,15 @@ def _deep_tune_time_budget_locked(
     """Locked implementation for :func:`deep_tune_time_budget`."""
     started_monotonic = time.monotonic()
     started_epoch = time.time()
-    tuner = load_run_cfg(ref_path, "tuner")
-    limit = float(
-        tuner.get(
-            "deep_tune_time_limit_seconds",
-            DEFAULT_DEEP_TUNE_TIME_LIMIT,
-        )
-    )
+    # Phase C has no wall-clock limit. The budget is trial-denominated:
+    # patience, n_trials, the per-candidate objective cap, and the run share.
+    # A seconds cap sized below the sampler's startup regime silently degraded
+    # every stage to random fallback draws (run 0730-ds-ex100-1: 3600 s at
+    # ~450 s/eval never reached TPE's 10-trial startup, in every stage). The
+    # legacy `tuner.deep_tune_time_limit_seconds` key still parses but is
+    # ignored. Elapsed accounting below is kept for receipts and crash
+    # recovery, not for enforcement.
+    limit = math.inf
     report = read_tune_report(report_path)
     phase_c = report.get("phase_c")
     if phase_c is None:
@@ -590,7 +591,9 @@ def _deep_tune_time_budget_locked(
     )
     write_tune_report(report_path, report)
     return {
-        "limit_seconds": limit,
+        # Receipts serialize this as null: no wall-clock limit exists anymore.
+        # Internal arithmetic uses remaining_seconds (always +inf).
+        "limit_seconds": None,
         "used_seconds": total_used,
         "stage_used_seconds": stage_used,
         "remaining_seconds": remaining,
@@ -608,7 +611,11 @@ def deep_tune_stage_elapsed(time_budget: dict) -> float:
 
 
 def deep_tune_time_remaining(time_budget: dict) -> float:
-    """Exact remaining candidate-level Phase-C seconds in this invocation."""
+    """Remaining Phase-C seconds: always +inf since the wall clock was removed.
+
+    Kept so callers (optuna ``timeout=``, ``phase_time_limit_seconds=``
+    suppliers) keep working unchanged; +inf maps to "no limit" downstream.
+    """
     invocation_elapsed = max(
         0.0, time.monotonic() - float(time_budget["started_monotonic"])
     )
@@ -616,7 +623,7 @@ def deep_tune_time_remaining(time_budget: dict) -> float:
 
 
 def ensure_deep_tune_time_remaining(time_budget: dict) -> None:
-    """Reject setup/preflight/objective admission after the wall cap expires."""
+    """No-op retained for call-site compatibility: no wall cap exists."""
     if deep_tune_time_remaining(time_budget) <= 0:
         raise DeepTuneTimeExhausted(
             "candidate deep-tune wall-clock allocation exhausted"
@@ -708,6 +715,9 @@ def _resolve_phase_time_limit(
         raise ValueError(
             "phase_time_limit_seconds must be a finite positive number"
         ) from None
+    if limit == math.inf:
+        # No Phase-C wall clock exists (removed); only per_runtime_limit binds.
+        return None
     if not math.isfinite(limit) or limit <= 0:
         raise DeepTuneTimeExhausted(
             "candidate deep-tune wall-clock allocation exhausted"
