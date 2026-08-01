@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Step 1 — warm-config evaluator (sequential, resumable, stop-on-crash).
 
-Run by `tunable-contract-extractor` (segment ③) after it has produced a
+Run by the coordinator's Phase-A candidate service after it has produced a
 candidate `train.py` (PARAM_SCHEMA + SEARCH_SPACE + make_model, NO BASE_PARAMS
 yet) and written `_warm_configs.json` (the K warm configs). For schema-4
 candidates, config 0 is a mandatory control; non-fresh candidates must bind it

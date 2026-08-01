@@ -25,9 +25,9 @@ tools, latest context size, run evaluations, pending candidates, and alerts.
 Exit status is 2 when a one-shot report contains alerts; this is intentional for
 CI or shell checks.
 
-Default alerts cover:
+Default alerts for historical runtime transcripts cover:
 
-- candidate-writer assignments that include contract/evaluation work;
+- worker assignments that include contract/evaluation work;
 - recursive or unexpected delegation;
 - root context at or above 150k tokens;
 - child fresh input at or above 50k tokens;
@@ -36,17 +36,19 @@ Default alerts cover:
 
 Tune thresholds with `--max-root-context` and `--max-session-input`.
 
-The project-local `.opencode/plugins/hiera-guard.js` adds enforcement:
+The project-local `.opencode/plugins/hiera-guard.js` remains available for
+historical transcript analysis; new `hieraresearch` runs enforce these
+boundaries in `ModelGateway`:
 
-- `tool.execute.before` rejects the observed writer/step-0+1 role collapse;
+- `tool.execute.before` rejected the observed writer/step-0+1 role collapse;
 - `tool.execute.after` replaces relevant child output with a validated receipt
   before parent reinjection, regardless of whether the child followed its
   output prompt;
 - `session.idle` warns in the TUI when the run still has work remaining.
 
-Child agents also have `task: deny`, so they cannot recursively delegate. The
-candidate writer additionally has no shell tool; `new_candidate.py` materializes
-its narrow `_candidate_brief.json` before launch.
+The Python path does not delegate child agents. `new_candidate.py` materializes
+the narrow `_candidate_brief.json`, and the bounded Agent SDK policy denies
+shell access and writes outside the explicit candidate paths.
 
 ## Claude Code
 

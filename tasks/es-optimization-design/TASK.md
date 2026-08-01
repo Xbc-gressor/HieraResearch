@@ -39,7 +39,7 @@ scripts.
 - **Construct**: `train.py` exposes `make_model(problem, params)` returning a
   configured **optimizer object** with a `run() -> float` method (the best
   fitness found), plus the tuner contract (`PARAM_SCHEMA`, `SEARCH_SPACE`,
-  `BASE_PARAMS`) written by `tunable-contract-extractor`.
+  `BASE_PARAMS`) written by the coordinator's candidate contract stage.
 - **Optimize**: the optimizer may probe the function **only** through
   `problem.evaluate(x)` (`x`: a sequence of length `problem.dim`), at most
   `problem.budget` times (`budget = 2000 × dim`); track `problem.evals_used`
@@ -71,7 +71,7 @@ Rules:
 
 ## Files
 
-- `train.py`: no task-root baseline; `candidate-writer` writes each complete
+- `train.py`: no task-root baseline; the coordinator's bounded edit writes each complete
   candidate at its validated `background.md` semantic point (`fresh` from
   scratch, or informed by numeric parents for `improve`/`crossover`).
 - `prepare.py`: fixed benchmark suite, budget accounting, and the single
@@ -116,7 +116,7 @@ tuner scripts call `evaluate_config`. To evaluate a candidate by hand:
 uv --directory tasks/es-optimization-design sync
 # Requires an existing <run_id> ledger record; also derives _candidate_brief.json.
 python tools/new_candidate.py es-optimization-design <tag> <run_id> --skip-entrypoint
-# after candidate-writer + tunable-contract-extractor produce train.py + _warm_configs.json:
+# after the coordinator produces train.py + _warm_configs.json:
 # (--project selects the task env without chdir, so the repo-relative paths below resolve)
 uv --project tasks/es-optimization-design run python tools/tuners/warmstart_eval.py \
   --candidate-path   runs/es-optimization-design/<tag>/candidates/<run_id>/train.py \
@@ -124,17 +124,16 @@ uv --project tasks/es-optimization-design run python tools/tuners/warmstart_eval
   --tune-report-json runs/es-optimization-design/<tag>/candidates/<run_id>/tune_report.json
 ```
 
-Normally the experiment loop drives this through its agents
-(`tunable-contract-extractor` for step 0+1, `tuner-orchestrator` for the
-decoupled deep-tuning), not by hand.
+Normally the `hieraresearch` coordinator drives this through its Phase-A
+candidate service and deterministic `DeepTuner`, not by hand.
 
 ## Scoring And Recording
 
 There is no run-log summary. The tuner scripts call
 `prepare.evaluate_config(make_model, params)` and the score is written straight
 to `runs/es-optimization-design/<tag>/ledger.json` via `tools/ledger.py`
-(`tunable-contract-extractor` records `final_best_score` = `best_warm_score`;
-`tuner-orchestrator`, if it selects the candidate, lowers it with the tuned
+(`CandidatePipeline` records `final_best_score` = `best_warm_score`;
+`DeepTuner`, if it selects the candidate, lowers it with the tuned
 best). A completed run is `keep` only if its `final_best_score` strictly
 improves over the best previous kept value, otherwise `discard`; an unrunnable
 candidate is `crash` (`+inf`). `record-run` also regenerates `loop_state.md`.

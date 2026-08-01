@@ -1,162 +1,128 @@
 # autoresearch-automl
 
-Multi-task autonomous experimentation harness. The supported interactive
-runtimes are Claude Code (`.claude/`) and OpenCode (`.opencode/`); deterministic
-state, graph search, evaluation, and tuning live in `tools/` and are shared.
+HieraResearch uses a deterministic Python execution layer with bounded Claude
+capabilities. The run-level coordinator is `hieraresearch`; Claude sessions are
+disposable workers and never hold lifecycle state.
 
-The loop's current bar is beating `autoresearch-hillclimb` — the deliberately
-simple edit→run→keep/revert baseline — at matched evaluation budget. It does not
-yet; see `docs/hillclimb-gap.md`. Until it does, prefer diagnosing and
-simplifying the loop over extending it.
+## Start an experiment
 
-## Start an experiment with OpenCode
-
-Run from this repository root:
+From this repository root:
 
 ```bash
-opencode --agent autoresearch-experiment \
-  --model moonshotai/kimi-k3 --auto
+python -m hieraresearch <task-name> <tag> --model <claude-model>
 ```
 
-Then provide `task_name`, `tag`, and optionally `max_evaluations` and
-`timeout` (the hard limit in seconds for each evaluation). For a non-interactive
-session:
+Useful controls:
 
 ```bash
-opencode run --agent autoresearch-experiment \
-  --model moonshotai/kimi-k3 --auto \
-  "task_name=<task> tag=<tag> max_evaluations=<n> timeout=<seconds>"
+python -m hieraresearch <task> <tag> --recordings <dir>       # replay/ablation
+python -m hieraresearch <task> <tag> --preflight-only          # no model/objective work
+python -m hieraresearch <task> <tag> --resume-blocked --model <model>
 ```
 
-`autoresearch-hillclimb` is the deliberately simple comparison baseline and is
-started with the same commands using `--agent autoresearch-hillclimb`.
+The package entrypoint is also exposed as `hieraresearch`. `--recordings`
+selects the model-free recorded backend; no live model is needed in that mode.
+`autoresearch-hillclimb` remains a separate comparison baseline and is not the
+coordinator for these runs.
 
-The same controls can be set or changed deterministically before a run:
+## Authoritative inputs and artifacts
 
-```bash
-python tools/init_run.py <task> <tag> \
-  --max-evaluations <n> --timeout <seconds>
-```
+Before a run, the coordinator reads `tasks/<task>/TASK.md` and
+`tasks/<task>/task.toml`. The durable run artifacts are authoritative:
 
-They are persisted as `max_evaluations` and `per_runtime_limit` in the run's
-`framework_cfg.json`; explicit initialization values override the copied
-template.
+- `runs/<task>/<tag>/ledger.json` is changed only through existing ledger helpers;
+- `evaluation_attempts.jsonl` reserves every objective `score_fn` call immediately
+  before it starts, including calls that later crash;
+- no-score preflight is separate and must not reserve an objective slot;
+- candidate reports, receipts, and `evaluation_attempts.jsonl` are never replaced
+  by a model response or chat history;
+- `.orchestrator/state.json` stores restartable transition bookkeeping, while
+  `.orchestrator/rounds/` and `.orchestrator/invocations/` provide audit receipts.
 
-OpenCode primary and subagents inherit `moonshotai/kimi-k3` from the launch
-command. `--auto` approves permission requests that are not explicitly denied;
-the project agents still enforce their hard role boundaries. Every experiment
-agent explicitly allows doom-loop recovery so an unattended run does not pause
-for that prompt.
+Never hand-edit `runs/**/ledger.json` or task-owned source files during a run.
 
-## Authoritative inputs
+## Deterministic lifecycle
 
-Before experiment work, read:
-
-1. `tasks/<task-name>/TASK.md` and `tasks/<task-name>/task.toml`.
-2. `.opencode/rules/ledger.md` only when ledger schema detail is needed.
-
-OpenCode injects `AGENTS.md` and the selected agent prompt automatically. Do
-not read either one again from inside the agent session.
-
-The ledger contract is intentionally not injected globally through
-`opencode.json`; most role agents need only a narrow helper-rendered view.
-
-Read on demand, not by default: `docs/search-space.md` (the formal model the P2
-helpers implement), `docs/background-research.md` (search-space contract,
-evidence and scope semantics), `docs/dimension-induction.md` (only for the
-`llm_induced` strategy), `docs/hillclimb-gap.md` (why the loop loses to the
-baseline), `docs/observability.md` (`harness_watch.py`).
-
-## Runtime layout
+`ExperimentCoordinator` owns the following transitions:
 
 ```text
-.opencode/agents/                 project-local primary/subagents
-.opencode/skills/                 inline capability skills
-.opencode/rules/                  on-demand state contracts
-.opencode/plugins/hiera-guard.js  delegation and receipt guard
-contracts/                        versioned shared contracts (dimension catalog)
-docs/                             search-space, background, observability notes
-tools/                            shared deterministic machinery
-tests/                            pytest suite over tools/; tests/fixtures.py
-                                  holds the shared toy search space
-tasks/<task-name>/                independent uv task projects
-runs/<task-name>/<tag>/           local experiment artifacts (gitignored)
+initialize
+  -> environment_preflight
+  -> build_background
+  -> admit_baseline | admit_round
+  -> materialize_candidate
+  -> build_tuning_contract
+  -> preflight_candidate
+  -> evaluate_warm_configs
+  -> deep_tune
+  -> refresh_experience
+  -> complete | blocked
 ```
 
-`.claude/` and `.kimi/` mirror `.opencode/` for other runtimes — keep mirrored
-contracts synchronized when a shared agent protocol changes.
+`state_machine.next_transition` is pure. Side effects live behind explicit
+interfaces in `Toolchain`, `CoordinatorStore`, and the phase services. A
+transition persists its durable receipt before the next irreversible effect;
+restart reconciliation derives missing flags from ledger and candidate
+artifacts. A no-op deep-tune round that makes no objective progress is blocked
+explicitly rather than looped.
 
-The experiment primary agent may invoke exactly these six subagents through
-OpenCode's `Task` tool:
+## Model boundary
 
-| subagent | role | cadence |
-|---|---|---|
-| `background-researcher` | freezes `background.md` + `background_retrieval.json`: the run's semantic search space | once, before the loop (required) |
-| `idea-generator` | graph `SELECT` via `got_select`, then semantic point choice and record/receipt persistence | per round |
-| `candidate-writer` | implements one candidate's `train.py` from its own ledger record | per candidate |
-| `tunable-contract-extractor` | step 0+1: `PARAM_SCHEMA` refactor, warm configs, `SEARCH_SPACE`, screening evaluation | per candidate |
-| `tuner-orchestrator` | step 2: promotion gate, then deep-tune at most one selected candidate in place | once per round |
-| `experience-extractor` | regenerates the bounded belief snapshot and requests state transitions | per completed non-empty round |
+The model adapter is replaceable by `RecordedBackend` and may be removed from a
+replay entirely. Every invocation has a named purpose, schema version, model,
+bounded inputs, input revision hashes, and a recorded outcome.
 
-Each agent's prompt is authoritative for its own contract. The allow-list is
-encoded in the primary agent's native `permission.task` map. Every child has
-`task: deny`; `candidate-writer` also has `bash: deny`.
-`.opencode/plugins/hiera-guard.js` rejects the known writer/evaluation boundary
-collapse and replaces rich child output with compact receipts before it returns
-to the primary context.
+- `semantic.py` and `experience.py` use direct structured Messages/API calls;
+- `background.py` uses a bounded Agent SDK edit for frozen research artifacts;
+- `candidate.py` uses bounded edits for candidate code and tuning contracts;
+- candidate failure diagnosis is read-only structured inference;
+- an accepted repair is applied by a separate bounded edit and then checked by
+  Python syntax, contract/search-space validation, and no-score preflight;
+- editing calls have exact write paths and a pre-tool policy that denies shell
+  access and rejects reads outside their declared roots.
 
-Step 2 is decoupled from step 0+1 (design §15): every candidate stops at step
-0+1, then `tuner-orchestrator` runs once for the whole round and picks at most
-one candidate. A `none` selection is a valid no-op.
+The model may propose semantic content or code, but Python decides admission,
+budgets, evaluation, tuning, ledger mutation, finalization, and stop conditions.
 
-## Context and state discipline
+## Existing helper boundary
 
-- Pass paths and compact identifiers to child agents. Durable artifacts are the
-  payload; child responses are receipts, not copies of code, logs, or ledgers.
-- Never hand-edit `runs/**/ledger.json`; use `tools/ledger.py`.
-- Experience refresh reads `got_graph.py render --incremental` with fixed
-  Top/Bottom anchors. Do not inject the unbounded full ledger or global DAG.
-- Dimension/hypothesis beliefs cite `background_contract.py target-evidence`
-  only; `ledger.py apply-space-state` owns every append-only
-  `search_space_state` transition. The frozen registry never carries runtime
-  pruning state.
-- Retrieve a full record, source, or log only when a compact view identifies a
-  specific missing field or bottleneck.
-- Do not collapse role boundaries to save time. An evaluation budget does not
-  authorize combining writer, evaluation, or tuning contexts.
-- Run-level and task-owned candidate preflights are no-score engineering
-  checks. Their failures are diagnosed inline but never counted as objective
-  evaluations.
-- `evaluation_attempts.jsonl` is the strict objective-call admission log. A
-  tuner must reserve there immediately before `score_fn`; aggregate ledger
-  fields remain per-candidate summaries.
-- The outer loop searches semantic candidates; step 0+1 / step 2 tunes numeric
-  parameters inside one candidate. Keep those search levels distinct.
+Use the stable functions and subprocess adapters in `tools/` for:
 
-## Task and run boundaries
+- run initialization and environment checks;
+- background, graph, semantic, and search-space validation;
+- ledger admission and lifecycle mutation;
+- objective reservation and Phase-A evaluation;
+- Phase-C method execution and idempotent finalization;
+- bounded experience validation and state application.
 
-- `tasks/<task>/prepare.py` is the fixed evaluation surface.
-- A candidate entrypoint declared in `[seed].provided` is copied into run `000`
-  and evaluated first at the all-baselines point; seedless tasks bootstrap with
-  normal `fresh` candidates.
-- Experiments modify candidate copies under `runs/`, never task-source
-  `train.py` in place.
-- Do not commit anything under `runs/`.
-- Add dependencies only when `constraints.allow_dependencies = true`.
-- Each task is its own uv project; use `uv --directory tasks/<task> ...`.
+Do not duplicate helper policy in the coordinator. Add a module only for a
+distinct invariant or replacement boundary. Use `pathlib.Path`, argument-vector
+subprocesses, bounded output capture, and explicit timeouts.
 
-## Narrow checks
+## Task boundaries
+
+- `tasks/<task>/prepare.py` is fixed evaluation code;
+- experiments edit only run-local candidate copies;
+- a `[seed].provided` entrypoint is copied to run `000` and evaluated first at
+  the exact all-baselines configuration;
+- task dependencies are isolated uv projects;
+- dependency additions require `constraints.allow_dependencies = true`;
+- never commit anything under `runs/`.
+
+## Verification
+
+Run the narrow check implied by a change, then the full local suite at an
+integration point:
 
 ```bash
-python -m pytest tests -q             # the suite; fast, no GPU, no network
-python tools/validate_tasks.py        # task contracts
-python tools/validate_background.py   # background round trip, shape
-                                      # neutrality, retrieval, lifecycle
-python tools/validate_got.py          # graph/ledger invariants
+python -m pytest tests -q
+python tools/validate_tasks.py
+python tools/validate_background.py
+python tools/validate_got.py
 python tools/validate_search_backends.py
 ```
 
-Add only the check implied by the touched contract. Do not add required-wording
-or forbidden-wording checks over agent prompts, rules, or docs. OpenCode runtime
-wiring is checked with the real CLI (`opencode debug agent <name>` and
-`opencode agent list`) rather than another repository-specific validator.
+Prefer tests for transition boundaries, durable receipts, stale/malformed
+model output, edit path enforcement, objective accounting, and subprocess
+termination. Do not add prompt-wording tests or duplicate existing helper
+coverage.

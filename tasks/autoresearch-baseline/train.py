@@ -29,8 +29,8 @@ from prepare import evaluate_config
 # ---------------------------------------------------------------------------
 # Tuner contract: tunable keys (PARAM_SCHEMA) + the safe-baseline config
 # (DEFAULT_PARAMS = the original hyperparameter values). SEARCH_SPACE and
-# BASE_PARAMS are written later per candidate by tunable-contract-extractor /
-# warmstart_eval — do not add them here.
+# BASE_PARAMS are written later per candidate by the coordinator's Phase-A /
+# Phase-C stages — do not add them here.
 # ---------------------------------------------------------------------------
 
 PARAM_SCHEMA = {

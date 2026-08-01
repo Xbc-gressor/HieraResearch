@@ -16,7 +16,7 @@ phase_c.stages[cmaes] as it completes.
 Evaluates configurations via the task's one `config → score` function
 (`score_fn`). Requires `cma` in the task's uv environment.
 
-Invoked by the tuner-orchestrator as the deterministic fallback when BO rejects.
+Invoked by the deterministic `DeepTuner` as the fallback when BO rejects.
 """
 
 from __future__ import annotations

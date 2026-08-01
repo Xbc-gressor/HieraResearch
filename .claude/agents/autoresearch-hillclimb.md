@@ -14,7 +14,7 @@ color: blue
 
 The **generalized Karpathy autoresearch loop**: an autonomous researcher that
 repeatedly hacks one editable file, runs it, and keeps changes that lower the
-metric. It is the **simple baseline** to compare against `autoresearch-experiment`
+metric. It is the **simple baseline** to compare against `hieraresearch`
 (the GoT + decoupled-tuner framework) on the *same* task harness.
 
 It runs as the main thread (`claude --agent autoresearch-hillclimb`), uses no

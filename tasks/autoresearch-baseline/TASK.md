@@ -4,7 +4,7 @@ This task preserves the original single-GPU autoresearch example. It gives an
 agent a small LLM pretraining setup and asks it to improve validation bits per
 byte by editing `train.py` while keeping `prepare.py` and the evaluation metric
 fixed. It follows the framework's single config→score contract, so it runs
-under both `autoresearch-experiment` (tuner loop) and `autoresearch-hillclimb`
+under `hieraresearch` (deterministic coordinator) and `autoresearch-hillclimb`
 (standalone edit/run loop).
 
 ## Goal
@@ -29,8 +29,8 @@ against that function by the tuner scripts.
 
 - **Construct**: `train.py` exposes `make_model(env, params)` returning a
   configured **trainer object** with a `run() -> float` method, plus the tuner
-  contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) written by
-  `tunable-contract-extractor`. The provided task-root `train.py` already
+  contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) written by the
+  coordinator's candidate contract stage. The provided task-root `train.py` already
   carries `make_model` + `PARAM_SCHEMA`, and its `DEFAULT_PARAMS` are the
   original hyperparameter values. The trainer also exposes
   **`preflight() -> dict`**, which constructs the real model/optimizer and runs
@@ -107,7 +107,7 @@ During autonomous experiments this task uses candidate directories. Because the
 task-root `train.py` is declared by `[seed].provided`, the experiment admits its
 unchanged run-local copy first at the all-baselines semantic point. Its exact
 `DEFAULT_PARAMS` are the sole step-0+1 baseline evaluation; the normal decoupled
-tuner may later tune that same point. Otherwise `candidate-writer` writes each
+tuner may later tune that same point. Otherwise the coordinator's bounded edit writes each
 candidate's `train.py` (a `fresh` candidate from scratch, or informed by parent
 candidates for `improve`/`crossover`). Only run-local candidate files are edited.
 
@@ -138,7 +138,7 @@ scored only where the tuner scripts call `evaluate_config`:
 python tools/new_candidate.py autoresearch-baseline <tag> 000 --provided-baseline
 # Later records derive _candidate_brief.json without copying the entrypoint.
 python tools/new_candidate.py autoresearch-baseline <tag> <run_id> --skip-entrypoint
-# after candidate-writer + tunable-contract-extractor produce train.py + _warm_configs.json:
+# after the coordinator produces train.py + _warm_configs.json:
 # (--project selects the task env without chdir, so the repo-relative paths below resolve)
 uv --project tasks/autoresearch-baseline run python tools/tuners/warmstart_eval.py \
   --candidate-path   runs/autoresearch-baseline/<tag>/candidates/<run_id>/train.py \
@@ -173,9 +173,9 @@ The key metric is `val_bpb`, and lower is better. In standalone mode a
 completed run should include both `val_bpb:` and `peak_vram_mb:` in the run
 log; the generic task parser is declared in `task.toml`.
 
-Under the experiment loop there is no log parse: `tunable-contract-extractor`
+Under the experiment loop there is no log parse: the Phase-A candidate service
 records `final_best_score` = `best_warm_score` straight into the candidate's
 `ledger.json` record via `tools/ledger.py` (`record-run` + `set-tuning`); the
-decoupled `tuner-orchestrator`, if it selects the candidate, lowers
+deterministic `DeepTuner`, if it selects the candidate, lowers
 `final_best_score` with the tuned best. One JSON record per run; see
-`.claude/rules/ledger.md`.
+`ledger.json` is mutated through the existing ledger helper.

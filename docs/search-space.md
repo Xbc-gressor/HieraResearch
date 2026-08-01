@@ -51,8 +51,8 @@ score differently. The outer loop's induced objective is
     F(s) = inf { f(x) : x ∈ π⁻¹(s) },
 
 the best score achievable at that semantic point. The inner loop
-(`tunable-contract-extractor` warm-start plus `tuner-orchestrator` deep
-tuning) searches within one fiber and approximates `F(s)`; every scored
+(`CandidatePipeline` warm-start plus `DeepTuner` deep tuning) searches within
+one fiber and approximates `F(s)`; every scored
 candidate `x` yields only an upper bound `f(x) ≥ F(π(x))`. This is why the
 contract insists that point membership is attribution, not causal evidence
 of value: ledger observations are noisy one-sided bounds on `F`, and any

@@ -9,7 +9,7 @@ tune_report.json under phase_c.stages[bo] as it completes.
 Evaluates configurations via the task's one `config → score` function
 (`score_fn`). Requires `optuna` in the task's uv environment.
 
-Invoked by the tuner-orchestrator agent when 3 ≤ n_dims ≤ 15.
+Invoked by the deterministic `DeepTuner` when 3 ≤ n_dims ≤ 15.
 """
 
 from __future__ import annotations

@@ -1,7 +1,8 @@
 """got_select.py — 选择层 / SELECT(设计稿 §5 / §6)。
 
 确定性图搜索:给定当前 DAG + 全局量,选出本代的"做什么(op)+ 对谁(父代/方向)"。
-idea-generator(LLM agent)调它拿指派,再做 IDEATE(写具体 idea)。本模块不含 LLM。
+SemanticAdmission 调它拿指派，再把确定性选点交给 bounded idea inference。
+本模块不含 LLM。
 
 - decide_gen:每代 fresh 代 / PUCB 代 二选一(自举 / 停滞 / 否则 PUCB)。
 - PUCB 代:动作池 = improve(L) + crossover(L 中所有不同对),两 op 解耦定额、不混排:
@@ -121,7 +122,7 @@ def pick_pucb(graph, L, gbar, Nop, cfg):
 
 
 # ============================ 派生量重算 + decide CLI(SELECT,§14.1/§14.3)============================
-# idea-generator 调 `got_select.py decide --ledger <path>` 拿本代指派(确定性);
+# SemanticAdmission 调 `got_select.py decide --ledger <path>` 拿本代指派(确定性);
 # 再对每个 action 做 IDEATE(LLM)→ ledger.py add-record。全局量全部从 records 重算,无持久状态。
 # Outer-search defaults, tuned under an EQUAL total-validation budget (max_evals=200,
 # 8 seeds, 3 toys) on the two-level toy — the budget-fair re-tune that replaced the
@@ -214,7 +215,7 @@ def load_run_cfg(ledger_path: Path, section: str) -> dict:
     """Per-run framework-hyperparameter overrides from `<run_dir>/framework_cfg.json`.
 
     Lets a single run (e.g. a Phase-3 OFAT trial) override framework meta-params
-    without code edits or CLI flags, so a headless `autoresearch-experiment` run
+    without code edits or CLI flags, so a headless `hieraresearch` run
     honors them too. Shape: `{"got": {...s-got keys...}, "tuner": {...}}`.
     Returns the requested section ({} if the file/section is absent); a file
     that exists but cannot be parsed raises RunConfigError instead of silently

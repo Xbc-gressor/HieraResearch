@@ -2,8 +2,8 @@
 """Compatibility log parser — not called by the current experiment loop.
 
 The S-GoT single `config -> score` model has no run log: a candidate's score is
-written straight to `ledger.json` by `tunable-contract-extractor` / `tuner-
-orchestrator` (`record-run`), so this script is not invoked there. It remains a
+written straight to `ledger.json` by the deterministic Phase-A/Phase-C helpers
+(`record-run`), so this script is not invoked there. It remains a
 functional compatibility surface for task contracts and legacy/manual flows
 that already have a framework ledger record: parse one candidate run log for
 the score + model name and hand them to `tools/ledger.py` (which owns the

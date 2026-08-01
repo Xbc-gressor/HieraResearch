@@ -12,7 +12,7 @@ non-improving combos is reached, the search stops. The patience monitor
 is seeded with the best score from prior trials in tune_report.json
 (phase_a warm-start + any earlier phase_c stages).
 
-Invoked by the tuner-orchestrator agent when n_dims ≤ 2. Reports
+Invoked by the deterministic `DeepTuner` when n_dims ≤ 2. Reports
 rejection via stdout JSON if total combos exceed --max-trials so the
 orchestrator can fall back to a different method.
 """

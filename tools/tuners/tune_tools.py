@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic helpers the tuner-orchestrator calls instead of doing the
+"""Deterministic helpers the `DeepTuner` calls instead of doing the
 work by hand. Each subcommand is a pure computation/check — no judgment — so
 the choices stay stable across long autonomous runs.
 

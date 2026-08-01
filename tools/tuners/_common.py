@@ -986,7 +986,7 @@ def append_preflight_attempt(
 
 def append_trial(report_path: Path, method: str, trial: dict) -> None:
     """Append one trial to phase_c.stages[method].trials. Single-writer-safe
-    because tuner-orchestrator blocks on the subprocess.
+    because `DeepTuner` blocks on the subprocess.
     """
     report = read_tune_report(report_path)
     phase_c = report.setdefault("phase_c", {"stages": []})
@@ -1004,7 +1004,7 @@ def set_stage_meta(report_path: Path, method: str, **meta: Any) -> None:
     into phase_c.stages[method] so a downstream summarizer can read them from
     the report rather than the script's stdout. Creates the stage if missing
     (e.g. a method that rejected before running any trial). Single-writer-safe
-    because tuner-orchestrator blocks on the subprocess.
+    because `DeepTuner` blocks on the subprocess.
     """
     report = read_tune_report(report_path)
     phase_c = report.setdefault("phase_c", {"stages": []})
@@ -1040,7 +1040,7 @@ def set_stage_meta(report_path: Path, method: str, **meta: Any) -> None:
 def read_prior_trials(report_path: Path) -> list[dict]:
     """Collect all (params, score) trials seen so far for this candidate.
 
-    Flattens phase_a.base (the candidate-writer BASE_PARAMS evaluation)
+    Flattens phase_a.base (the Phase-A BASE_PARAMS evaluation)
     + phase_a.warm_start_configs + every phase_c.stages[*].trials. The
     base trial is included as the first prior so downstream tuners never
     lose sight of the candidate's starting point: BO injects it as a TPE

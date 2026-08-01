@@ -25,8 +25,8 @@ where `make_model` is evaluated against that function by the tuner scripts.
 
 - **Construct**: the candidate's `train.py` exposes `make_model(dataset, params)`
   returning an unfitted sklearn-style estimator (`.fit` / `.predict`), plus the
-  tuner contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) that
-  `tunable-contract-extractor` writes at step 0+1.
+  tuner contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) that the
+  coordinator's candidate contract stage writes at step 0+1.
 - **Train**: `prepare.load_datasets()` returns `DatasetSplit` items; train only
   on `dataset.x_train` / `dataset.y_train`.
 - **Score**: `evaluation.score_fn` (`prepare.evaluate_config(make_model, params)`)
@@ -46,7 +46,7 @@ Rules:
 
 ## Files
 
-- `train.py`: no task-root baseline is provided; `candidate-writer` writes each
+- `train.py`: no task-root baseline is provided; the coordinator's bounded edit writes each
   complete candidate at its validated `background.md` semantic point (`fresh`
   from scratch, or informed by numeric parents for `improve`/`crossover`).
 - `prepare.py`: fixed synthetic datasets, train/test splits, and the single
@@ -57,9 +57,8 @@ Rules:
 
 ## Program Mapping
 
-This task follows the repository-level experiment protocol (see
-`.claude/agents/autoresearch-experiment.md`) with these task-specific file
-roles:
+This task follows the repository-level deterministic protocol in
+`docs/execution-layer.md` with these task-specific file roles:
 
 - Editable experiment surface: `runs/tabular-model-search/<tag>/candidates/<run_id>/train.py`
 - Fixed data split + the one `config → score` function: `prepare.py`
@@ -77,7 +76,7 @@ Candidate granularity:
 - One candidate directory is one candidate.
 - Each candidate directory must contain `prepare.py` and `train.py`.
 - `prepare.py` is copied from the task root and treated as readonly.
-- A candidate's `train.py` is written by `candidate-writer` — from scratch for a
+- A candidate's `train.py` is written by the coordinator's bounded edit — from scratch for a
   `fresh` candidate, or informed by the parent candidates' `train.py` for an
   `improve`/`crossover` candidate.
 - Do not enumerate many competing candidates inside a single `train.py`.
@@ -136,11 +135,10 @@ uv --directory tasks/tabular-model-search sync
 
 # 2. After ledger.py add-record has persisted <run_id>, create the candidate
 #    directory. This copies prepare.py and derives _candidate_brief.json;
-#    candidate-writer writes train.py (do NOT pre-copy a baseline train.py).
+#    the coordinator writes train.py (do NOT pre-copy a baseline train.py).
 python tools/new_candidate.py tabular-model-search <tag> <run_id> --skip-entrypoint
 
-# 3. Once train.py + _warm_configs.json exist (candidate-writer +
-#    tunable-contract-extractor), score the K warm configs against evaluate_config
+# 3. Once train.py + _warm_configs.json exist, score the K warm configs against evaluate_config
 #    in the task-local uv env (step 0+1):
 #    (--project selects the task env without chdir, so the repo-relative paths below resolve)
 uv --project tasks/tabular-model-search run python tools/tuners/warmstart_eval.py \
@@ -149,9 +147,8 @@ uv --project tasks/tabular-model-search run python tools/tuners/warmstart_eval.p
   --tune-report-json runs/tabular-model-search/<tag>/candidates/<run_id>/tune_report.json
 ```
 
-Normally the experiment loop drives this through its agents
-(`tunable-contract-extractor` for step 0+1, `tuner-orchestrator` for the decoupled
-deep-tuning), not by hand. Candidate files under `runs/` are
+Normally `hieraresearch` drives this through its Phase-A candidate service and
+deterministic `DeepTuner`, not by hand. Candidate files under `runs/` are
 intentionally outside git.
 
 ## Scoring And Recording
@@ -160,10 +157,10 @@ There is **no run-log summary** — a candidate is never run as a script. The tu
 scripts call `prepare.evaluate_config(make_model, params)` (warm-start eval +
 Phase C) and the score is written straight to `ledger.json` via `tools/ledger.py`:
 
-- `tunable-contract-extractor` (step 0+1) records the warm-start best as the
+- The Phase-A candidate service records the warm-start best as the
   candidate's `final_best_score` (= `best_warm_score`) with `ledger.py record-run`,
   and the warm metadata with `set-tuning` (no `--mark-tuned`).
-- `tuner-orchestrator`, if it selects the candidate, calls
+- `DeepTuner`, if it selects the candidate, calls
   `tools/finalize_tuning.py`. The helper accepts only a terminal Phase-C report,
   applies the global best, and updates `final_best_score`, status, tuning
   metadata, and `tune: true` together. An interrupted search leaves all of

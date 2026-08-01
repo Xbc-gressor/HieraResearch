@@ -256,7 +256,7 @@ def main() -> int:
         "--skip-entrypoint",
         action="store_true",
         help=(
-            "Require its ledger record and write the candidate-writer brief; "
+            "Require its ledger record and write the coordinator candidate brief; "
             "non-fresh candidates start from an exact primary-parent entrypoint "
             "snapshot, while fresh candidates start without an entrypoint. "
             "Mutually exclusive with --from-candidate."
@@ -402,7 +402,7 @@ def main() -> int:
         sources.append((relative, source, expected_revision))
 
     # Normal non-fresh generation starts from an exact, helper-pinned snapshot
-    # of the primary parent.  candidate-writer edits this local copy in place;
+    # of the primary parent.  the bounded candidate edit edits this local copy;
     # it no longer reconstructs a parent program from prose and references.
     if (
         args.skip_entrypoint

@@ -232,7 +232,7 @@ semantic_search.py propose
   -> bounded valid points for that action
 replaceable acquisition policy
   -> one point + policy receipt
-idea-generator
+SemanticAdmission
   -> complete concrete solution at that point
 ledger.py add-record
   -> ancestry + attribution + policy receipt (still no observation)
@@ -433,11 +433,11 @@ it has an explicit revision contract.
 
 ## Evidence-aware background research
 
-The background-researcher runtime prompts keep only the mission, boundaries,
-and phase order always loaded; they load the operational details on demand
-from `docs/agent-resources/background-researcher/` (`retrieval.md` before the
-first retrieval action, `evidence-registry.md` before registry distillation,
-and `background-template.md` before writing the artifact).
+`BackgroundBuilder` gives the bounded research worker only the mission,
+boundaries, and phase order, while the operational details remain in
+`docs/agent-resources/background-researcher/` (`retrieval.md` before the first
+retrieval action, `evidence-registry.md` before registry distillation, and
+`background-template.md` before writing the artifact).
 
 The retrieval path starts from the task contract and resolved registry. For each
 searchable dimension, research asks what evidence is needed to propose or
