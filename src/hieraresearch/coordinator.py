@@ -434,15 +434,17 @@ class ExperimentCoordinator:
         materialization_ready = self.candidates.materialization_is_ready(
             action, record
         )
-        report_exists = self.candidates.evaluation_has_started(action)
-        action.contract_ready = (
-            report_exists
-            or self.candidates.contract_is_ready(action)
-        )
-        action.preflight_ready = (
-            report_exists
-            or self.candidates.preflight_is_ready(action)
-        )
+        # Keep corruption detection independent from stage readiness. A report
+        # is useful evidence that evaluation started, but only its own
+        # revision-bound receipts can authorize the next contract/preflight
+        # transition.
+        self.candidates.evaluation_has_started(action)
+        # A report proves that evaluation started, not that a current
+        # candidate contract or no-score preflight receipt still matches the
+        # candidate. Debug repairs can change those inputs after the report
+        # was written, so recovery must trust only revision-bound receipts.
+        action.contract_ready = self.candidates.contract_is_ready(action)
+        action.preflight_ready = self.candidates.preflight_is_ready(action)
         action.implemented = (
             action.contract_ready
             or self.candidates.implementation_is_ready(action)

@@ -387,6 +387,52 @@ class CrashClosureToolchainStub:
         return {"run_id": run_id, "status": "crash"}
 
 
+class DebugPreflightToolchainStub:
+    def __init__(self):
+        self.preflight_calls: list[tuple[Path, Path, int]] = []
+        self.inheritance_calls = 0
+        self.search_space_checks = 0
+
+    def build_inheritance(self, candidate_path: Path, configs_path: Path) -> dict:
+        del candidate_path, configs_path
+        self.inheritance_calls += 1
+        return {"status": "ok"}
+
+    def check_search_space(
+        self, candidate_path: Path, space_path: Path, configs_path: Path
+    ) -> dict:
+        del candidate_path, space_path, configs_path
+        self.search_space_checks += 1
+        return {"ok": True}
+
+    def candidate_preflight(
+        self,
+        candidate_path: Path,
+        configs_path: Path,
+        *,
+        k_eval: int,
+        task_config: dict,
+    ) -> dict:
+        del task_config
+        self.preflight_calls.append((candidate_path, configs_path, k_eval))
+        return {"status": "ok", "objective_calls": 0}
+
+
+class DebugModelStub:
+    def __init__(self, decision):
+        self.decision = decision
+        self.edit_calls = 0
+
+    def infer(self, **kwargs):
+        del kwargs
+        return self.decision
+
+    def edit(self, spec, *, validate):
+        del spec
+        self.edit_calls += 1
+        return validate()
+
+
 class OrchestratorBoundaryTests(unittest.TestCase):
     def test_contract_ready_candidate_preflights_before_warm_evaluation(self) -> None:
         action = RoundAction(
@@ -736,6 +782,154 @@ class OrchestratorBoundaryTests(unittest.TestCase):
                     "repair_instructions": "",
                 }
             )
+
+    def test_debug_repair_runs_bounded_preflight_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "run")
+            task_dir = repo_root / "tasks" / "toy"
+            candidate_dir = identity.run_dir / "candidates" / "001"
+            task_dir.mkdir(parents=True)
+            candidate_dir.mkdir(parents=True)
+            (task_dir / "TASK.md").write_text("# task\n", encoding="utf-8")
+            (task_dir / "task.toml").write_text("", encoding="utf-8")
+            (candidate_dir / "prepare.py").write_text("", encoding="utf-8")
+            (candidate_dir / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
+            atomic_write_json(
+                candidate_dir / "_candidate_brief.json",
+                {"implementation_source": {"kind": "generated"}},
+            )
+            atomic_write_json(candidate_dir / "_warm_configs.json", [{"x": 1}])
+            atomic_write_json(candidate_dir / "_search_space.json", {"x": ["int", 1, 2]})
+            atomic_write_json(identity.run_dir / "framework_cfg.json", {"tuner": {"K_eval": 2}})
+
+            evidence = FailureEvidence(
+                run_id="001",
+                phase="a",
+                crash_index=0,
+                crash_params={"x": 1},
+                failure_receipt={"type": "ValueError", "message": "incompatible"},
+                failure_ref={"failure_id": "failure-001"},
+            )
+            models = DebugModelStub(
+                parse_debug_response(
+                    {
+                        "verdict": "code_incompatible",
+                        "rationale": "the implementation rejects a legal value",
+                        "corrected_config": [],
+                        "repair_instructions": "accept the legal value",
+                    }
+                )
+            )
+            toolchain = DebugPreflightToolchainStub()
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=models,
+                task_config={},
+            )
+
+            repaired = pipeline._debug_once(
+                RoundAction(op="fresh", run_id="001", admitted=True),
+                evidence,
+                candidate_dir / "tune_report.json",
+            )
+
+            self.assertTrue(repaired)
+            self.assertEqual(models.edit_calls, 1)
+            self.assertEqual(len(toolchain.preflight_calls), 1)
+            self.assertEqual(toolchain.preflight_calls[0][2], 2)
+
+    def test_debug_rejects_failure_artifact_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "run")
+            candidate_dir = identity.run_dir / "candidates" / "001"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
+            atomic_write_json(candidate_dir / "_warm_configs.json", [{"x": 1}])
+            atomic_write_json(candidate_dir / "_search_space.json", {"x": ["int", 1, 2]})
+            evidence = FailureEvidence(
+                run_id="001",
+                phase="a",
+                crash_index=0,
+                crash_params={"x": 1},
+                failure_receipt={"type": "ValueError"},
+                failure_ref={"failure_id": "failure-escape", "artifact": "../outside.json"},
+            )
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=DebugPreflightToolchainStub(),
+                models=DebugModelStub(
+                    parse_debug_response(
+                        {
+                            "verdict": "abandon",
+                            "rationale": "the evidence is not repairable",
+                            "corrected_config": [],
+                            "repair_instructions": "",
+                        }
+                    )
+                ),
+                task_config={},
+            )
+
+            with self.assertRaisesRegex(ArtifactError, "escapes candidate directory"):
+                pipeline._debug_once(
+                    RoundAction(op="fresh", run_id="001", admitted=True),
+                    evidence,
+                    candidate_dir / "tune_report.json",
+                )
+
+    def test_restart_does_not_promote_stale_report_to_contract_or_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "run")
+            candidate_dir = identity.run_dir / "candidates" / "001"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "prepare.py").write_text("", encoding="utf-8")
+            (candidate_dir / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
+            atomic_write_json(
+                candidate_dir / "_candidate_brief.json",
+                {
+                    "schema_version": 4,
+                    "run_id": "001",
+                    "op": "fresh",
+                    "source_run_ids": [],
+                    "implementation_source": {"kind": "generated"},
+                },
+            )
+            atomic_write_json(
+                candidate_dir / CandidatePipeline.IMPLEMENTATION_RECEIPT,
+                {
+                    "schema_version": 1,
+                    "run_id": "001",
+                    "candidate_revision": file_revision(candidate_dir / "train.py"),
+                },
+            )
+            atomic_write_json(candidate_dir / "tune_report.json", {"phase_a": {"status": "crashed"}})
+
+            coordinator = ExperimentCoordinator(
+                identity,
+                toolchain=object(),
+                models=object(),
+                controls=RunControls(),
+            )
+            coordinator.task_config = {}
+            coordinator.candidates = CandidatePipeline(
+                identity,
+                toolchain=object(),
+                models=object(),
+                task_config={},
+            )
+            action = RoundAction(op="fresh", run_id="001", admitted=True)
+
+            coordinator._infer_candidate_stages(action, {"status": "pending"})
+
+            self.assertTrue(action.materialized)
+            self.assertTrue(action.implemented)
+            self.assertFalse(action.contract_ready)
+            self.assertFalse(action.preflight_ready)
+            self.assertFalse(action.resolved)
 
     def test_attempted_budget_exhaustion_closes_without_projecting_failed_phase_a(
         self,

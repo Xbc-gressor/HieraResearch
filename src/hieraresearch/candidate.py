@@ -480,11 +480,25 @@ class CandidatePipeline:
             return False
 
         artifact_value = evidence.failure_ref.get("artifact")
-        failure_artifact = (
-            candidate_dir / artifact_value
-            if isinstance(artifact_value, str) and artifact_value
-            else None
-        )
+        failure_artifact = None
+        if artifact_value is not None:
+            if not isinstance(artifact_value, str) or not artifact_value:
+                raise ArtifactError(
+                    f"failure artifact reference is malformed for candidate {run_id}"
+                )
+            candidate_root = candidate_dir.resolve()
+            failure_artifact = (candidate_root / artifact_value).resolve()
+            try:
+                failure_artifact.relative_to(candidate_root)
+            except ValueError as exc:
+                raise ArtifactError(
+                    f"failure artifact escapes candidate directory: {artifact_value!r}"
+                ) from exc
+            if not failure_artifact.is_file():
+                raise ArtifactError(
+                    f"failure artifact does not exist for candidate {run_id}: "
+                    f"{artifact_value}"
+                )
         prompt = (
             f"Candidate: {run_id}\nFailure phase: {evidence.phase}\n"
             f"Crash config index: {evidence.crash_index}\n"
@@ -544,6 +558,10 @@ class CandidatePipeline:
             if action.parents:
                 self.toolchain.build_inheritance(candidate_path, configs_path)
             self.toolchain.check_search_space(candidate_path, space_path, configs_path)
+            try:
+                self.preflight(action)
+            except ToolFailure:
+                return False
             return True
 
         try:
@@ -590,6 +608,10 @@ class CandidatePipeline:
         if action.parents:
             self.toolchain.build_inheritance(candidate_path, configs_path)
         self.toolchain.check_search_space(candidate_path, space_path, configs_path)
+        try:
+            self.preflight(action)
+        except ToolFailure:
+            return False
         return True
 
     def _close_budget_exhausted(self, run_id: str, report_path: Path) -> CandidateOutcome:
