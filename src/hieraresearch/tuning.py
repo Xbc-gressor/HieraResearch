@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import RunIdentity
+from .artifacts import ArtifactError, paths_revision
+from .models import DeepTuneOutcome, DeepTuneSelection, RunIdentity
 from .toolchain import Toolchain
-
-
-@dataclass(frozen=True)
-class DeepTuneOutcome:
-    tuned_run_id: str | None
-    ledger_updated: bool
-    reason: str
 
 
 class DeepTuner:
@@ -28,18 +21,20 @@ class DeepTuner:
         self.toolchain = toolchain
         self.task_config = task_config
 
-    def run(self) -> DeepTuneOutcome:
-        selection = self.toolchain.select_tuning_candidate(self.identity.run_dir)
-        run_id = selection.get("run_id")
-        reason = str(selection.get("reason") or "no eligible candidate")
+    def select(self) -> DeepTuneSelection:
+        before = paths_revision(self._selection_input_paths())
+        value = self.toolchain.select_tuning_candidate(self.identity.run_dir)
+        if paths_revision(self._selection_input_paths()) != before:
+            raise ArtifactError("deep-tune selection inputs changed during selection")
+        return DeepTuneSelection.from_tool_result(value, input_revision=before)
+
+    def run(self, selection: DeepTuneSelection) -> DeepTuneOutcome:
+        run_id = selection.run_id
         if run_id is None:
-            return DeepTuneOutcome(None, False, reason)
-        if not isinstance(run_id, str) or not run_id.isdigit():
-            raise ValueError(f"invalid selected tuning run id: {run_id!r}")
-        allocation = selection.get("budget_allocation")
-        trial_cap = allocation.get("trial_cap") if isinstance(allocation, dict) else None
-        if not isinstance(trial_cap, int) or isinstance(trial_cap, bool) or trial_cap <= 0:
-            return DeepTuneOutcome(None, False, "no Phase-C objective allocation remains")
+            return DeepTuneOutcome(None, False, selection.reason)
+        trial_cap = selection.trial_cap
+        if trial_cap is None:  # pragma: no cover - validated by DeepTuneSelection
+            raise ValueError("reserved deep-tune candidate has no trial cap")
 
         candidate_dir = self.identity.run_dir / "candidates" / run_id
         candidate_path = candidate_dir / "train.py"
@@ -51,13 +46,39 @@ class DeepTuner:
             if kind == "stop":
                 return DeepTuneOutcome(None, False, str(action.get("reason") or "phase-c stop"))
             if kind == "finalize":
-                self.toolchain.finalize_tuning(
+                receipt = self.toolchain.finalize_tuning(
                     self.identity.run_dir,
                     run_id,
                     candidate_path,
                     report_path,
                 )
-                return DeepTuneOutcome(run_id, True, reason)
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("status") != "ok"
+                    or receipt.get("run_id") != run_id
+                    or receipt.get("ledger_updated") is not True
+                ):
+                    raise ArtifactError(
+                        f"invalid deep-tune finalization receipt for {run_id}: {receipt!r}"
+                    )
+                record = self.toolchain.ledger_record(
+                    self.identity.run_dir,
+                    run_id,
+                )
+                if (
+                    not isinstance(record, dict)
+                    or record.get("tune") is not True
+                    or record.get("final_best_score")
+                    != receipt.get("final_best_score")
+                ):
+                    raise ArtifactError(
+                        f"deep-tune finalization did not commit ledger record {run_id}"
+                    )
+                return DeepTuneOutcome(
+                    run_id,
+                    True,
+                    str(action.get("reason") or "phase_c_finalized"),
+                )
             if kind != "run":
                 raise ValueError(f"unknown phase-c action: {kind!r}")
             method = action.get("method")
@@ -85,3 +106,12 @@ class DeepTuner:
                 # A later round can resume this nonterminal stage.
                 return DeepTuneOutcome(None, False, "phase_c_interrupted")
         raise ValueError("Phase-C method chain exceeded its deterministic bound")
+
+    def _selection_input_paths(self) -> tuple[Path, ...]:
+        run_dir = self.identity.run_dir
+        return (
+            run_dir / "ledger.json",
+            run_dir / "framework_cfg.json",
+            run_dir / "evaluation_attempts.jsonl",
+            *sorted((run_dir / "candidates").glob("*/tune_report.json")),
+        )

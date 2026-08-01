@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import CoordinatorState
+from .models import ActiveRound, CoordinatorState
 
 
 class ArtifactError(RuntimeError):
@@ -122,6 +122,27 @@ class CoordinatorStore:
 
     def save(self, state: CoordinatorState) -> None:
         atomic_write_json(self.path, state.to_dict())
+
+    def complete_round(self, active: ActiveRound) -> Path:
+        """Persist an immutable audit receipt before forgetting active state."""
+        if not active.tuning_complete:
+            raise ArtifactError("cannot complete a round before deep tuning returns")
+        receipt = {
+            "schema_version": 1,
+            "kind": "completed_round",
+            "round": active.to_dict(),
+        }
+        path = self.root / "rounds" / f"{active.round_id:06d}.json"
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ArtifactError(f"invalid completed round receipt {path}: {exc}") from exc
+            if existing != receipt:
+                raise ArtifactError(f"completed round receipt changed: {path}")
+            return path
+        atomic_write_json(path, receipt)
+        return path
 
 
 @dataclass(frozen=True)

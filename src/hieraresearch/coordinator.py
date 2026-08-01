@@ -325,7 +325,18 @@ class ExperimentCoordinator:
         if active is None:
             raise ValueError("deep tuning requires an active round")
         assert self.deep_tuner is not None
-        self.deep_tuner.run()
+        if active.deep_tune_selection is None:
+            active.deep_tune_selection = self.deep_tuner.select()
+            # Selection is the round's irreversible-effect reservation. Persist
+            # it before a worker or finalizer can change objective/ledger state.
+            self.store.save(self.state)
+        outcome = self.deep_tuner.run(active.deep_tune_selection)
+        if (
+            outcome.tuned_run_id is not None
+            and outcome.tuned_run_id != active.deep_tune_selection.run_id
+        ):
+            raise ArtifactError("deep-tune outcome changed the reserved candidate")
+        active.deep_tune_outcome = outcome
         active.tuning_complete = True
         after = self.toolchain.ledger_brief(self.identity.run_dir)
         no_admissions = not active.actions
@@ -349,6 +360,7 @@ class ExperimentCoordinator:
             return
         if any(not action.resolved for action in active.actions):
             raise ArtifactError("cannot close a round with unresolved candidates")
+        self.store.complete_round(active)
         self.state.next_round_id = max(self.state.next_round_id, active.round_id + 1)
         self.state.active_round = None
         self.store.save(self.state)
