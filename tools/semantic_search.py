@@ -33,8 +33,10 @@ import argparse
 import itertools
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -106,7 +108,17 @@ def _load_object(path: Path) -> dict[str, Any]:
 
 def _write_object(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2) + "\n")
+    payload = (json.dumps(value, indent=2, allow_nan=False) + "\n").encode()
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:

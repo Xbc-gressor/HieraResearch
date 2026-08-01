@@ -2991,7 +2991,10 @@ def select_candidate(
 
 
 def cmd_lint_contract(args) -> int:
-    result = lint_contract(args.candidate_path)
+    result = lint_contract(
+        args.candidate_path,
+        require_base_params=not args.allow_missing_base_params,
+    )
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
 
@@ -3154,6 +3157,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     lc = sub.add_parser("lint-contract", help="Check a candidate's tuner-contract relational invariants by AST.")
     lc.add_argument("--candidate-path", required=True, type=Path)
+    lc.add_argument(
+        "--allow-missing-base-params",
+        action="store_true",
+        help="validate the authored contract before Phase A materializes BASE_PARAMS",
+    )
     lc.set_defaults(func=cmd_lint_contract)
 
     ls = sub.add_parser("lint-schema",

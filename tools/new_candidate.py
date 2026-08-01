@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shlex
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -194,6 +196,53 @@ def candidate_brief(
     return None
 
 
+def _copy_candidate_files(
+    destination: Path,
+    sources: list[tuple[str, Path, str]],
+    brief: dict | None,
+) -> None:
+    for relative, source, expected_revision in sources:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        if _content_sha256(target) != expected_revision:
+            raise ValueError(f"source changed while materializing {relative}: {source}")
+    if brief is not None:
+        (destination / BRIEF_FILENAME).write_text(
+            json.dumps(brief, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+
+def _publish_candidate(
+    destination: Path,
+    sources: list[tuple[str, Path, str]],
+    brief: dict | None,
+) -> None:
+    """Build a new candidate completely before making its directory visible."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.materializing-",
+            dir=destination.parent,
+        )
+    )
+    try:
+        _copy_candidate_files(staging, sources, brief)
+        os.replace(staging, destination)
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("task_name", help="Task folder name under tasks/.")
@@ -250,6 +299,14 @@ def main() -> int:
         parser.error("candidate.copy_files must be a list of strings")
     if not isinstance(entrypoint, str):
         parser.error("candidate.entrypoint must be a string")
+    entrypoint_path = Path(entrypoint)
+    if entrypoint_path.is_absolute() or ".." in entrypoint_path.parts:
+        parser.error("candidate.entrypoint must stay inside the candidate directory")
+    dest = candidate_path(template, args.task_name, args.tag, args.run_id)
+    try:
+        dest.resolve().relative_to(ROOT.resolve())
+    except ValueError:
+        parser.error(f"candidate.root_template escapes the repository: {dest}")
     selected_modes = sum(
         bool(value)
         for value in (
@@ -318,20 +375,17 @@ def main() -> int:
             f"{args.run_id}: {ledger_path}"
         )
 
-    dest = candidate_path(template, args.task_name, args.tag, args.run_id)
-    if dest.exists() and any(dest.iterdir()) and not args.force:
-        parser.error(f"candidate directory already exists and is not empty: {dest}")
-    if not args.dry_run:
-        dest.mkdir(parents=True, exist_ok=True)
-
     source_candidate = resolve_source_candidate(
         template,
         args.task_name,
         args.tag,
         args.from_candidate,
     )
-
+    sources: list[tuple[str, Path, str]] = []
     for relative in copy_files:
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            parser.error(f"candidate.copy_files entry escapes the candidate: {relative}")
         if relative == entrypoint and source_candidate is not None:
             source = source_candidate / entrypoint
         elif relative == entrypoint and provided_entrypoint is not None:
@@ -340,17 +394,12 @@ def main() -> int:
             source = task_dir / relative
         if not source.is_file():
             parser.error(f"missing source file for {relative}: {source}")
-        target = dest / relative
-        if args.dry_run:
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and not args.force:
-            parser.error(f"target file already exists: {target}")
-        shutil.copy2(source, target)
-
-    brief_path = dest / BRIEF_FILENAME
-    if brief is not None and not args.dry_run:
-        brief_path.write_text(json.dumps(brief, indent=2) + "\n")
+        expected_revision = _content_sha256(source)
+        if relative == entrypoint and provided_entrypoint is not None:
+            implementation_source = brief.get("implementation_source", {})
+            if isinstance(implementation_source, dict):
+                expected_revision = implementation_source.get("sha256", expected_revision)
+        sources.append((relative, source, expected_revision))
 
     # Normal non-fresh generation starts from an exact, helper-pinned snapshot
     # of the primary parent.  candidate-writer edits this local copy in place;
@@ -367,11 +416,19 @@ def main() -> int:
             parser.error(f"missing primary-parent entrypoint: {parent_path}")
         if _content_sha256(parent_path) != brief["primary_parent"]["sha256"]:
             parser.error("primary-parent entrypoint changed while materializing candidate")
-        target = dest / entrypoint
-        if not args.dry_run:
-            if target.exists() and not args.force:
-                parser.error(f"target file already exists: {target}")
-            shutil.copy2(parent_path, target)
+        sources.append(
+            (entrypoint, parent_path, str(brief["primary_parent"]["sha256"]))
+        )
+
+    brief_path = dest / BRIEF_FILENAME
+    if not args.dry_run:
+        if args.force:
+            dest.mkdir(parents=True, exist_ok=True)
+            _copy_candidate_files(dest, sources, brief)
+        else:
+            if dest.exists():
+                parser.error(f"candidate directory already exists: {dest}")
+            _publish_candidate(dest, sources, brief)
 
     entrypoint_path = dest / entrypoint
     task_project = config.get("env", {}).get("project", f"tasks/{args.task_name}")

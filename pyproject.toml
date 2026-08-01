@@ -1,7 +1,21 @@
 [project]
 name = "autoresearch-automl"
 version = "0.1.0"
-description = "Claude Code-driven multi-task autoresearch harness"
-readme = "README.md"
+description = "Deterministic multi-task autoresearch harness with bounded Claude inference"
+readme = "README_ZH.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "anthropic>=0.120.0",
+  "claude-agent-sdk>=0.1.0",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -25,7 +25,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import shutil
+import os
+import tempfile
 from pathlib import Path
 
 from semantic_space import DEFAULT_DIMENSION_STRATEGY, DIMENSION_STRATEGIES
@@ -38,6 +39,22 @@ SEMANTIC_ARTIFACTS = ("dimension_catalog.json", "background.md", "ledger.json")
 
 def _read_framework_config(path: Path) -> dict:
     return read_framework_cfg(path)
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    payload = (
+        json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode()
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _task_runtime_limit(repo_root: Path, task_name: str) -> float | None:
@@ -78,28 +95,9 @@ def initialize_run(
 ) -> Path:
     repo_root = Path(repo_root).resolve()
     run_dir = repo_root / "runs" / task_name / tag
-    run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Run directory: {run_dir.relative_to(repo_root)}")
-
     template = repo_root / "tasks" / "framework_cfg.example.json"
     target = run_dir / "framework_cfg.json"
     target_existed = target.exists()
-    if template.exists():
-        if not target.exists():
-            shutil.copy2(template, target)
-            print(f"Copied framework config template to {target.relative_to(repo_root)}")
-            print("  → Edit this file to override framework behavior for this run.")
-        else:
-            print(
-                "Framework config already exists at "
-                f"{target.relative_to(repo_root)}, skipping copy."
-            )
-    elif not target.exists():
-        print(
-            f"Template {template.relative_to(repo_root)} not found, "
-            "skipping framework_cfg.json copy."
-        )
-        print("  → Framework will use code defaults.")
 
     # New runs inherit a task-appropriate limit instead of blindly retaining
     # the generic template's 60 seconds. Existing run-local choices remain
@@ -151,10 +149,23 @@ def initialize_run(
         and llm_intelligence_score is None
         and max_evaluations is None
         and per_runtime_limit is None
+        and not target_existed
+        and not template.exists()
     ):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Run directory: {run_dir.relative_to(repo_root)}")
+        print(
+            f"Template {template.relative_to(repo_root)} not found; "
+            "framework defaults will be used."
+        )
         return run_dir
 
-    config = _read_framework_config(target) if target.exists() else {}
+    if target_existed:
+        config = _read_framework_config(target)
+    elif template.exists():
+        config = _read_framework_config(template)
+    else:
+        config = {}
     updates: list[str] = []
 
     if dimension_strategy is not None:
@@ -175,7 +186,7 @@ def initialize_run(
                 "cannot change dimension strategy after semantic artifacts exist: "
                 + ", ".join(existing_artifacts)
             )
-        if current != dimension_strategy or not target.exists():
+        if current != dimension_strategy or not target_existed:
             config["space_initialization"] = {
                 **section,
                 "dimension_strategy": dimension_strategy,
@@ -240,12 +251,22 @@ def initialize_run(
         config["per_runtime_limit"] = normalized_limit
         updates.append(f"per_runtime_limit={normalized_limit}")
 
-    if updates:
-        target.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    if not target_existed or updates:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(target, config)
+    print(f"Run directory: {run_dir.relative_to(repo_root)}")
+    if target_existed:
         print(
-            f"Set {', '.join(updates)} in "
-            f"{target.relative_to(repo_root)}"
+            "Framework config already exists at "
+            f"{target.relative_to(repo_root)}."
         )
+    elif template.exists():
+        print(f"Initialized framework config at {target.relative_to(repo_root)}")
+    print(
+        f"Set {', '.join(updates)} in {target.relative_to(repo_root)}"
+        if updates
+        else "Framework config unchanged."
+    )
     return run_dir
 
 
