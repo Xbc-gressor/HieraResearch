@@ -106,12 +106,14 @@ candidate code, raw retrieval material, or logs by default.
    unpaired, and independently tuned comparisons remain confounded.
    Empty `summary` is a valid abstention. Never call a target `promising` or
    `unpromising` unless its mechanical state is `comparator_covered` with at
-   least two direct non-crash edges; all weaker/confounded evidence is `mixed`
+   least two direct tuned edges (matched comparators whose child was
+   deep-tuned; screening-only children measure one parameter point and stay
+   weaker evidence); all weaker/confounded evidence is `mixed`
    or `unknown`.
 5. Keep crash-only targets `failed`/`unknown`/`active`: scores are
    lower-is-better, a crash is worst and never a missing success, and a crash
    alone cannot contradict a semantic hypothesis.
-6. Validate and store the snapshot as schema 3.
+6. Validate and store the snapshot as schema 4.
 7. Invoke `python tools/ledger.py apply-space-state` once after a successful
    store.
 8. Never edit `background.md`, records, semantic points, edge or policy
@@ -124,7 +126,7 @@ exactly this shape; do not add undeclared evidence or status collections:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "updated_at_run": "<latest processed run id>",
   "generation": 0,
   "summary": "<display-only bounded interpretation, or empty string>",
@@ -162,7 +164,8 @@ exactly this shape; do not add undeclared evidence or status collections:
       "evidence_run_ids": ["002", "004", "006"],
       "evidence_edge_ids": ["sedge-000-002", "sedge-004-006"],
       "comparator_coverage": {
-        "direct_noncrash_edges": 2,
+        "direct_tuned_edges": 2,
+        "direct_noncrash_edges": 0,
         "confounded_noncrash_edges": 0,
         "crash_edges": 0
       },
@@ -189,12 +192,12 @@ Recommendation gates are exact and identical for both target levels:
   `confidence: low`, and `recommended_status: active`.
 - `deprioritized` requires `assessment: unpromising`, `confidence: med` or
   `high`, `evaluation_state: comparator_covered`, at least two direct
-  non-crash edges, and a non-empty `reopen_when`.
+  tuned edges, and a non-empty `reopen_when`.
 - `pruned` requires `assessment: unpromising`, `confidence: high`,
-  `evaluation_state: comparator_covered`, at least two direct non-crash edges,
+  `evaluation_state: comparator_covered`, at least two direct tuned edges,
   and a non-empty `reopen_when`.
 - Every `promising` or `unpromising` assessment requires
-  `comparator_covered` with at least two direct non-crash edges, regardless of
+  `comparator_covered` with at least two direct tuned edges, regardless of
   prose confidence.
 - A hypothesis `promising`/`unpromising` assessment must also agree with the
   mechanical direction of all cited repeated pairs; mixed signs require

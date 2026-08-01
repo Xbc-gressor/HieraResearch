@@ -88,6 +88,7 @@ RECORD_FIELDS = (
     "unevaluated_receipt",  # helper proof: budget exhausted before this run attempted
     "best_warm_score",
     "final_best_score",
+    "evaluation_depth",  # screening | tuned: has a scored Phase-C trial
     "n_dims",
     "warm_start_K",
     "warm_percentile",
@@ -105,6 +106,7 @@ RECORD_FIELDS = (
 
 TUNING_FIELDS = (
     "best_warm_score",
+    "evaluation_depth",
     "n_dims",
     "warm_start_K",
     "warm_percentile",

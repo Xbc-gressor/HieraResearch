@@ -49,6 +49,7 @@ from semantic_evidence import (
     comparator_coverage,
     edge_index,
     mechanical_gain_direction,
+    normalize_coverage,
     render_target_evidence,
     target_evaluation_state,
     validate_conditioning_against_ledger,
@@ -2077,6 +2078,11 @@ TARGET_EVIDENCE_OPTIONAL = {"reopen_when"}
 TARGET_ASSESSMENTS = {"unknown", "promising", "mixed", "unpromising"}
 TARGET_RECOMMENDATIONS = {"active", "deprioritized", "pruned"}
 EXPERIENCE_CONFIDENCE = {"low", "med", "high"}
+# Schema 4 split `direct_tuned_edges` out of `direct_noncrash_edges` in every
+# target's `comparator_coverage`. Schema 3 stays readable: its three-key
+# coverage normalizes forward with `direct_tuned_edges` at 0.
+EXPERIENCE_SCHEMA_VERSION = 4
+READABLE_EXPERIENCE_SCHEMA_VERSIONS = {3, 4}
 
 
 def _validate_target_evidence(
@@ -2220,17 +2226,8 @@ def _validate_target_evidence(
         expected_coverage = comparator_coverage(
             ledger, edge_ids, target_kind=target_kind, target_id=target_id
         )
-        coverage = item.get("comparator_coverage")
-        if (
-            not isinstance(coverage, dict)
-            or set(coverage) != set(COVERAGE_KEYS)
-            or any(
-                not isinstance(coverage.get(key), int)
-                or isinstance(coverage.get(key), bool)
-                or coverage[key] < 0
-                for key in COVERAGE_KEYS
-            )
-        ):
+        coverage = normalize_coverage(item.get("comparator_coverage"))
+        if coverage is None:
             errors.append(
                 f"{target}.comparator_coverage must hold non-negative integer "
                 f"counts for {', '.join(COVERAGE_KEYS)}"
@@ -2274,7 +2271,7 @@ def _validate_target_evidence(
         if confidence not in EXPERIENCE_CONFIDENCE:
             errors.append(f"{target}.confidence must be low, med, or high")
 
-        direct_edges = expected_coverage["direct_noncrash_edges"]
+        direct_edges = expected_coverage["direct_tuned_edges"]
         mechanical_direction = mechanical_gain_direction(
             ledger,
             target_kind=target_kind,
@@ -2298,7 +2295,7 @@ def _validate_target_evidence(
             errors.append(
                 f"{target}.recommended_status deprioritized requires assessment "
                 "unpromising, confidence med or high, evaluation_state "
-                "comparator_covered, at least two direct non-crash edges, "
+                "comparator_covered, at least two direct tuned edges, "
                 "and a non-empty reopen_when"
             )
         if recommended == "pruned" and not (
@@ -2311,7 +2308,7 @@ def _validate_target_evidence(
             errors.append(
                 f"{target}.recommended_status pruned requires assessment "
                 "unpromising, confidence high, evaluation_state "
-                "comparator_covered, at least two direct non-crash edges, "
+                "comparator_covered, at least two direct tuned edges, "
                 "and a non-empty reopen_when"
             )
         if assessment in {"promising", "unpromising"} and not (
@@ -2320,7 +2317,7 @@ def _validate_target_evidence(
             errors.append(
                 f"{target} assessment promising or unpromising requires "
                 "comparator_covered evaluation_state with at least two direct "
-                "non-crash edges"
+                "tuned edges"
             )
         if target_kind == "hypothesis" and assessment in {
             "promising",
@@ -2363,8 +2360,11 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
     unknown_top = sorted(set(experience) - allowed_top)
     if unknown_top:
         errors.append(f"experience has unknown fields {unknown_top}")
-    if experience.get("schema_version") != 3:
-        errors.append("experience.schema_version must be 3")
+    if experience.get("schema_version") not in READABLE_EXPERIENCE_SCHEMA_VERSIONS:
+        errors.append(
+            "experience.schema_version must be "
+            f"{sorted(READABLE_EXPERIENCE_SCHEMA_VERSIONS)}"
+        )
     generation = experience.get("generation")
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
         errors.append("experience.generation must be a non-negative integer")

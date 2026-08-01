@@ -331,7 +331,7 @@ background schema 3 (immutable S)
   -> semantic point selection at search_space_state revision r
   -> candidate + persistent semantic edge receipts
   -> score/crash observations
-  -> bounded experience schema 3 (replaceable belief)
+  -> bounded experience schema 4 (replaceable belief)
   -> deterministic validated decision transition
   -> append-only search_space_state revision r+1
   -> next proposal set filters/orders against r+1
@@ -352,7 +352,8 @@ is two-stage (`active -> deprioritized`, then `deprioritized -> pruned` in a
 later experience generation with changed evidence for the same target), and
 every recommendation is gated on mechanically recomputed evidence:
 deprioritization and pruning both require `comparator_covered` with at least
-two direct non-crash edges; deprioritization requires med/high confidence,
+two direct tuned edges (matched comparators whose child was deep-tuned);
+deprioritization requires med/high confidence,
 pruning requires high confidence, and a hypothesis direction must agree across
 all cited pairs. A later generation, crash, unpaired transfer, or unrelated
 DAG update alone cannot complete the second stage or reopen a target: a new or
@@ -505,7 +506,7 @@ Hypotheses keep the existing literature credibility label:
 
 This is an external evidence stamp, not a truth score. A replicated method can
 fail locally; a preliminary hypothesis can work. Run-status belief about
-dimensions and hypotheses lives in the schema-3 experience snapshot and the
+dimensions and hypotheses lives in the schema-4 experience snapshot and the
 `search_space_state` overlay, never in this registry stamp.
 
 Sources, hypotheses, and guidance share five exact-tag scope facets:

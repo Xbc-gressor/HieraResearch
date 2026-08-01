@@ -161,7 +161,7 @@ per-record aggregates. Never hand-edit or truncate the reservation log.
 
 ## Experience boundary
 
-Raw records are the durable history. `experience` (schema 3) is a bounded
+Raw records are the durable history. `experience` (schema 4; schema 3 stays readable) is a bounded
 regenerated belief snapshot: `summary`, `promising_regions`, `lessons`,
 `bottlenecks`, plus two bounded target collections, `dimension_evidence`
 (at most 16 entries) and `hypothesis_evidence` (at most 32 entries), each
@@ -178,12 +178,15 @@ target-related runs), `evidence_edge_ids` (0–5 unique persisted
 target-touching edges), `comparator_coverage`, `confidence`, `uncertainty`,
 and optional `reopen_when`. `evaluation_state` is mechanical: `unevaluated`
 (no cited terminal runs or edges), `failed` (cited evidence is crash-only),
-`observed` (a non-crash observation but fewer than two direct non-crash
-edges), or `comparator_covered` (at least two direct non-crash edges). A direct
+`observed` (a non-crash observation but fewer than two direct tuned
+edges), or `comparator_covered` (at least two direct tuned edges). A direct
 edge is not merely a one-dimension final-vs-final or inherited-parameter
 comparison: it requires a validated same-child-code control/treatment pair
 whose configs differ only in the declared semantic switch, the pinned parent
-snapshot, and no shared-key reset. Ordinary schema-2 transfers declare the
+snapshot, and no shared-key reset. A direct edge is **tuned** when the child
+record's `evaluation_depth` is `tuned` (it has a scored Phase-C trial);
+screening-depth and legacy direct edges remain evidence but cannot drive
+contradiction gates. Ordinary schema-2 transfers declare the
 semantic pair `unverified`, so they remain confounded. Legacy,
 multi-dimension, reset-bearing, unpaired, or independently tuned comparisons
 are also confounded.
@@ -198,12 +201,12 @@ Recommendation gates are exact and identical for both levels:
   contradicts a semantic element.
 - `deprioritized` requires `assessment: unpromising`, `confidence: med` or
   `high`, `evaluation_state: comparator_covered`, at least two direct
-  non-crash edges, and a non-empty `reopen_when`.
+  tuned edges, and a non-empty `reopen_when`.
 - `pruned` requires `assessment: unpromising`, `confidence: high`,
-  `evaluation_state: comparator_covered`, at least two direct non-crash
+  `evaluation_state: comparator_covered`, at least two direct tuned
   edges, and a non-empty `reopen_when`.
 - Every `promising` or `unpromising` claim requires
-  `comparator_covered` with at least two direct edges.
+  `comparator_covered` with at least two direct tuned edges.
 
 `unpromising` means that another outer-search evaluation has low expected
 marginal value after considering attribution, consistency, mechanism,

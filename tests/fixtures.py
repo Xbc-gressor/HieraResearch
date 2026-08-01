@@ -593,6 +593,7 @@ def record(
     score: float,
     status: str,
     prior_records: list[dict] | None = None,
+    depth: str = "tuned",
 ) -> dict:
     """A full ledger record: attribution, ancestry, receipts, and observation."""
     entry = {
@@ -610,6 +611,7 @@ def record(
         ),
         "status": status,
         "final_best_score": score,
+        "evaluation_depth": depth,
     }
     entry["semantic_edges"] = build_semantic_edges(prior_records or [], entry)
     if parents and math.isfinite(float(score)):
@@ -632,20 +634,22 @@ def belief_ledger(registry: dict) -> dict:
         {
             "run_id": "000", "source_run_ids": [], "semantic_point": baseline,
             "semantic_edges": [], "status": "keep", "final_best_score": 0.40,
-            "dag_revision": 1,
+            "evaluation_depth": "tuned", "dag_revision": 1,
         },
         {
             "run_id": "001", "source_run_ids": ["000"], "semantic_point": filtered,
-            "status": "discard", "final_best_score": 0.50, "dag_revision": 2,
+            "status": "discard", "final_best_score": 0.50,
+            "evaluation_depth": "tuned", "dag_revision": 2,
         },
         {
             "run_id": "002", "source_run_ids": [], "semantic_point": baseline,
             "semantic_edges": [], "status": "keep", "final_best_score": 0.41,
-            "dag_revision": 3,
+            "evaluation_depth": "tuned", "dag_revision": 3,
         },
         {
             "run_id": "003", "source_run_ids": ["002"], "semantic_point": filtered,
-            "status": "discard", "final_best_score": 0.52, "dag_revision": 4,
+            "status": "discard", "final_best_score": 0.52,
+            "evaluation_depth": "tuned", "dag_revision": 4,
         },
     ]
     records[1]["semantic_edges"] = build_semantic_edges(records[:1], records[1])

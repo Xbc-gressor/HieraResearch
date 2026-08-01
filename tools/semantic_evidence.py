@@ -55,7 +55,50 @@ MAX_RUNS_PER_TARGET = 5
 MAX_COMPARATOR_GAIN_ADJUSTMENT = 0.15
 MAX_EVIDENCE_UNCERTAINTY_ADJUSTMENT = 0.10
 
-COVERAGE_KEYS = ("direct_noncrash_edges", "confounded_noncrash_edges", "crash_edges")
+COVERAGE_KEYS = (
+    "direct_tuned_edges",
+    "direct_noncrash_edges",
+    "confounded_noncrash_edges",
+    "crash_edges",
+)
+# Coverage shape before `direct_tuned_edges` split screening-depth direct
+# comparators out of `direct_noncrash_edges`. Legacy artifacts and decision
+# receipts carry exactly these three keys.
+LEGACY_COVERAGE_KEYS = (
+    "direct_noncrash_edges",
+    "confounded_noncrash_edges",
+    "crash_edges",
+)
+
+
+def normalize_coverage(raw: Any) -> dict[str, int] | None:
+    """Read either coverage shape, or return None if it is neither.
+
+    A legacy three-key map is read forward with ``direct_tuned_edges`` at 0:
+    it predates the depth split, so none of its direct edges are known to be
+    tuned and the conservative reading is that none were. Callers must treat
+    the result as backward-readable evidence, never as a recomputed claim.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _counts(keys: tuple[str, ...]) -> dict[str, int] | None:
+        out: dict[str, int] = {}
+        for key in keys:
+            value = raw.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            out[key] = value
+        return out
+
+    if set(raw) == set(COVERAGE_KEYS):
+        return _counts(COVERAGE_KEYS)
+    if set(raw) == set(LEGACY_COVERAGE_KEYS):
+        counts = _counts(LEGACY_COVERAGE_KEYS)
+        if counts is None:
+            return None
+        return {"direct_tuned_edges": 0, **counts}
+    return None
 DIRECT_COMPARATOR_CAPABILITY_KEY = "direct_comparator_capability"
 DIRECT_COMPARATOR_CAPABILITY = {
     "schema_version": 1,
@@ -295,16 +338,8 @@ def acquisition_conditioning(
             if not run_ids and not edge_ids:
                 continue
             raw_coverage = item.get("comparator_coverage")
-            coverage = {
-                key: (
-                    raw_coverage.get(key, 0)
-                    if isinstance(raw_coverage, dict)
-                    and isinstance(raw_coverage.get(key, 0), int)
-                    and not isinstance(raw_coverage.get(key, 0), bool)
-                    and raw_coverage.get(key, 0) >= 0
-                    else 0
-                )
-                for key in COVERAGE_KEYS
+            coverage = normalize_coverage(raw_coverage) or {
+                key: 0 for key in COVERAGE_KEYS
             }
             direction = directions.get(str(target_id), "none")
             if target_kind != "hypothesis" or relation in {
@@ -319,7 +354,7 @@ def acquisition_conditioning(
                 }.get(direction, "none")
             comparator_gain = (
                 item.get("evaluation_state") == "comparator_covered"
-                and coverage["direct_noncrash_edges"] >= MIN_EDGES_PER_TARGET
+                and coverage["direct_tuned_edges"] >= MIN_EDGES_PER_TARGET
                 and direction in {"positive", "negative"}
             )
             rendered.append(
@@ -452,17 +487,8 @@ def validate_conditioned_adjustment(
         if identity in seen_targets:
             errors.append(f"{where} duplicates target {target_id}")
         seen_targets.add(identity)
-        coverage = item.get("comparator_coverage")
-        if (
-            not isinstance(coverage, dict)
-            or set(coverage) != set(COVERAGE_KEYS)
-            or any(
-                not isinstance(coverage.get(key), int)
-                or isinstance(coverage.get(key), bool)
-                or coverage.get(key) < 0
-                for key in COVERAGE_KEYS
-            )
-        ):
+        coverage = normalize_coverage(item.get("comparator_coverage"))
+        if coverage is None:
             errors.append(f"{where}.comparator_coverage is invalid")
             coverage = {key: 0 for key in COVERAGE_KEYS}
         run_ids = item.get("evidence_run_ids")
@@ -485,7 +511,7 @@ def validate_conditioned_adjustment(
             "comparator_gain"
             if (
                 item.get("evaluation_state") == "comparator_covered"
-                and coverage["direct_noncrash_edges"] >= MIN_EDGES_PER_TARGET
+                and coverage["direct_tuned_edges"] >= MIN_EDGES_PER_TARGET
                 and item.get("gain_direction") in {"positive", "negative"}
             )
             else "uncertainty_only"
@@ -1578,6 +1604,13 @@ def _coverage_category(
     if "crash" in statuses:
         return "crash_edges"
     if matched_inherited_control(ledger, receipt) is not None:
+        # A direct comparator is contradiction-grade only when the child was
+        # deep-tuned: screening-only children measure the hypothesis at one
+        # parameter point. Legacy records without evaluation_depth read as
+        # screening and fail closed into the weaker category.
+        child = records.get(str(receipt.get("child_run_id")), {})
+        if child.get("evaluation_depth") == "tuned":
+            return "direct_tuned_edges"
         return "direct_noncrash_edges"
     return "confounded_noncrash_edges"
 
@@ -1616,11 +1649,17 @@ def mechanical_gain_direction(
     """
     if target_kind != "hypothesis":
         return "none"
+    records = _records_by_id(ledger)
     index = edge_index(ledger)
     oriented_effects: list[float] = []
     for edge_id in dict.fromkeys(str(value) for value in evidence_edge_ids):
         receipt = index.get(edge_id)
         if receipt is None:
+            continue
+        # Only tuned-child controls orient a direction: screening-depth
+        # controls measure one parameter point and abstain here.
+        child = records.get(str(receipt.get("child_run_id")), {})
+        if child.get("evaluation_depth") != "tuned":
             continue
         matched = matched_inherited_control(ledger, receipt)
         if matched is None:
@@ -1766,7 +1805,7 @@ def validate_conditioning_against_ledger(
             "comparator_gain"
             if (
                 expected_state == "comparator_covered"
-                and expected_coverage["direct_noncrash_edges"]
+                and expected_coverage["direct_tuned_edges"]
                 >= MIN_EDGES_PER_TARGET
                 and expected_direction in {"positive", "negative"}
             )
@@ -1828,10 +1867,13 @@ def target_evaluation_state(
         target_kind=target_kind,
         target_id=target_id,
     )
-    if coverage["direct_noncrash_edges"] >= 2:
+    if coverage["direct_tuned_edges"] >= 2:
         return "comparator_covered"
     noncrash_observation = (
-        coverage["direct_noncrash_edges"] + coverage["confounded_noncrash_edges"] > 0
+        coverage["direct_tuned_edges"]
+        + coverage["direct_noncrash_edges"]
+        + coverage["confounded_noncrash_edges"]
+        > 0
     ) or any(
         record.get("status") in NONCRASH_TERMINAL_STATUSES
         and _run_bears_target(record, target_kind=target_kind, target_id=target_id)
@@ -1881,7 +1923,10 @@ def _target_block(
             pools[category].append(receipt)
     for pool in pools.values():
         pool.sort(key=_edge_sort_key, reverse=True)
-    direct = pools["direct_noncrash_edges"]
+    # Direct comparators first, strongest depth first; each pool is already
+    # recency-sorted. Screening-depth direct edges remain displayable direct
+    # evidence — they just cannot drive contradiction gates.
+    direct = pools["direct_tuned_edges"] + pools["direct_noncrash_edges"]
     confounded = pools["confounded_noncrash_edges"]
     crash = pools["crash_edges"]
 

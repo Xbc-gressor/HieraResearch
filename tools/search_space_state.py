@@ -30,17 +30,24 @@ import re
 from typing import Any
 
 from semantic_evidence import (
+    COVERAGE_KEYS,
     TERMINAL_STATUSES,
     comparator_coverage,
     edge_observation,
     mechanical_gain_direction,
+    normalize_coverage,
     target_evaluation_state,
 )
 from semantic_space import dimension_map, hypothesis_map, selected_assignments
 
 
 STATE_SCHEMA_VERSION = 1
-DECISION_SCHEMA_VERSION = 1
+DECISION_SCHEMA_VERSION = 2
+# Decision schema 2 carries the four-key `comparator_coverage` that split
+# `direct_tuned_edges` out of `direct_noncrash_edges`. Schema-1 receipts are
+# append-only history and stay valid: their three-key coverage normalizes
+# forward on read. New decisions are always written at the current version.
+READABLE_DECISION_SCHEMA_VERSIONS = {1, 2}
 RUNTIME_STATUSES = {"active", "deprioritized", "pruned"}
 LEGAL_TRANSITIONS = {
     ("active", "deprioritized"),
@@ -73,7 +80,6 @@ DECISION_FIELDS = {
     "evidence_observations",
 }
 TARGET_FIELDS = {"kind", "dimension_id", "id"}
-COVERAGE_KEYS = {"direct_noncrash_edges", "confounded_noncrash_edges", "crash_edges"}
 OBSERVATION_FIELDS = {
     "edge_id",
     "parent_status",
@@ -245,10 +251,8 @@ def _validate_belief_copy(decision: dict[str, Any], where: str) -> list[str]:
     edge_ids = decision.get("evidence_edge_ids")
     if not isinstance(edge_ids, list) or any(not _nonempty(item) for item in edge_ids):
         errors.append(f"{where}.evidence_edge_ids must be a list of edge id strings")
-    coverage = decision.get("comparator_coverage")
-    if not isinstance(coverage, dict) or set(coverage) != COVERAGE_KEYS or any(
-        not _nonnegative_int(coverage.get(key)) for key in COVERAGE_KEYS
-    ):
+    coverage = normalize_coverage(decision.get("comparator_coverage"))
+    if coverage is None:
         errors.append(
             f"{where}.comparator_coverage must hold exactly the non-negative "
             f"counts {sorted(COVERAGE_KEYS)}"
@@ -324,8 +328,11 @@ def validate_search_space_state(registry: dict[str, Any], ledger: dict[str, Any]
         missing = sorted(DECISION_FIELDS - set(decision))
         if missing:
             errors.append(f"{item_where} is missing fields {missing}")
-        if decision.get("schema_version") != DECISION_SCHEMA_VERSION:
-            errors.append(f"{item_where}.schema_version must be {DECISION_SCHEMA_VERSION}")
+        if decision.get("schema_version") not in READABLE_DECISION_SCHEMA_VERSIONS:
+            errors.append(
+                f"{item_where}.schema_version must be "
+                f"{sorted(READABLE_DECISION_SCHEMA_VERSIONS)}"
+            )
         expected_revision = index + 1
         if decision.get("revision") != expected_revision:
             errors.append(
@@ -485,7 +492,7 @@ def _effective_recommendation(
         belief.get("assessment") == "unpromising"
         and belief.get("confidence") in {"med", "high"}
         and evaluation_state == "comparator_covered"
-        and coverage["direct_noncrash_edges"] >= 2
+        and coverage["direct_tuned_edges"] >= 2
         and (
             target_kind != "hypothesis"
             or mechanical_direction == "negative"
@@ -499,7 +506,7 @@ def _effective_recommendation(
     prune_ok = (
         belief.get("confidence") == "high"
         and evaluation_state == "comparator_covered"
-        and coverage["direct_noncrash_edges"] >= 2
+        and coverage["direct_tuned_edges"] >= 2
     )
     return "pruned" if prune_ok else "deprioritized"
 

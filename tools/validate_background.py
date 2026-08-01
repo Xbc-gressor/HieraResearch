@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 
 from background_contract import (  # noqa: E402
     ContractError,
+    EXPERIENCE_SCHEMA_VERSION,
     derive_hypothesis_selection,
     load_registry,
     validate_background_markdown,
@@ -293,6 +294,11 @@ class Run:
                     r for r in stored["records"] if r["run_id"] == parents[0]
                 )
                 attach_matched_transfer(parent, child, control_score=float(score))
+                # The lifecycle's prune/reopen beliefs need contradiction-grade
+                # comparators, which require tuned children. No runtime tuning
+                # report exists in this CLI fixture, so mark depth directly —
+                # same fixture posture as the capability patch below.
+                child["evaluation_depth"] = "tuned"
                 # This validator exercises the dormant downstream paired
                 # contract. Production ledger writers emit only the explicit
                 # unavailable capability; the fixture-only gate cannot be
@@ -316,7 +322,7 @@ class Run:
         self.experience.write_text(
             json.dumps(
                 {
-                    "schema_version": 3,
+                    "schema_version": EXPERIENCE_SCHEMA_VERSION,
                     "updated_at_run": updated_at_run,
                     "generation": generation,
                     "summary": (
@@ -387,7 +393,8 @@ def _belief(runs: list[str], edges: list[str], **overrides) -> dict:
         "evidence_run_ids": runs,
         "evidence_edge_ids": edges,
         "comparator_coverage": {
-            "direct_noncrash_edges": len(edges),
+            "direct_tuned_edges": len(edges),
+            "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
         },

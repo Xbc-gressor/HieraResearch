@@ -113,7 +113,8 @@ def decision(revision: int, target_id: str, before: str, after: str) -> dict:
         "reopen_when": "A later direct comparison contradicts this decision.",
         "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
         "comparator_coverage": {
-            "direct_noncrash_edges": 2,
+            "direct_tuned_edges": 2,
+            "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
         },
@@ -520,8 +521,9 @@ class ExperienceTransitionTests(unittest.TestCase):
                     *self.additional_evidence_edge_ids,
                 ][-5:],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 2
+                    "direct_tuned_edges": 2
                     + len(self.additional_evidence_edge_ids),
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -577,7 +579,7 @@ class ExperienceTransitionTests(unittest.TestCase):
         entry = experience["hypothesis_evidence"][0]
         entry["evidence_run_ids"].append("004")
         entry["evidence_edge_ids"].append("sedge-000-004")
-        entry["comparator_coverage"]["direct_noncrash_edges"] = 3
+        entry["comparator_coverage"]["direct_noncrash_edges"] = 1
         self.ledger["experience"] = experience
         second = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(second[0]["from_status"], "deprioritized")
@@ -674,7 +676,8 @@ class ExperienceTransitionTests(unittest.TestCase):
                 "evidence_run_ids": ["000", "001"],
                 "evidence_edge_ids": ["sedge-000-001"],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 1,
+                    "direct_tuned_edges": 1,
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -736,6 +739,7 @@ class ExperienceTransitionTests(unittest.TestCase):
                 "evidence_run_ids": ["004"],
                 "evidence_edge_ids": ["sedge-002-004"],
                 "comparator_coverage": {
+                    "direct_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 1,
@@ -826,7 +830,8 @@ class ExperienceTransitionTests(unittest.TestCase):
                     f"sedge-{parent_id}-{child_id}",
                 ][-5:],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": len(existing_edges) + 1,
+                    "direct_tuned_edges": len(existing_edges) + 1,
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -1592,7 +1597,8 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 "evidence_run_ids": ["000", "001"],
                 "evidence_edge_ids": ["sedge-000-001"],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 1,
+                    "direct_tuned_edges": 1,
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },

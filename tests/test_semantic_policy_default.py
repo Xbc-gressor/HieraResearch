@@ -216,6 +216,7 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
                 "evidence_run_ids": ["000", "001"],
                 "evidence_edge_ids": ["sedge-000-001"],
                 "comparator_coverage": {
+                    "direct_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 1,
                     "crash_edges": 0,
@@ -357,7 +358,8 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
                 "evidence_run_ids": ["000", "001", "002", "003"],
                 "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 2,
+                    "direct_tuned_edges": 2,
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -368,7 +370,8 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
                 "evidence_run_ids": ["000", "001", "002", "003"],
                 "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 2,
+                    "direct_tuned_edges": 2,
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -426,7 +429,8 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
                 "evidence_run_ids": ["000", "001", "002", "003"],
                 "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 2,
+                    "direct_tuned_edges": 2,
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },
@@ -505,7 +509,8 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
                 "evidence_run_ids": ["000", "001", "002", "003"],
                 "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
                 "comparator_coverage": {
-                    "direct_noncrash_edges": 2,
+                    "direct_tuned_edges": 2,
+                    "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
                 },

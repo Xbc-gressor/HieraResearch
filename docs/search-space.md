@@ -235,7 +235,7 @@ of mutating a flag, so `S_r` is a pure function of the whole decision log.
 The loop at revision `r`:
 
     select point s ∈ S_r -> candidate x with π(x) = s and persisted edge
-    receipts -> observations f(x) (a crash is +inf) -> bounded schema-3
+    receipts -> observations f(x) (a crash is +inf) -> bounded schema-4
     belief regenerated over the ledger -> deterministic validated decision
     transition -> revision r+1 -> the next proposal filters/orders over
     S_{r+1}.

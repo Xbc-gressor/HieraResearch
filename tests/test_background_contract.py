@@ -489,7 +489,8 @@ def _comparator_covered_entry() -> dict:
         "evidence_run_ids": ["000", "001", "002", "003"],
         "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
         "comparator_coverage": {
-            "direct_noncrash_edges": 2,
+            "direct_tuned_edges": 2,
+            "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
         },
@@ -509,7 +510,8 @@ def _observed_entry() -> dict:
         "evidence_run_ids": ["000", "001"],
         "evidence_edge_ids": ["sedge-000-001"],
         "comparator_coverage": {
-            "direct_noncrash_edges": 1,
+            "direct_tuned_edges": 1,
+            "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
         },
@@ -546,6 +548,7 @@ def _failed_entry() -> dict:
         "evidence_run_ids": ["004"],
         "evidence_edge_ids": ["sedge-002-004"],
         "comparator_coverage": {
+            "direct_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 1,
@@ -588,6 +591,7 @@ class ExperienceSchema3Tests(unittest.TestCase):
             "evidence_run_ids": [],
             "evidence_edge_ids": [],
             "comparator_coverage": {
+                "direct_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -646,6 +650,7 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 "evidence_run_ids": [],
                 "evidence_edge_ids": ["sedge-000-001"],
                 "comparator_coverage": {
+                    "direct_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
@@ -655,7 +660,8 @@ class ExperienceSchema3Tests(unittest.TestCase):
 
         forged_counts = _comparator_covered_entry()
         forged_counts["comparator_coverage"] = {
-            "direct_noncrash_edges": 1,
+            "direct_tuned_edges": 1,
+            "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
         }
@@ -719,6 +725,7 @@ class ExperienceSchema3Tests(unittest.TestCase):
             evidence_run_ids=["001"],
             evidence_edge_ids=[],
             comparator_coverage={
+                "direct_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -726,9 +733,9 @@ class ExperienceSchema3Tests(unittest.TestCase):
         )
 
         cases = [
-            # Contraction needs two direct non-crash edges, not one.
+            # Contraction needs two direct tuned edges, not one.
             ("comparator_covered", single_edge),
-            ("at least two direct non-crash edges", no_edge),
+            ("at least two direct tuned edges", no_edge),
             ("deprioritized requires", variant(deprioritized, assessment="mixed")),
             ("deprioritized requires", variant(deprioritized, confidence="low")),
             ("deprioritized requires", variant(deprioritized, reopen_when=None)),
@@ -747,11 +754,11 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 self._reject(entry, needle)
 
     def test_rejects_unbounded_or_malformed_snapshots(self) -> None:
-        """The snapshot stays bounded and schema-3; P1 needs a migration."""
+        """The snapshot stays bounded; only schema 3 and 4 are readable."""
         registry = fixture_registry()
         ledger = belief_ledger(registry)
         cases = [
-            ("schema_version must be 3", {"schema_version": 2}),
+            ("schema_version must be [3, 4]", {"schema_version": 2}),
             (
                 "duplicates an earlier",
                 {

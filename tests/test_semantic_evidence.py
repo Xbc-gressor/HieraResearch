@@ -45,6 +45,7 @@ def _append(
     status: str,
     score: float | None,
     dag_revision: int,
+    depth: str = "tuned",
 ) -> dict:
     record = {
         "run_id": run_id,
@@ -52,6 +53,7 @@ def _append(
         "semantic_point": point,
         "status": status,
         "final_best_score": score,
+        "evaluation_depth": depth,
         "dag_revision": dag_revision,
     }
     record["semantic_edges"] = build_semantic_edges(records, record)
@@ -441,6 +443,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
                 target_id="hyp-data-filtered",
             ),
             {
+                "direct_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 1,
                 "crash_edges": 0,
@@ -456,7 +459,8 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         ledger = belief_ledger(registry)
         both = ["sedge-000-001", "sedge-002-003"]
         expected = {
-            "direct_noncrash_edges": 2,
+            "direct_tuned_edges": 2,
+            "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
         }
@@ -476,7 +480,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             comparator_coverage(
                 ledger, both, target_kind="hypothesis", target_id="hyp-model-linear"
             ),
-            {"direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             comparator_coverage(
@@ -485,7 +489,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
                 target_kind="hypothesis",
                 target_id="hyp-data-filtered",
             ),
-            {"direct_noncrash_edges": 1, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 1, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             comparator_coverage(
@@ -494,7 +498,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
                 target_kind="hypothesis",
                 target_id="hyp-data-filtered",
             ),
-            {"direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
 
     def test_gain_direction_uses_repeated_control_scores_not_final_tuning(self) -> None:
@@ -876,6 +880,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
                 target_id="hyp-data-filtered",
             ),
             {
+                "direct_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -903,6 +908,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         self.assertEqual(
             block["comparator_coverage"],
             {
+                "direct_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -930,13 +936,13 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             comparator_coverage(
                 ledger, edge_ids, target_kind="hypothesis", target_id="hyp-model-multibranch"
             ),
-            {"direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 0},
         )
         self.assertEqual(
             comparator_coverage(
                 ledger, edge_ids, target_kind="hypothesis", target_id="hyp-data-filtered"
             ),
-            {"direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 1},
+            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 1},
         )
 
     def test_target_evaluation_state_machine(self) -> None:
@@ -1047,15 +1053,15 @@ class TargetEvidenceViewTests(unittest.TestCase):
         self.assertEqual(block["evidence_edge_ids"], ["sedge-000-001", "sedge-002-003"])
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_noncrash_edges": 2, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["available_comparator_coverage"],
-            {"direct_noncrash_edges": 2, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["omitted_edge_counts"],
-            {"direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["edges"],
@@ -1084,15 +1090,15 @@ class TargetEvidenceViewTests(unittest.TestCase):
         )
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_noncrash_edges": 3, "confounded_noncrash_edges": 1, "crash_edges": 1},
+            {"direct_tuned_edges": 3, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 1},
         )
         self.assertEqual(
             block["available_comparator_coverage"],
-            {"direct_noncrash_edges": 4, "confounded_noncrash_edges": 2, "crash_edges": 1},
+            {"direct_tuned_edges": 4, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
         )
         self.assertEqual(
             block["omitted_edge_counts"],
-            {"direct_noncrash_edges": 1, "confounded_noncrash_edges": 1, "crash_edges": 0},
+            {"direct_tuned_edges": 1, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 0},
         )
         self.assertEqual(block["evidence_run_ids"], ["002", "003", "004", "005", "006"])
         self.assertEqual(block["evaluation_state"], "comparator_covered")
@@ -1110,15 +1116,15 @@ class TargetEvidenceViewTests(unittest.TestCase):
         )
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_noncrash_edges": 2, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["available_comparator_coverage"],
-            {"direct_noncrash_edges": 4, "confounded_noncrash_edges": 2, "crash_edges": 1},
+            {"direct_tuned_edges": 4, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
         )
         self.assertEqual(
             block["omitted_edge_counts"],
-            {"direct_noncrash_edges": 2, "confounded_noncrash_edges": 2, "crash_edges": 1},
+            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
         )
         self.assertEqual(view["bounds"]["max_edges_per_target"], 2)
         self.assertLessEqual(len(block["edges"]), view["bounds"]["max_edges_per_target"])
@@ -1190,7 +1196,7 @@ class TargetEvidenceViewTests(unittest.TestCase):
         self.assertEqual(block["evidence_edge_ids"], ["sedge-000-001", "sedge-002-003"])
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_noncrash_edges": 2, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(block["evaluation_state"], "comparator_covered")
 
