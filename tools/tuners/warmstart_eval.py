@@ -727,6 +727,7 @@ def main() -> int:
                     args.candidate_path,
                     phase="phase_a",
                     method="warmstart",
+                    expected_execution_revision=candidate_code_revision,
                 )
             except EvaluationBudgetExhausted as exc:
                 if preflight_enabled:

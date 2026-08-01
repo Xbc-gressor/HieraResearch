@@ -10,6 +10,9 @@ dependencies = [
   "tomli>=2.0; python_version < '3.11'",
 ]
 
+[project.scripts]
+hieraresearch = "hieraresearch.cli:main"
+
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"

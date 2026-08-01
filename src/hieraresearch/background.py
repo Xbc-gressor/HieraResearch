@@ -6,10 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .artifacts import file_revision
 from .llm import AgentEditSpec, ModelGateway
 from .models import RunIdentity
 from .prompts import BACKGROUND_SYSTEM
 from .toolchain import ToolFailure, Toolchain
+
+
+class BackgroundArtifactError(ValueError):
+    """A frozen background artifact is inconsistent with deterministic inputs."""
 
 
 class BackgroundBuilder:
@@ -31,13 +36,13 @@ class BackgroundBuilder:
         required = [run_dir / "background.md", run_dir / "background_retrieval.json"]
         if induced:
             required.append(run_dir / "dimension_catalog.json")
+        if self._has_provided_baseline():
+            required.append(run_dir / "baseline_mechanisms.json")
         if all(path.is_file() for path in required):
             try:
-                self.toolchain.validate_background(
-                    run_dir, induced=induced, provided_baseline=self._has_provided_baseline()
-                )
+                self._validate_artifacts(induced=induced)
                 return
-            except ToolFailure:
+            except (ToolFailure, BackgroundArtifactError):
                 if self.identity.ledger_path.exists():
                     raise
         elif self.identity.ledger_path.exists():
@@ -113,14 +118,51 @@ class BackgroundBuilder:
                         ),
                         max_turns=48,
                     ),
-                    validate=lambda: self.toolchain.validate_background(
-                        run_dir, induced=induced, provided_baseline=self._has_provided_baseline()
-                    ),
+                    validate=lambda: self._validate_artifacts(induced=induced),
                 )
                 return
-            except ToolFailure as exc:
+            except (ToolFailure, BackgroundArtifactError) as exc:
                 last_error = exc
         raise ValueError(f"background artifacts remain invalid: {last_error}")
+
+    def _validate_artifacts(self, *, induced: bool) -> None:
+        provided_baseline = self._has_provided_baseline()
+        self.toolchain.validate_background(
+            self.identity.run_dir,
+            induced=induced,
+            provided_baseline=provided_baseline,
+        )
+        if provided_baseline:
+            self._validate_baseline_entrypoint_receipt()
+
+    def _validate_baseline_entrypoint_receipt(self) -> None:
+        entrypoint = self._seed_entrypoint()
+        if entrypoint is None:  # pragma: no cover - guarded by the caller
+            return
+        inventory_path = self.identity.run_dir / "baseline_mechanisms.json"
+        try:
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BackgroundArtifactError(
+                f"invalid baseline mechanism inventory {inventory_path}: {exc}"
+            ) from exc
+        receipt = inventory.get("entrypoint") if isinstance(inventory, dict) else None
+        expected_path = entrypoint.relative_to(self.identity.repo_root.resolve()).as_posix()
+        actual_revision = file_revision(entrypoint)
+        if not isinstance(receipt, dict):
+            raise BackgroundArtifactError(
+                "baseline mechanism inventory requires an entrypoint receipt"
+            )
+        if receipt.get("path") != expected_path:
+            raise BackgroundArtifactError(
+                "baseline mechanism inventory entrypoint.path does not match "
+                f"the task seed: expected {expected_path!r}"
+            )
+        if receipt.get("sha256") != actual_revision:
+            raise BackgroundArtifactError(
+                "baseline mechanism inventory entrypoint.sha256 does not match "
+                f"the current task seed {expected_path}"
+            )
 
     def _dimension_strategy(self) -> str:
         path = self.identity.run_dir / "framework_cfg.json"
@@ -142,4 +184,18 @@ class BackgroundBuilder:
         entrypoint = seed.get("entrypoint", "train.py")
         if not isinstance(entrypoint, str) or not entrypoint:
             raise ValueError("seed.entrypoint must be a non-empty string")
-        return self.identity.repo_root / "tasks" / self.identity.task_name / entrypoint
+        task_dir = (
+            self.identity.repo_root / "tasks" / self.identity.task_name
+        ).resolve()
+        resolved = (task_dir / entrypoint).resolve()
+        try:
+            resolved.relative_to(task_dir)
+        except ValueError as exc:
+            raise BackgroundArtifactError(
+                f"seed.entrypoint escapes the task directory: {entrypoint!r}"
+            ) from exc
+        if not resolved.is_file():
+            raise BackgroundArtifactError(
+                f"provided seed entrypoint does not exist: {resolved}"
+            )
+        return resolved

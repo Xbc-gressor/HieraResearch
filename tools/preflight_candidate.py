@@ -19,8 +19,17 @@ sys.path.insert(0, str(TUNER_DIR))
 
 from _common import (  # noqa: E402
     _configured_preflight_name,
+    cast_params_to_search_space,
     load_candidate_modules,
     timed_preflight,
+)
+from warmstart_eval import (  # noqa: E402
+    _validated_warm_configs,
+    validate_provided_baseline_configs,
+)
+from tune_tools import (  # noqa: E402
+    PARAMETER_TRANSFER_FILENAME,
+    validate_parameter_transfer,
 )
 
 
@@ -46,19 +55,92 @@ def read_standalone_params(candidate_path: Path) -> tuple[str, dict]:
     )
 
 
+def preflight_warm_configs(
+    candidate_path: Path,
+    configs_path: Path,
+    *,
+    k_eval: int | None,
+) -> dict:
+    """Validate and preflight the exact authored configs without scoring."""
+    try:
+        configs = json.loads(configs_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid warm configs {configs_path}: {exc}") from exc
+    if not isinstance(configs, list) or not configs:
+        raise ValueError("warm configs must be a non-empty JSON list")
+    control = validate_provided_baseline_configs(candidate_path, configs, k_eval)
+    if control["requires_parameter_transfer"]:
+        receipt_path = candidate_path.parent / PARAMETER_TRANSFER_FILENAME
+        try:
+            transfer = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid parameter-transfer receipt {receipt_path}: {exc}") from exc
+        validate_parameter_transfer(candidate_path, configs, transfer)
+    configs, search_space = _validated_warm_configs(candidate_path, configs)
+    if _configured_preflight_name(candidate_path) is None:
+        return {
+            "status": "not_declared",
+            "objective_calls": 0,
+            "configs_checked": len(configs),
+            "attempts": [],
+        }
+
+    attempts = []
+    for index, raw_params in enumerate(configs):
+        params = cast_params_to_search_space(dict(raw_params), search_space)
+        result = timed_preflight(params, candidate_path)
+        attempts.append(
+            {
+                "index": index,
+                "params": params,
+                "status": "ok",
+                "task_status": (
+                    result.get("status")
+                    if isinstance(result, dict) and isinstance(result.get("status"), str)
+                    else None
+                ),
+            }
+        )
+    return {
+        "status": "ok",
+        "objective_calls": 0,
+        "configs_checked": len(configs),
+        "attempts": attempts,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-path", required=True, type=Path)
+    parser.add_argument(
+        "--configs-json",
+        type=Path,
+        help="preflight every exact authored warm config instead of standalone params",
+    )
+    parser.add_argument(
+        "--k-eval",
+        type=int,
+        help="official warm-evaluation count, used by provided-control validation",
+    )
     args = parser.parse_args()
     candidate_path = args.candidate_path.resolve()
     if not candidate_path.is_file():
         parser.error(f"candidate does not exist: {candidate_path}")
 
-    if _configured_preflight_name(candidate_path) is None:
-        print(json.dumps({"status": "not_declared", "objective_calls": 0}))
-        return 0
-
     try:
+        if args.configs_json is not None:
+            payload = preflight_warm_configs(
+                candidate_path,
+                args.configs_json.resolve(),
+                k_eval=args.k_eval,
+            )
+            print(json.dumps(payload, default=str))
+            return 0
+        if args.k_eval is not None:
+            parser.error("--k-eval requires --configs-json")
+        if _configured_preflight_name(candidate_path) is None:
+            print(json.dumps({"status": "not_declared", "objective_calls": 0}))
+            return 0
         params_name, params = read_standalone_params(candidate_path)
         result = timed_preflight(params, candidate_path)
     except Exception as exc:

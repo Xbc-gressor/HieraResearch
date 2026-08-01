@@ -840,6 +840,84 @@ def make_model(env, params):
             self.assertEqual(payload["result"]["seen"], 7)
             self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
 
+    def test_authored_preflight_uses_exact_provided_warm_control_without_score(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = (
+                Path(tmp)
+                / "runs"
+                / "autoresearch-baseline"
+                / "coordinator"
+            )
+            candidate_dir = run_dir / "candidates" / "000"
+            candidate_dir.mkdir(parents=True)
+            candidate = candidate_dir / "train.py"
+            configs = candidate_dir / "_warm_configs.json"
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 1, "preflight_runtime_limit": 30})
+            )
+            (candidate_dir / "prepare.py").write_text(
+                """
+def evaluate_config(make_model, params):
+    raise AssertionError("objective surface must not run during preflight")
+
+def preflight_config(make_model, params):
+    return {"status": "ok", "seen": make_model(None, params)}
+""".lstrip()
+            )
+            candidate.write_text(
+                """
+PARAM_SCHEMA = {"x": "int"}
+DEFAULT_PARAMS = {"x": 7}
+SEARCH_SPACE = {"x": ("int", 1, 9)}
+
+def make_model(env, params):
+    return params["x"]
+""".lstrip()
+            )
+            (candidate_dir / "_candidate_brief.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 4,
+                        "run_id": "000",
+                        "source_run_ids": [],
+                        "implementation_source": {
+                            "kind": "provided_entrypoint",
+                            "path": "tasks/autoresearch-baseline/train.py",
+                            "sha256": "sha256:" + "0" * 64,
+                        },
+                    }
+                )
+            )
+            configs.write_text(json.dumps([{"x": 7}]))
+            command = [
+                sys.executable,
+                str(ROOT / "tools" / "preflight_candidate.py"),
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs),
+                "--k-eval",
+                "1",
+            ]
+
+            completed = subprocess.run(command, capture_output=True, text=True)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["objective_calls"], 0)
+            self.assertEqual(payload["configs_checked"], 1)
+            self.assertEqual(payload["attempts"][0]["params"], {"x": 7})
+            self.assertEqual(payload["attempts"][0]["task_status"], "ok")
+            self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
+
+            configs.write_text(json.dumps([{"x": 8}]))
+            rejected = subprocess.run(command, capture_output=True, text=True)
+
+            self.assertEqual(rejected.returncode, 3)
+            self.assertIn("literal DEFAULT_PARAMS", rejected.stderr)
+            self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

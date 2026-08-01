@@ -336,13 +336,13 @@ class Toolchain:
             str(run_dir / "ledger.json"),
             "--op",
             op,
-            "--parents",
-            ",".join(parents),
             "--max-points",
             "24",
             "--output",
             str(output),
         ]
+        if parents:
+            args.extend(["--parents", ",".join(parents)])
         if baseline_only:
             args.append("--baseline-only")
         self._json_python("tools/semantic_search.py", *args, label="semantic proposal")
@@ -408,8 +408,7 @@ class Toolchain:
         candidate_name_hint: str,
         description: str,
     ) -> dict[str, Any]:
-        return self._json_python(
-            "tools/ledger.py",
+        args = [
             "add-record",
             "--ledger",
             str(run_dir / "ledger.json"),
@@ -421,8 +420,6 @@ class Toolchain:
             "optimization",
             "--op",
             op,
-            "--source-run-ids",
-            ",".join(parents),
             "--idea",
             idea,
             "--change",
@@ -437,6 +434,12 @@ class Toolchain:
             candidate_name_hint,
             "--description",
             description,
+        ]
+        if parents:
+            args.extend(["--source-run-ids", ",".join(parents)])
+        return self._json_python(
+            "tools/ledger.py",
+            *args,
             label="candidate admission",
         )
 
@@ -544,6 +547,47 @@ class Toolchain:
             str(space_path),
             label="apply search space",
         )
+
+    def candidate_preflight(
+        self,
+        candidate_path: Path,
+        configs_path: Path,
+        *,
+        k_eval: int,
+        task_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._task_project(task_config)
+        result = self._run(
+            [
+                "uv",
+                "--project",
+                str(project),
+                "run",
+                "python",
+                str(self.repo_root / "tools/preflight_candidate.py"),
+                "--candidate-path",
+                str(candidate_path),
+                "--configs-json",
+                str(configs_path),
+                "--k-eval",
+                str(k_eval),
+            ],
+            timeout=self.worker_timeout,
+            label="candidate preflight",
+            check=False,
+        )
+        try:
+            payload = parse_json_output(result.output)
+        except ValueError as exc:
+            raise ToolFailure("candidate preflight", result) from exc
+        if (
+            not result.ok
+            or not isinstance(payload, dict)
+            or payload.get("status") not in {"ok", "not_declared"}
+            or payload.get("objective_calls") != 0
+        ):
+            raise ToolFailure("candidate preflight", result)
+        return payload
 
     def warmstart(
         self,

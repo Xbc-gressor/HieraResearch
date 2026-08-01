@@ -108,6 +108,11 @@ def evaluate_config(make_model, params):
             self.assertEqual(first_eval.call_count, expected_evaluations)
             first_report = json.loads(report_path.read_text())
             first_revision = first_report["phase_a"]["candidate_code_revision"]
+            for call in first_eval.call_args_list:
+                self.assertEqual(
+                    call.kwargs["expected_execution_revision"],
+                    first_revision,
+                )
             self.assertEqual(first_revision["schema_version"], 3)
             self.assertTrue(first_revision["structure_sha256"].startswith("sha256:"))
             self.assertTrue(

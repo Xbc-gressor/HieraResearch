@@ -19,7 +19,10 @@ from hieraresearch.artifacts import (  # noqa: E402
     json_revision,
     paths_revision,
 )
-from hieraresearch.background import BackgroundBuilder  # noqa: E402
+from hieraresearch.background import (  # noqa: E402
+    BackgroundArtifactError,
+    BackgroundBuilder,
+)
 from hieraresearch.llm import (  # noqa: E402
     InferenceContractError,
     ModelGateway,
@@ -312,6 +315,55 @@ class FoundationTests(unittest.TestCase):
             self.assertTrue(
                 all(not provided for _, _, provided in toolchain.validation_calls)
             )
+
+    def test_frozen_background_rejects_stale_provided_baseline_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "frozen")
+            task_dir = repo_root / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            entrypoint = task_dir / "train.py"
+            entrypoint.write_text("CURRENT = True\n", encoding="utf-8")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            (identity.run_dir / "background.md").write_text(
+                "# Frozen background\n", encoding="utf-8"
+            )
+            atomic_write_json(
+                identity.run_dir / "background_retrieval.json",
+                {"schema_version": 3},
+            )
+            atomic_write_json(
+                identity.run_dir / "baseline_mechanisms.json",
+                {
+                    "entrypoint": {
+                        "path": "tasks/toy/train.py",
+                        "sha256": "sha256:" + "0" * 64,
+                    }
+                },
+            )
+            atomic_write_json(identity.ledger_path, {"records": []})
+            toolchain = BackgroundToolchainStub()
+            models = BackgroundModelStub()
+            builder = BackgroundBuilder(
+                identity,
+                toolchain,
+                models,
+                task_config={
+                    "seed": {"provided": ["train.py"], "entrypoint": "train.py"}
+                },
+            )
+
+            with self.assertRaisesRegex(
+                BackgroundArtifactError, "entrypoint.sha256 does not match"
+            ):
+                builder.ensure()
+
+            self.assertEqual(models.specs, [])
+            self.assertEqual(len(toolchain.validation_calls), 1)
 
     @staticmethod
     def _process_state(pid: int) -> str | None:

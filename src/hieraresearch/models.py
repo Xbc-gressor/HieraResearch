@@ -16,6 +16,7 @@ class Transition(str, Enum):
     ADMIT_ROUND = "admit_round"
     MATERIALIZE_CANDIDATE = "materialize_candidate"
     BUILD_TUNING_CONTRACT = "build_tuning_contract"
+    PREFLIGHT_CANDIDATE = "preflight_candidate"
     EVALUATE_WARM_CONFIGS = "evaluate_warm_configs"
     DEBUG_CANDIDATE = "debug_candidate"
     DEEP_TUNE = "deep_tune"
@@ -60,6 +61,7 @@ class RoundAction:
     materialized: bool = False
     implemented: bool = False
     contract_ready: bool = False
+    preflight_ready: bool = False
     resolved: bool = False
 
     @classmethod
@@ -78,6 +80,7 @@ class RoundAction:
             materialized=bool(value.get("materialized", False)),
             implemented=bool(value.get("implemented", False)),
             contract_ready=bool(value.get("contract_ready", False)),
+            preflight_ready=bool(value.get("preflight_ready", False)),
             resolved=bool(value.get("resolved", False)),
         )
 
