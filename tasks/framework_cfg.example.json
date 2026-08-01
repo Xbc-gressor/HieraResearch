@@ -25,7 +25,7 @@
     "dimension_strategy": "catalog_subset"
   },
   "semantic_search": {
-    "policy": "gain_uncertainty_nocost",
+    "policy": "coverage",
     "coverage_weight": 0.1,
     "cost_weight": 0.2,
     "uncertainty_weight": 0.5,
@@ -56,7 +56,7 @@
     "got.c_leaf": "outer: select_leaf UCB exploration constant during descent (default 0.4). OFAT {0.2,0.4,0.8}.",
     "got.tau": "outer: op-prior softmax temperature (default 0.3). OFAT {0.1,0.3,0.6}.",
     "space_initialization.dimension_strategy": "search-space setup: catalog_subset selects from contracts/semantic-dimensions-v1.json (default); llm_induced makes BackgroundBuilder create and fully use a validated run-local dimension_catalog.json before retrieval. Explicit --catalog overrides the source, not the configured full-vs-subset semantics.",
-    "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage (fully deterministic, no LLM scores), gain, gain_uncertainty, or gain_uncertainty_nocost (gain_uncertainty without any cost prediction, for when pre-implementation cost estimates are noise). The last three require per-proposal rubric inputs and preserve background priors, signed experience adjustments, final predicted_gain/uncertainty, cost (absent for gain_uncertainty_nocost), and coverage separately in each record's policy_receipt.",
+    "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage (default; fully deterministic, no LLM scores), gain, gain_uncertainty, or gain_uncertainty_nocost (gain_uncertainty without any cost prediction, for when pre-implementation cost estimates are noise). The last three are explicit model-scored alternatives that require per-proposal rubric inputs and preserve background priors, signed experience adjustments, final predicted_gain/uncertainty, cost (absent for gain_uncertainty_nocost), and coverage separately in each record's policy_receipt.",
     "semantic_search.coverage_weight": "semantic acquisition: additive deterministic under-coverage contribution for gain policies (default 0.1).",
     "semantic_search.cost_weight": "semantic acquisition: subtractive predicted implementation/evaluation cost contribution (default 0.2).",
     "semantic_search.uncertainty_weight": "semantic acquisition: exploration bonus used only by gain_uncertainty and gain_uncertainty_nocost (default 0.5); uncertainty is a rubric score, not a calibrated posterior.",

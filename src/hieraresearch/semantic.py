@@ -118,7 +118,7 @@ class SemanticAdmission:
         section = value.get("semantic_search", {})
         if not isinstance(section, dict):
             raise ValueError(f"{path}: semantic_search must be an object")
-        policy = section.get("policy", "gain_uncertainty_nocost")
+        policy = section.get("policy", "coverage")
         if not isinstance(policy, str):
             raise ValueError(f"{path}: semantic_search.policy must be a string")
         return policy
