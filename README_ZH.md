@@ -550,7 +550,7 @@ runs/<task>/<tag>/framework_cfg.json
 主要配置包括：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
-- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；`llm_intelligence_score` 以固定 `score/100` 缩放 LLM 判断项（默认 100 保持旧行为，0 只保留已配置的 coverage 项，但仍收集原始预测）；默认使用 `gain_uncertainty_nocost`（不预测成本），`coverage` 保留为确定性消融或失败回退策略
+- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认使用纯 `coverage`（确定性选择，不调用 LLM 打分）。`gain`、`gain_uncertainty` 和 `gain_uncertainty_nocost` 保留为显式配置；使用这些策略时，`llm_intelligence_score` 以固定 `score/100` 缩放 LLM 判断项（默认 100 保持其原始行为，0 只保留已配置的 coverage 项，但仍收集原始预测）
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

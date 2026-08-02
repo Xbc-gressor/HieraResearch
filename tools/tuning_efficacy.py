@@ -21,7 +21,8 @@ reconstructed otherwise), and flags:
   the rejection measures the hypothesis at one parameter point. Under the
   ledger's evidence grading it cannot drive contradiction-grade findings.
 
-Exit status is always 0; this is a report, not a gate.
+Exit status is 0 when the report is complete and 2 when required artifacts are
+missing or malformed. Findings remain diagnostic rather than pass/fail gates.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ import json
 import math
 import sys
 from pathlib import Path
+
+from evaluation_budget import attempt_log_summary
 
 DEFAULT_N_STARTUP = 10  # bo_search.TPESampler n_startup_trials
 
@@ -85,24 +88,25 @@ def main(argv: list[str]) -> int:
         print(f"no ledger.json under {run_dir}", file=sys.stderr)
         return 2
 
-    ledger = json.loads(ledger_path.read_text())
+    try:
+        ledger = json.loads(ledger_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"invalid {ledger_path}: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(ledger, dict):
+        print(f"invalid {ledger_path}: expected a JSON object", file=sys.stderr)
+        return 2
     records = {
         str(record.get("run_id")): record
         for record in ledger.get("records", [])
         if isinstance(record, dict)
     }
 
-    attempts_path = run_dir / "evaluation_attempts.jsonl"
-    phase_counts: dict[str, int] = {}
-    if attempts_path.is_file():
-        for line in attempts_path.read_text().splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            phase = row.get("phase")
-            if isinstance(phase, str):
-                phase_counts[phase] = phase_counts.get(phase, 0) + 1
+    try:
+        attempts = attempt_log_summary(run_dir)
+    except (OSError, ValueError) as exc:
+        print(f"invalid {run_dir / 'evaluation_attempts.jsonl'}: {exc}", file=sys.stderr)
+        return 2
 
     flags: list[str] = []
     header = (
@@ -115,8 +119,12 @@ def main(argv: list[str]) -> int:
         run_id = report_path.parent.name
         try:
             report = json.loads(report_path.read_text())
-        except json.JSONDecodeError:
-            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"invalid {report_path}: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(report, dict):
+            print(f"invalid {report_path}: expected a JSON object", file=sys.stderr)
+            return 2
         record = records.get(run_id, {})
         phase_a = report.get("phase_a", {})
         warm = _finite(phase_a.get("best_warm_score"))
@@ -169,10 +177,27 @@ def main(argv: list[str]) -> int:
         )
 
     print()
-    if phase_counts:
-        total = sum(phase_counts.values())
-        parts = ", ".join(f"{k}={v}" for k, v in sorted(phase_counts.items()))
-        print(f"admitted evaluations: {total} ({parts})")
+    if attempts is not None:
+        parts = [
+            f"{key}={value}"
+            for key, value in attempts["phase_counts"].items()
+        ]
+        if attempts["carried_evaluations"]:
+            parts.append(f"baseline/sync={attempts['carried_evaluations']}")
+        if attempts["unclassified_score_attempts"]:
+            parts.append(
+                "unclassified_score_attempts="
+                f"{attempts['unclassified_score_attempts']}"
+            )
+        print(
+            f"admitted evaluations: {attempts['evaluations_done']} "
+            f"({', '.join(parts) or 'no classified rows'})"
+        )
+        if attempts["unrecognized_rows"]:
+            print(
+                "warning: unrecognized attempt-log rows="
+                f"{attempts['unrecognized_rows']}"
+            )
     if flags:
         print("flags:")
         for flag in flags:

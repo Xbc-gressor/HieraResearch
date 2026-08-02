@@ -306,14 +306,13 @@ schema 6 records the selection index, interval, scheduled/selected lanes,
 fallback reason, and the selected point's pre-lane acquisition rank.
 
 Run-local configuration lives under `framework_cfg.json.semantic_search`.
-`gain_uncertainty_nocost` is the code and copied-template default; `coverage` (fully
-deterministic, no LLM scores) is an explicit opt-in for ablations, bootstrap
-runs, or prediction-failure fallback, for example:
+`coverage` (fully deterministic, no LLM scores) is the code and copied-template
+default. Model-scored policies remain explicit opt-ins, for example:
 
 ```json
 {
   "semantic_search": {
-    "policy": "coverage"
+    "policy": "gain_uncertainty_nocost"
   }
 }
 ```

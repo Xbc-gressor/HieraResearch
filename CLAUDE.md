@@ -8,8 +8,8 @@ are shared.
 
 The loop's current bar is beating `autoresearch-hillclimb` — the deliberately
 simple edit→run→keep/revert baseline — at matched evaluation budget. It does not
-yet; see `docs/hillclimb-gap.md`. Until it does, prefer diagnosing and
-simplifying the loop over extending it.
+yet. Until it does, prefer diagnosing current run artifacts and simplifying the
+loop over extending it.
 
 ## Start an experiment
 
@@ -76,8 +76,6 @@ Read on demand, not by default:
   evidence and scope semantics, retrieval fallback, validation commands.
 - `docs/dimension-induction.md` — only when using the `llm_induced` dimension
   strategy.
-- `docs/hillclimb-gap.md` — why the loop currently loses to the hillclimb
-  baseline, and which mitigations have landed.
 - `docs/observability.md` — `tools/harness_watch.py` token and drift attribution.
 
 ## Skills

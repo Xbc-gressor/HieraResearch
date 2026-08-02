@@ -441,7 +441,7 @@ def main() -> int:
         "seed": args.seed,
         "multivariate": True,
         "group": True,
-        "n_startup_trials": 10,
+        "n_startup_trials": 8,
         # Always constrained: crashed trials (not only preflight rejections)
         # are marked infeasible so TPE steers away from crashing regions.
         "constraints_func": _infeasible_constraints,

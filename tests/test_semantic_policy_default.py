@@ -578,11 +578,9 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
         self.assertEqual(removed["proposal_relation"], "removed")
         self.assertEqual(removed["gain_direction"], "positive")
 
-    def test_default_policy_is_gain_uncertainty_nocost_in_template_and_cli(self) -> None:
+    def test_default_policy_is_pure_coverage_in_template_and_cli(self) -> None:
         template = json.loads((ROOT / "tasks" / "framework_cfg.example.json").read_text())
-        self.assertEqual(
-            template["semantic_search"]["policy"], "gain_uncertainty_nocost"
-        )
+        self.assertEqual(template["semantic_search"]["policy"], "coverage")
         self.assertEqual(
             template["semantic_search"]["deprioritized_budget_interval"], 5
         )
@@ -593,32 +591,17 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
         proposal_set = build_proposal_set(
             fixture_registry(), {"records": []}, op="fresh", parents=[], max_points=3
         )
-        predictions = {
-            "schema_version": 1,
-            "proposal_set_revision": proposal_set["proposal_set_revision"],
-            "predictions": [
-                {
-                    "point_id": proposal["point_id"],
-                    "predicted_gain": 0.5,
-                    "uncertainty": 0.5,
-                    "evidence": ["regression fixture"],
-                }
-                for proposal in proposal_set["proposals"]
-            ],
-        }
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             proposals_path = tmp_path / "proposals.json"
-            predictions_path = tmp_path / "predictions.json"
             point_path = tmp_path / "point.json"
             receipt_path = tmp_path / "policy.json"
             proposals_path.write_text(json.dumps(proposal_set))
-            predictions_path.write_text(json.dumps(predictions))
 
             result = cmd_select(
                 SimpleNamespace(
                     proposals=proposals_path,
-                    predictions=predictions_path,
+                    predictions=None,
                     ledger=None,
                     policy=None,
                     cfg=None,
@@ -629,11 +612,12 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             receipt = json.loads(receipt_path.read_text())
-            self.assertEqual(receipt["policy"]["name"], "gain_uncertainty_nocost")
+            self.assertEqual(receipt["policy"]["name"], "coverage")
             self.assertEqual(receipt["schema_version"], 6)
-            self.assertEqual(
-                receipt["components"]["llm_judgment_weight"], 1.0
-            )
+            self.assertIsNone(receipt["components"]["llm_judgment_weight"])
+            self.assertIsNone(receipt["components"]["predicted_gain"])
+            self.assertIsNone(receipt["components"]["uncertainty"])
+            self.assertEqual(receipt["evidence"], [])
             self.assertEqual(receipt["experience"]["conditioning"], [])
             self.assertEqual(receipt["budget"]["selected_lane"], "active")
 

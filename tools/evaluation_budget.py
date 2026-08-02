@@ -235,6 +235,10 @@ def _read_rows(handle) -> list[dict]:
             raise ValueError(
                 f"invalid {ATTEMPT_LOG} line {line_number}: {exc}"
             ) from exc
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"invalid {ATTEMPT_LOG} line {line_number}: expected a JSON object"
+            )
         if row.get("schema_version") != SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported {ATTEMPT_LOG} schema on line {line_number}: "
@@ -275,6 +279,50 @@ def _summarize_rows(rows: list[dict]) -> tuple[int, dict[str, int]]:
             if isinstance(run_id, str):
                 per_candidate[run_id] += 1
     return total, dict(per_candidate)
+
+
+def attempt_log_summary(run_dir: Path) -> dict[str, Any] | None:
+    """Read the append-only attempt log without mutating it.
+
+    This is the public diagnostic view over the same strict parser and
+    accounting used by budget admission.  ``baseline`` and ``sync`` rows may
+    carry more than one evaluation, so callers must use ``evaluations_done``
+    rather than count JSONL rows.  Valid but unfamiliar rows are surfaced for
+    observability instead of disappearing into a phase-only tally.
+    """
+    path = Path(run_dir) / ATTEMPT_LOG
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        rows = _read_rows(handle)
+
+    total, per_candidate = _summarize_rows(rows)
+    phase_counts: Counter[str] = Counter()
+    score_attempts = 0
+    unclassified_score_attempts = 0
+    unrecognized_rows = 0
+    for row in rows:
+        kind = row.get("kind")
+        if kind == "score_attempt":
+            score_attempts += 1
+            phase = row.get("phase")
+            if isinstance(phase, str) and phase:
+                phase_counts[phase] += 1
+            else:
+                unclassified_score_attempts += 1
+        elif kind not in {"baseline", "sync"}:
+            unrecognized_rows += 1
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "evaluations_done": total,
+        "per_candidate": per_candidate,
+        "phase_counts": dict(sorted(phase_counts.items())),
+        "score_attempts": score_attempts,
+        "carried_evaluations": total - score_attempts,
+        "unclassified_score_attempts": unclassified_score_attempts,
+        "unrecognized_rows": unrecognized_rows,
+    }
 
 
 def _append_row(handle, row: dict) -> None:

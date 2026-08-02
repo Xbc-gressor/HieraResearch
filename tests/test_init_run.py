@@ -169,7 +169,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(semantic_search["llm_intelligence_score"], 72.5)
             self.assertEqual(
                 semantic_search["policy"],
-                "gain_uncertainty_nocost",
+                "coverage",
             )
             self.assertEqual(semantic_search["uncertainty_weight"], 0.5)
 

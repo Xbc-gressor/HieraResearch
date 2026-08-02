@@ -6,8 +6,8 @@ state, graph search, evaluation, and tuning live in `tools/` and are shared.
 
 The loop's current bar is beating `autoresearch-hillclimb` — the deliberately
 simple edit→run→keep/revert baseline — at matched evaluation budget. It does not
-yet; see `docs/hillclimb-gap.md`. Until it does, prefer diagnosing and
-simplifying the loop over extending it.
+yet. Until it does, prefer diagnosing current run artifacts and simplifying the
+loop over extending it.
 
 ## Start an experiment with OpenCode
 
@@ -64,8 +64,7 @@ The ledger contract is intentionally not injected globally through
 Read on demand, not by default: `docs/search-space.md` (the formal model the P2
 helpers implement), `docs/background-research.md` (search-space contract,
 evidence and scope semantics), `docs/dimension-induction.md` (only for the
-`llm_induced` strategy), `docs/hillclimb-gap.md` (why the loop loses to the
-baseline), `docs/observability.md` (`harness_watch.py`).
+`llm_induced` strategy), and `docs/observability.md` (`harness_watch.py`).
 
 ## Runtime layout
 

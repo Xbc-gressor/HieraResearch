@@ -116,7 +116,7 @@ attribution, not a full program specification.
 
 ## Step 3 — Apply the configured semantic policy
 
-Read `framework_cfg.json.semantic_search`. If absent, use `gain_uncertainty_nocost`.
+Read `framework_cfg.json.semantic_search`. If absent, use `coverage`.
 Supported policies are:
 
 - `coverage`: no LLM scores; select by under-covered hypotheses and point
