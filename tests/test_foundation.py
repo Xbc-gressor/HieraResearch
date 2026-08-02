@@ -22,6 +22,7 @@ from hieraresearch.artifacts import (  # noqa: E402
 from hieraresearch.background import (  # noqa: E402
     BackgroundArtifactError,
     BackgroundBuilder,
+    MAX_BACKGROUND_REPAIR_ATTEMPTS,
 )
 from hieraresearch.llm import (  # noqa: E402
     AgentEditSpec,
@@ -30,7 +31,8 @@ from hieraresearch.llm import (  # noqa: E402
     PathPolicy,
 )
 from hieraresearch.models import IdeaProposal, RunIdentity  # noqa: E402
-from hieraresearch.process import ProcessRunner  # noqa: E402
+from hieraresearch.process import ProcessResult, ProcessRunner  # noqa: E402
+from hieraresearch.toolchain import ToolFailure  # noqa: E402
 
 
 class StructuredStub:
@@ -455,8 +457,14 @@ class FoundationTests(unittest.TestCase):
                     "background_research:repair:2",
                 ],
             )
-            self.assertEqual(len(toolchain.retrieval_imports), 3)
+            self.assertEqual(len(toolchain.retrieval_imports), 2)
             self.assertEqual(len(toolchain.validation_calls), 2)
+            final_spec = models.specs[-1]
+            self.assertEqual({path.name for path in final_spec.write_paths}, {"background.md"})
+            self.assertEqual(final_spec.derived_output_paths, ())
+            self.assertNotIn("WebSearch", final_spec.tools)
+            self.assertNotIn("WebFetch", final_spec.tools)
+            self.assertIn("is frozen for this repair", final_spec.prompt)
 
     def test_background_builder_reuses_valid_retrieval_during_registry_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -491,6 +499,7 @@ class FoundationTests(unittest.TestCase):
 
             self.assertEqual(len(models.specs), 1)
             spec = models.specs[0]
+            self.assertEqual(spec.purpose, "background_research:repair:1")
             self.assertEqual(
                 {path.name for path in spec.write_paths}, {"background.md"}
             )
@@ -498,6 +507,94 @@ class FoundationTests(unittest.TestCase):
             self.assertNotIn("WebSearch", spec.tools)
             self.assertNotIn("WebFetch", spec.tools)
             self.assertEqual(toolchain.retrieval_imports, [])
+            diagnostic_path = (
+                identity.run_dir / ".orchestrator" / "background_repair_diagnostic.json"
+            )
+            self.assertIn(diagnostic_path, spec.input_paths)
+            self.assertIn(diagnostic_path, spec.immutable_input_paths)
+            self.assertIn(str(diagnostic_path), spec.prompt)
+            self.assertEqual(
+                json.loads(diagnostic_path.read_text(encoding="utf-8"))["message"],
+                "registry rejected",
+            )
+
+    def test_background_builder_persists_complete_validation_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "complete-diagnostic")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            expected_errors = [f"contract error {index}" for index in range(200)]
+
+            class ReportingToolchain(BackgroundToolchainStub):
+                def validate_background(self, run_dir, *, induced, provided_baseline):
+                    super().validate_background(
+                        run_dir,
+                        induced=induced,
+                        provided_baseline=provided_baseline,
+                    )
+                    if len(self.validation_calls) == 1:
+                        raise ToolFailure(
+                            "background validation",
+                            ProcessResult(
+                                args=("validator",),
+                                returncode=1,
+                                output=json.dumps({"ok": False, "errors": expected_errors}),
+                                elapsed_seconds=0.0,
+                            ),
+                        )
+
+            models = BackgroundModelStub()
+            BackgroundBuilder(
+                identity, ReportingToolchain(), models, task_config={}
+            ).ensure()
+
+            diagnostic_path = (
+                identity.run_dir / ".orchestrator" / "background_repair_diagnostic.json"
+            )
+            diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["validator_errors"], expected_errors)
+            self.assertFalse(diagnostic["validator_errors_truncated"])
+            repair_spec = models.specs[-1]
+            self.assertIn(diagnostic_path, repair_spec.input_paths)
+            self.assertIn(str(diagnostic_path), repair_spec.prompt)
+
+    def test_background_builder_bounds_repairs_after_five_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "bounded-repairs")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+
+            class RejectingToolchain(BackgroundToolchainStub):
+                def validate_background(self, run_dir, *, induced, provided_baseline):
+                    super().validate_background(
+                        run_dir,
+                        induced=induced,
+                        provided_baseline=provided_baseline,
+                    )
+                    raise BackgroundArtifactError("registry remains invalid")
+
+            toolchain = RejectingToolchain()
+            models = BackgroundModelStub()
+            builder = BackgroundBuilder(identity, toolchain, models, task_config={})
+
+            with self.assertRaisesRegex(ValueError, "registry remains invalid"):
+                builder.ensure()
+
+            self.assertEqual(len(models.specs), MAX_BACKGROUND_REPAIR_ATTEMPTS + 1)
+            self.assertEqual(models.specs[0].purpose, "background_research")
+            self.assertEqual(
+                models.specs[-1].purpose,
+                f"background_research:repair:{MAX_BACKGROUND_REPAIR_ATTEMPTS}",
+            )
+            self.assertEqual(len(toolchain.retrieval_imports), 1)
 
     def test_frozen_background_rejects_stale_provided_baseline_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
