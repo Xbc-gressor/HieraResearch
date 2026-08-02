@@ -112,6 +112,64 @@ Record failures too, with `--status failed --error "<reason>"`. Never claim a
 source merely because it appeared in a search snippet.
 Delete the temporary file after the receipt is stored.
 
+### Bounded coordinator draft
+
+The deterministic Python coordinator intentionally gives its background writer
+no shell. In that invocation the caller names
+`<run_dir>/background_retrieval.draft.json` as an authored output. Do not write
+the canonical `background_retrieval.json` and do not invent hashes, canonical
+keys, timestamps, lane budgets, ranks, or selection receipts. Retain the raw
+WebSearch rows and the exact bounded text returned by every WebFetch used by the
+registry in this schema-1 draft:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "external_retrieval_draft",
+  "retrieval_condition": "open_world",
+  "queries": [
+    {
+      "id": "q-01",
+      "text": "<exact WebSearch query>",
+      "target_dimension_ids": ["dim-..."],
+      "evidence_roles": ["hypothesis", "counterevidence"],
+      "backend": "claude-websearch",
+      "backend_version": "runtime-native",
+      "status": "success",
+      "results": [
+        {
+          "url": "https://...",
+          "title": "<returned title>",
+          "snippet": "<returned snippet>"
+        }
+      ],
+      "error": null
+    }
+  ],
+  "coverage_exemptions": [],
+  "visits": [
+    {
+      "url": "https://...",
+      "backend": "claude-webfetch",
+      "backend_version": "runtime-native",
+      "view": "page",
+      "section": null,
+      "status": "success",
+      "content": "<exact retained fetched text>",
+      "error": null
+    }
+  ],
+  "backend_failures": []
+}
+```
+
+Use `status: "failed"`, an empty `results` list or null `content`, and a
+specific non-empty `error` for a failed query or visit. Keep total successful
+visit content within the grounding lane's 6000-token/24000-character retained
+budget. Python imports this draft through `search_backends.py import-external`,
+derives all mechanical fields, and then applies the normal schema-3 validator.
+The draft remains as provenance; it is not itself a runtime authority.
+
 ## Novelty lane isolation
 
 Keep post-hoc novelty search isolated from grounding. The adapter defines a

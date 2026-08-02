@@ -24,6 +24,7 @@ from hieraresearch.background import (  # noqa: E402
     BackgroundBuilder,
 )
 from hieraresearch.llm import (  # noqa: E402
+    AgentEditSpec,
     InferenceContractError,
     ModelGateway,
     PathPolicy,
@@ -54,6 +55,26 @@ class UnusedEditor:
 class BackgroundToolchainStub:
     def __init__(self):
         self.validation_calls: list[tuple[Path, bool, bool]] = []
+        self.retrieval_imports: list[tuple[Path, Path]] = []
+
+    def background_catalog_receipt(self, catalog_path=None):
+        del catalog_path
+        return {
+            "id": "semantic-dimensions/v1",
+            "revision": "sha256:" + "a" * 64,
+        }
+
+    def import_background_retrieval(self, run_dir: Path, draft_path: Path):
+        self.retrieval_imports.append((run_dir, draft_path))
+        atomic_write_json(
+            run_dir / "background_retrieval.json",
+            {"schema_version": 3, "kind": "canonical-test-manifest"},
+        )
+        return {"ok": True}
+
+    def validate_background_retrieval(self, run_dir: Path):
+        if not (run_dir / "background_retrieval.json").is_file():
+            raise AssertionError("canonical background retrieval is missing")
 
     def validate_background(
         self,
@@ -80,9 +101,23 @@ class BackgroundModelStub:
         for path in spec.write_paths:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.name == "background.md":
-                path.write_text("# Frozen background\n", encoding="utf-8")
-            elif path.name == "background_retrieval.json":
-                atomic_write_json(path, {"schema_version": 1})
+                path.write_text(
+                    "# Frozen background\n\n"
+                    "## Search space registry\n"
+                    "```json\n"
+                    '{"catalog":{"id":"semantic-dimensions/v1",'
+                    '"revision":"coordinator-owned"}}\n'
+                    "```\n",
+                    encoding="utf-8",
+                )
+            elif path.name == "background_retrieval.draft.json":
+                atomic_write_json(
+                    path,
+                    {
+                        "schema_version": 1,
+                        "kind": "external_retrieval_draft",
+                    },
+                )
             else:  # pragma: no cover - catalog/provided variants are not in this slice test
                 raise AssertionError(f"unexpected background output: {path}")
         return validate()
@@ -220,6 +255,63 @@ class FoundationTests(unittest.TestCase):
                 )
             )
 
+    def test_model_gateway_records_but_does_not_authorize_derived_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            authored = root / "draft.json"
+            derived = root / "manifest.json"
+
+            class DerivedEditor:
+                def edit(self, *, policy, **kwargs):
+                    del kwargs
+                    self.assertions = (
+                        policy.decision(
+                            "Write", {"file_path": str(authored)}
+                        )[0],
+                        policy.decision(
+                            "Write", {"file_path": str(derived)}
+                        )[0],
+                    )
+                    authored.write_text("{}\n", encoding="utf-8")
+                    return "draft written", {"backend": "stub"}
+
+            editor = DerivedEditor()
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=StructuredStub({}),
+                edit_backend=editor,
+            )
+
+            gateway.edit(
+                AgentEditSpec(
+                    purpose="derived-output",
+                    schema_version=1,
+                    cwd=root,
+                    system_prompt="system",
+                    prompt="prompt",
+                    tools=("Write",),
+                    read_roots=(root,),
+                    write_paths=(authored,),
+                    input_paths=(authored, derived),
+                    immutable_input_paths=(),
+                    derived_output_paths=(derived,),
+                ),
+                validate=lambda: atomic_write_json(derived, {"canonical": True}),
+            )
+
+            self.assertEqual(editor.assertions, (True, False))
+            response_path = next(
+                (root / ".orchestrator" / "invocations").glob(
+                    "derived-output-*"
+                )
+            ) / "response.json"
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(response["output_revisions"]),
+                {str(authored.resolve()), str(derived.resolve())},
+            )
+
     def test_agent_path_policy_enforces_exact_edit_and_readonly_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -308,13 +400,104 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(spec.purpose, "background_research")
             self.assertEqual(
                 {path.name for path in spec.write_paths},
-                {"background.md", "background_retrieval.json"},
+                {"background.md", "background_retrieval.draft.json"},
+            )
+            self.assertEqual(
+                {path.name for path in spec.derived_output_paths},
+                {"background_retrieval.json"},
             )
             self.assertEqual(len(toolchain.validation_calls), 2)
+            self.assertEqual(len(toolchain.retrieval_imports), 1)
+            self.assertIn(
+                "sha256:" + "a" * 64,
+                (identity.run_dir / "background.md").read_text(encoding="utf-8"),
+            )
             self.assertTrue(all(not induced for _, induced, _ in toolchain.validation_calls))
             self.assertTrue(
                 all(not provided for _, _, provided in toolchain.validation_calls)
             )
+
+    def test_background_builder_bounds_layered_repairs_across_derived_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "layered-repair")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+
+            class LayeredToolchain(BackgroundToolchainStub):
+                def import_background_retrieval(self, run_dir, draft_path):
+                    if not self.retrieval_imports:
+                        self.retrieval_imports.append((run_dir, draft_path))
+                        raise BackgroundArtifactError("draft contract rejected")
+                    return super().import_background_retrieval(run_dir, draft_path)
+
+                def validate_background(self, run_dir, *, induced, provided_baseline):
+                    super().validate_background(
+                        run_dir,
+                        induced=induced,
+                        provided_baseline=provided_baseline,
+                    )
+                    if len(self.validation_calls) == 1:
+                        raise BackgroundArtifactError("registry contract rejected")
+
+            toolchain = LayeredToolchain()
+            models = BackgroundModelStub()
+            BackgroundBuilder(identity, toolchain, models, task_config={}).ensure()
+
+            self.assertEqual(
+                [spec.purpose for spec in models.specs],
+                [
+                    "background_research",
+                    "background_research:repair:1",
+                    "background_research:repair:2",
+                ],
+            )
+            self.assertEqual(len(toolchain.retrieval_imports), 3)
+            self.assertEqual(len(toolchain.validation_calls), 2)
+
+    def test_background_builder_reuses_valid_retrieval_during_registry_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "registry-repair")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            (identity.run_dir / "background.md").write_text(
+                "# Invalid registry draft\n", encoding="utf-8"
+            )
+            atomic_write_json(
+                identity.run_dir / "background_retrieval.json",
+                {"schema_version": 3, "kind": "canonical-test-manifest"},
+            )
+
+            class RegistryRepairToolchain(BackgroundToolchainStub):
+                def validate_background(self, run_dir, *, induced, provided_baseline):
+                    super().validate_background(
+                        run_dir,
+                        induced=induced,
+                        provided_baseline=provided_baseline,
+                    )
+                    if len(self.validation_calls) == 1:
+                        raise BackgroundArtifactError("registry rejected")
+
+            toolchain = RegistryRepairToolchain()
+            models = BackgroundModelStub()
+            BackgroundBuilder(identity, toolchain, models, task_config={}).ensure()
+
+            self.assertEqual(len(models.specs), 1)
+            spec = models.specs[0]
+            self.assertEqual(
+                {path.name for path in spec.write_paths}, {"background.md"}
+            )
+            self.assertEqual(spec.derived_output_paths, ())
+            self.assertNotIn("WebSearch", spec.tools)
+            self.assertNotIn("WebFetch", spec.tools)
+            self.assertEqual(toolchain.retrieval_imports, [])
 
     def test_frozen_background_rejects_stale_provided_baseline_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

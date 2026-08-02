@@ -19,8 +19,12 @@ except ModuleNotFoundError:  # pragma: no cover
 class ToolFailure(RuntimeError):
     def __init__(self, label: str, result: ProcessResult):
         detail = result.output.strip()
-        if len(detail) > 2000:
-            detail = detail[-2000:]
+        if len(detail) > 6000:
+            detail = (
+                detail[:3000]
+                + "\n...[bounded diagnostic omitted]...\n"
+                + detail[-3000:]
+            )
         suffix = f": {detail}" if detail else ""
         super().__init__(f"{label} failed with exit {result.returncode}{suffix}")
         self.label = label
@@ -241,13 +245,8 @@ class Toolchain:
                 str(run_dir / "dimension_catalog.json"),
                 label="dimension catalog validation",
             )
-        self._validation_python(
-            "tools/search_backends.py",
-            "validate",
-            "--manifest",
-            str(run_dir / "background_retrieval.json"),
-            label="background retrieval validation",
-        )
+        self.validate_background_retrieval(run_dir)
+
         args = [
             "validate",
             "--background",
@@ -264,6 +263,44 @@ class Toolchain:
             *args,
             label="background validation",
         )
+
+    def validate_background_retrieval(self, run_dir: Path) -> None:
+        self._validation_python(
+            "tools/search_backends.py",
+            "validate",
+            "--manifest",
+            str(run_dir / "background_retrieval.json"),
+            label="background retrieval validation",
+        )
+
+    def import_background_retrieval(self, run_dir: Path, draft_path: Path) -> dict[str, Any]:
+        return self._json_python(
+            "tools/search_backends.py",
+            "import-external",
+            "--draft",
+            str(draft_path),
+            "--manifest",
+            str(run_dir / "background_retrieval.json"),
+            label="background retrieval import",
+        )
+
+    def background_catalog_receipt(self, catalog_path: Path | None = None) -> dict[str, str]:
+        args = ["catalog", "--compact"]
+        if catalog_path is not None:
+            args.extend(["--path", str(catalog_path)])
+        payload = self._json_python(
+            "tools/background_contract.py",
+            *args,
+            label="background catalog receipt",
+        )
+        receipt = payload.get("receipt") if isinstance(payload, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or not isinstance(receipt.get("id"), str)
+            or not isinstance(receipt.get("revision"), str)
+        ):
+            raise ValueError("background catalog command returned no valid receipt")
+        return {"id": receipt["id"], "revision": receipt["revision"]}
 
     def background_preflight(self, run_dir: Path) -> dict[str, Any]:
         args = ["preflight", "--background", str(run_dir / "background.md")]

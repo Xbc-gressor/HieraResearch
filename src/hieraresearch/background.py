@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
-from .artifacts import file_revision
+from .artifacts import atomic_write_json, atomic_write_text, file_revision
 from .llm import AgentEditSpec, ModelGateway
 from .models import RunIdentity
 from .prompts import BACKGROUND_SYSTEM
@@ -52,14 +53,32 @@ class BackgroundBuilder:
         task_dir = self.identity.repo_root / "tasks" / self.identity.task_name
         docs_dir = self.identity.repo_root / "docs"
         contracts_dir = self.identity.repo_root / "contracts"
-        output_paths = [
-            run_dir / "background.md",
-            run_dir / "background_retrieval.json",
-        ]
+        background_path = run_dir / "background.md"
+        retrieval_manifest_path = run_dir / "background_retrieval.json"
+        reuse_retrieval = False
+        if retrieval_manifest_path.is_file():
+            try:
+                self.toolchain.validate_background_retrieval(run_dir)
+                reuse_retrieval = True
+            except ToolFailure:
+                pass
+        retrieval_draft_path = (
+            None
+            if reuse_retrieval
+            else run_dir / "background_retrieval.draft.json"
+        )
+        authored_paths = [background_path]
+        if retrieval_draft_path is not None:
+            authored_paths.append(retrieval_draft_path)
         if induced:
-            output_paths.append(run_dir / "dimension_catalog.json")
+            authored_paths.append(run_dir / "dimension_catalog.json")
         if self._has_provided_baseline():
-            output_paths.append(run_dir / "baseline_mechanisms.json")
+            authored_paths.append(run_dir / "baseline_mechanisms.json")
+        derived_paths = () if reuse_retrieval else (retrieval_manifest_path,)
+        mutable_paths = {*authored_paths, *derived_paths}
+        catalog_receipt = (
+            None if induced else self.toolchain.background_catalog_receipt()
+        )
         input_paths = [
             task_dir / "TASK.md",
             task_dir / "task.toml",
@@ -71,7 +90,8 @@ class BackgroundBuilder:
             docs_dir / "agent-resources/background-researcher/retrieval.md",
             docs_dir / "agent-resources/background-researcher/evidence-registry.md",
             contracts_dir / "semantic-dimensions-v1.json",
-            *output_paths,
+            *authored_paths,
+            retrieval_manifest_path,
         ]
         seed_entrypoint = self._seed_entrypoint()
         if seed_entrypoint is not None:
@@ -79,25 +99,51 @@ class BackgroundBuilder:
         prompt = (
             f"Task: {self.identity.task_name}\nRun directory: {run_dir}\n"
             f"Dimension strategy: {'llm_induced' if induced else 'catalog_subset'}\n"
-            "Write only these outputs:\n- "
-            + "\n- ".join(str(path) for path in output_paths)
-            + "\nRead the repository background instructions and exact template before writing. "
-            "The retrieval manifest must truthfully describe sources you actually inspected."
+            "Write only these authored outputs:\n- "
+            + "\n- ".join(str(path) for path in authored_paths)
+            + (
+                f"\nThe validated canonical retrieval manifest {retrieval_manifest_path} "
+                "is frozen for this repair. Do not repeat searches or change its evidence.\n"
+                if reuse_retrieval
+                else (
+                    f"\nThe canonical retrieval manifest {retrieval_manifest_path} is "
+                    "Python-owned: do not write it. Record runtime WebSearch/WebFetch "
+                    f"work in the exact schema-1 draft {retrieval_draft_path}; retain "
+                    "exact bounded fetched text, not hashes or reconstructed receipts.\n"
+                )
+            )
+            + (
+                "Use this exact catalog receipt in background.md: "
+                + json.dumps(catalog_receipt, sort_keys=True)
+                if catalog_receipt is not None
+                else (
+                    "Write the induced dimension catalog first and use any explicit "
+                    "placeholder revision in background.md; Python will bind the exact "
+                    "content-addressed catalog revision before validation."
+                )
+            )
+            + "\nRead the repository background instructions and exact templates before writing."
         )
         last_error: BaseException | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             attempt_prompt = prompt
             if last_error is not None:
                 attempt_prompt += (
-                    "\n\nThe deterministic background validator rejected the first output. "
-                    "Repair only the reported contract error once.\n"
+                    "\n\nThe deterministic background boundary rejected the prior output. "
+                    "Repair every reported contract error. Preserve successful searches "
+                    "and exact retained evidence unless a reported error requires changing "
+                    "them.\n"
                     + str(last_error)
                 )
             try:
                 self.models.edit(
                     AgentEditSpec(
-                        purpose="background_research" + (":repair" if attempt else ""),
-                        schema_version=1,
+                        purpose=(
+                            "background_research"
+                            if attempt == 0
+                            else f"background_research:repair:{attempt}"
+                        ),
+                        schema_version=2,
                         cwd=self.identity.repo_root,
                         system_prompt=BACKGROUND_SYSTEM,
                         prompt=attempt_prompt,
@@ -107,23 +153,126 @@ class BackgroundBuilder:
                             "Grep",
                             "Write",
                             "Edit",
-                            "WebSearch",
-                            "WebFetch",
+                            *(
+                                ()
+                                if reuse_retrieval
+                                else ("WebSearch", "WebFetch")
+                            ),
                         ),
                         read_roots=(task_dir, docs_dir, contracts_dir, run_dir),
-                        write_paths=tuple(output_paths),
+                        write_paths=tuple(authored_paths),
                         input_paths=tuple(input_paths),
                         immutable_input_paths=tuple(
-                            path for path in input_paths if path not in output_paths
+                            path
+                            for path in input_paths
+                            if path not in mutable_paths
                         ),
+                        derived_output_paths=derived_paths,
                         max_turns=48,
                     ),
-                    validate=lambda: self._validate_artifacts(induced=induced),
+                    validate=lambda: self._finalize_and_validate(
+                        induced=induced,
+                        retrieval_draft_path=retrieval_draft_path,
+                        catalog_receipt=catalog_receipt,
+                    ),
                 )
                 return
             except (ToolFailure, BackgroundArtifactError) as exc:
                 last_error = exc
         raise ValueError(f"background artifacts remain invalid: {last_error}")
+
+    def _finalize_and_validate(
+        self,
+        *,
+        induced: bool,
+        retrieval_draft_path: Path | None,
+        catalog_receipt: dict[str, str] | None,
+    ) -> None:
+        if retrieval_draft_path is not None:
+            if not retrieval_draft_path.is_file():
+                raise BackgroundArtifactError(
+                    f"background writer did not produce {retrieval_draft_path.name}"
+                )
+            self.toolchain.import_background_retrieval(
+                self.identity.run_dir, retrieval_draft_path
+            )
+        if catalog_receipt is None:
+            catalog_receipt = self.toolchain.background_catalog_receipt(
+                self.identity.run_dir / "dimension_catalog.json"
+            )
+        self._bind_catalog_receipt(catalog_receipt)
+        if self._has_provided_baseline():
+            self._bind_baseline_entrypoint_receipt()
+        self._validate_artifacts(induced=induced)
+
+    def _bind_catalog_receipt(self, receipt: dict[str, str]) -> None:
+        background_path = self.identity.run_dir / "background.md"
+        try:
+            text = background_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise BackgroundArtifactError(
+                f"cannot read background artifact {background_path}: {exc}"
+            ) from exc
+        pattern = re.compile(
+            r"(?P<prefix>^## Search space registry\s*\n```json\s*\n)"
+            r"(?P<body>.*?)"
+            r"(?P<suffix>^```\s*$)",
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        matches = list(pattern.finditer(text))
+        if len(matches) != 1:
+            raise BackgroundArtifactError(
+                "background.md must contain exactly one fenced Search space registry"
+            )
+        match = matches[0]
+        try:
+            registry = json.loads(match.group("body"))
+        except json.JSONDecodeError as exc:
+            raise BackgroundArtifactError(
+                f"background search-space registry is invalid JSON: {exc}"
+            ) from exc
+        catalog = registry.get("catalog") if isinstance(registry, dict) else None
+        if not isinstance(catalog, dict):
+            raise BackgroundArtifactError(
+                "background search-space registry requires a catalog receipt"
+            )
+        if catalog.get("id") != receipt["id"]:
+            raise BackgroundArtifactError(
+                "background catalog id does not match the resolved catalog: "
+                f"expected {receipt['id']!r}, got {catalog.get('id')!r}"
+            )
+        catalog["revision"] = receipt["revision"]
+        rendered = json.dumps(registry, indent=2, ensure_ascii=False, allow_nan=False)
+        updated = text[: match.start("body")] + rendered + "\n" + text[match.end("body") :]
+        atomic_write_text(background_path, updated)
+
+    def _bind_baseline_entrypoint_receipt(self) -> None:
+        entrypoint = self._seed_entrypoint()
+        if entrypoint is None:  # pragma: no cover - guarded by the caller
+            return
+        inventory_path = self.identity.run_dir / "baseline_mechanisms.json"
+        try:
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BackgroundArtifactError(
+                f"invalid baseline mechanism inventory {inventory_path}: {exc}"
+            ) from exc
+        if not isinstance(inventory, dict):
+            raise BackgroundArtifactError(
+                "baseline mechanism inventory must be a JSON object"
+            )
+        existing = inventory.get("entrypoint")
+        entrypoint_receipt = dict(existing) if isinstance(existing, dict) else {}
+        entrypoint_receipt.update(
+            {
+                "path": entrypoint.relative_to(
+                    self.identity.repo_root.resolve()
+                ).as_posix(),
+                "sha256": file_revision(entrypoint),
+            }
+        )
+        inventory["entrypoint"] = entrypoint_receipt
+        atomic_write_json(inventory_path, inventory)
 
     def _validate_artifacts(self, *, induced: bool) -> None:
         provided_baseline = self._has_provided_baseline()

@@ -7,7 +7,10 @@ or touch any ledger. Read the task contract and the repository's background
 research instructions/templates. Use primary or otherwise credible sources,
 retain source URLs and applicability limits, and distinguish evidence from
 hypothesis. You may write only the output files explicitly named by the caller.
-The Python coordinator validates every artifact after you return; do not invoke
+When runtime web tools are enabled, retain their exact bounded results and fetched
+text in the explicitly named external-retrieval draft; never manufacture the
+canonical manifest's hashes, timestamps, ranks, or receipts. The Python
+coordinator derives and validates those fields after you return. Do not invoke
 shell commands or claim validation you did not perform.
 """
 

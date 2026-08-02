@@ -19,6 +19,7 @@ from search_backends import (
     add_visit,
     canonical_key,
     dispatch_search,
+    import_external_draft,
     merge_candidates,
     new_manifest,
     select_balanced,
@@ -381,6 +382,90 @@ else:
     assert any("content_chars must be positive" in error for error in errors), errors
 
     assert LANE_BUDGETS["grounding"] > LANE_BUDGETS["novelty"]
+
+    external_draft = {
+        "schema_version": 1,
+        "kind": "external_retrieval_draft",
+        "retrieval_condition": "open_world",
+        "queries": [
+            {
+                "id": "q-01",
+                "text": "runtime web evidence",
+                "target_dimension_ids": ["dim-method-choice"],
+                "evidence_roles": ["hypothesis"],
+                "backend": "claude-websearch",
+                "backend_version": "runtime-native",
+                "status": "success",
+                "results": [
+                    {
+                        "url": "https://www.example.test/paper/?tracking=1",
+                        "title": "Runtime paper",
+                        "snippet": "A bounded search result.",
+                    }
+                ],
+                "error": None,
+            }
+        ],
+        "coverage_exemptions": [],
+        "visits": [
+            {
+                "url": "https://example.test/paper/",
+                "backend": "claude-webfetch",
+                "backend_version": "runtime-native",
+                "view": "page",
+                "section": None,
+                "status": "success",
+                "content": "Exact retained primary-source text.",
+                "error": None,
+            }
+        ],
+        "backend_failures": [],
+    }
+    external = import_external_draft(external_draft)
+    assert validate_manifest(external) == []
+    assert external["external_draft_revision"].startswith("sha256:")
+    assert external["queries"][0]["lane"] == "grounding"
+    assert external["results"][0]["canonical_key"] == "example.test/paper"
+    assert external["backend_calls"][0]["response_sha256"]
+    assert external["visits"][0]["content_sha256"]
+    assert external["visits"][0]["content_chars"] == len(
+        "Exact retained primary-source text."
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        draft_path = Path(tmp) / "external-draft.json"
+        manifest_path = Path(tmp) / "external-manifest.json"
+        draft_path.write_text(json.dumps(external_draft), encoding="utf-8")
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("search_backends.py")),
+            "import-external",
+            "--draft",
+            str(draft_path),
+            "--manifest",
+            str(manifest_path),
+        ]
+        first = subprocess.run(command, text=True, capture_output=True, check=False)
+        assert first.returncode == 0, first.stderr or first.stdout
+        first_bytes = manifest_path.read_bytes()
+        second = subprocess.run(command, text=True, capture_output=True, check=False)
+        assert second.returncode == 0, second.stderr or second.stdout
+        assert json.loads(second.stdout)["reused"] is True
+        assert manifest_path.read_bytes() == first_bytes
+
+    malformed_condition = new_manifest()
+    malformed_condition["queries"] = [
+        {
+            "id": "q-01",
+            "text": "typed condition guard",
+            "lane": "grounding",
+            "target_dimension_ids": [],
+            "evidence_roles": ["baseline"],
+        }
+    ]
+    malformed_condition["retrieval_condition"] = {"type": "open_world"}
+    errors = validate_manifest(malformed_condition)
+    assert "retrieval_condition must describe a populated search" in errors
 
     def plan_query(roles, targets=()):
         return {

@@ -71,7 +71,18 @@ class AgentEditSpec:
     write_paths: tuple[Path, ...]
     input_paths: tuple[Path, ...]
     immutable_input_paths: tuple[Path, ...]
+    derived_output_paths: tuple[Path, ...] = ()
     max_turns: int = 24
+
+    def __post_init__(self) -> None:
+        authored = {Path(path).resolve() for path in self.write_paths}
+        derived = {Path(path).resolve() for path in self.derived_output_paths}
+        overlap = sorted(authored & derived, key=str)
+        if overlap:
+            raise ValueError(
+                "agent-authored and Python-derived outputs must be disjoint: "
+                + ", ".join(map(str, overlap))
+            )
 
 
 class ModelGateway:
@@ -182,6 +193,9 @@ class ModelGateway:
             "cwd": str(spec.cwd.resolve()),
             "read_roots": [str(path.resolve()) for path in spec.read_roots],
             "write_paths": [str(path.resolve()) for path in spec.write_paths],
+            "derived_output_paths": [
+                str(path.resolve()) for path in spec.derived_output_paths
+            ],
             "input_paths": [str(path.resolve()) for path in spec.input_paths],
             "input_path_revision": input_path_revision,
             "immutable_input_revision": immutable_revision,
@@ -211,9 +225,19 @@ class ModelGateway:
                     f"{spec.purpose} immutable inputs changed during the edit"
                 )
             validated = validate()
+            missing_derived = [
+                path.resolve()
+                for path in spec.derived_output_paths
+                if not path.resolve().is_file()
+            ]
+            if missing_derived:
+                raise InferenceContractError(
+                    f"{spec.purpose} validation produced no derived outputs: "
+                    + ", ".join(map(str, missing_derived))
+                )
             output_revisions = {
                 str(path.resolve()): file_revision(path.resolve())
-                for path in spec.write_paths
+                for path in (*spec.write_paths, *spec.derived_output_paths)
                 if path.resolve().is_file()
             }
             response = {"result": result, "output_revisions": output_revisions}

@@ -69,15 +69,9 @@ def paths_revision(paths: Iterable[Path]) -> str:
     return json_revision(entries)
 
 
-def atomic_write_json(path: Path, value: Any) -> None:
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        value,
-        indent=2,
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8") + b"\n"
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -96,6 +90,20 @@ def atomic_write_json(path: Path, value: Any) -> None:
             os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    _atomic_write_bytes(Path(path), value.encode("utf-8"))
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    payload = json.dumps(
+        value,
+        indent=2,
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8") + b"\n"
+    _atomic_write_bytes(Path(path), payload)
 
 
 class CoordinatorStore:

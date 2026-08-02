@@ -31,6 +31,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 3
+EXTERNAL_DRAFT_SCHEMA_VERSION = 1
 LANE_BUDGETS = {"novelty": 2048, "grounding": 6000}
 EVIDENCE_ROLES = {
     "hypothesis",
@@ -267,6 +268,11 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"retrieval manifest schema_version must be {SCHEMA_VERSION}")
+    draft_revision = manifest.get("external_draft_revision")
+    if draft_revision is not None and re.fullmatch(
+        r"sha256:[0-9a-f]{64}", str(draft_revision)
+    ) is None:
+        errors.append("retrieval manifest external_draft_revision must be a sha256 digest")
     budgets = manifest.get("lane_budgets")
     if not isinstance(budgets, dict):
         errors.append("retrieval manifest lane_budgets must be an object")
@@ -287,7 +293,10 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     )
     errors.extend(plan_errors)
     condition = manifest.get("retrieval_condition")
-    if query_ids and condition not in {"frozen", "open_world", "mixed"}:
+    if query_ids and (
+        not isinstance(condition, str)
+        or condition not in {"frozen", "open_world", "mixed"}
+    ):
         errors.append("retrieval_condition must describe a populated search")
 
     result_keys: set[str] = set()
@@ -1070,6 +1079,284 @@ def add_visit(
     )
 
 
+def _is_http_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith(("https://", "http://")):
+        return False
+    try:
+        return bool(urllib.parse.urlsplit(value).hostname)
+    except ValueError:
+        return False
+
+
+def import_external_draft(draft: Any) -> dict[str, Any]:
+    """Canonicalize a bounded WebSearch/WebFetch research draft.
+
+    Runtime-native web tools cannot invoke this module while they are running.
+    They therefore retain the semantic query fields, raw result rows, and exact
+    fetched text in a deliberately small draft.  Python owns every mechanical
+    receipt: canonical identities, hashes, timestamps, ranks, lane budgets, and
+    balanced selection.
+    """
+
+    errors: list[str] = []
+    if not isinstance(draft, dict):
+        raise ValueError("external retrieval draft must be a JSON object")
+    allowed_top = {
+        "schema_version",
+        "kind",
+        "retrieval_condition",
+        "queries",
+        "coverage_exemptions",
+        "visits",
+        "backend_failures",
+    }
+    unknown_top = sorted(set(draft) - allowed_top)
+    if unknown_top:
+        errors.append(f"external retrieval draft has unknown fields {unknown_top}")
+    if draft.get("schema_version") != EXTERNAL_DRAFT_SCHEMA_VERSION:
+        errors.append(
+            "external retrieval draft schema_version must be "
+            f"{EXTERNAL_DRAFT_SCHEMA_VERSION}"
+        )
+    if draft.get("kind") != "external_retrieval_draft":
+        errors.append("external retrieval draft kind must be external_retrieval_draft")
+    if draft.get("retrieval_condition") != "open_world":
+        errors.append("external retrieval draft must declare open_world retrieval")
+
+    raw_queries = draft.get("queries")
+    if not isinstance(raw_queries, list) or not raw_queries:
+        errors.append("external retrieval draft queries must be a non-empty list")
+        raw_queries = []
+    queries: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    backend_calls: list[dict[str, Any]] = []
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    query_fields = {
+        "id",
+        "text",
+        "target_dimension_ids",
+        "evidence_roles",
+        "backend",
+        "backend_version",
+        "status",
+        "results",
+        "error",
+    }
+    result_fields = {"url", "title", "snippet", "external_id"}
+    for index, raw_query in enumerate(raw_queries):
+        where = f"external retrieval draft queries[{index}]"
+        if not isinstance(raw_query, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        unknown = sorted(set(raw_query) - query_fields)
+        if unknown:
+            errors.append(f"{where} has unknown fields {unknown}")
+        query = {
+            "id": raw_query.get("id"),
+            "text": raw_query.get("text"),
+            "lane": "grounding",
+            "target_dimension_ids": raw_query.get("target_dimension_ids"),
+            "evidence_roles": raw_query.get("evidence_roles"),
+        }
+        queries.append(query)
+        backend = raw_query.get("backend")
+        backend_version = raw_query.get("backend_version")
+        status = raw_query.get("status")
+        if not isinstance(backend, str) or not backend.strip():
+            errors.append(f"{where}.backend must be non-empty")
+        if not isinstance(backend_version, str) or not backend_version.strip():
+            errors.append(f"{where}.backend_version must be non-empty")
+        if status not in {"success", "failed"}:
+            errors.append(f"{where}.status must be success or failed")
+        rows = raw_query.get("results")
+        if not isinstance(rows, list):
+            errors.append(f"{where}.results must be a list")
+            rows = []
+        clean_rows: list[dict[str, Any]] = []
+        for result_index, row in enumerate(rows):
+            row_where = f"{where}.results[{result_index}]"
+            if not isinstance(row, dict):
+                errors.append(f"{row_where} must be an object")
+                continue
+            result_unknown = sorted(set(row) - result_fields)
+            if result_unknown:
+                errors.append(f"{row_where} has unknown fields {result_unknown}")
+            url = row.get("url")
+            title = row.get("title")
+            snippet = row.get("snippet")
+            if not _is_http_url(url):
+                errors.append(f"{row_where}.url must be a valid non-empty URL")
+                continue
+            if not isinstance(title, str) or not title.strip():
+                errors.append(f"{row_where}.title must be non-empty")
+                continue
+            if not isinstance(snippet, str):
+                errors.append(f"{row_where}.snippet must be a string")
+                continue
+            clean = {
+                "url": canonical_url(url),
+                "title": title.strip(),
+                "snippet": snippet,
+            }
+            external_id = row.get("external_id")
+            if external_id is not None:
+                if not isinstance(external_id, str) or not external_id.strip():
+                    errors.append(f"{row_where}.external_id must be non-empty when present")
+                else:
+                    clean["external_id"] = external_id.strip()
+            clean_rows.append(clean)
+            candidates.append(
+                {
+                    **clean,
+                    "query_id": query["id"],
+                    "query": query["text"],
+                    "backend": backend,
+                    "rank": result_index + 1,
+                }
+            )
+        if status == "failed" and clean_rows:
+            errors.append(f"{where} failed query must not retain successful results")
+        error = raw_query.get("error")
+        if status == "failed" and (not isinstance(error, str) or not error.strip()):
+            errors.append(f"{where}.error must explain a failed query")
+        raw_response = {"results": clean_rows}
+        call = {
+            "query_id": query["id"],
+            "backend": backend,
+            "backend_version": backend_version,
+            "status": status,
+            "retrieved_at": recorded_at,
+            "raw_response": raw_response if status == "success" else None,
+            "response_sha256": (
+                hashlib.sha256(
+                    json.dumps(
+                        raw_response, sort_keys=True, ensure_ascii=False
+                    ).encode()
+                ).hexdigest()
+                if status == "success"
+                else None
+            ),
+            "error": error if status == "failed" else None,
+        }
+        backend_calls.append(call)
+
+    exemptions = draft.get("coverage_exemptions")
+    if not isinstance(exemptions, list):
+        errors.append("external retrieval draft coverage_exemptions must be a list")
+        exemptions = []
+    plan_errors, _ = _validate_query_plan(queries, exemptions)
+    errors.extend(plan_errors)
+
+    raw_visits = draft.get("visits")
+    if not isinstance(raw_visits, list):
+        errors.append("external retrieval draft visits must be a list")
+        raw_visits = []
+    visit_fields = {
+        "url",
+        "backend",
+        "backend_version",
+        "view",
+        "section",
+        "status",
+        "content",
+        "error",
+    }
+    prepared_visits: list[dict[str, Any]] = []
+    retained_chars = 0
+    for index, raw_visit in enumerate(raw_visits):
+        where = f"external retrieval draft visits[{index}]"
+        if not isinstance(raw_visit, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        unknown = sorted(set(raw_visit) - visit_fields)
+        if unknown:
+            errors.append(f"{where} has unknown fields {unknown}")
+        url = raw_visit.get("url")
+        backend = raw_visit.get("backend")
+        backend_version = raw_visit.get("backend_version")
+        view = raw_visit.get("view")
+        section = raw_visit.get("section")
+        status = raw_visit.get("status")
+        content = raw_visit.get("content")
+        error = raw_visit.get("error")
+        if not _is_http_url(url):
+            errors.append(f"{where}.url must be a valid non-empty URL")
+        if not isinstance(backend, str) or not backend.strip():
+            errors.append(f"{where}.backend must be non-empty")
+        if not isinstance(backend_version, str) or not backend_version.strip():
+            errors.append(f"{where}.backend_version must be non-empty")
+        if view not in SUBSTANTIVE_VIEWS | {"brief", "head"}:
+            errors.append(f"{where}.view must be a supported receipt view")
+        if view == "section" and (not isinstance(section, str) or not section.strip()):
+            errors.append(f"{where}.section must be non-empty for a section view")
+        if view != "section" and section is not None:
+            errors.append(f"{where}.section is only valid for a section view")
+        if status not in {"success", "failed"}:
+            errors.append(f"{where}.status must be success or failed")
+        if status == "success" and (not isinstance(content, str) or not content.strip()):
+            errors.append(f"{where}.content must retain fetched text for a successful visit")
+        if status == "failed" and (not isinstance(error, str) or not error.strip()):
+            errors.append(f"{where}.error must explain a failed visit")
+        if isinstance(content, str) and status == "success":
+            retained_chars += len(content)
+        prepared_visits.append(
+            {
+                "url": url,
+                "backend": backend,
+                "backend_version": backend_version,
+                "view": view,
+                "section": section,
+                "status": status,
+                "content": content if status == "success" else None,
+                "error": error if status == "failed" else None,
+            }
+        )
+    if retained_chars > LANE_BUDGETS["grounding"] * 4:
+        errors.append(
+            "external retrieval draft retained content exceeds the grounding lane budget"
+        )
+
+    failures = draft.get("backend_failures")
+    if not isinstance(failures, list) or any(not isinstance(item, dict) for item in failures):
+        errors.append("external retrieval draft backend_failures must be a list of objects")
+        failures = []
+    if errors:
+        raise ValueError("invalid external retrieval draft: " + "; ".join(errors))
+
+    merged = merge_candidates(candidates)
+    manifest = new_manifest()
+    manifest.update(
+        {
+            "external_draft_revision": "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    draft,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "retrieval_condition": "open_world",
+            "queries": queries,
+            "coverage_exemptions": exemptions,
+            "results": merged,
+            "selected_keys": select_balanced(merged, [query["id"] for query in queries]),
+            "backend_calls": backend_calls,
+            "backend_failures": failures,
+        }
+    )
+    for visit in prepared_visits:
+        add_visit(manifest, lane="grounding", **visit)
+    manifest_errors = validate_manifest(manifest)
+    if manifest_errors:
+        raise ValueError(
+            "canonical external retrieval manifest is invalid: "
+            + "; ".join(manifest_errors)
+        )
+    return manifest
+
+
 def _parse_cli_objects(
     values: list[str], *, label: str, fields: set[str]
 ) -> list[dict[str, Any]]:
@@ -1295,6 +1582,36 @@ def cmd_record_visit(args: argparse.Namespace) -> int:
     return 0 if not errors else 1
 
 
+def cmd_import_external(args: argparse.Namespace) -> int:
+    draft = json.loads(args.draft.read_text(encoding="utf-8"))
+    manifest = import_external_draft(draft)
+    reused = False
+    if args.manifest.is_file():
+        existing = load_manifest(args.manifest)
+        reused = (
+            existing.get("external_draft_revision")
+            == manifest["external_draft_revision"]
+            and validate_manifest(existing) == []
+        )
+        if reused:
+            manifest = existing
+    if not reused:
+        save_manifest(args.manifest, manifest)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "queries": len(manifest["queries"]),
+                "results": len(manifest["results"]),
+                "visits": len(manifest["visits"]),
+                "reused": reused,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     errors = validate_manifest(manifest)
@@ -1361,6 +1678,14 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--content-file", type=Path)
     record.add_argument("--error")
     record.set_defaults(func=cmd_record_visit)
+
+    external = sub.add_parser(
+        "import-external",
+        help="canonicalize a bounded runtime WebSearch/WebFetch draft",
+    )
+    external.add_argument("--draft", type=Path, required=True)
+    external.add_argument("--manifest", type=Path, required=True)
+    external.set_defaults(func=cmd_import_external)
 
     validate = sub.add_parser("validate", help="validate a retrieval manifest")
     validate.add_argument("--manifest", type=Path, required=True)
