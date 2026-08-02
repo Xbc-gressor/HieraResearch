@@ -158,7 +158,6 @@ class SemanticAdmission:
             schema=prediction_schema(include_cost=include_cost),
             input_paths=input_paths,
             parser=_object_response,
-            max_tokens=12_000,
         )
         predictions_path = proposals.parent / "predictions.json"
         atomic_write_json(predictions_path, predictions)
@@ -186,7 +185,6 @@ class SemanticAdmission:
                 schema=prediction_schema(include_cost=include_cost),
                 input_paths=[*input_paths, predictions_path],
                 parser=_object_response,
-                max_tokens=12_000,
             )
             atomic_write_json(predictions_path, corrected)
             point, receipt, _ = self.toolchain.semantic_select(
@@ -238,5 +236,4 @@ class SemanticAdmission:
                 self.identity.repo_root / "tasks" / self.identity.task_name / "task.toml",
             ],
             parser=IdeaProposal.from_dict,
-            max_tokens=4096,
         )

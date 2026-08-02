@@ -59,7 +59,6 @@ class ExperienceRefresh:
             schema=EXPERIENCE_SCHEMA,
             input_paths=input_paths,
             parser=_object_response,
-            max_tokens=16_000,
         )
         atomic_write_json(output, proposal)
         try:
@@ -80,7 +79,6 @@ class ExperienceRefresh:
                 schema=EXPERIENCE_SCHEMA,
                 input_paths=[*input_paths, output],
                 parser=_object_response,
-                max_tokens=16_000,
             )
             atomic_write_json(output, correction)
             self.toolchain.validate_experience(run_dir, output)

@@ -22,6 +22,15 @@ from .artifacts import (
 
 T = TypeVar("T")
 
+# Documented max output of claude-sonnet-5 on the Messages API
+# (https://docs.claude.com/en/docs/about-claude/models/overview). This is a
+# cap, not an allocation: billing is by tokens actually generated, so a
+# smaller cap saves nothing and only truncates valid responses. Adaptive
+# thinking is always on for Sonnet 5 and thinking tokens count against this
+# budget, which is why "conservative" values like 4096 truncate real calls.
+# Brevity pressure belongs in prompts, never in this number.
+MODEL_MAX_OUTPUT_TOKENS = 128_000
+
 
 class InferenceError(RuntimeError):
     pass
@@ -111,7 +120,7 @@ class ModelGateway:
         schema: dict[str, Any],
         input_paths: Sequence[Path],
         parser: Callable[[Any], T],
-        max_tokens: int = 4096,
+        max_tokens: int = MODEL_MAX_OUTPUT_TOKENS,
     ) -> T:
         path_revision = paths_revision(input_paths)
         request = {
@@ -252,7 +261,9 @@ class AnthropicMessagesBackend:
     def __init__(
         self,
         *,
-        timeout_seconds: float = 180.0,
+        # Headroom for adaptive thinking plus a long structured generation;
+        # matches the Anthropic SDK's own default request timeout.
+        timeout_seconds: float = 600.0,
         max_retries: int = 2,
         client: Any | None = None,
     ):

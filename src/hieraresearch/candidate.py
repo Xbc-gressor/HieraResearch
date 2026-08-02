@@ -530,7 +530,6 @@ class CandidatePipeline:
                 schema=DEBUG_SCHEMA,
                 input_paths=input_paths,
                 parser=parse_debug_response,
-                max_tokens=4096,
             )
         except InferenceContractError:
             return False
