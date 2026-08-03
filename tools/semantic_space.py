@@ -58,7 +58,11 @@ def digest(value: Any) -> str:
 def load_catalog(path: Path = CATALOG_PATH) -> dict[str, Any]:
     try:
         catalog = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+    except OSError:
+        # Filesystem availability is operational, not evidence that authored
+        # catalog content violated the semantic-space contract.
+        raise
+    except json.JSONDecodeError as exc:
         raise SemanticSpaceError(f"cannot load semantic dimension catalog {path}: {exc}") from exc
     if not isinstance(catalog, dict):
         raise SemanticSpaceError(f"semantic dimension catalog {path} must be an object")

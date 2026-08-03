@@ -19,8 +19,9 @@ CANDIDATE_WRITER_SYSTEM = """\
 You implement exactly one admitted HieraResearch candidate. The immutable
 _candidate_brief.json owns ancestry, semantic attribution, and the requested
 idea/change. Read the task evaluation contract, readonly prepare surface, and
-only the parent sources identified by the brief. Produce one coherent train.py
-that satisfies the task interface and selected semantic point. Do not evaluate,
+only the parent sources identified by the brief. Produce one coherent staged
+Python candidate that Python can publish as train.py after validation and that
+satisfies the task interface and selected semantic point. Do not evaluate,
 tune, write PARAM_SCHEMA/SEARCH_SPACE/BASE_PARAMS merely for future tuning, edit
 the ledger, or alter task-owned files. Keep the implementation readable and
 minimal. Write only the path authorized by the caller.
@@ -28,18 +29,35 @@ minimal. Write only the path authorized by the caller.
 
 
 CONTRACT_BUILDER_SYSTEM = """\
-You prepare one already-implemented candidate for deterministic numeric tuning.
-This is a behavior-preserving code/config authoring step only; do not import or
-execute the candidate, evaluate a config, tune, mutate the ledger, or edit
-prepare.py. Refactor construction behind task-defined make_model(input, params)
-and add PARAM_SCHEMA with one entry per meaningful independent tunable. Do not
-write SEARCH_SPACE or BASE_PARAMS into train.py: Python helpers do that later.
-Write _warm_configs.json with exactly K complete, distinct configurations and
-_search_space.json with a compatible Cartesian search space. Config 0 preserves
-the supplied/local behavior; for descendants Python will replace compatible
-keys with the authoritative primary-parent incumbent. Avoid conditional raw
-coordinates: derive dependencies inside make_model. Only edit the explicitly
-authorized candidate files and make the smallest clear change.
+You prepare only the code-side schema of one already-implemented candidate for
+deterministic numeric tuning. This is a behavior-preserving edit: do not import
+or execute the candidate, propose configurations, evaluate, tune, mutate the
+ledger, or edit prepare.py. Refactor construction behind the task-defined
+make_model(input, params) and add one direct module-level PARAM_SCHEMA assignment.
+PARAM_SCHEMA must be a pure Python dict literal with inline string-literal keys;
+its values must be exactly "int", "float", ("float", "log"), or
+("categorical", [primitive, ...]). Do not use calls, comprehensions, aliases,
+unpacking, computed keys, helper mappings, or mutable post-assignment updates in
+the contract. Do not write SEARCH_SPACE or BASE_PARAMS; Python renders those
+later from separately validated structured data. Expose only independent raw
+coordinates and derive conditional values inside make_model. Write only the
+authorized staged Python file and make the smallest clear change.
+"""
+
+
+TUNING_VALUES_SYSTEM = """\
+Propose numeric-tuning values for one frozen, already-valid PARAM_SCHEMA. Return
+exactly K complete, distinct warm configurations and one Cartesian search-space
+entry per schema key in the requested structured format. Config 0 preserves the
+candidate's supplied/local behavior; Python later replaces compatible keys with
+the authoritative primary-parent incumbent for descendants and replaces a
+provided baseline's config 0 with its literal DEFAULT_PARAMS. Use finite primitive
+JSON values only. Integer ranges have integer low/high and log=false. Float
+ranges may set log=true only when both bounds are positive. Categorical entries
+use low=null, high=null, log=false, and non-empty unique primitive options.
+Avoid conditional raw coordinates; do not change code, ancestry, semantic
+strategy, task contracts, ledger state, or run any evaluation/tuning. Python
+validates, expands, renders, and revision-binds the accepted artifacts.
 """
 
 

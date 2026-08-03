@@ -586,6 +586,80 @@ class FailureArtifactTests(unittest.TestCase):
                 first["failure_receipt"]["content_sha256"], r"^sha256:[0-9a-f]{64}$"
             )
 
+    def test_conflicting_existing_failure_artifact_is_not_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "tune_report.json"
+            kwargs = {
+                "report_path": report_path,
+                "candidate_path": Path(tmp) / "train.py",
+                "phase": "phase_a",
+                "method": "warmstart",
+                "params": {"depth": 0},
+                "error": ValueError("depth must be positive"),
+                "traceback_text": TRACEBACK,
+            }
+            recorded = record_failure(**kwargs)
+            artifact = report_path.parent / recorded["failure_ref"]["artifact"]
+            artifact.write_bytes(b"truncated-existing-artifact")
+
+            with self.assertRaisesRegex(RuntimeError, "immutable failure artifact differs"):
+                record_failure(**kwargs)
+
+            self.assertEqual(artifact.read_bytes(), b"truncated-existing-artifact")
+            self.assertEqual(list(artifact.parent.glob(f".{artifact.name}.*.tmp")), [])
+
+    def test_abandoned_partial_temp_does_not_poison_final_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "tune_report.json"
+            kwargs = {
+                "report_path": report_path,
+                "candidate_path": Path(tmp) / "train.py",
+                "phase": "phase_a",
+                "method": "warmstart",
+                "params": {"depth": 0},
+                "error": ValueError("depth must be positive"),
+                "traceback_text": TRACEBACK,
+            }
+            first = record_failure(**kwargs)
+            artifact = report_path.parent / first["failure_ref"]["artifact"]
+            artifact.unlink()
+            abandoned_temp = artifact.parent / f".{artifact.name}.crashed.tmp"
+            abandoned_temp.write_bytes(b"partial")
+
+            retried = record_failure(**kwargs)
+
+            self.assertEqual(retried, first)
+            self.assertEqual(
+                render_failure(report_path, first["failure_ref"]["failure_id"], view="full"),
+                TRACEBACK,
+            )
+            self.assertEqual(abandoned_temp.read_bytes(), b"partial")
+
+    def test_interrupted_publish_leaves_final_path_available_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "tune_report.json"
+            kwargs = {
+                "report_path": report_path,
+                "candidate_path": Path(tmp) / "train.py",
+                "phase": "phase_a",
+                "method": "warmstart",
+                "params": {"depth": 0},
+                "error": ValueError("depth must be positive"),
+                "traceback_text": TRACEBACK,
+            }
+            failure_dir = report_path.parent / "_failures"
+
+            with mock.patch("failure_artifacts.os.link", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    record_failure(**kwargs)
+
+            self.assertEqual(list(failure_dir.glob("*.json")), [])
+            self.assertEqual(list(failure_dir.glob(".*.tmp")), [])
+
+            recorded = record_failure(**kwargs)
+            artifact = report_path.parent / recorded["failure_ref"]["artifact"]
+            self.assertTrue(artifact.is_file())
+
     def test_config_infeasible_error_classification(self) -> None:
         self.assertTrue(is_config_infeasible_error(TimeoutError("timed out")))
         self.assertTrue(

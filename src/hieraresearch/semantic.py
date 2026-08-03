@@ -11,7 +11,7 @@ from .llm import ModelGateway
 from .models import IdeaProposal, RunIdentity
 from .prompts import IDEA_SYSTEM, SEMANTIC_PREDICTION_SYSTEM
 from .schemas import IDEA_SCHEMA, prediction_schema
-from .toolchain import ToolFailure, Toolchain
+from .toolchain import Toolchain, ValidationRejected
 
 
 GAIN_POLICIES = {"gain", "gain_uncertainty", "gain_uncertainty_nocost"}
@@ -168,7 +168,7 @@ class SemanticAdmission:
                 predictions=predictions_path,
             )
             return point, receipt
-        except ToolFailure as first_error:
+        except ValidationRejected as first_error:
             correction_prompt = (
                 prompt
                 + "\n\nYour first response was rejected by the deterministic selector. "

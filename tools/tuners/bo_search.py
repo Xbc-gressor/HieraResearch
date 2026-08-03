@@ -15,7 +15,6 @@ Invoked by the deterministic `DeepTuner` when 3 ≤ n_dims ≤ 15.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 import traceback
@@ -33,15 +32,21 @@ from _common import (  # noqa: E402
     PatienceMonitor,
     append_preflight_attempt,
     append_trial,
+    attempted_config_identities,
+    bind_phase_c_objective_reservation,
+    cancel_phase_c_objective_attempt,
     cast_params_to_search_space,
     clamp_search_space_to_preflight,
+    commit_phase_c_objective_trial,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
     deep_tune_time_remaining,
     ensure_deep_tune_time_remaining,
     is_config_infeasible_error,
     load_candidate_modules,
+    objective_slot_consumed,
     params_identity,
+    prepare_phase_c_objective_attempt,
     prior_patience_state,
     read_deferred_configs,
     read_prior_infeasible_trials,
@@ -69,7 +74,7 @@ class DeferredConfigError(ValueError):
 
 def _params_key(params: dict) -> str:
     """Canonical identity for one fully cast BO configuration."""
-    return json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+    return params_identity(params)
 
 
 def _input_rejection(
@@ -200,9 +205,12 @@ def _enqueue_unique_deferred(
     deferred_configs: list[dict],
     search_space: dict,
     distributions: dict,
+    *,
+    blocked_identities: set[str] | None = None,
 ) -> int:
     """Enqueue every novel deferred config or raise with rejection receipts."""
     seen = {_params_key(trial.params) for trial in study.trials}
+    seen.update(blocked_identities or ())
     n_enqueued = 0
     rejections: list[dict] = []
     for index, raw_params in enumerate(deferred_configs):
@@ -500,12 +508,17 @@ def main() -> int:
     deferred_in_space, deferred_outside = split_configs_by_space(
         read_deferred_configs(args.tune_report_json), search_space
     )
+    attempted_identities = attempted_config_identities(
+        args.tune_report_json,
+        search_space,
+    )
     try:
         n_enqueued = _enqueue_unique_deferred(
             study,
             deferred_in_space,
             search_space,
             distributions,
+            blocked_identities=attempted_identities,
         )
     except DeferredConfigError as exc:
         set_stage_meta(
@@ -592,6 +605,9 @@ def main() -> int:
             continue
         known_infeasible.add(params_identity(normalized))
     known_infeasible.difference_update(known_scores)
+    known_unscored = (
+        attempted_identities - set(known_scores) - known_infeasible
+    )
 
     def admit_timed_work() -> None:
         try:
@@ -616,6 +632,11 @@ def main() -> int:
             counters["duplicates_skipped"] += 1
             _set_feasibility(trial, feasible=False)
             return infeasible_value
+        if identity in known_unscored:
+            counters["duplicates_skipped"] += 1
+            raise RuntimeError(
+                "optimizer reproposed a previously consumed scoreless config"
+            )
         if preflight_enabled:
             try:
                 preflight_result = timed_preflight(
@@ -678,8 +699,16 @@ def main() -> int:
                 result=preflight_result or {"status": "ok"},
             )
             admit_timed_work()
+        objective_intent = None
         try:
             admit_timed_work()
+            objective_intent = prepare_phase_c_objective_attempt(
+                args.tune_report_json,
+                args.candidate_path,
+                "bo",
+                params,
+                time_budget["candidate_execution_revision"],
+            )
             score = timed_eval(
                 evaluate,
                 make_model,
@@ -689,6 +718,18 @@ def main() -> int:
                 method="bo",
                 phase_time_limit_seconds=lambda: deep_tune_time_remaining(
                     time_budget
+                ),
+                expected_execution_revision=time_budget[
+                    "candidate_execution_revision"
+                ],
+                on_objective_reserved=lambda receipt: (
+                    bind_phase_c_objective_reservation(
+                        args.tune_report_json,
+                        args.candidate_path,
+                        "bo",
+                        objective_intent,
+                        receipt,
+                    )
                 ),
             )
         except DeepTuneTimeExhausted as exc:
@@ -703,9 +744,11 @@ def main() -> int:
                     error=exc,
                     traceback_text=traceback.format_exc(),
                 )
-                append_trial(
+                commit_phase_c_objective_trial(
                     args.tune_report_json,
+                    args.candidate_path,
                     "bo",
+                    objective_intent,
                     {
                         "params": params,
                         "score": None,
@@ -717,12 +760,26 @@ def main() -> int:
                 )
                 if failure["failure_ref"] not in failure_refs:
                     failure_refs.append(failure["failure_ref"])
+            elif objective_intent is not None:
+                cancel_phase_c_objective_attempt(
+                    args.tune_report_json,
+                    args.candidate_path,
+                    "bo",
+                    objective_intent,
+                )
             counters["time_exhausted"] = True
             early_stopped["flag"] = True
             early_stopped["reason"] = "time_budget"
             study.stop()
             raise
         except EvaluationBudgetExhausted as exc:
+            if objective_intent is not None:
+                cancel_phase_c_objective_attempt(
+                    args.tune_report_json,
+                    args.candidate_path,
+                    "bo",
+                    objective_intent,
+                )
             counters["budget_exhausted"] = True
             counters["budget_exhausted_scope"] = exc.scope
             early_stopped["flag"] = True
@@ -730,6 +787,15 @@ def main() -> int:
             study.stop()
             raise
         except Exception as exc:
+            if not objective_slot_consumed(exc):
+                if objective_intent is not None:
+                    cancel_phase_c_objective_attempt(
+                        args.tune_report_json,
+                        args.candidate_path,
+                        "bo",
+                        objective_intent,
+                    )
+                raise
             counters["objective_attempts"] += 1
             failure = record_failure(
                 report_path=args.tune_report_json,
@@ -745,8 +811,11 @@ def main() -> int:
             # bug, malformed result) is not a parameter-region signal: it stays
             # an ordinary FAILED trial rather than teaching a false boundary.
             config_infeasible = is_config_infeasible_error(exc)
-            append_trial(
-                args.tune_report_json, "bo",
+            commit_phase_c_objective_trial(
+                args.tune_report_json,
+                args.candidate_path,
+                "bo",
+                objective_intent,
                 {
                     "params": params,
                     "score": None,
@@ -758,21 +827,28 @@ def main() -> int:
             if failure["failure_ref"] not in failure_refs:
                 failure_refs.append(failure["failure_ref"])
             if not config_infeasible:
+                known_unscored.add(identity)
                 raise
             # Complete this Optuna trial as constrained-infeasible instead of
             # FAILED: built-in samplers ignore failed trials, while constrained
             # TPE can use this receipt to avoid nearby infeasible proposals.
             _set_feasibility(trial, feasible=False)
             known_infeasible.add(identity)
+            known_unscored.discard(identity)
             return infeasible_value
         counters["objective_attempts"] += 1
         counters["objective_completed"] += 1
-        append_trial(
-            args.tune_report_json, "bo", {"params": params, "score": score}
+        commit_phase_c_objective_trial(
+            args.tune_report_json,
+            args.candidate_path,
+            "bo",
+            objective_intent,
+            {"params": params, "score": score},
         )
         known_scores[identity] = float(score)
         known_score_params[identity] = params
         known_infeasible.discard(identity)
+        known_unscored.discard(identity)
         return score
 
     def patience_callback(study, trial):

@@ -4,7 +4,7 @@
 The Markdown document is the human view.  Its fenced ``Search space
 registry`` JSON object is the machine contract shared by both runtimes.  This
 module validates literature receipts and typed guidance around the structural
-contract owned by :mod:`semantic_space`, checks the schema-3 experience
+contract owned by :mod:`semantic_space`, checks the versioned experience
 snapshot and the append-only ``search_space_state`` overlay against persisted
 receipts, and renders the bounded per-target evidence view consumed by the
 experience extractor.
@@ -141,6 +141,10 @@ class ContractError(ValueError):
     """A malformed or incompatible background contract."""
 
 
+class AuthoredBackgroundRejected(ContractError):
+    """Model-authored background wire data failed deterministic parsing."""
+
+
 def _nonempty(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -155,26 +159,51 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _load_authored_json(path: Path) -> dict[str, Any]:
+    """Load a model-authored JSON object without treating I/O as bad content."""
+    try:
+        value = json.loads(path.read_text())
+    except OSError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise AuthoredBackgroundRejected(
+            f"invalid authored JSON object {path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise AuthoredBackgroundRejected(
+            f"{path}: authored JSON value must be an object"
+        )
+    return value
+
+
 def load_registry(path: Path) -> dict[str, Any]:
     """Extract the canonical semantic-search-space registry from Markdown."""
     text = path.read_text(errors="replace")
     marker = re.search(r"^## Search space registry\s*$", text, flags=re.MULTILINE)
     if marker is None:
         if re.search(r"^## Direction registry\s*$", text, flags=re.MULTILINE):
-            raise ContractError(
+            raise AuthoredBackgroundRejected(
                 f"{path}: legacy flat 'Direction registry' is unsupported; "
                 "regenerate a schema_version 3 hierarchical search space"
             )
-        raise ContractError(f"{path}: missing '## Search space registry'")
+        raise AuthoredBackgroundRejected(
+            f"{path}: missing '## Search space registry'"
+        )
     fence = re.search(r"```json\s*(\{.*?\})\s*```", text[marker.end() :], flags=re.DOTALL)
     if fence is None:
-        raise ContractError(f"{path}: search space registry must be a fenced JSON object")
+        raise AuthoredBackgroundRejected(
+            f"{path}: search space registry must be a fenced JSON object"
+        )
     try:
         registry = json.loads(fence.group(1))
     except json.JSONDecodeError as exc:
-        raise ContractError(f"{path}: invalid search space registry JSON: {exc}") from exc
+        raise AuthoredBackgroundRejected(
+            f"{path}: invalid search space registry JSON: {exc}"
+        ) from exc
     if not isinstance(registry, dict):
-        raise ContractError(f"{path}: search space registry must be an object")
+        raise AuthoredBackgroundRejected(
+            f"{path}: search space registry must be an object"
+        )
     return registry
 
 
@@ -2335,7 +2364,7 @@ def _validate_target_evidence(
 
 
 def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
-    """Validate the bounded schema-3 belief snapshot over the durable records.
+    """Validate a readable bounded belief snapshot over the durable records.
 
     Generic collections stay bounded.  The two-level ``dimension_evidence``
     and ``hypothesis_evidence`` collections are replaceable belief: their
@@ -2570,7 +2599,7 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         else None
     )
     baseline_mechanisms = (
-        _load_json(args.baseline_mechanisms)
+        _load_authored_json(args.baseline_mechanisms)
         if getattr(args, "baseline_mechanisms", None)
         else None
     )
@@ -2588,8 +2617,40 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
 
 def cmd_catalog(args: argparse.Namespace) -> int:
     path = getattr(args, "path", None)
-    catalog = load_catalog(path) if path else load_catalog()
-    value = {"catalog": catalog, "receipt": catalog_receipt(catalog)}
+    try:
+        catalog = load_catalog(path) if path else load_catalog()
+    except FileNotFoundError as exc:
+        if path is None:
+            raise
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "failure_kind": "dimension_catalog_validation",
+                    "errors": [str(exc)],
+                },
+                indent=2,
+            )
+        )
+        return 1
+    except SemanticSpaceError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "failure_kind": "dimension_catalog_validation",
+                    "errors": [str(exc)],
+                },
+                indent=2,
+            )
+        )
+        return 1
+    value = {
+        "ok": True,
+        "errors": [],
+        "catalog": catalog,
+        "receipt": catalog_receipt(catalog),
+    }
     print(json.dumps(value, indent=None if args.compact else 2, separators=(",", ":") if args.compact else None))
     return 0
 
@@ -2598,6 +2659,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
     registry, _, errors = _validated_inputs(args)
     result = {
         "ok": not errors,
+        **(
+            {"failure_kind": "background_validation"}
+            if errors
+            else {}
+        ),
         "schema_version": registry.get("schema_version"),
         "space": space_receipt(registry),
         "dimensions": len(registry.get("dimensions", [])),
@@ -2685,6 +2751,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
 def cmd_validate_experience(args: argparse.Namespace) -> int:
     registry, ledger, errors = _validated_inputs(args)
+    input_errors = bool(errors)
     if args.experience:
         experience = _load_json(args.experience)
     else:
@@ -2693,7 +2760,14 @@ def cmd_validate_experience(args: argparse.Namespace) -> int:
         errors.extend(validate_experience(experience, registry, ledger or {}))
         if args.experience:
             errors.extend(validate_experience_replacement(experience, ledger or {}))
-    print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
+    payload = {"ok": not errors, "errors": errors}
+    if errors:
+        payload["failure_kind"] = (
+            "input_contract_invalid"
+            if input_errors
+            else "experience_validation"
+        )
+    print(json.dumps(payload, indent=2))
     return 0 if not errors else 1
 
 
@@ -2769,7 +2843,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     experience = sub.add_parser(
         "validate-experience",
-        help="validate a schema-3 experience snapshot against cited receipts",
+        help="validate a versioned experience snapshot against cited receipts",
     )
     experience.add_argument("--background", type=Path, required=True)
     experience.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
@@ -2801,6 +2875,19 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         return args.func(args)
+    except AuthoredBackgroundRejected as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "failure_kind": "background_validation",
+                    "errors": [str(exc)],
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     except (ContractError, SemanticSpaceError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "errors": [str(exc)]}, indent=2), file=sys.stderr)
         return 1

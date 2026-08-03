@@ -41,8 +41,11 @@ from _common import (  # noqa: E402
     append_preflight_attempt,
     append_trial,
     attempted_config_identities,
+    bind_phase_c_objective_reservation,
+    cancel_phase_c_objective_attempt,
     cast_params_to_search_space,
     clamp_search_space_to_preflight,
+    commit_phase_c_objective_trial,
     deduplicate_configs,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
@@ -51,8 +54,10 @@ from _common import (  # noqa: E402
     is_config_infeasible_error,
     is_finite_score,
     load_candidate_modules,
+    objective_slot_consumed,
     params_identity,
     params_within_search_space,
+    prepare_phase_c_objective_attempt,
     prior_patience_state,
     read_deferred_configs,
     read_prior_infeasible_trials,
@@ -629,8 +634,16 @@ def main() -> int:
                 early_stop_reason = "patience"
                 break
             continue
+        objective_intent = None
         try:
             ensure_deep_tune_time_remaining(time_budget)
+            objective_intent = prepare_phase_c_objective_attempt(
+                args.tune_report_json,
+                args.candidate_path,
+                "cmaes",
+                params,
+                time_budget["candidate_execution_revision"],
+            )
             score = timed_eval(
                 evaluate,
                 make_model,
@@ -640,6 +653,18 @@ def main() -> int:
                 method="cmaes",
                 phase_time_limit_seconds=lambda: deep_tune_time_remaining(
                     time_budget
+                ),
+                expected_execution_revision=time_budget[
+                    "candidate_execution_revision"
+                ],
+                on_objective_reserved=lambda receipt: (
+                    bind_phase_c_objective_reservation(
+                        args.tune_report_json,
+                        args.candidate_path,
+                        "cmaes",
+                        objective_intent,
+                        receipt,
+                    )
                 ),
             )
         except DeepTuneTimeExhausted as exc:
@@ -655,9 +680,11 @@ def main() -> int:
                     error=exc,
                     traceback_text=traceback.format_exc(),
                 )
-                append_trial(
+                commit_phase_c_objective_trial(
                     args.tune_report_json,
+                    args.candidate_path,
                     "cmaes",
+                    objective_intent,
                     {
                         "params": params,
                         "score": None,
@@ -669,17 +696,40 @@ def main() -> int:
                 )
                 if failure["failure_ref"] not in failure_refs:
                     failure_refs.append(failure["failure_ref"])
+            elif objective_intent is not None:
+                cancel_phase_c_objective_attempt(
+                    args.tune_report_json,
+                    args.candidate_path,
+                    "cmaes",
+                    objective_intent,
+                )
             time_exhausted = True
             early_stopped = True
             early_stop_reason = "time_budget"
             break
         except EvaluationBudgetExhausted as exc:
+            if objective_intent is not None:
+                cancel_phase_c_objective_attempt(
+                    args.tune_report_json,
+                    args.candidate_path,
+                    "cmaes",
+                    objective_intent,
+                )
             budget_exhausted = True
             budget_exhausted_scope = exc.scope
             early_stopped = True
             early_stop_reason = "evaluation_budget"
             break
         except Exception as exc:
+            if not objective_slot_consumed(exc):
+                if objective_intent is not None:
+                    cancel_phase_c_objective_attempt(
+                        args.tune_report_json,
+                        args.candidate_path,
+                        "cmaes",
+                        objective_intent,
+                    )
+                raise
             trials_attempted += 1
             identity = params_identity(params)
             attempted_identities.add(identity)
@@ -694,9 +744,19 @@ def main() -> int:
                 error=exc,
                 traceback_text=traceback.format_exc(),
             )
-            append_trial(args.tune_report_json, "cmaes",
-                         {"params": params, "score": None, "status": "failed",
-                          "config_infeasible": is_config_infeasible_error(exc), **failure})
+            commit_phase_c_objective_trial(
+                args.tune_report_json,
+                args.candidate_path,
+                "cmaes",
+                objective_intent,
+                {
+                    "params": params,
+                    "score": None,
+                    "status": "failed",
+                    "config_infeasible": is_config_infeasible_error(exc),
+                    **failure,
+                },
+            )
             if failure["failure_ref"] not in failure_refs:
                 failure_refs.append(failure["failure_ref"])
             if monitor.update_failed():
@@ -705,7 +765,13 @@ def main() -> int:
                 break
             continue
         trials_attempted += 1
-        append_trial(args.tune_report_json, "cmaes", {"params": params, "score": score})
+        commit_phase_c_objective_trial(
+            args.tune_report_json,
+            args.candidate_path,
+            "cmaes",
+            objective_intent,
+            {"params": params, "score": score},
+        )
         identity = params_identity(params)
         attempted_identities.add(identity)
         known_scores[identity] = float(score)
@@ -787,8 +853,16 @@ def main() -> int:
                     stop_now = True
                     break
                 continue
+            objective_intent = None
             try:
                 ensure_deep_tune_time_remaining(time_budget)
+                objective_intent = prepare_phase_c_objective_attempt(
+                    args.tune_report_json,
+                    args.candidate_path,
+                    "cmaes",
+                    params,
+                    time_budget["candidate_execution_revision"],
+                )
                 score = timed_eval(
                     evaluate,
                     make_model,
@@ -798,6 +872,18 @@ def main() -> int:
                     method="cmaes",
                     phase_time_limit_seconds=lambda: deep_tune_time_remaining(
                         time_budget
+                    ),
+                    expected_execution_revision=time_budget[
+                        "candidate_execution_revision"
+                    ],
+                    on_objective_reserved=lambda receipt: (
+                        bind_phase_c_objective_reservation(
+                            args.tune_report_json,
+                            args.candidate_path,
+                            "cmaes",
+                            objective_intent,
+                            receipt,
+                        )
                     ),
                 )
             except DeepTuneTimeExhausted as exc:
@@ -813,9 +899,11 @@ def main() -> int:
                         error=exc,
                         traceback_text=traceback.format_exc(),
                     )
-                    append_trial(
+                    commit_phase_c_objective_trial(
                         args.tune_report_json,
+                        args.candidate_path,
                         "cmaes",
+                        objective_intent,
                         {
                             "params": params,
                             "score": None,
@@ -827,12 +915,26 @@ def main() -> int:
                     )
                     if failure["failure_ref"] not in failure_refs:
                         failure_refs.append(failure["failure_ref"])
+                elif objective_intent is not None:
+                    cancel_phase_c_objective_attempt(
+                        args.tune_report_json,
+                        args.candidate_path,
+                        "cmaes",
+                        objective_intent,
+                    )
                 time_exhausted = True
                 early_stopped = True
                 early_stop_reason = "time_budget"
                 stop_now = True
                 break
             except EvaluationBudgetExhausted as exc:
+                if objective_intent is not None:
+                    cancel_phase_c_objective_attempt(
+                        args.tune_report_json,
+                        args.candidate_path,
+                        "cmaes",
+                        objective_intent,
+                    )
                 budget_exhausted = True
                 budget_exhausted_scope = exc.scope
                 early_stopped = True
@@ -840,6 +942,15 @@ def main() -> int:
                 stop_now = True
                 break
             except Exception as exc:
+                if not objective_slot_consumed(exc):
+                    if objective_intent is not None:
+                        cancel_phase_c_objective_attempt(
+                            args.tune_report_json,
+                            args.candidate_path,
+                            "cmaes",
+                            objective_intent,
+                        )
+                    raise
                 trials_attempted += 1
                 attempted_identities.add(identity)
                 if is_config_infeasible_error(exc):
@@ -855,9 +966,19 @@ def main() -> int:
                     error=exc,
                     traceback_text=traceback.format_exc(),
                 )
-                append_trial(args.tune_report_json, "cmaes",
-                             {"params": params, "score": None, "status": "failed",
-                              "config_infeasible": is_config_infeasible_error(exc), **failure})
+                commit_phase_c_objective_trial(
+                    args.tune_report_json,
+                    args.candidate_path,
+                    "cmaes",
+                    objective_intent,
+                    {
+                        "params": params,
+                        "score": None,
+                        "status": "failed",
+                        "config_infeasible": is_config_infeasible_error(exc),
+                        **failure,
+                    },
+                )
                 if failure["failure_ref"] not in failure_refs:
                     failure_refs.append(failure["failure_ref"])
                 results.append((x, None))
@@ -869,8 +990,12 @@ def main() -> int:
                     break
                 continue
             trials_attempted += 1
-            append_trial(
-                args.tune_report_json, "cmaes", {"params": params, "score": score}
+            commit_phase_c_objective_trial(
+                args.tune_report_json,
+                args.candidate_path,
+                "cmaes",
+                objective_intent,
+                {"params": params, "score": score},
             )
             attempted_identities.add(identity)
             known_scores[identity] = float(score)

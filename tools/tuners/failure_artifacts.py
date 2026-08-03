@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 
 
@@ -21,6 +23,45 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_immutable(target: Path, encoded: bytes) -> None:
+    """Durably publish complete bytes without ever replacing ``target``."""
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        try:
+            os.link(temp_path, target)
+        except FileExistsError:
+            if target.read_bytes() != encoded:
+                raise RuntimeError(f"immutable failure artifact differs: {target}") from None
+        else:
+            _fsync_directory(target.parent)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            _fsync_directory(target.parent)
 
 
 def _exception_detail(traceback_text: str, error: BaseException) -> tuple[str, int | None]:
@@ -122,12 +163,8 @@ def record_failure(
 
     target = report_path.parent / relative_artifact
     target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with target.open("xb") as handle:
-            handle.write(encoded)
-    except FileExistsError:
-        if target.read_bytes() != encoded:
-            raise RuntimeError(f"immutable failure artifact differs: {target}") from None
+    _fsync_directory(target.parent.parent)
+    _publish_immutable(target, encoded)
 
     return {
         "error": f"{type(error).__name__}: {error}"[:300],
@@ -151,6 +188,17 @@ def _load_verified(report_path: Path, failure_id: str) -> dict[str, Any]:
     actual = _sha256(_canonical_json(unhashed))
     if expected != actual:
         raise ValueError(f"failure artifact hash mismatch: {artifact_path}")
+    failure = artifact.get("failure")
+    receipt = artifact.get("receipt")
+    expected_relative = f"_failures/{failure_id}.json"
+    if (
+        not isinstance(failure, dict)
+        or not isinstance(receipt, dict)
+        or receipt.get("failure_id") != failure_id
+        or receipt.get("artifact") != expected_relative
+        or receipt.get("content_sha256") != _sha256(_canonical_json(failure))
+    ):
+        raise ValueError(f"invalid failure artifact payload: {artifact_path}")
     return artifact
 
 
@@ -165,6 +213,16 @@ def render_failure(
     artifact = _load_verified(Path(report_path), failure_id)
     if view == "receipt":
         return artifact["receipt"]
+    if view == "verification":
+        return {
+            "failure_ref": {
+                "schema_version": SCHEMA_VERSION,
+                "failure_id": failure_id,
+                "artifact": f"_failures/{failure_id}.json",
+                "sha256": artifact["sha256"],
+            },
+            "failure_receipt": artifact["receipt"],
+        }
     traceback_text = artifact["failure"]["traceback"]
     if view == "full":
         return traceback_text

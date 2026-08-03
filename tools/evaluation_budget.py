@@ -223,9 +223,48 @@ def _canonical_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def evaluation_params_sha256(params: dict) -> str:
+    """Return the exact params digest stored in one reservation receipt."""
+    if not isinstance(params, dict):
+        raise TypeError("evaluation params must be a dict")
+    return _canonical_hash(params)
+
+
+def _validate_score_attempt_row(
+    row: dict,
+    *,
+    path: Path,
+    seen_ids: set[str],
+) -> None:
+    attempt_id = row.get("attempt_id")
+    params_sha256 = row.get("params_sha256")
+    if (
+        not isinstance(attempt_id, str)
+        or not attempt_id
+        or attempt_id in seen_ids
+        or not isinstance(row.get("run_id"), str)
+        or not row["run_id"]
+        or not isinstance(row.get("phase"), str)
+        or not row["phase"]
+        or not isinstance(row.get("method"), str)
+        or not row["method"]
+        or not isinstance(params_sha256, str)
+        or len(params_sha256) != 71
+        or not params_sha256.startswith("sha256:")
+        or any(
+            character not in "0123456789abcdef"
+            for character in params_sha256.removeprefix("sha256:")
+        )
+    ):
+        raise ValueError(f"malformed objective reservation in {path}")
+    seen_ids.add(attempt_id)
+
+
 def _read_rows(handle) -> list[dict]:
     handle.seek(0)
     rows: list[dict] = []
+    seen_attempt_ids: set[str] = set()
+    path = Path(handle.name)
     for line_number, raw in enumerate(handle, start=1):
         if not raw.strip():
             continue
@@ -239,6 +278,12 @@ def _read_rows(handle) -> list[dict]:
             raise ValueError(
                 f"unsupported {ATTEMPT_LOG} schema on line {line_number}: "
                 f"{row.get('schema_version')!r}"
+            )
+        if row.get("kind") == "score_attempt":
+            _validate_score_attempt_row(
+                row,
+                path=path,
+                seen_ids=seen_attempt_ids,
             )
         rows.append(row)
     return rows
@@ -388,6 +433,35 @@ def reserve_evaluation(
         return receipt
 
 
+def objective_attempt_receipts(
+    ref_path: Any,
+    *,
+    phase: str,
+    method: str,
+) -> list[dict]:
+    """Read exact reservations for one candidate/phase without creating state."""
+    run_dir = find_run_dir(ref_path)
+    if run_dir is None:
+        return []
+    path = run_dir / ATTEMPT_LOG
+    if not path.exists():
+        return []
+    run_id = Path(ref_path).resolve().parent.name
+    with _locked_log(run_dir) as handle:
+        rows = _read_rows(handle)
+    receipts: list[dict] = []
+    for row in rows:
+        if row.get("kind") != "score_attempt":
+            continue
+        if (
+            row.get("run_id") == run_id
+            and row.get("phase") == phase
+            and row.get("method") == method
+        ):
+            receipts.append(dict(row))
+    return receipts
+
+
 def budget_status(run_dir: Path, *, create: bool = False) -> dict:
     """Return the strict objective usage view without mutating by default."""
     run_dir = Path(run_dir)
@@ -458,6 +532,13 @@ def main() -> int:
     reserve_parser.add_argument("--ref-path", required=True, type=Path)
     reserve_parser.add_argument("--phase", default="hillclimb")
     reserve_parser.add_argument("--method", default="direct")
+    receipts_parser = subparsers.add_parser(
+        "receipts",
+        help="read exact objective reservations for one candidate/phase/method",
+    )
+    receipts_parser.add_argument("--ref-path", required=True, type=Path)
+    receipts_parser.add_argument("--phase", required=True)
+    receipts_parser.add_argument("--method", required=True)
     args = parser.parse_args()
     if args.command == "status":
         print(json.dumps(budget_status(args.run_dir, create=args.initialize)))
@@ -491,6 +572,23 @@ def main() -> int:
         if receipt is None:
             parser.error("--ref-path is not inside an initialized runs/<task>/<tag>")
         print(json.dumps({"status": "reserved", "receipt": receipt}))
+        return 0
+    if args.command == "receipts":
+        ref_path = args.ref_path.resolve()
+        if not ref_path.is_file():
+            parser.error(f"--ref-path does not exist: {ref_path}")
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "receipts": objective_attempt_receipts(
+                        ref_path,
+                        phase=args.phase,
+                        method=args.method,
+                    ),
+                }
+            )
+        )
         return 0
     raise AssertionError(args.command)
 

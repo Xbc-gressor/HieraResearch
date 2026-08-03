@@ -7,11 +7,16 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .artifacts import atomic_write_json, atomic_write_text, file_revision
+from .artifacts import (
+    atomic_write_json,
+    atomic_write_text,
+    file_revision,
+    paths_revision,
+)
 from .llm import AgentEditSpec, ModelGateway
 from .models import RunIdentity
 from .prompts import BACKGROUND_SYSTEM
-from .toolchain import ToolFailure, Toolchain
+from .toolchain import ToolFailure, Toolchain, ValidationRejected
 
 
 MAX_BACKGROUND_REPAIR_ATTEMPTS = 5
@@ -43,12 +48,12 @@ class BackgroundBuilder:
             required.append(run_dir / "dimension_catalog.json")
         if self._has_provided_baseline():
             required.append(run_dir / "baseline_mechanisms.json")
-        initial_error: ToolFailure | BackgroundArtifactError | None = None
+        initial_error: ValidationRejected | BackgroundArtifactError | None = None
         if all(path.is_file() for path in required):
             try:
                 self._validate_artifacts(induced=induced)
                 return
-            except (ToolFailure, BackgroundArtifactError) as exc:
+            except (ValidationRejected, BackgroundArtifactError) as exc:
                 if self.identity.ledger_path.exists():
                     raise
                 initial_error = exc
@@ -79,11 +84,59 @@ class BackgroundBuilder:
         seed_entrypoint = self._seed_entrypoint()
         if seed_entrypoint is not None:
             fixed_input_paths.append(seed_entrypoint)
+        authoring_state_path = (
+            run_dir / ".orchestrator" / "background_authoring.json"
+        )
+        input_revision = paths_revision(fixed_input_paths)
+        state = self._read_authoring_state(
+            authoring_state_path,
+            input_revision=input_revision,
+        )
+        if state is None:
+            inferred_initial_attempt = initial_error is not None
+            state = {
+                "schema_version": 1,
+                "kind": "background_authoring",
+                "status": "rejected" if inferred_initial_attempt else "ready",
+                "input_revision": input_revision,
+                "attempts_admitted": 1 if inferred_initial_attempt else 0,
+                "initial_admitted": inferred_initial_attempt,
+                "repairs_admitted": 0,
+                "purpose": None,
+                "last_error": str(initial_error or ""),
+            }
+            atomic_write_json(authoring_state_path, state)
+        elif state["status"] == "completed":
+            raise BackgroundArtifactError(
+                "completed background authoring state has invalid artifacts"
+            )
+        elif initial_error is not None and not state["initial_admitted"]:
+            state = {
+                **state,
+                "status": "rejected",
+                "attempts_admitted": max(1, int(state["attempts_admitted"])),
+                "initial_admitted": True,
+                "last_error": str(initial_error),
+            }
+            atomic_write_json(authoring_state_path, state)
         last_error: BaseException | None = initial_error
-        first_repair_number = 1 if initial_error is not None else 0
-        for repair_number in range(
-            first_repair_number, MAX_BACKGROUND_REPAIR_ATTEMPTS + 1
-        ):
+        if last_error is None:
+            last_error = self._resumed_error(state)
+        while int(state["attempts_admitted"]) < MAX_BACKGROUND_REPAIR_ATTEMPTS + 1:
+            resuming_started = state["status"] == "started"
+            retry_purpose = state.get("purpose") if resuming_started else None
+            if isinstance(retry_purpose, str) and retry_purpose:
+                purpose = retry_purpose
+            elif not state["initial_admitted"]:
+                purpose = "background_research"
+                state = {**state, "initial_admitted": True}
+            else:
+                repairs_admitted = int(state["repairs_admitted"])
+                if repairs_admitted >= MAX_BACKGROUND_REPAIR_ATTEMPTS:
+                    break
+                next_repair = repairs_admitted + 1
+                purpose = f"background_research:repair:{next_repair}"
+                state = {**state, "repairs_admitted": next_repair}
             diagnostic_path = (
                 self._write_repair_diagnostic(last_error)
                 if last_error is not None
@@ -156,13 +209,17 @@ class BackgroundBuilder:
                     + str(last_error)
                 )
             try:
+                state = {
+                    **state,
+                    "status": "started",
+                    "attempts_admitted": int(state["attempts_admitted"]) + 1,
+                    "purpose": purpose,
+                    "last_error": str(last_error or ""),
+                }
+                atomic_write_json(authoring_state_path, state)
                 self.models.edit(
                     AgentEditSpec(
-                        purpose=(
-                            "background_research"
-                            if repair_number == 0
-                            else f"background_research:repair:{repair_number}"
-                        ),
+                        purpose=purpose,
                         schema_version=2,
                         cwd=self.identity.repo_root,
                         system_prompt=BACKGROUND_SYSTEM,
@@ -196,9 +253,23 @@ class BackgroundBuilder:
                         catalog_receipt=catalog_receipt,
                     ),
                 )
+                atomic_write_json(
+                    authoring_state_path,
+                    {
+                        **state,
+                        "status": "completed",
+                        "last_error": "",
+                    },
+                )
                 return
-            except (ToolFailure, BackgroundArtifactError) as exc:
+            except (ValidationRejected, BackgroundArtifactError) as exc:
                 last_error = exc
+                state = {
+                    **state,
+                    "status": "rejected",
+                    "last_error": str(exc),
+                }
+                atomic_write_json(authoring_state_path, state)
         raise ValueError(f"background artifacts remain invalid: {last_error}")
 
     def _has_valid_retrieval(self, manifest_path: Path) -> bool:
@@ -206,9 +277,66 @@ class BackgroundBuilder:
             return False
         try:
             self.toolchain.validate_background_retrieval(self.identity.run_dir)
-        except ToolFailure:
+        except ValidationRejected:
             return False
         return True
+
+    @staticmethod
+    def _resumed_error(state: dict[str, Any]) -> BaseException | None:
+        """Rebuild the persisted rejection from its durable message."""
+        message = state["last_error"].strip()
+        if not message:
+            return None
+        return BackgroundArtifactError(message)
+
+    @staticmethod
+    def _read_authoring_state(
+        path: Path,
+        *,
+        input_revision: str,
+    ) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BackgroundArtifactError(
+                f"invalid background authoring state {path}: {exc}"
+            ) from exc
+        attempts = state.get("attempts_admitted") if isinstance(state, dict) else None
+        repairs = state.get("repairs_admitted") if isinstance(state, dict) else None
+        status = state.get("status") if isinstance(state, dict) else None
+        purpose = state.get("purpose") if isinstance(state, dict) else None
+        if not (
+            isinstance(state, dict)
+            and state.get("schema_version") == 1
+            and state.get("kind") == "background_authoring"
+            and state.get("input_revision") == input_revision
+            and isinstance(attempts, int)
+            and not isinstance(attempts, bool)
+            and 0 <= attempts <= MAX_BACKGROUND_REPAIR_ATTEMPTS + 1
+            and isinstance(repairs, int)
+            and not isinstance(repairs, bool)
+            and 0 <= repairs <= MAX_BACKGROUND_REPAIR_ATTEMPTS
+            and isinstance(state.get("initial_admitted"), bool)
+            and status in {"ready", "started", "rejected", "completed"}
+            and (purpose is None or isinstance(purpose, str))
+            and isinstance(state.get("last_error"), str)
+            and state.get("last_error_kind", "")
+            in {"", "artifact_error", "validation_rejected"}
+            and isinstance(state.get("last_error_label", ""), str)
+            and isinstance(state.get("last_error_output", ""), str)
+            and isinstance(state.get("last_error_returncode", 0), int)
+            and not isinstance(state.get("last_error_returncode", 0), bool)
+        ):
+            raise BackgroundArtifactError(
+                f"malformed background authoring state: {path}"
+            )
+        if status == "started" and not purpose:
+            raise BackgroundArtifactError(
+                "started background authoring state lacks a purpose"
+            )
+        return state
 
     def _write_repair_diagnostic(self, error: BaseException) -> Path:
         """Persist bounded structured validation feedback for the next editor."""

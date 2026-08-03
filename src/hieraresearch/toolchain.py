@@ -41,6 +41,44 @@ def _validation_error(label: str, result: ProcessResult) -> ToolFailure:
     return ToolFailure(label, result)
 
 
+def _validation_payload(
+    label: str,
+    result: ProcessResult,
+    *,
+    rejection_kind: str,
+) -> dict[str, Any]:
+    """Parse one typed validator receipt without guessing from exit code alone."""
+    try:
+        payload = parse_json_output(result.output)
+    except ValueError as exc:
+        raise ToolFailure(label, result) from exc
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if not result.ok:
+        recognized_rejection = bool(
+            isinstance(payload, dict)
+            and payload.get("ok") is False
+            and payload.get("failure_kind") == rejection_kind
+            and isinstance(errors, list)
+            and errors
+            and all(
+                (isinstance(error, str) and bool(error))
+                or (isinstance(error, dict) and bool(error))
+                for error in errors
+            )
+        )
+        if recognized_rejection:
+            raise _validation_error(label, result)
+        raise ToolFailure(label, result)
+    if not (
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and (errors is None or errors == [])
+        and payload.get("failure_kind") is None
+    ):
+        raise ToolFailure(label, result)
+    return payload
+
+
 def parse_json_output(output: str) -> Any:
     text = output.strip()
     if not text:
@@ -141,10 +179,10 @@ class Toolchain:
         script: str,
         *args: str,
         label: str,
+        rejection_kind: str,
     ) -> ProcessResult:
         result = self._python(script, *args, label=label, check=False)
-        if not result.ok:
-            raise _validation_error(label, result)
+        _validation_payload(label, result, rejection_kind=rejection_kind)
         return result
 
     def _json_validation_python(
@@ -152,15 +190,14 @@ class Toolchain:
         script: str,
         *args: str,
         label: str,
+        rejection_kind: str,
     ) -> Any:
         result = self._python(script, *args, label=label, check=False)
-        try:
-            payload = parse_json_output(result.output)
-        except ValueError as exc:
-            raise ToolFailure(label, result) from exc
-        if not result.ok:
-            raise _validation_error(label, result)
-        return payload
+        return _validation_payload(
+            label,
+            result,
+            rejection_kind=rejection_kind,
+        )
 
     def initialize_run(
         self,
@@ -244,6 +281,7 @@ class Toolchain:
                 "--path",
                 str(run_dir / "dimension_catalog.json"),
                 label="dimension catalog validation",
+                rejection_kind="dimension_catalog_validation",
             )
         self.validate_background_retrieval(run_dir)
 
@@ -262,6 +300,7 @@ class Toolchain:
             "tools/background_contract.py",
             *args,
             label="background validation",
+            rejection_kind="background_validation",
         )
 
     def validate_background_retrieval(self, run_dir: Path) -> None:
@@ -271,10 +310,11 @@ class Toolchain:
             "--manifest",
             str(run_dir / "background_retrieval.json"),
             label="background retrieval validation",
+            rejection_kind="retrieval_validation",
         )
 
     def import_background_retrieval(self, run_dir: Path, draft_path: Path) -> dict[str, Any]:
-        return self._json_python(
+        return self._json_validation_python(
             "tools/search_backends.py",
             "import-external",
             "--draft",
@@ -282,16 +322,18 @@ class Toolchain:
             "--manifest",
             str(run_dir / "background_retrieval.json"),
             label="background retrieval import",
+            rejection_kind="retrieval_draft_validation",
         )
 
     def background_catalog_receipt(self, catalog_path: Path | None = None) -> dict[str, str]:
         args = ["catalog", "--compact"]
         if catalog_path is not None:
             args.extend(["--path", str(catalog_path)])
-        payload = self._json_python(
+        payload = self._json_validation_python(
             "tools/background_contract.py",
             *args,
             label="background catalog receipt",
+            rejection_kind="dimension_catalog_validation",
         )
         receipt = payload.get("receipt") if isinstance(payload, dict) else None
         if (
@@ -425,8 +467,11 @@ class Toolchain:
             args.extend(["--policy", policy])
         if predictions:
             args.extend(["--predictions", str(predictions)])
-        payload = self._json_python(
-            "tools/semantic_search.py", *args, label="semantic selection"
+        payload = self._json_validation_python(
+            "tools/semantic_search.py",
+            *args,
+            label="semantic selection",
+            rejection_kind="prediction_validation",
         )
         return point, receipt, payload
 
@@ -494,18 +539,28 @@ class Toolchain:
         return self.repo_root / "runs" / task_name / tag / "candidates" / run_id
 
     def lint_schema(self, candidate_path: Path) -> dict[str, Any]:
-        result = self._python(
+        return self._json_validation_python(
             "tools/tuners/tune_tools.py",
             "lint-schema",
             "--candidate-path",
             str(candidate_path),
             label="candidate schema lint",
-            check=False,
+            rejection_kind="candidate_schema_validation",
         )
-        payload = parse_json_output(result.output)
-        if not result.ok or not payload.get("ok"):
-            raise ToolFailure("candidate schema lint", result)
-        return payload
+
+    def provided_baseline_defaults(self, candidate_path: Path) -> dict[str, Any]:
+        payload = self._json_validation_python(
+            "tools/tuners/tune_tools.py",
+            "read-default-params",
+            "--candidate-path",
+            str(candidate_path),
+            label="provided baseline defaults",
+            rejection_kind="default_params_validation",
+        )
+        defaults = payload.get("defaults") if isinstance(payload, dict) else None
+        if not isinstance(defaults, dict):
+            raise ValueError("provided baseline defaults returned no defaults object")
+        return defaults
 
     def lint_contract(
         self,
@@ -520,16 +575,38 @@ class Toolchain:
         ]
         if not require_base_params:
             args.append("--allow-missing-base-params")
-        result = self._python(
+        return self._json_validation_python(
             "tools/tuners/tune_tools.py",
             *args,
             label="candidate contract lint",
-            check=False,
+            rejection_kind="candidate_contract_validation",
         )
-        payload = parse_json_output(result.output)
-        if not result.ok or not payload.get("ok"):
-            raise ToolFailure("candidate contract lint", result)
-        return payload
+
+    def candidate_execution_revision(
+        self,
+        candidate_path: Path,
+    ) -> dict[str, Any]:
+        return self._json_python(
+            "tools/tuners/tune_tools.py",
+            "execution-revision",
+            "--candidate-path",
+            str(candidate_path),
+            label="candidate execution revision",
+        )
+
+    def apply_base_params(
+        self,
+        candidate_path: Path,
+        params_path: Path,
+    ) -> dict[str, Any]:
+        return self._json_python(
+            "tools/apply_base_params.py",
+            "--candidate-path",
+            str(candidate_path),
+            "--params-json",
+            str(params_path),
+            label="apply corrected base params",
+        )
 
     def lineage_evidence(self, run_dir: Path, parents: list[str]) -> dict[str, Any]:
         if not parents:
@@ -558,7 +635,7 @@ class Toolchain:
     def check_search_space(
         self, candidate_path: Path, space_path: Path, configs_path: Path
     ) -> dict[str, Any]:
-        result = self._python(
+        return self._json_validation_python(
             "tools/tuners/tune_tools.py",
             "check-search-space",
             "--candidate-path",
@@ -568,12 +645,8 @@ class Toolchain:
             "--configs-json",
             str(configs_path),
             label="search-space validation",
-            check=False,
+            rejection_kind="search_space_validation",
         )
-        payload = parse_json_output(result.output)
-        if not result.ok or not payload.get("ok"):
-            raise ToolFailure("search-space validation", result)
-        return payload
 
     def apply_search_space(self, candidate_path: Path, space_path: Path) -> None:
         self._python(
@@ -613,14 +686,13 @@ class Toolchain:
             label="candidate preflight",
             check=False,
         )
-        try:
-            payload = parse_json_output(result.output)
-        except ValueError as exc:
-            raise ToolFailure("candidate preflight", result) from exc
+        payload = _validation_payload(
+            "candidate preflight",
+            result,
+            rejection_kind="candidate_preflight_validation",
+        )
         if (
-            not result.ok
-            or not isinstance(payload, dict)
-            or payload.get("status") not in {"ok", "not_declared"}
+            payload.get("status") not in {"ok", "not_declared"}
             or payload.get("objective_calls") != 0
         ):
             raise ToolFailure("candidate preflight", result)
@@ -721,6 +793,31 @@ class Toolchain:
             label="evaluation budget status",
         )
 
+    def objective_attempt_receipts(
+        self,
+        candidate_path: Path,
+        *,
+        phase: str,
+        method: str,
+    ) -> list[dict[str, Any]]:
+        payload = self._json_python(
+            "tools/evaluation_budget.py",
+            "receipts",
+            "--ref-path",
+            str(candidate_path),
+            "--phase",
+            phase,
+            "--method",
+            method,
+            label="objective attempt receipts",
+        )
+        receipts = payload.get("receipts") if isinstance(payload, dict) else None
+        if not isinstance(receipts, list) or not all(
+            isinstance(receipt, dict) for receipt in receipts
+        ):
+            raise ValueError("objective receipt reader returned malformed output")
+        return receipts
+
     def select_tuning_candidate(self, run_dir: Path) -> dict[str, Any]:
         return self._json_python(
             "tools/tuners/tune_tools.py",
@@ -792,6 +889,23 @@ class Toolchain:
             label="finalize deep tuning",
         )
 
+    def verify_failure_artifact(
+        self,
+        report_path: Path,
+        failure_id: str,
+    ) -> dict[str, Any]:
+        return self._json_python(
+            "tools/tuners/tune_tools.py",
+            "render-failure",
+            "--tune-report-json",
+            str(report_path),
+            "--failure-id",
+            failure_id,
+            "--view",
+            "verification",
+            label="verify tuning failure artifact",
+        )
+
     def experience_views(self, run_dir: Path) -> dict[str, Any]:
         ledger = run_dir / "ledger.json"
         background = run_dir / "background.md"
@@ -816,16 +930,16 @@ class Toolchain:
         }
         result: dict[str, Any] = {}
         for key, (script, args) in commands.items():
-            process = self._python(script, *args, label=f"experience {key} view")
-            try:
-                result[key] = parse_json_output(process.output)
-            except ValueError:
-                result[key] = process.output.strip()
+            result[key] = self._json_python(
+                script,
+                *args,
+                label=f"experience {key} view",
+            )
         result["prior_experience"] = self.ledger_experience(run_dir)
         return result
 
     def validate_experience(self, run_dir: Path, experience_path: Path) -> None:
-        self._python(
+        self._json_validation_python(
             "tools/background_contract.py",
             "validate-experience",
             "--background",
@@ -835,6 +949,7 @@ class Toolchain:
             "--experience",
             str(experience_path),
             label="experience validation",
+            rejection_kind="experience_validation",
         )
 
     def store_experience(self, run_dir: Path, experience_path: Path) -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -14,14 +15,22 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 
 import _common  # noqa: E402
+import bo_search  # noqa: E402
+import cmaes_search  # noqa: E402
+import grid_search  # noqa: E402
 from _common import (  # noqa: E402
     DEEP_TUNE_INVOCATION_STARTED_AT,
     DeepTuneStageAdmissionError,
     DeepTuneTimeExhausted,
+    PhaseCObjectiveRecoveryError,
+    append_trial,
+    bind_phase_c_objective_reservation,
+    commit_phase_c_objective_trial,
     deduplicate_configs,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
     ensure_deep_tune_time_remaining,
+    prepare_phase_c_objective_attempt,
     set_stage_meta,
     timed_eval,
     timed_preflight,
@@ -125,6 +134,374 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             self.assertEqual(stage["elapsed_seconds"], 4.0)
             self.assertEqual(stage[DEEP_TUNE_INVOCATION_STARTED_AT], 104.0)
             resumed["_phase_c_lock_handle"].close()
+
+    def test_phase_c_recovery_retries_intent_without_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "intent-only"
+            candidate, report_path = self._fixture(run_dir)
+            first = deep_tune_time_budget(candidate, report_path, "grid")
+            prepare_phase_c_objective_attempt(
+                report_path,
+                candidate,
+                "grid",
+                {"x0": 0.25},
+                first["candidate_execution_revision"],
+            )
+            first["_phase_c_lock_handle"].close()
+
+            resumed = deep_tune_time_budget(candidate, report_path, "grid")
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
+            self.assertNotIn(_common.PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT, stage)
+            self.assertEqual(stage["trials"], [])
+            self.assertEqual(
+                _common.objective_attempt_receipts(
+                    candidate,
+                    phase="phase_c",
+                    method="grid",
+                ),
+                [],
+            )
+            resumed["_phase_c_lock_handle"].close()
+
+    def test_phase_c_recovery_consumes_orphaned_reservation_without_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "reserved-only"
+            candidate, report_path = self._fixture(run_dir)
+            first = deep_tune_time_budget(candidate, report_path, "grid")
+            intent = prepare_phase_c_objective_attempt(
+                report_path,
+                candidate,
+                "grid",
+                {"x0": 0.25},
+                first["candidate_execution_revision"],
+            )
+            receipt = _common.reserve_evaluation(
+                candidate,
+                params={"x0": 0.25},
+                phase="phase_c",
+                method="grid",
+            )
+            self.assertIsNotNone(receipt)
+            # Simulate SIGKILL before the callback can bind the receipt.
+            first["_phase_c_lock_handle"].close()
+
+            resumed = deep_tune_time_budget(candidate, report_path, "grid")
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
+            self.assertNotIn(_common.PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT, stage)
+            self.assertEqual(len(stage["trials"]), 1)
+            recovered = stage["trials"][0]
+            self.assertEqual(recovered["params"], intent["params"])
+            self.assertIsNone(recovered["score"])
+            self.assertEqual(recovered["status"], "failed")
+            self.assertEqual(
+                recovered["failure_category"],
+                _common.PHASE_C_INTERRUPTION_CATEGORY,
+            )
+            self.assertEqual(
+                recovered["objective_reservation"]["attempt_id"],
+                receipt["attempt_id"],
+            )
+            self.assertEqual(
+                recovered["candidate_execution_revision_sha256"],
+                first["candidate_execution_revision"]["revision_sha256"],
+            )
+            resumed["_phase_c_lock_handle"].close()
+
+            # Recovery is idempotent: a later restart neither appends a second
+            # failure row nor reserves another objective slot.
+            again = deep_tune_time_budget(candidate, report_path, "grid")
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
+            self.assertEqual(len(stage["trials"]), 1)
+            self.assertEqual(
+                len(
+                    _common.objective_attempt_receipts(
+                        candidate,
+                        phase="phase_c",
+                        method="grid",
+                    )
+                ),
+                1,
+            )
+            again["_phase_c_lock_handle"].close()
+
+    def test_phase_c_recovery_blocks_mismatched_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "mismatch"
+            candidate, report_path = self._fixture(run_dir)
+            first = deep_tune_time_budget(candidate, report_path, "grid")
+            prepare_phase_c_objective_attempt(
+                report_path,
+                candidate,
+                "grid",
+                {"x0": 0.25},
+                first["candidate_execution_revision"],
+            )
+            _common.reserve_evaluation(
+                candidate,
+                params={"x0": 0.75},
+                phase="phase_c",
+                method="grid",
+            )
+            first["_phase_c_lock_handle"].close()
+
+            with self.assertRaisesRegex(
+                DeepTuneStageAdmissionError,
+                "reservation does not match",
+            ):
+                deep_tune_time_budget(candidate, report_path, "grid")
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
+            self.assertIn(_common.PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT, stage)
+            self.assertEqual(stage["trials"], [])
+
+    def test_phase_c_commit_clears_intent_with_exact_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "commit"
+            candidate, report_path = self._fixture(run_dir)
+            budget = deep_tune_time_budget(candidate, report_path, "grid")
+            params = {"x0": 0.25}
+            intent = prepare_phase_c_objective_attempt(
+                report_path,
+                candidate,
+                "grid",
+                params,
+                budget["candidate_execution_revision"],
+            )
+            receipt = _common.reserve_evaluation(
+                candidate,
+                params=params,
+                phase="phase_c",
+                method="grid",
+            )
+            bind_phase_c_objective_reservation(
+                report_path,
+                candidate,
+                "grid",
+                intent,
+                receipt,
+            )
+
+            with self.assertRaises(PhaseCObjectiveRecoveryError):
+                append_trial(
+                    report_path,
+                    "grid",
+                    {"params": params, "score": 0.5},
+                )
+            with self.assertRaises(PhaseCObjectiveRecoveryError):
+                set_stage_meta(report_path, "grid", status="ok")
+
+            committed = commit_phase_c_objective_trial(
+                report_path,
+                candidate,
+                "grid",
+                intent,
+                {"params": params, "score": 0.5},
+            )
+            self.assertEqual(committed["objective_reservation"], receipt)
+            self.assertEqual(
+                committed["candidate_execution_revision_sha256"],
+                budget["candidate_execution_revision"]["revision_sha256"],
+            )
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
+            self.assertNotIn(_common.PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT, stage)
+            self.assertEqual(stage["trials"], [committed])
+            budget["_phase_c_lock_handle"].close()
+
+    def test_active_tuners_do_not_replay_recovered_orphan(self):
+        class BOTrial:
+            def __init__(
+                self,
+                params,
+                *,
+                value=None,
+                user_attrs=None,
+                system_attrs=None,
+            ):
+                self.params = dict(params)
+                self.value = value
+                self.user_attrs = dict(user_attrs or {})
+                self.system_attrs = dict(system_attrs or {})
+
+            def set_user_attr(self, key, value):
+                self.user_attrs[key] = value
+
+            def suggest_float(self, key, low, high, *, log=False):
+                return self.params[key]
+
+            def suggest_int(self, key, low, high):
+                return self.params[key]
+
+            def suggest_categorical(self, key, choices):
+                return self.params[key]
+
+        class BOStudy:
+            def __init__(self, proposal):
+                self.proposal = dict(proposal)
+                self.trials = []
+                self.stopped = False
+
+            def add_trial(self, trial):
+                self.trials.append(trial)
+
+            def enqueue_trial(self, params, *, skip_if_exists=False):
+                raise AssertionError("no deferred config should be enqueued")
+
+            def stop(self):
+                self.stopped = True
+
+            def optimize(
+                self,
+                objective,
+                *,
+                n_trials,
+                timeout,
+                show_progress_bar,
+                callbacks,
+                catch,
+            ):
+                trial = BOTrial(self.proposal)
+                try:
+                    trial.value = objective(trial)
+                except catch:
+                    trial.value = None
+                self.trials.append(trial)
+                for callback in callbacks:
+                    callback(self, trial)
+
+        for method, n_dims, module in [
+            ("grid", 1, grid_search),
+            ("bo", 3, bo_search),
+            ("cmaes", 3, cmaes_search),
+        ]:
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp) / "runs" / "unit" / method
+                candidate, report_path = self._fixture(run_dir, n_dims=n_dims)
+                if method == "cmaes":
+                    report = json.loads(report_path.read_text())
+                    report["phase_c"] = {
+                        "stages": [
+                            {
+                                "method": "bo",
+                                "status": "rejected",
+                                "trials": [],
+                            }
+                        ]
+                    }
+                    report_path.write_text(json.dumps(report))
+
+                budget = deep_tune_time_budget(
+                    candidate,
+                    report_path,
+                    method,
+                )
+                orphan_params = {
+                    f"x{index}": 1.0 for index in range(n_dims)
+                }
+                prepare_phase_c_objective_attempt(
+                    report_path,
+                    candidate,
+                    method,
+                    orphan_params,
+                    budget["candidate_execution_revision"],
+                )
+                first_receipt = _common.reserve_evaluation(
+                    candidate,
+                    params=orphan_params,
+                    phase="phase_c",
+                    method=method,
+                )
+                budget["_phase_c_lock_handle"].close()
+
+                argv = [
+                    f"{method}_search.py",
+                    "--candidate-path",
+                    str(candidate),
+                    "--tune-report-json",
+                    str(report_path),
+                ]
+                if method == "grid":
+                    argv.extend(["--resolution", "2", "--max-trials", "2"])
+                elif method == "bo":
+                    argv.extend(["--n-trials", "1"])
+                else:
+                    argv.extend(["--max-evals", "1", "--popsize", "1"])
+
+                timed_eval_mock = mock.Mock(
+                    side_effect=AssertionError(
+                        "recovered orphan reached objective reservation again"
+                    )
+                )
+                contexts = [
+                    mock.patch.object(module, "timed_eval", timed_eval_mock),
+                    mock.patch.object(module, "write_json"),
+                    mock.patch.object(sys, "argv", argv),
+                ]
+                if method == "bo":
+                    study = BOStudy(orphan_params)
+                    distribution = lambda *args, **kwargs: object()
+                    fake_optuna = types.SimpleNamespace(
+                        samplers=types.SimpleNamespace(
+                            TPESampler=distribution
+                        ),
+                        distributions=types.SimpleNamespace(
+                            FloatDistribution=distribution,
+                            IntDistribution=distribution,
+                            CategoricalDistribution=distribution,
+                        ),
+                        trial=types.SimpleNamespace(
+                            create_trial=lambda **kwargs: BOTrial(
+                                kwargs["params"],
+                                value=kwargs.get("value"),
+                                user_attrs=kwargs.get("user_attrs"),
+                                system_attrs=kwargs.get("system_attrs"),
+                            )
+                        ),
+                        logging=types.SimpleNamespace(
+                            WARNING=30,
+                            set_verbosity=lambda level: None,
+                        ),
+                        create_study=lambda **kwargs: study,
+                    )
+                    contexts.append(
+                        mock.patch.dict(sys.modules, {"optuna": fake_optuna})
+                    )
+                elif method == "cmaes":
+                    strategy = mock.Mock()
+                    strategy.stop.return_value = False
+                    strategy.ask.return_value = [
+                        [orphan_params[f"x{index}"] for index in range(n_dims)]
+                    ]
+                    fake_cma = types.SimpleNamespace(
+                        CMAEvolutionStrategy=lambda *args, **kwargs: strategy
+                    )
+                    contexts.append(
+                        mock.patch.dict(sys.modules, {"cma": fake_cma})
+                    )
+
+                with contexts[0], contexts[1], contexts[2]:
+                    if len(contexts) == 4:
+                        with contexts[3]:
+                            self.assertEqual(module.main(), 0)
+                    else:
+                        self.assertEqual(module.main(), 0)
+
+                timed_eval_mock.assert_not_called()
+                receipts = _common.objective_attempt_receipts(
+                    candidate,
+                    phase="phase_c",
+                    method=method,
+                )
+                self.assertEqual(receipts, [first_receipt])
+                report = json.loads(report_path.read_text())
+                stage = next(
+                    item
+                    for item in report["phase_c"]["stages"]
+                    if item["method"] == method
+                )
+                self.assertEqual(len(stage["trials"]), 1)
+                self.assertEqual(
+                    stage["trials"][0]["failure_category"],
+                    _common.PHASE_C_INTERRUPTION_CATEGORY,
+                )
 
     def test_elapsed_is_full_precision_and_never_blocks_work(self):
         with tempfile.TemporaryDirectory() as tmp:

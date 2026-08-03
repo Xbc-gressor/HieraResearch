@@ -19,7 +19,7 @@ from .models import (
     RunIdentity,
     Transition,
 )
-from .process import ProcessInterrupted
+from .process import ProcessError, ProcessInterrupted
 from .semantic import SemanticAdmission
 from .state_machine import next_transition
 from .toolchain import ToolFailure, Toolchain, read_task_config
@@ -66,7 +66,14 @@ class ExperimentCoordinator:
         except (ProcessInterrupted, KeyboardInterrupt) as exc:
             self._block(f"interrupted: {exc}")
             return self.status()
-        except (ArtifactError, ToolFailure, InferenceError, ValueError) as exc:
+        except (
+            ArtifactError,
+            CandidateBuildError,
+            ProcessError,
+            ToolFailure,
+            InferenceError,
+            ValueError,
+        ) as exc:
             self._block(f"{type(exc).__name__}: {exc}")
             return self.status()
         except Exception as exc:
@@ -131,6 +138,11 @@ class ExperimentCoordinator:
                 ledger_exists=self.identity.ledger_path.exists(),
                 ledger_brief=brief,
                 has_provided_baseline=self._has_provided_baseline(),
+                experience_refresh_pending=(
+                    self.experience.has_pending(brief)
+                    if self.experience is not None and brief is not None
+                    else False
+                ),
             )
             if transition is Transition.STOP:
                 if brief and brief.get("phase") == "blocked":
@@ -447,6 +459,8 @@ class ExperimentCoordinator:
         action.preflight_ready = self.candidates.preflight_is_ready(action)
         action.implemented = (
             action.contract_ready
+            or self.candidates.tuning_values_are_ready(action)
+            or self.candidates.tuning_schema_is_ready(action)
             or self.candidates.implementation_is_ready(action)
         )
         action.materialized = action.implemented or materialization_ready

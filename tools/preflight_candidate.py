@@ -36,6 +36,10 @@ from tune_tools import (  # noqa: E402
 PARAM_NAMES = ("DEFAULT_PARAMS", "BASE_PARAMS", "PARAMS")
 
 
+class CandidatePreflightRejected(ValueError):
+    """The frozen candidate/config contract failed before no-score execution."""
+
+
 def read_standalone_params(candidate_path: Path) -> tuple[str, dict]:
     """Return the first standalone params mapping declared by a candidate."""
     train_module, _ = load_candidate_modules(
@@ -64,21 +68,40 @@ def preflight_warm_configs(
     """Validate and preflight the exact authored configs without scoring."""
     try:
         configs = json.loads(configs_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid warm configs {configs_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise CandidatePreflightRejected(
+            f"invalid warm configs {configs_path}: {exc}"
+        ) from exc
     if not isinstance(configs, list) or not configs:
-        raise ValueError("warm configs must be a non-empty JSON list")
-    control = validate_provided_baseline_configs(candidate_path, configs, k_eval)
+        raise CandidatePreflightRejected(
+            "warm configs must be a non-empty JSON list"
+        )
+    try:
+        control = validate_provided_baseline_configs(
+            candidate_path, configs, k_eval
+        )
+    except (TypeError, ValueError, SyntaxError) as exc:
+        raise CandidatePreflightRejected(str(exc)) from exc
     if control["requires_parameter_transfer"]:
         receipt_path = candidate_path.parent / PARAMETER_TRANSFER_FILENAME
         try:
             transfer = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"invalid parameter-transfer receipt {receipt_path}: {exc}") from exc
-        validate_parameter_transfer(candidate_path, configs, transfer)
-    configs, search_space = _validated_warm_configs(candidate_path, configs)
+        except json.JSONDecodeError as exc:
+            raise CandidatePreflightRejected(
+                f"invalid parameter-transfer receipt {receipt_path}: {exc}"
+            ) from exc
+        try:
+            validate_parameter_transfer(candidate_path, configs, transfer)
+        except (TypeError, ValueError, SyntaxError) as exc:
+            raise CandidatePreflightRejected(str(exc)) from exc
+    try:
+        configs, search_space = _validated_warm_configs(candidate_path, configs)
+    except (TypeError, ValueError, SyntaxError) as exc:
+        raise CandidatePreflightRejected(str(exc)) from exc
     if _configured_preflight_name(candidate_path) is None:
         return {
+            "ok": True,
+            "errors": [],
             "status": "not_declared",
             "objective_calls": 0,
             "configs_checked": len(configs),
@@ -102,6 +125,8 @@ def preflight_warm_configs(
             }
         )
     return {
+        "ok": True,
+        "errors": [],
         "status": "ok",
         "objective_calls": 0,
         "configs_checked": len(configs),
@@ -139,15 +164,30 @@ def main() -> int:
         if args.k_eval is not None:
             parser.error("--k-eval requires --configs-json")
         if _configured_preflight_name(candidate_path) is None:
-            print(json.dumps({"status": "not_declared", "objective_calls": 0}))
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "errors": [],
+                        "status": "not_declared",
+                        "objective_calls": 0,
+                    }
+                )
+            )
             return 0
-        params_name, params = read_standalone_params(candidate_path)
+        try:
+            params_name, params = read_standalone_params(candidate_path)
+        except (TypeError, ValueError, SyntaxError) as exc:
+            raise CandidatePreflightRejected(str(exc)) from exc
         result = timed_preflight(params, candidate_path)
-    except Exception as exc:
+    except CandidatePreflightRejected as exc:
         print(
             json.dumps(
                 {
                     "status": "failed",
+                    "ok": False,
+                    "failure_kind": "candidate_preflight_validation",
+                    "errors": [str(exc)],
                     "objective_calls": 0,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
@@ -156,11 +196,29 @@ def main() -> int:
             ),
             file=sys.stderr,
         )
-        return 3
+        return 1
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "operational_failure",
+                    "ok": False,
+                    "errors": [str(exc)],
+                    "objective_calls": 0,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                default=str,
+            ),
+            file=sys.stderr,
+        )
+        return 2
 
     print(
         json.dumps(
             {
+                "ok": True,
+                "errors": [],
                 "status": "ok",
                 "objective_calls": 0,
                 "params_source": params_name,

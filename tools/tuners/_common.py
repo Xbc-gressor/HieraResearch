@@ -55,6 +55,9 @@ except ImportError:  # pragma: no cover - Phase C currently runs on POSIX hosts.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from evaluation_budget import (  # noqa: E402
     EvaluationBudgetExhausted,
+    evaluation_params_sha256,
+    find_run_dir,
+    objective_attempt_receipts,
     reserve_evaluation,
 )
 from run_cfg import find_framework_cfg, read_framework_cfg  # noqa: E402
@@ -66,6 +69,8 @@ DEFAULT_SCORE_FN = "evaluate_config"
 DEFAULT_PREFLIGHT_LIMIT = 180.0
 DEEP_TUNE_INVOCATION_STARTED_AT = "invocation_started_at_epoch_seconds"
 PHASE_C_LOCK_FILENAME = ".phase_c.lock"
+PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT = "active_objective_attempt"
+PHASE_C_INTERRUPTION_CATEGORY = "process_interruption_or_orphaned_work"
 
 
 class DeepTuneStageAdmissionError(RuntimeError):
@@ -78,6 +83,15 @@ class DeepTuneTimeExhausted(RuntimeError):
     def __init__(self, message: str, *, attempt_reserved: bool = False):
         super().__init__(message)
         self.attempt_reserved = attempt_reserved
+
+
+class PhaseCObjectiveRecoveryError(RuntimeError):
+    """Durable Phase-C intent and reservation receipts contradict each other."""
+
+
+def objective_slot_consumed(error: BaseException) -> bool:
+    """Whether ``timed_eval`` durably reserved before raising ``error``."""
+    return getattr(error, "objective_slot_consumed", False) is True
 
 
 class _PhaseCLock:
@@ -535,6 +549,23 @@ def _deep_tune_time_budget_locked(
                 f"(status={stage.get('status')!r})"
             )
 
+    if stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT) is not None:
+        try:
+            reconcile_phase_c_objective_attempt(
+                report_path,
+                Path(ref_path),
+                method,
+                candidate_execution_revision,
+            )
+        except (PhaseCObjectiveRecoveryError, ValueError) as exc:
+            raise DeepTuneStageAdmissionError(str(exc)) from None
+        # Reconciliation atomically rewrites the report. Continue from that
+        # durable view so later invocation accounting cannot overwrite it.
+        report = read_tune_report(report_path)
+        phase_c = report["phase_c"]
+        stages = phase_c["stages"]
+        stage = next(item for item in stages if item.get("method") == method)
+
     # Recover every abandoned invocation conservatively before calculating the
     # candidate-level total. A legal report has at most the active method here,
     # but stale timestamps must never disappear even in a malformed report.
@@ -735,6 +766,7 @@ def timed_eval(
     method: str = "unknown",
     phase_time_limit_seconds: float | Callable[[], float] | None = None,
     expected_execution_revision: dict | None = None,
+    on_objective_reserved: Callable[[dict], None] | None = None,
 ) -> float:
     """Run ONE config eval under task and Phase-C hard wall-clock limits.
 
@@ -752,12 +784,48 @@ def timed_eval(
     # remains. A live supplier is resolved again after atomic reservation so
     # lock contention/I/O cannot grant the child a stale, overly large timeout.
     phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
-    reserve_evaluation(
+    reservation = reserve_evaluation(
         candidate_path,
         params=params,
         phase=phase,
         method=method,
     )
+    try:
+        if reservation is not None and on_objective_reserved is not None:
+            on_objective_reserved(dict(reservation))
+        return _timed_eval_after_reservation(
+            evaluate,
+            make_model,
+            params,
+            candidate_path,
+            phase_limit=phase_limit,
+            phase_time_limit_seconds=phase_time_limit_seconds,
+            expected_execution_revision=expected_execution_revision,
+        )
+    except BaseException as exc:
+        # A returned reservation receipt is the exact durable boundary. If the
+        # reservation helper itself raises, its append state is ambiguous and
+        # callers must block without fabricating a failed objective row; the
+        # append-only log remains authoritative on recovery.
+        if reservation is not None:
+            setattr(exc, "objective_slot_consumed", True)
+            setattr(exc, "objective_reservation", dict(reservation))
+            if isinstance(exc, DeepTuneTimeExhausted):
+                exc.attempt_reserved = True
+        raise
+
+
+def _timed_eval_after_reservation(
+    evaluate,
+    make_model,
+    params: dict,
+    candidate_path: Any,
+    *,
+    phase_limit: float | None,
+    phase_time_limit_seconds: float | Callable[[], float] | None,
+    expected_execution_revision: dict | None,
+) -> float:
+    """Execute one evaluation after the caller has a durable reservation."""
     try:
         phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
     except DeepTuneTimeExhausted as exc:
@@ -954,6 +1022,465 @@ def write_tune_report(report_path: Path, report: dict) -> None:
     tmp.replace(report_path)
 
 
+def _phase_c_stage(report: dict, method: str) -> dict:
+    phase_c = report.get("phase_c")
+    stages = phase_c.get("stages") if isinstance(phase_c, dict) else None
+    if not isinstance(stages, list) or not all(
+        isinstance(stage, dict) for stage in stages
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            "phase_c.stages must be a list of objects"
+        )
+    matching = [stage for stage in stages if stage.get("method") == method]
+    if len(matching) != 1:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} must have exactly one stage"
+        )
+    stage = matching[0]
+    trials = stage.get("trials")
+    if not isinstance(trials, list) or not all(
+        isinstance(trial, dict) for trial in trials
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} trials must be a list of objects"
+        )
+    return stage
+
+
+def _json_native_mapping(value: dict, *, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise PhaseCObjectiveRecoveryError(f"{label} must be an object")
+    try:
+        native = json.loads(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+                default=_to_native,
+            )
+        )
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise PhaseCObjectiveRecoveryError(
+            f"{label} is not finite JSON: {exc}"
+        ) from exc
+    if not isinstance(native, dict):  # pragma: no cover - guarded above
+        raise PhaseCObjectiveRecoveryError(f"{label} must remain an object")
+    return native
+
+
+def _execution_revision_sha256(candidate_execution_revision: dict) -> str:
+    revision = (
+        candidate_execution_revision.get("revision_sha256")
+        if isinstance(candidate_execution_revision, dict)
+        else None
+    )
+    if (
+        not isinstance(revision, str)
+        or not revision.startswith("sha256:")
+        or len(revision) != len("sha256:") + 64
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            "candidate execution revision requires revision_sha256"
+        )
+    return revision
+
+
+def _phase_c_intent_id(payload: dict) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_phase_c_objective_intent(
+    intent: Any,
+    *,
+    method: str,
+    candidate_execution_revision: dict | None = None,
+) -> dict:
+    if not isinstance(intent, dict):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} active objective intent is not an object"
+        )
+    required = {
+        "schema_version",
+        "kind",
+        "intent_id",
+        "status",
+        "run_id",
+        "phase",
+        "method",
+        "params",
+        "params_sha256",
+        "candidate_execution_revision_sha256",
+        "reservation_attempt_ids_before",
+        "stage_trial_count_before",
+    }
+    optional = {"reservation"}
+    if set(intent) - required - optional or required - set(intent):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} active objective intent has invalid fields"
+        )
+    if (
+        intent.get("schema_version") != 1
+        or intent.get("kind") != "phase_c_objective_attempt"
+        or intent.get("phase") != "phase_c"
+        or intent.get("method") != method
+        or intent.get("status") not in {"prepared", "reserved"}
+        or not isinstance(intent.get("run_id"), str)
+        or not intent.get("run_id")
+        or not isinstance(intent.get("reservation_attempt_ids_before"), list)
+        or any(
+            not isinstance(attempt_id, str) or not attempt_id
+            for attempt_id in intent.get("reservation_attempt_ids_before", [])
+        )
+        or len(intent.get("reservation_attempt_ids_before", []))
+        != len(set(intent.get("reservation_attempt_ids_before", [])))
+        or not isinstance(intent.get("stage_trial_count_before"), int)
+        or isinstance(intent.get("stage_trial_count_before"), bool)
+        or intent["stage_trial_count_before"] < 0
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} active objective intent is malformed"
+        )
+    params = _json_native_mapping(intent.get("params"), label="objective params")
+    if intent.get("params_sha256") != evaluation_params_sha256(params):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective params digest mismatch"
+        )
+    identity_payload = {
+        key: intent[key]
+        for key in required
+        if key not in {"intent_id", "status"}
+    }
+    if intent.get("intent_id") != _phase_c_intent_id(identity_payload):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective intent identity mismatch"
+        )
+    if candidate_execution_revision is not None and (
+        intent.get("candidate_execution_revision_sha256")
+        != _execution_revision_sha256(candidate_execution_revision)
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective intent belongs to a stale "
+            "candidate execution revision"
+        )
+    if intent["status"] == "prepared" and "reservation" in intent:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} prepared objective cannot claim a reservation"
+        )
+    if intent["status"] == "reserved" and not isinstance(
+        intent.get("reservation"), dict
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} reserved objective lacks its receipt"
+        )
+    return dict(intent)
+
+
+def _validate_phase_c_reservation(intent: dict, receipt: Any) -> dict:
+    if not isinstance(receipt, dict):
+        raise PhaseCObjectiveRecoveryError(
+            "Phase-C objective reservation receipt must be an object"
+        )
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("kind") != "score_attempt"
+        or not isinstance(receipt.get("attempt_id"), str)
+        or not receipt.get("attempt_id")
+        or receipt.get("run_id") != intent["run_id"]
+        or receipt.get("phase") != "phase_c"
+        or receipt.get("method") != intent["method"]
+        or receipt.get("params_sha256") != intent["params_sha256"]
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {intent['method']!r} reservation does not match "
+            "its active objective intent"
+        )
+    return dict(receipt)
+
+
+def prepare_phase_c_objective_attempt(
+    report_path: Path,
+    candidate_path: Path,
+    method: str,
+    params: dict,
+    candidate_execution_revision: dict,
+) -> dict:
+    """Persist a side-effect-free intent immediately before ``timed_eval``."""
+    report = read_tune_report(report_path)
+    stage = _phase_c_stage(report, method)
+    if stage.get("status") != "running":
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} is not running"
+        )
+    if stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT) is not None:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} has an unreconciled objective intent"
+        )
+    native_params = _json_native_mapping(params, label="objective params")
+    receipts = objective_attempt_receipts(
+        candidate_path,
+        phase="phase_c",
+        method=method,
+    )
+    identity_payload = {
+        "schema_version": 1,
+        "kind": "phase_c_objective_attempt",
+        "run_id": Path(candidate_path).resolve().parent.name,
+        "phase": "phase_c",
+        "method": method,
+        "params": native_params,
+        "params_sha256": evaluation_params_sha256(native_params),
+        "candidate_execution_revision_sha256": (
+            _execution_revision_sha256(candidate_execution_revision)
+        ),
+        "reservation_attempt_ids_before": [
+            receipt["attempt_id"] for receipt in receipts
+        ],
+        "stage_trial_count_before": len(stage["trials"]),
+    }
+    intent = {
+        **identity_payload,
+        "intent_id": _phase_c_intent_id(identity_payload),
+        "status": "prepared",
+    }
+    stage[PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT] = intent
+    write_tune_report(report_path, report)
+    return intent
+
+
+def bind_phase_c_objective_reservation(
+    report_path: Path,
+    candidate_path: Path,
+    method: str,
+    intent: dict,
+    receipt: dict,
+) -> None:
+    """Bind the exact append-only reservation to a prepared stage intent."""
+    report = read_tune_report(report_path)
+    stage = _phase_c_stage(report, method)
+    active = _validate_phase_c_objective_intent(
+        stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT),
+        method=method,
+    )
+    if active.get("intent_id") != intent.get("intent_id"):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective intent changed before reservation"
+        )
+    if active["status"] != "prepared":
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective is already reserved"
+        )
+    durable = objective_attempt_receipts(
+        candidate_path,
+        phase="phase_c",
+        method=method,
+    )
+    before_ids = active["reservation_attempt_ids_before"]
+    durable_ids = [item["attempt_id"] for item in durable]
+    validated = _validate_phase_c_reservation(active, receipt)
+    if (
+        durable_ids != [*before_ids, validated["attempt_id"]]
+        or durable[-1] != validated
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} reservation log advanced unexpectedly"
+        )
+    active["status"] = "reserved"
+    active["reservation"] = validated
+    stage[PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT] = active
+    write_tune_report(report_path, report)
+
+
+def cancel_phase_c_objective_attempt(
+    report_path: Path,
+    candidate_path: Path,
+    method: str,
+    intent: dict,
+) -> None:
+    """Clear a prepared intent only when no objective reservation was appended."""
+    report = read_tune_report(report_path)
+    stage = _phase_c_stage(report, method)
+    active = _validate_phase_c_objective_intent(
+        stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT),
+        method=method,
+    )
+    if active.get("intent_id") != intent.get("intent_id"):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective intent changed before cancellation"
+        )
+    durable = objective_attempt_receipts(
+        candidate_path,
+        phase="phase_c",
+        method=method,
+    )
+    durable_ids = [item["attempt_id"] for item in durable]
+    if (
+        active["status"] != "prepared"
+        or durable_ids != active["reservation_attempt_ids_before"]
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} cannot cancel a reserved objective"
+        )
+    stage.pop(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT)
+    write_tune_report(report_path, report)
+
+
+def commit_phase_c_objective_trial(
+    report_path: Path,
+    candidate_path: Path,
+    method: str,
+    intent: dict,
+    trial: dict,
+) -> dict:
+    """Atomically append one objective outcome and clear its active intent."""
+    report = read_tune_report(report_path)
+    stage = _phase_c_stage(report, method)
+    active = _validate_phase_c_objective_intent(
+        stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT),
+        method=method,
+    )
+    if active.get("intent_id") != intent.get("intent_id"):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective intent changed before commit"
+        )
+    if len(stage["trials"]) != active["stage_trial_count_before"]:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} trials changed during objective execution"
+        )
+    native_trial = _json_native_mapping(trial, label="objective trial")
+    trial_params = native_trial.get("params")
+    if (
+        not isinstance(trial_params, dict)
+        or evaluation_params_sha256(trial_params) != active["params_sha256"]
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} committed trial params do not match its intent"
+        )
+
+    durable = objective_attempt_receipts(
+        candidate_path,
+        phase="phase_c",
+        method=method,
+    )
+    before_ids = active["reservation_attempt_ids_before"]
+    durable_ids = [item["attempt_id"] for item in durable]
+    reservation = active.get("reservation")
+    if active["status"] == "reserved":
+        reservation = _validate_phase_c_reservation(active, reservation)
+        if (
+            durable_ids != [*before_ids, reservation["attempt_id"]]
+            or durable[-1] != reservation
+        ):
+            raise PhaseCObjectiveRecoveryError(
+                f"Phase-C method {method!r} reserved receipt is no longer authoritative"
+            )
+    elif find_run_dir(candidate_path) is None and durable_ids == before_ids:
+        # Standalone tuner/unit-test uses intentionally have no run-level ledger.
+        reservation = None
+    elif len(durable) == len(before_ids) + 1 and durable_ids[:-1] == before_ids:
+        # The score or exception returned before the callback persisted its bind.
+        reservation = _validate_phase_c_reservation(active, durable[-1])
+    else:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective outcome has no exact reservation"
+        )
+
+    native_trial["candidate_execution_revision_sha256"] = active[
+        "candidate_execution_revision_sha256"
+    ]
+    if reservation is not None:
+        native_trial["objective_reservation"] = reservation
+        native_trial["objective_slot_consumed"] = True
+    stage["trials"].append(native_trial)
+    stage.pop(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT)
+    write_tune_report(report_path, report)
+    return native_trial
+
+
+def reconcile_phase_c_objective_attempt(
+    report_path: Path,
+    candidate_path: Path,
+    method: str,
+    candidate_execution_revision: dict,
+) -> dict | None:
+    """Forward-complete an interrupted Phase-C reservation without replaying it."""
+    report = read_tune_report(report_path)
+    stage = _phase_c_stage(report, method)
+    raw_active = stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT)
+    if raw_active is None:
+        return None
+    active = _validate_phase_c_objective_intent(
+        raw_active,
+        method=method,
+        candidate_execution_revision=candidate_execution_revision,
+    )
+    if active.get("run_id") != Path(candidate_path).resolve().parent.name:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} objective intent run_id mismatch"
+        )
+    if len(stage["trials"]) != active["stage_trial_count_before"]:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} trials advanced without clearing its intent"
+        )
+    durable = objective_attempt_receipts(
+        candidate_path,
+        phase="phase_c",
+        method=method,
+    )
+    before_ids = active["reservation_attempt_ids_before"]
+    durable_ids = [item["attempt_id"] for item in durable]
+    if durable_ids == before_ids and active["status"] == "prepared":
+        # The process died before objective admission. Clearing the intent makes
+        # the deterministic proposal safe to retry without charging a slot.
+        stage.pop(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT)
+        write_tune_report(report_path, report)
+        return None
+    if len(durable_ids) != len(before_ids) + 1 or durable_ids[:-1] != before_ids:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} reservation history contradicts its intent"
+        )
+    reservation = _validate_phase_c_reservation(active, durable[-1])
+    if active["status"] == "reserved" and active.get("reservation") != reservation:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} persisted reservation receipt changed"
+        )
+    failure_receipt = {
+        "schema_version": 1,
+        "kind": "orphaned_objective_reservation",
+        "attempt_id": reservation["attempt_id"],
+        "params_sha256": reservation["params_sha256"],
+        "message": (
+            "objective reservation has no persisted score or failure outcome "
+            "after process interruption"
+        ),
+    }
+    trial = {
+        "params": active["params"],
+        "score": None,
+        "status": "failed",
+        "failure_category": PHASE_C_INTERRUPTION_CATEGORY,
+        "config_infeasible": False,
+        "objective_slot_consumed": True,
+        "candidate_execution_revision_sha256": active[
+            "candidate_execution_revision_sha256"
+        ],
+        "objective_reservation": reservation,
+        "failure_receipt": failure_receipt,
+    }
+    stage["trials"].append(trial)
+    stage.pop(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT)
+    write_tune_report(report_path, report)
+    return trial
+
+
 def append_preflight_attempt(
     report_path: Path,
     *,
@@ -995,6 +1522,11 @@ def append_trial(report_path: Path, method: str, trial: dict) -> None:
     if stage is None:
         stage = {"method": method, "trials": []}
         stages.append(stage)
+    if stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT) is not None:
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} has an active objective intent; "
+            "commit its outcome atomically"
+        )
     stage.setdefault("trials", []).append(trial)
     write_tune_report(report_path, report)
 
@@ -1014,6 +1546,15 @@ def set_stage_meta(report_path: Path, method: str, **meta: Any) -> None:
         stage = {"method": method, "trials": []}
         stages.append(stage)
     status = meta.get("status")
+    if (
+        status is not None
+        and status != "running"
+        and stage.get(PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT) is not None
+    ):
+        raise PhaseCObjectiveRecoveryError(
+            f"Phase-C method {method!r} cannot become terminal with an "
+            "active objective intent"
+        )
     if status is not None and status != "running":
         invocation_started = stage.pop(DEEP_TUNE_INVOCATION_STARTED_AT, None)
         if "elapsed_seconds" not in meta and (

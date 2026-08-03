@@ -1583,8 +1583,22 @@ def cmd_record_visit(args: argparse.Namespace) -> int:
 
 
 def cmd_import_external(args: argparse.Namespace) -> int:
-    draft = json.loads(args.draft.read_text(encoding="utf-8"))
-    manifest = import_external_draft(draft)
+    raw_draft = args.draft.read_text(encoding="utf-8")
+    try:
+        draft = json.loads(raw_draft)
+        manifest = import_external_draft(draft)
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "failure_kind": "retrieval_draft_validation",
+                    "errors": [str(exc)],
+                },
+                indent=2,
+            )
+        )
+        return 1
     reused = False
     if args.manifest.is_file():
         existing = load_manifest(args.manifest)
@@ -1615,7 +1629,10 @@ def cmd_import_external(args: argparse.Namespace) -> int:
 def cmd_validate(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     errors = validate_manifest(manifest)
-    print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
+    payload = {"ok": not errors, "errors": errors}
+    if errors:
+        payload["failure_kind"] = "retrieval_validation"
+    print(json.dumps(payload, indent=2))
     return 0 if not errors else 1
 
 

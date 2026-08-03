@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 
+EXPERIENCE_SCHEMA_VERSION = 4
+TUNING_VALUES_SCHEMA_VERSION = 1
+
+
 IDEA_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -43,6 +47,80 @@ DEBUG_SCHEMA: dict[str, Any] = {
     "required": ["verdict", "rationale", "corrected_config", "repair_instructions"],
     "additionalProperties": False,
 }
+
+
+def tuning_values_schema(k: int) -> dict[str, Any]:
+    """Structured proposal for warm configs and a canonical search space.
+
+    Dynamic parameter names are represented as entries rather than arbitrary
+    object properties. Python turns the accepted response into the two run-local
+    JSON mappings consumed by the authoritative tuner helpers.
+    """
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError("tuning-values schema requires a positive K")
+    primitive = {"type": ["string", "number", "boolean", "null"]}
+    return {
+        "type": "object",
+        "properties": {
+            "schema_version": {
+                "type": "integer",
+                "enum": [TUNING_VALUES_SCHEMA_VERSION],
+            },
+            "warm_configs": {
+                "type": "array",
+                # Claude's structured-output grammar accepts array minItems
+                # only as 0 or 1.  Exact cardinality remains a Python-owned
+                # domain invariant in TuningValues.from_response.
+                "minItems": 1,
+                "description": f"Exactly {k} complete, distinct configurations.",
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string"},
+                            "value": primitive,
+                        },
+                        "required": ["key", "value"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "search_space": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["int", "float", "categorical"],
+                        },
+                        "low": {"type": ["number", "null"]},
+                        "high": {"type": ["number", "null"]},
+                        "log": {"type": "boolean"},
+                        "options": {
+                            "type": "array",
+                            "items": primitive,
+                        },
+                    },
+                    "required": [
+                        "key",
+                        "kind",
+                        "low",
+                        "high",
+                        "log",
+                        "options",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["schema_version", "warm_configs", "search_space"],
+        "additionalProperties": False,
+    }
 
 
 def prediction_schema(*, include_cost: bool) -> dict[str, Any]:
@@ -177,7 +255,10 @@ def _target_evidence_schema() -> dict[str, Any]:
 EXPERIENCE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "schema_version": {"type": "integer", "enum": [4]},
+        "schema_version": {
+            "type": "integer",
+            "enum": [EXPERIENCE_SCHEMA_VERSION],
+        },
         "updated_at_run": {"type": "string"},
         "generation": {"type": "integer"},
         "summary": {"type": "string"},

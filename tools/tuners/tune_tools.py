@@ -80,7 +80,7 @@ def _read_search_space(train_path: Path) -> dict:
     (lint-contract's job to explain why)."""
     try:
         return _read_literal_mapping(train_path, "SEARCH_SPACE")
-    except (OSError, SyntaxError, ValueError) as exc:
+    except (SyntaxError, ValueError) as exc:
         raise SystemExit(f"invalid SEARCH_SPACE contract: {exc}") from None
 
 
@@ -845,6 +845,10 @@ def lint_contract(train_path: Path, *, require_base_params: bool = True) -> dict
         "ok": not errors,
         "n_dims": len(search_space) if isinstance(search_space, dict) else None,
         "keys": sorted(search_space) if isinstance(search_space, dict) else [],
+        # Reuse the same normalized executable-structure identity that binds
+        # cached objective rows.  Debug repair admission uses it to reject
+        # comment-only/no-op edits without inventing a second code hash.
+        "candidate_structure_sha256": _candidate_structure_sha256(train_path),
         "make_model_defined": make_model_defined,
         "make_model_called": make_model_called,
         "errors": errors,
@@ -1495,6 +1499,11 @@ def _read_literal_mapping(train_path: Path, name: str) -> dict:
     except ValueError as exc:
         raise ValueError(f"{name} in {train_path} {exc}") from exc
     return value
+
+
+def read_default_params(train_path: Path) -> dict:
+    """Read the observed provided-baseline control without importing candidate code."""
+    return _read_literal_mapping(train_path, "DEFAULT_PARAMS")
 
 
 def _candidate_structure_sha256(candidate_path: Path) -> str:
@@ -2995,12 +3004,23 @@ def cmd_lint_contract(args) -> int:
         args.candidate_path,
         require_base_params=not args.allow_missing_base_params,
     )
+    if not result["ok"]:
+        result = {**result, "failure_kind": "candidate_contract_validation"}
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
 
 
 def cmd_select_method(args) -> int:
     print(json.dumps(select_method(len(_read_search_space(args.candidate_path)))))
+    return 0
+
+
+def cmd_execution_revision(args) -> int:
+    try:
+        result = _candidate_execution_revision(args.candidate_path)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -3066,8 +3086,29 @@ def cmd_render_failure(args) -> int:
 
 def cmd_lint_schema(args) -> int:
     result = lint_schema(args.candidate_path)
+    if not result["ok"]:
+        result = {**result, "failure_kind": "candidate_schema_validation"}
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
+
+
+def cmd_read_default_params(args) -> int:
+    try:
+        defaults = read_default_params(args.candidate_path)
+    except (SyntaxError, ValueError) as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "failure_kind": "default_params_validation",
+                    "errors": [str(exc)],
+                },
+                indent=2,
+            )
+        )
+        return 1
+    print(json.dumps({"ok": True, "defaults": defaults}, indent=2))
+    return 0
 
 
 def cmd_check_search_space(args) -> int:
@@ -3075,6 +3116,8 @@ def cmd_check_search_space(args) -> int:
     proposed = json.loads(Path(args.space_json).read_text())
     configs = json.loads(Path(args.configs_json).read_text())
     result = check_search_space(schema, proposed, configs)
+    if not result["ok"]:
+        result = {**result, "failure_kind": "search_space_validation"}
     if result["ok"]:
         # Persist the finalized (expanded) space back to the SAME artifact so the
         # caller never hand-extracts finalized_space from stdout — writing the whole
@@ -3169,9 +3212,23 @@ def build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--candidate-path", required=True, type=Path)
     ls.set_defaults(func=cmd_lint_schema)
 
+    dp = sub.add_parser(
+        "read-default-params",
+        help="Read a provided baseline's literal DEFAULT_PARAMS without importing it.",
+    )
+    dp.add_argument("--candidate-path", required=True, type=Path)
+    dp.set_defaults(func=cmd_read_default_params)
+
     sm = sub.add_parser("select-method", help="Pick the Phase C method from a candidate's SEARCH_SPACE.")
     sm.add_argument("--candidate-path", required=True, type=Path)
     sm.set_defaults(func=cmd_select_method)
+
+    er = sub.add_parser(
+        "execution-revision",
+        help="Read the authoritative candidate/evaluator execution revision.",
+    )
+    er.add_argument("--candidate-path", required=True, type=Path)
+    er.set_defaults(func=cmd_execution_revision)
 
     pa = sub.add_parser(
         "phase-c-action",
@@ -3203,7 +3260,11 @@ def build_parser() -> argparse.ArgumentParser:
     rf = sub.add_parser("render-failure", help="Read a frozen failure receipt or retrieve its traceback.")
     rf.add_argument("--tune-report-json", required=True, type=Path)
     rf.add_argument("--failure-id", required=True)
-    rf.add_argument("--view", choices=("receipt", "full", "lines"), default="receipt")
+    rf.add_argument(
+        "--view",
+        choices=("receipt", "verification", "full", "lines"),
+        default="receipt",
+    )
     rf.add_argument("--line-range", help="1-based inclusive START:END; only for --view lines")
     rf.set_defaults(func=cmd_render_failure)
 

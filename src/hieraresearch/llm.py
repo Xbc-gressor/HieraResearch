@@ -40,6 +40,10 @@ class InferenceContractError(InferenceError):
     pass
 
 
+class InferenceRequestError(InferenceError):
+    """The provider rejected the immutable request contract; replay is unsafe."""
+
+
 class StructuredBackend(Protocol):
     def generate(
         self,
@@ -150,6 +154,17 @@ class ModelGateway:
                     f"recorded {purpose} response no longer satisfies schema {schema_version}: {exc}"
                 ) from exc
 
+        failed = self.journal.nonretryable_failure(
+            purpose=purpose,
+            schema_version=schema_version,
+            input_revision=input_revision,
+            model=self.model,
+        )
+        if failed is not None:
+            raise InferenceRequestError(
+                f"recorded non-retryable {purpose} request failure: {failed}"
+            )
+
         invocation = self.journal.begin(
             purpose=purpose,
             schema_version=schema_version,
@@ -179,7 +194,11 @@ class ModelGateway:
             self.journal.complete(invocation, response=response, metadata=metadata)
             return parsed
         except BaseException as exc:
-            self.journal.fail(invocation, exc)
+            self.journal.fail(
+                invocation,
+                exc,
+                retryable=not isinstance(exc, InferenceRequestError),
+            )
             raise
 
     def edit(self, spec: AgentEditSpec, *, validate: Callable[[], T]) -> T:
@@ -219,16 +238,23 @@ class ModelGateway:
             request=request,
         )
         try:
-            result, metadata = self.edit_backend.edit(
-                purpose=spec.purpose,
-                model=self.model,
-                cwd=spec.cwd,
-                system_prompt=spec.system_prompt,
-                prompt=spec.prompt,
-                tools=spec.tools,
-                policy=policy,
-                max_turns=spec.max_turns,
-            )
+            try:
+                result, metadata = self.edit_backend.edit(
+                    purpose=spec.purpose,
+                    model=self.model,
+                    cwd=spec.cwd,
+                    system_prompt=spec.system_prompt,
+                    prompt=spec.prompt,
+                    tools=spec.tools,
+                    policy=policy,
+                    max_turns=spec.max_turns,
+                )
+            except InferenceError:
+                raise
+            except Exception as exc:
+                raise InferenceError(
+                    f"{spec.purpose} edit backend failed: {exc}"
+                ) from exc
             if paths_revision(spec.immutable_input_paths) != immutable_revision:
                 raise StaleInferenceError(
                     f"{spec.purpose} immutable inputs changed during the edit"
@@ -255,6 +281,20 @@ class ModelGateway:
         except BaseException as exc:
             self.journal.fail(invocation, exc)
             raise
+
+    def completed_edit_matches(self, spec: AgentEditSpec) -> bool:
+        """Whether a completed journal receipt owns the current edit outputs."""
+        outputs = (*spec.write_paths, *spec.derived_output_paths)
+        return bool(outputs) and all(
+            self.journal.completed_output_matches(
+                purpose=spec.purpose,
+                schema_version=spec.schema_version,
+                model=self.model,
+                output_path=path,
+                immutable_input_paths=spec.immutable_input_paths,
+            )
+            for path in outputs
+        )
 
 
 class AnthropicMessagesBackend:
@@ -308,6 +348,20 @@ class AnthropicMessagesBackend:
                 },
             )
         except Exception as exc:
+            body = getattr(exc, "body", None)
+            error_body = body.get("error") if isinstance(body, dict) else None
+            error_type = (
+                error_body.get("type")
+                if isinstance(error_body, dict)
+                else body.get("type") if isinstance(body, dict) else None
+            )
+            if (
+                getattr(exc, "status_code", None) == 400
+                and error_type == "invalid_request_error"
+            ):
+                raise InferenceRequestError(
+                    f"Claude Messages rejected the request contract: {exc}"
+                ) from exc
             raise InferenceError(f"Claude Messages request failed: {exc}") from exc
         if getattr(message, "stop_reason", None) in {"refusal", "max_tokens"}:
             raise InferenceContractError(

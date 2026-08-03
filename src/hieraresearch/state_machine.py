@@ -13,6 +13,7 @@ def next_transition(
     ledger_exists: bool,
     ledger_brief: dict[str, Any] | None,
     has_provided_baseline: bool,
+    experience_refresh_pending: bool = False,
 ) -> Transition:
     if state.phase in {CoordinatorPhase.BLOCKED, CoordinatorPhase.COMPLETED}:
         return Transition.STOP
@@ -34,6 +35,11 @@ def next_transition(
             return Transition.EVALUATE_WARM_CONFIGS
         if not active.tuning_complete:
             return Transition.DEEP_TUNE
+
+    if experience_refresh_pending:
+        if not ledger_exists or ledger_brief is None:
+            raise ValueError("pending experience refresh requires an existing ledger")
+        return Transition.REFRESH_EXPERIENCE
 
     if not ledger_exists:
         return Transition.ADMIT_BASELINE if has_provided_baseline else Transition.ADMIT_ROUND

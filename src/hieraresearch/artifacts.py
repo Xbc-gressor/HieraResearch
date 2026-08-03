@@ -224,6 +224,63 @@ class InvocationJournal:
                 )
         return None
 
+    def nonretryable_failure(
+        self,
+        *,
+        purpose: str,
+        schema_version: int,
+        input_revision: str,
+        model: str | None = None,
+    ) -> str | None:
+        """Return an exact recorded request failure that must not be replayed."""
+        if not self.root.exists():
+            return None
+        for path in sorted(
+            self.root.glob(f"{self._purpose_name(purpose)}-*"), reverse=True
+        ):
+            receipt_path = path / "receipt.json"
+            request_path = path / "request.json"
+            if not receipt_path.is_file():
+                continue
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ArtifactError(
+                    f"invalid invocation receipt {receipt_path}: {exc}"
+                ) from exc
+            if not isinstance(receipt, dict):
+                raise ArtifactError(
+                    f"invocation receipt must be an object: {receipt_path}"
+                )
+            if (
+                receipt.get("purpose") != purpose
+                or receipt.get("status") != "failed"
+                or receipt.get("retryable") is not False
+            ):
+                continue
+            try:
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ArtifactError(
+                    f"invalid failed invocation request {request_path}: {exc}"
+                ) from exc
+            if receipt.get("input_revision") != json_revision(request):
+                raise ArtifactError(
+                    f"failed invocation request revision mismatch: {path}"
+                )
+            if (
+                receipt.get("schema_version") == schema_version
+                and receipt.get("input_revision") == input_revision
+                and (model is None or receipt.get("model") == model)
+            ):
+                error = receipt.get("error")
+                if not isinstance(error, str) or not error:
+                    raise ArtifactError(
+                        f"non-retryable invocation lacks its error: {path}"
+                    )
+                return error
+        return None
+
     def completed_output_matches(
         self,
         *,
@@ -339,7 +396,13 @@ class InvocationJournal:
             path=path,
         )
 
-    def fail(self, path: Path, error: BaseException) -> None:
+    def fail(
+        self,
+        path: Path,
+        error: BaseException,
+        *,
+        retryable: bool = True,
+    ) -> None:
         receipt_path = path / "receipt.json"
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -349,4 +412,6 @@ class InvocationJournal:
             return
         receipt["status"] = "failed"
         receipt["error"] = f"{type(error).__name__}: {error}"
+        receipt["error_type"] = type(error).__name__
+        receipt["retryable"] = retryable
         atomic_write_json(receipt_path, receipt)

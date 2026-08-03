@@ -45,7 +45,6 @@ guard: exactly one warm config may run, `k_eval` must be one, and a literal
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import random
 import sys
@@ -56,6 +55,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))  # tools/ for apply_base_params
 import apply_base_params  # noqa: E402
+from evaluation_budget import (  # noqa: E402
+    evaluation_params_sha256,
+    objective_attempt_receipts,
+)
 from _common import (  # noqa: E402
     EvaluationBudgetExhausted,
     resolve_score_fn,
@@ -65,6 +68,7 @@ from _common import (  # noqa: E402
     cast_params_to_search_space,
     is_finite_score,
     load_candidate_modules,
+    objective_slot_consumed,
     read_tune_report,
     search_space_for_json,
     write_json,
@@ -81,11 +85,195 @@ from tune_tools import (  # noqa: E402
     _validate_schema_values,
     finite_warm_incumbent_rows,
     lint_contract,
+    read_default_params,
     validate_parameter_transfer,
 )
 
 CRASHED = 3  # a not-yet-scored config raised; the caller diagnoses + fixes + resumes
 BUDGET_EXHAUSTED = 4  # no score_fn call was started; coordinator ends the run
+
+
+class ObjectiveProcessInterruption(RuntimeError):
+    """A reserved Phase-A objective has no durable result after restart."""
+
+
+class ObjectiveRecoveryError(RuntimeError):
+    """Durable Phase-A intent and reservation artifacts are contradictory."""
+
+
+def _failure_category(
+    error: BaseException,
+    failure: dict,
+    candidate_path: Path,
+) -> str:
+    """Attribute only traceback-proven candidate failures to editable code."""
+    if isinstance(error, TimeoutError):
+        return "timeout_or_resource"
+    receipt = failure.get("failure_receipt") if isinstance(failure, dict) else None
+    frames = receipt.get("frames") if isinstance(receipt, dict) else None
+    candidate = candidate_path.resolve()
+    if isinstance(frames, list):
+        for frame in frames:
+            raw_path = frame.get("path") if isinstance(frame, dict) else None
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            try:
+                if Path(raw_path).resolve() == candidate:
+                    return "candidate_code_incompatibility"
+            except OSError:
+                continue
+    return "unknown_non_candidate_failure"
+
+
+def _reservation_ids(receipts: list[dict]) -> list[str]:
+    return [receipt["attempt_id"] for receipt in receipts]
+
+
+def _validate_reservation_for_intent(receipt: dict, intent: dict) -> None:
+    expected = {
+        "schema_version": 1,
+        "kind": "score_attempt",
+        "run_id": intent["run_id"],
+        "phase": "phase_a",
+        "method": "warmstart",
+        "params_sha256": intent["params_sha256"],
+    }
+    if not isinstance(receipt, dict) or any(
+        receipt.get(key) != value for key, value in expected.items()
+    ):
+        raise ObjectiveRecoveryError(
+            "Phase-A objective reservation does not match its durable intent"
+        )
+    attempt_id = receipt.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ObjectiveRecoveryError(
+            "Phase-A objective reservation requires a nonempty attempt_id"
+        )
+
+
+def _validate_active_objective(
+    active: dict,
+    *,
+    candidate_path: Path,
+    candidate_code_revision: dict,
+    configs: list[dict],
+    selected_indices: list[int],
+    search_space: dict,
+) -> None:
+    """Validate a persisted Phase-A intent against the work selected on disk."""
+    if not isinstance(active, dict) or active.get("schema_version") != 1:
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective must be a schema-1 object"
+        )
+    if active.get("phase") != "phase_a" or active.get("method") != "warmstart":
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective has the wrong phase or method"
+        )
+    if active.get("run_id") != candidate_path.resolve().parent.name:
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective run_id does not match the candidate"
+        )
+    if active.get("candidate_execution_revision") != candidate_code_revision:
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective candidate revision does not match disk"
+        )
+    position = active.get("evaluation_position")
+    proposed_index = active.get("proposed_index")
+    if (
+        not isinstance(position, int)
+        or isinstance(position, bool)
+        or position < 0
+        or position >= len(configs)
+        or proposed_index != selected_indices[position]
+    ):
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective does not match the persisted selection"
+        )
+    expected_params = cast_params_to_search_space(
+        dict(configs[position]), search_space
+    )
+    if (
+        active.get("params") != expected_params
+        or active.get("params_sha256")
+        != evaluation_params_sha256(expected_params)
+    ):
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective params do not match the selected config"
+        )
+    before = active.get("attempt_ids_before")
+    if (
+        not isinstance(before, list)
+        or any(not isinstance(value, str) or not value for value in before)
+        or len(before) != len(set(before))
+    ):
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective attempt_ids_before is malformed"
+        )
+    status = active.get("status")
+    if status not in {"intent_persisted", "reservation_persisted"}:
+        raise ObjectiveRecoveryError(
+            "phase_a.active_objective has an unknown status"
+        )
+    if status == "reservation_persisted":
+        _validate_reservation_for_intent(active.get("reservation"), active)
+    elif active.get("reservation") is not None:
+        raise ObjectiveRecoveryError(
+            "unreserved Phase-A intent cannot contain a reservation"
+        )
+
+
+def _reconcile_active_objective(
+    active: dict | None,
+    *,
+    candidate_path: Path,
+    candidate_code_revision: dict,
+    configs: list[dict],
+    selected_indices: list[int],
+    search_space: dict,
+) -> dict | None:
+    """Return one interrupted reservation, or None when no append occurred."""
+    if active is None:
+        return None
+    _validate_active_objective(
+        active,
+        candidate_path=candidate_path,
+        candidate_code_revision=candidate_code_revision,
+        configs=configs,
+        selected_indices=selected_indices,
+        search_space=search_space,
+    )
+    receipts = objective_attempt_receipts(
+        candidate_path,
+        phase="phase_a",
+        method="warmstart",
+    )
+    current_ids = _reservation_ids(receipts)
+    before = active["attempt_ids_before"]
+    if current_ids[: len(before)] != before:
+        raise ObjectiveRecoveryError(
+            "Phase-A objective reservation history no longer matches its intent"
+        )
+    appended = receipts[len(before) :]
+    if not appended:
+        if active["status"] == "reservation_persisted":
+            raise ObjectiveRecoveryError(
+                "persisted Phase-A reservation is missing from the attempt log"
+            )
+        return None
+    if len(appended) != 1:
+        raise ObjectiveRecoveryError(
+            "Phase-A objective intent has ambiguous appended reservations"
+        )
+    reservation = appended[0]
+    _validate_reservation_for_intent(reservation, active)
+    if (
+        active["status"] == "reservation_persisted"
+        and active["reservation"] != reservation
+    ):
+        raise ObjectiveRecoveryError(
+            "persisted Phase-A reservation differs from the attempt log"
+        )
+    return reservation
 
 
 def _params_key(params: dict) -> str:
@@ -257,25 +445,6 @@ def select_warm_config_indices(
     return result
 
 
-def _literal_default_params(candidate_path: Path) -> dict | None:
-    tree = ast.parse(candidate_path.read_text())
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(
-            isinstance(target, ast.Name) and target.id == "DEFAULT_PARAMS"
-            for target in targets
-        ):
-            continue
-        try:
-            value = ast.literal_eval(node.value)
-        except (ValueError, SyntaxError):
-            return None
-        return value if isinstance(value, dict) else None
-    return None
-
-
 def validate_provided_baseline_configs(
     candidate_path: Path,
     configs: list,
@@ -285,8 +454,6 @@ def validate_provided_baseline_configs(
     brief_path = candidate_path.parent / "_candidate_brief.json"
     try:
         brief = json.loads(brief_path.read_text())
-    except OSError as exc:
-        raise ValueError(f"warmstart requires candidate brief {brief_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid candidate brief {brief_path}: {exc}") from exc
     schema_version = brief.get("schema_version") if isinstance(brief, dict) else None
@@ -351,11 +518,12 @@ def validate_provided_baseline_configs(
         raise ValueError("provided baseline requires exactly one warm config")
     if k_eval not in (None, 1):
         raise ValueError("provided baseline requires k_eval=1")
-    defaults = _literal_default_params(candidate_path)
-    if defaults is None:
+    try:
+        defaults = read_default_params(candidate_path)
+    except (SyntaxError, ValueError):
         raise ValueError(
             "provided baseline requires a module-level literal DEFAULT_PARAMS"
-        )
+        ) from None
     if configs[0] != defaults:
         raise ValueError(
             "provided baseline warm config must equal its literal DEFAULT_PARAMS"
@@ -451,6 +619,7 @@ def main() -> int:
         )
     previous_report = read_tune_report(args.tune_report_json)
     previous_phase_a = previous_report.get("phase_a", {})
+    previous_active_objective = previous_phase_a.get("active_objective")
     try:
         selection = select_warm_config_indices(
             len(all_configs),
@@ -563,6 +732,15 @@ def main() -> int:
         for key, row in cache_rows.items()
     }
 
+    interrupted_reservation = _reconcile_active_objective(
+        previous_active_objective,
+        candidate_path=args.candidate_path,
+        candidate_code_revision=candidate_code_revision,
+        configs=configs,
+        selected_indices=selected_indices,
+        search_space=search_space,
+    )
+
     def _cache_receipt() -> dict:
         receipt = {
             "schema_version": 1,
@@ -617,6 +795,17 @@ def main() -> int:
         # untouched suffix and force duplicate objective calls on the next run.
         "warm_score_cache": _cache_receipt(),
     }
+    if interrupted_reservation is not None:
+        # Reconciliation itself is not the finalizer.  Keep the exact active
+        # reservation durable while rebuilding the running projection below,
+        # so a second process death cannot erase the only link between the
+        # append-only attempt and its not-yet-written terminal row.
+        previous_active_objective = dict(previous_active_objective)
+        previous_active_objective["status"] = "reservation_persisted"
+        previous_active_objective["reservation"] = dict(
+            interrupted_reservation
+        )
+        report["phase_a"]["active_objective"] = previous_active_objective
     if parameter_transfer is not None:
         report["phase_a"]["parameter_transfer"] = parameter_transfer
         report["phase_a"]["inherited_control"] = {
@@ -656,6 +845,79 @@ def main() -> int:
             )
         return receipt
 
+    if interrupted_reservation is not None:
+        active = previous_active_objective
+        interrupted_position = active["evaluation_position"]
+        interrupted_params = dict(active["params"])
+        for position in range(interrupted_position):
+            prefix_params = cast_params_to_search_space(
+                dict(configs[position]), search_space
+            )
+            prefix_key = _params_key(prefix_params)
+            if prefix_key not in cache:
+                raise ObjectiveRecoveryError(
+                    "interrupted Phase-A objective has an uncommitted prefix"
+                )
+            wsc.append(
+                {
+                    "params": prefix_params,
+                    "score": cache[prefix_key],
+                    **_trial_receipt(selected_indices[position]),
+                }
+            )
+
+        attempt_id = interrupted_reservation["attempt_id"]
+        interruption = ObjectiveProcessInterruption(
+            f"objective attempt {attempt_id} was interrupted after its durable "
+            "reservation; no score result will be inferred or replayed"
+        )
+        interruption_text = (
+            f"ObjectiveProcessInterruption: {interruption}\n"
+        )
+        failure = record_failure(
+            report_path=args.tune_report_json,
+            candidate_path=args.candidate_path,
+            phase="phase_a",
+            method="warmstart",
+            params=interrupted_params,
+            error=interruption,
+            traceback_text=interruption_text,
+        )
+        trial_receipt = _trial_receipt(active["proposed_index"])
+        failed_row = {
+            "params": interrupted_params,
+            "score": None,
+            "status": "failed",
+            "failure_category": "process_interruption",
+            "objective_attempt_id": attempt_id,
+            "objective_reservation": interrupted_reservation,
+            **trial_receipt,
+            **failure,
+        }
+        wsc.append(failed_row)
+        trials_attempted += 1
+        terminal_failure = {
+            "phase": "a",
+            "status": "crashed",
+            "crash_index": active["proposed_index"],
+            "evaluation_position": interrupted_position,
+            "crash_params": interrupted_params,
+            "objective_slot_consumed": True,
+            "failure_category": "process_interruption",
+            "objective_attempt_id": attempt_id,
+            "objective_reservation": interrupted_reservation,
+            "candidate_execution_revision": candidate_code_revision,
+            **failure,
+        }
+        report["phase_a"]["trials_attempted"] = trials_attempted
+        report["phase_a"]["warm_start_configs"] = wsc
+        report["phase_a"]["status"] = "crashed"
+        report["phase_a"]["terminal_failure"] = terminal_failure
+        report["phase_a"].pop("active_objective", None)
+        write_tune_report(args.tune_report_json, report)
+        write_json(terminal_failure)
+        return CRASHED
+
     for i, raw in enumerate(configs):
         proposed_index = selected_indices[i]
         params = cast_params_to_search_space(dict(raw), search_space)
@@ -679,30 +941,38 @@ def main() -> int:
                     error=exc,
                     traceback_text=tb,
                 )
+                failure_category = _failure_category(
+                    exc, failure, args.candidate_path
+                )
                 preflight_report.setdefault("attempts", []).append(
                     {
                         "params": params,
                         "source": "warmstart",
                         "status": "failed",
+                        "failure_category": failure_category,
                         **failure,
                     }
                 )
                 preflight_report["invocations"] = len(preflight_report["attempts"])
                 preflight_report["status"] = "failed"
+                terminal_failure = {
+                    "phase": "preflight",
+                    "status": "crashed",
+                    "crash_index": proposed_index,
+                    "evaluation_position": i,
+                    "crash_params": params,
+                    "objective_slot_consumed": False,
+                    "objective_attempt_id": None,
+                    "objective_reservation": None,
+                    "failure_category": failure_category,
+                    "candidate_execution_revision": candidate_code_revision,
+                    **failure,
+                }
                 report["phase_a"]["warm_start_configs"] = wsc
                 report["phase_a"]["status"] = "preflight_failed"
+                report["phase_a"]["terminal_failure"] = terminal_failure
                 write_tune_report(args.tune_report_json, report)
-                write_json(
-                    {
-                        "phase": "preflight",
-                        "status": "crashed",
-                        "crash_index": proposed_index,
-                        "evaluation_position": i,
-                        "crash_params": params,
-                        "objective_slot_consumed": False,
-                        **failure,
-                    }
-                )
+                write_json(terminal_failure)
                 return CRASHED
             preflight_report.setdefault("attempts", []).append(
                 {
@@ -719,6 +989,47 @@ def main() -> int:
         if key in cache:
             wsc.append({"params": params, "score": cache[key], **trial_receipt})
         else:
+            attempt_receipts_before = objective_attempt_receipts(
+                args.candidate_path,
+                phase="phase_a",
+                method="warmstart",
+            )
+            active_objective = {
+                "schema_version": 1,
+                "phase": "phase_a",
+                "method": "warmstart",
+                "status": "intent_persisted",
+                "run_id": args.candidate_path.resolve().parent.name,
+                "proposed_index": proposed_index,
+                "evaluation_position": i,
+                "params": params,
+                "params_sha256": evaluation_params_sha256(params),
+                "candidate_execution_revision": candidate_code_revision,
+                "attempt_ids_before": _reservation_ids(
+                    attempt_receipts_before
+                ),
+                "reservation": None,
+            }
+            report["phase_a"]["active_objective"] = active_objective
+            write_tune_report(args.tune_report_json, report)
+            reserved: dict[str, dict | None] = {"receipt": None}
+
+            def _persist_reservation(reservation: dict) -> None:
+                _validate_reservation_for_intent(
+                    reservation, active_objective
+                )
+                if reservation["attempt_id"] in active_objective[
+                    "attempt_ids_before"
+                ]:
+                    raise ObjectiveRecoveryError(
+                        "new Phase-A reservation reuses an earlier attempt_id"
+                    )
+                reserved["receipt"] = dict(reservation)
+                active_objective["status"] = "reservation_persisted"
+                active_objective["reservation"] = dict(reservation)
+                report["phase_a"]["active_objective"] = active_objective
+                write_tune_report(args.tune_report_json, report)
+
             try:
                 score = timed_eval(
                     evaluate,
@@ -728,8 +1039,10 @@ def main() -> int:
                     phase="phase_a",
                     method="warmstart",
                     expected_execution_revision=candidate_code_revision,
+                    on_objective_reserved=_persist_reservation,
                 )
             except EvaluationBudgetExhausted as exc:
+                report["phase_a"].pop("active_objective", None)
                 if preflight_enabled:
                     preflight_report["status"] = "ok"
                 recovered = list(wsc)
@@ -814,7 +1127,11 @@ def main() -> int:
                     }
                 )
                 return BUDGET_EXHAUSTED
+            except ObjectiveRecoveryError:
+                raise
             except Exception as exc:
+                if not objective_slot_consumed(exc):
+                    raise
                 trials_attempted += 1
                 report["phase_a"]["trials_attempted"] = trials_attempted
                 tb = traceback.format_exc()
@@ -828,21 +1145,49 @@ def main() -> int:
                     error=exc,
                     traceback_text=tb,
                 )
+                failure_category = _failure_category(
+                    exc, failure, args.candidate_path
+                )
+                objective_reservation = reserved["receipt"] or getattr(
+                    exc, "objective_reservation", None
+                )
+                objective_fields = (
+                    {
+                        "objective_attempt_id": objective_reservation[
+                            "attempt_id"
+                        ],
+                        "objective_reservation": objective_reservation,
+                    }
+                    if objective_reservation is not None
+                    else {}
+                )
                 wsc.append({
                     "params": params,
                     "score": None,
                     "status": "failed",
+                    "failure_category": failure_category,
+                    **objective_fields,
                     **trial_receipt,
                     **failure,
                 })
+                terminal_failure = {
+                    "phase": "a",
+                    "status": "crashed",
+                    "crash_index": proposed_index,
+                    "evaluation_position": i,
+                    "crash_params": params,
+                    "objective_slot_consumed": True,
+                    "failure_category": failure_category,
+                    "candidate_execution_revision": candidate_code_revision,
+                    **objective_fields,
+                    **failure,
+                }
                 report["phase_a"]["warm_start_configs"] = wsc
                 report["phase_a"]["status"] = "crashed"
+                report["phase_a"]["terminal_failure"] = terminal_failure
+                report["phase_a"].pop("active_objective", None)
                 write_tune_report(args.tune_report_json, report)
-                write_json({"phase": "a", "status": "crashed",
-                            "crash_index": proposed_index,
-                            "evaluation_position": i,
-                            "crash_params": params,
-                            **failure})
+                write_json(terminal_failure)
                 return CRASHED
             trials_attempted += 1
             report["phase_a"]["trials_attempted"] = trials_attempted
@@ -850,6 +1195,7 @@ def main() -> int:
             cache[key] = score
             cache_rows[key] = {"params": params, "score": score}
             report["phase_a"]["warm_score_cache"] = _cache_receipt()
+            report["phase_a"].pop("active_objective", None)
         report["phase_a"]["warm_start_configs"] = wsc
         write_tune_report(args.tune_report_json, report)
 

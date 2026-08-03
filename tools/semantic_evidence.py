@@ -164,7 +164,7 @@ def experience_cited_ids(experience: Any) -> tuple[set[str], set[str]]:
 
     This is the shared trust boundary for gain-context rendering, prediction
     validation, and candidate admission.  Keep collection mechanics here so
-    producer and consumers cannot silently diverge as experience schema 3
+    producer and consumers cannot silently diverge as the experience schema
     evolves.
     """
     if not isinstance(experience, dict):

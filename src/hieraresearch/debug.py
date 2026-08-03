@@ -11,6 +11,10 @@ from .artifacts import ArtifactError, atomic_write_json
 from .models import DebugDecision, DebugVerdict
 
 
+class DebugAllowanceExhausted(ArtifactError):
+    """A valid debug journal has already spent the configured allowance."""
+
+
 @dataclass(frozen=True)
 class FailureEvidence:
     run_id: str
@@ -19,6 +23,9 @@ class FailureEvidence:
     crash_params: dict[str, Any]
     failure_receipt: dict[str, Any]
     failure_ref: dict[str, Any]
+    objective_slot_consumed: bool
+    failure_category: str
+    candidate_execution_revision: dict[str, Any] | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -37,10 +44,37 @@ class FailureEvidence:
         params = payload.get("crash_params")
         receipt = payload.get("failure_receipt")
         ref = payload.get("failure_ref")
+        objective_slot_consumed = payload.get("objective_slot_consumed")
+        failure_category = payload.get("failure_category")
+        candidate_execution_revision = payload.get(
+            "candidate_execution_revision"
+        )
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
             raise ValueError("crash_index must be a non-negative integer")
         if not isinstance(params, dict) or not isinstance(receipt, dict) or not isinstance(ref, dict):
             raise ValueError("debuggable crash requires params, failure_receipt, and failure_ref")
+        if not isinstance(objective_slot_consumed, bool):
+            raise ValueError("debuggable crash must state objective_slot_consumed")
+        if payload["phase"] == "preflight" and objective_slot_consumed:
+            raise ValueError("preflight failure cannot consume an objective slot")
+        if payload["phase"] == "a" and not objective_slot_consumed:
+            raise ValueError("Phase-A failure must follow an objective reservation")
+        if payload["phase"] == "a" and not (
+            isinstance(candidate_execution_revision, dict)
+            and isinstance(
+                candidate_execution_revision.get("structure_sha256"), str
+            )
+            and isinstance(
+                candidate_execution_revision.get("revision_sha256"), str
+            )
+        ):
+            raise ValueError(
+                "Phase-A failure must carry its candidate execution revision"
+            )
+        if failure_category != "candidate_code_incompatibility":
+            raise ValueError(
+                "only deterministically attributed candidate-code failures are debuggable"
+            )
         evidence = cls(
             run_id=run_id,
             phase=str(payload["phase"]),
@@ -48,6 +82,13 @@ class FailureEvidence:
             crash_params=params,
             failure_receipt=receipt,
             failure_ref=ref,
+            objective_slot_consumed=objective_slot_consumed,
+            failure_category=failure_category,
+            candidate_execution_revision=(
+                candidate_execution_revision
+                if isinstance(candidate_execution_revision, dict)
+                else None
+            ),
         )
         _ = evidence.fingerprint
         return evidence
@@ -62,7 +103,12 @@ class DebugPolicy:
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"schema_version": 1, "failures": {}, "code_repairs": {}}
+            return {
+                "schema_version": 1,
+                "failures": {},
+                "code_repairs": {},
+                "code_repair_reservations": {},
+            }
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -71,27 +117,53 @@ class DebugPolicy:
             raise ArtifactError(f"unsupported debug attempt state: {self.path}")
         if not isinstance(value.get("failures"), dict) or not isinstance(value.get("code_repairs"), dict):
             raise ArtifactError(f"malformed debug attempt state: {self.path}")
+        reservations = value.setdefault("code_repair_reservations", {})
+        if not isinstance(reservations, dict):
+            raise ArtifactError(f"malformed debug repair reservations: {self.path}")
         return value
 
-    def reserve_analysis(self, evidence: FailureEvidence) -> None:
+    def reserve_analysis(
+        self,
+        evidence: FailureEvidence,
+        *,
+        reservation_id: str | None = None,
+    ) -> None:
         state = self._load()
         key = f"{evidence.run_id}:{evidence.fingerprint}"
-        if int(state["failures"].get(key, 0)) >= 1:
-            raise ArtifactError(
+        previous = state["failures"].get(key)
+        if reservation_id is not None and previous == reservation_id:
+            return
+        if previous is not None and previous != 0:
+            raise DebugAllowanceExhausted(
                 f"debug analyzer already invoked for candidate/failure {key}"
             )
-        state["failures"][key] = 1
+        state["failures"][key] = reservation_id if reservation_id is not None else 1
         atomic_write_json(self.path, state)
 
-    def reserve_code_repair(self, run_id: str) -> None:
+    def reserve_code_repair(
+        self,
+        run_id: str,
+        *,
+        reservation_id: str | None = None,
+    ) -> None:
         state = self._load()
+        if reservation_id is not None:
+            previous_run = state["code_repair_reservations"].get(reservation_id)
+            if previous_run == run_id:
+                return
+            if previous_run is not None:
+                raise ArtifactError(
+                    f"debug repair reservation {reservation_id} belongs to {previous_run}"
+                )
         count = int(state["code_repairs"].get(run_id, 0))
         if count >= self.max_code_repairs_per_candidate:
-            raise ArtifactError(
+            raise DebugAllowanceExhausted(
                 f"candidate {run_id} reached its code repair cap "
                 f"({self.max_code_repairs_per_candidate})"
             )
         state["code_repairs"][run_id] = count + 1
+        if reservation_id is not None:
+            state["code_repair_reservations"][reservation_id] = run_id
         atomic_write_json(self.path, state)
 
 

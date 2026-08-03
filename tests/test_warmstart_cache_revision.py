@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 
 import warmstart_eval  # noqa: E402
+import evaluation_budget  # noqa: E402
 
 
 class WarmstartCacheRevisionTests(unittest.TestCase):
@@ -95,6 +96,350 @@ def evaluate_config(make_model, params):
         ):
             self.assertEqual(warmstart_eval.main(), 0)
         return timed_eval
+
+    def test_phase_a_crash_receipt_marks_reserved_candidate_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, configs_path, report_path = self._fixture(
+                Path(tmp),
+                provided=False,
+            )
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs_path),
+                "--tune-report-json",
+                str(report_path),
+            ]
+            output = io.StringIO()
+            evaluation_error = RuntimeError("candidate bug")
+            evaluation_error.objective_slot_consumed = True
+            failure = {
+                "error": "RuntimeError: candidate bug",
+                "failure_ref": {
+                    "schema_version": 1,
+                    "failure_id": "fail-unit",
+                    "artifact": "_failures/fail-unit.json",
+                    "sha256": "sha256:" + "0" * 64,
+                },
+                "failure_receipt": {
+                    "frames": [{"path": str(candidate), "line": 8}],
+                },
+            }
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    warmstart_eval,
+                    "timed_eval",
+                    side_effect=evaluation_error,
+                ),
+                mock.patch.object(
+                    warmstart_eval,
+                    "record_failure",
+                    return_value=failure,
+                ),
+                mock.patch("sys.stdout", new=output),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                self.assertEqual(warmstart_eval.main(), warmstart_eval.CRASHED)
+
+            receipt = json.loads(output.getvalue())
+            self.assertTrue(receipt["objective_slot_consumed"])
+            self.assertEqual(
+                receipt["failure_category"],
+                "candidate_code_incompatibility",
+            )
+            report = json.loads(report_path.read_text())
+            failed = report["phase_a"]["warm_start_configs"][0]
+            self.assertEqual(
+                failed["failure_category"],
+                "candidate_code_incompatibility",
+            )
+
+    def test_reservation_failure_does_not_create_a_failed_warm_trial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, configs_path, report_path = self._fixture(
+                Path(tmp),
+                provided=False,
+            )
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs_path),
+                "--tune-report-json",
+                str(report_path),
+            ]
+            record_failure = mock.Mock()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    warmstart_eval,
+                    "timed_eval",
+                    side_effect=OSError("attempt log unavailable"),
+                ),
+                mock.patch.object(
+                    warmstart_eval,
+                    "record_failure",
+                    record_failure,
+                ),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                with self.assertRaisesRegex(OSError, "attempt log unavailable"):
+                    warmstart_eval.main()
+
+            record_failure.assert_not_called()
+            phase_a = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(phase_a["trials_attempted"], 0)
+            self.assertEqual(phase_a["warm_start_configs"], [])
+
+    def test_preflight_crash_receipt_never_claims_an_objective_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, configs_path, report_path = self._fixture(
+                Path(tmp),
+                provided=False,
+            )
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs_path),
+                "--tune-report-json",
+                str(report_path),
+            ]
+            output = io.StringIO()
+            failure = {
+                "error": "RuntimeError: candidate preflight bug",
+                "failure_ref": {
+                    "schema_version": 1,
+                    "failure_id": "fail-preflight-unit",
+                    "artifact": "_failures/fail-preflight-unit.json",
+                    "sha256": "sha256:" + "0" * 64,
+                },
+                "failure_receipt": {
+                    "frames": [{"path": str(candidate), "line": 8}],
+                },
+            }
+            timed_eval = mock.Mock()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    warmstart_eval,
+                    "resolve_preflight_fn",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    warmstart_eval,
+                    "timed_preflight",
+                    side_effect=RuntimeError("candidate preflight bug"),
+                ),
+                mock.patch.object(warmstart_eval, "timed_eval", timed_eval),
+                mock.patch.object(
+                    warmstart_eval,
+                    "record_failure",
+                    return_value=failure,
+                ),
+                mock.patch("sys.stdout", new=output),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                self.assertEqual(warmstart_eval.main(), warmstart_eval.CRASHED)
+
+            timed_eval.assert_not_called()
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["phase"], "preflight")
+            self.assertFalse(receipt["objective_slot_consumed"])
+            self.assertEqual(
+                receipt["failure_category"],
+                "candidate_code_incompatibility",
+            )
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["phase_a"]["status"], "preflight_failed")
+            self.assertEqual(report["phase_a"]["trials_attempted"], 0)
+
+    def test_restart_forward_closes_reservation_appended_before_result(self) -> None:
+        class SimulatedProcessKill(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "interrupted"
+            candidate, configs_path, report_path = self._fixture(
+                run_dir,
+                provided=True,
+            )
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 3})
+            )
+            (run_dir / "ledger.json").write_text(json.dumps({"records": []}))
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs_path),
+                "--tune-report-json",
+                str(report_path),
+            ]
+
+            def kill_after_append(
+                _evaluate, _make_model, params, candidate_path, **_kwargs
+            ):
+                evaluation_budget.reserve_evaluation(
+                    candidate_path,
+                    params=params,
+                    phase="phase_a",
+                    method="warmstart",
+                )
+                raise SimulatedProcessKill()
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    warmstart_eval,
+                    "timed_eval",
+                    side_effect=kill_after_append,
+                ),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                with self.assertRaises(SimulatedProcessKill):
+                    warmstart_eval.main()
+
+            interrupted = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(interrupted["active_objective"]["status"], "intent_persisted")
+            self.assertEqual(interrupted["trials_attempted"], 0)
+
+            score_again = mock.Mock()
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(warmstart_eval, "timed_eval", score_again),
+                mock.patch("sys.stdout", new=output),
+            ):
+                self.assertEqual(warmstart_eval.main(), warmstart_eval.CRASHED)
+
+            score_again.assert_not_called()
+            terminal = json.loads(output.getvalue())
+            self.assertEqual(terminal["failure_category"], "process_interruption")
+            self.assertTrue(terminal["objective_slot_consumed"])
+            self.assertEqual(terminal["objective_attempt_id"], "eval-000001")
+            report = json.loads(report_path.read_text())
+            phase_a = report["phase_a"]
+            self.assertNotIn("active_objective", phase_a)
+            self.assertEqual(phase_a["trials_attempted"], 1)
+            self.assertEqual(phase_a["terminal_failure"], terminal)
+            failed = phase_a["warm_start_configs"][0]
+            self.assertEqual(failed["objective_attempt_id"], "eval-000001")
+            self.assertEqual(
+                failed["candidate_execution_revision_sha256"],
+                terminal["candidate_execution_revision"]["revision_sha256"],
+            )
+
+    def test_second_kill_during_reservation_recovery_cannot_erase_intent(self) -> None:
+        class SimulatedProcessKill(BaseException):
+            pass
+
+        class SimulatedRecoveryKill(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "double-interrupted"
+            candidate, configs_path, report_path = self._fixture(
+                run_dir,
+                provided=True,
+            )
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 3})
+            )
+            (run_dir / "ledger.json").write_text(json.dumps({"records": []}))
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs_path),
+                "--tune-report-json",
+                str(report_path),
+            ]
+
+            def kill_after_append(
+                _evaluate, _make_model, params, candidate_path, **_kwargs
+            ):
+                evaluation_budget.reserve_evaluation(
+                    candidate_path,
+                    params=params,
+                    phase="phase_a",
+                    method="warmstart",
+                )
+                raise SimulatedProcessKill()
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    warmstart_eval,
+                    "timed_eval",
+                    side_effect=kill_after_append,
+                ),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                with self.assertRaises(SimulatedProcessKill):
+                    warmstart_eval.main()
+
+            real_write = warmstart_eval.write_tune_report
+
+            def kill_after_recovery_projection(path, report):
+                real_write(path, report)
+                active = report.get("phase_a", {}).get("active_objective")
+                if (
+                    isinstance(active, dict)
+                    and active.get("status") == "reservation_persisted"
+                ):
+                    raise SimulatedRecoveryKill()
+
+            score_again = mock.Mock()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(warmstart_eval, "timed_eval", score_again),
+                mock.patch.object(
+                    warmstart_eval,
+                    "write_tune_report",
+                    side_effect=kill_after_recovery_projection,
+                ),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                with self.assertRaises(SimulatedRecoveryKill):
+                    warmstart_eval.main()
+            score_again.assert_not_called()
+
+            recovered = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(
+                recovered["active_objective"]["status"],
+                "reservation_persisted",
+            )
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(warmstart_eval, "timed_eval", score_again),
+                mock.patch("sys.stdout", new=output),
+            ):
+                self.assertEqual(warmstart_eval.main(), warmstart_eval.CRASHED)
+
+            score_again.assert_not_called()
+            terminal = json.loads(output.getvalue())
+            self.assertEqual(terminal["failure_category"], "process_interruption")
+            self.assertEqual(terminal["objective_attempt_id"], "eval-000001")
+            attempts = [
+                json.loads(line)
+                for line in (run_dir / "evaluation_attempts.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            reservations = [
+                row for row in attempts if row.get("kind") == "score_attempt"
+            ]
+            self.assertEqual(len(reservations), 1)
 
     def _assert_revision_bound_resume(self, *, provided: bool) -> None:
         with tempfile.TemporaryDirectory() as tmp:

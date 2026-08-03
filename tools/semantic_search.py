@@ -42,6 +42,7 @@ from typing import Any, Iterable
 
 from background_contract import (
     ContractError,
+    READABLE_EXPERIENCE_SCHEMA_VERSIONS,
     derive_hypothesis_selection,
     load_registry,
     validate_background_markdown,
@@ -83,6 +84,12 @@ CONDITIONED_PREDICTION_SCHEMA_VERSION = 2
 LEGACY_PREDICTION_SCHEMA_VERSION = 1
 POLICY_RECEIPT_SCHEMA_VERSION = 6
 POLICIES = {"coverage", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
+
+
+class PredictionValidationRejected(ContractError):
+    """The model-authored prediction payload failed deterministic validation."""
+
+
 DEFAULT_POLICY_CONFIG = {
     "coverage_weight": 0.10,
     "cost_weight": 0.20,
@@ -122,10 +129,10 @@ def _write_object(path: Path, value: dict[str, Any]) -> None:
 
 
 def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
-    """Return the exact replaceable-belief revision used for one prediction.
+    """Return the exact replaceable-belief revision used for one selection.
 
-    The full experience remains in the ledger.  Predictions copy this compact
-    receipt so ``select`` can reject a stale or hand-waved history adjustment.
+    The full experience remains in the ledger.  Policy receipts and predictions
+    copy this compact receipt so ``select`` can reject stale conditioning.
     """
     if experience in (None, {}):
         return {
@@ -138,7 +145,7 @@ def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
     generation = experience.get("generation")
     updated_at_run = experience.get("updated_at_run")
     if (
-        experience.get("schema_version") != 3
+        experience.get("schema_version") not in READABLE_EXPERIENCE_SCHEMA_VERSIONS
         or not isinstance(generation, int)
         or isinstance(generation, bool)
         or generation < 0
@@ -146,8 +153,9 @@ def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
         or not updated_at_run.isdigit()
     ):
         raise ContractError(
-            "ledger.experience must be a valid schema-3 snapshot with generation "
-            "and numeric updated_at_run before gain prediction"
+            "ledger.experience must use a readable experience schema "
+            f"{sorted(READABLE_EXPERIENCE_SCHEMA_VERSIONS)} with generation "
+            "and numeric updated_at_run before semantic acquisition"
         )
     return {
         "generation": generation,
@@ -848,15 +856,9 @@ def _prediction_map(
         )
     if value.get("proposal_set_revision") != proposal_set.get("proposal_set_revision"):
         errors.append("predictions.proposal_set_revision does not match proposals")
-    try:
-        expected_experience = _experience_snapshot_receipt(experience)
-    except ContractError as exc:
-        errors.append(str(exc))
-        expected_experience = {
-            "generation": None,
-            "updated_at_run": None,
-            "revision": None,
-        }
+    # The current ledger snapshot is an authoritative input contract.  Do not
+    # turn its corruption into an authored-prediction rejection/correction.
+    expected_experience = _experience_snapshot_receipt(experience)
     has_experience_snapshot = expected_experience["revision"] is not None
     gain_directions = mechanical_gain_directions(ledger or {}, experience)
     if schema_version == LEGACY_PREDICTION_SCHEMA_VERSION:
@@ -1236,7 +1238,9 @@ def select_proposal(
             ledger=ledger,
         )
         if prediction_errors:
-            raise ContractError("invalid policy predictions: " + "; ".join(prediction_errors))
+            raise PredictionValidationRejected(
+                "invalid policy predictions: " + "; ".join(prediction_errors)
+            )
 
     ranked: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
     llm_judgment_weight = float(cfg["llm_intelligence_score"]) / 100.0
@@ -1662,6 +1666,19 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         return args.func(args)
+    except PredictionValidationRejected as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "failure_kind": "prediction_validation",
+                    "errors": [str(exc)],
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     except (ContractError, SemanticSpaceError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "errors": [str(exc)]}, indent=2), file=sys.stderr)
         return 1

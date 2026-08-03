@@ -498,6 +498,9 @@ class TuningFinalizationTests(unittest.TestCase):
                     "kind": "score_attempt",
                     "attempt_id": f"eval-{index:06d}",
                     "run_id": "001",
+                    "phase": "phase_a",
+                    "method": "warmstart",
+                    "params_sha256": _json_sha256({"x": index}),
                 }
                 for index in range(1, 4)
             ]

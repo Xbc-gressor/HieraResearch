@@ -12,8 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from background_contract import ContractError  # noqa: E402
+from background_contract import (  # noqa: E402
+    ContractError,
+    EXPERIENCE_SCHEMA_VERSION as DURABLE_EXPERIENCE_SCHEMA_VERSION,
+)
 from hieraresearch.models import RunIdentity  # noqa: E402
+from hieraresearch.schemas import (  # noqa: E402
+    EXPERIENCE_SCHEMA_VERSION as PRODUCED_EXPERIENCE_SCHEMA_VERSION,
+)
 from hieraresearch.semantic import SemanticAdmission  # noqa: E402
 from semantic_evidence import (  # noqa: E402
     acquisition_conditioning,
@@ -83,12 +89,16 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
             "predictions": rows,
         }
 
-    def test_empty_evidence_snapshot_is_pinned_but_does_not_force_adjustment(self) -> None:
+    def test_current_experience_schema_flows_into_coverage_and_gain_policies(self) -> None:
         proposal_set = build_proposal_set(
             fixture_registry(), {"records": []}, op="fresh", parents=[], max_points=3
         )
+        self.assertEqual(
+            PRODUCED_EXPERIENCE_SCHEMA_VERSION,
+            DURABLE_EXPERIENCE_SCHEMA_VERSION,
+        )
         experience = {
-            "schema_version": 3,
+            "schema_version": PRODUCED_EXPERIENCE_SCHEMA_VERSION,
             "updated_at_run": "000",
             "generation": 0,
             "summary": "No bounded belief carries evidence yet.",
@@ -98,6 +108,16 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
             "dimension_evidence": [],
             "hypothesis_evidence": [],
         }
+        _, coverage_receipt = select_proposal(
+            proposal_set,
+            policy="coverage",
+            experience=experience,
+        )
+        self.assertEqual(coverage_receipt["experience"]["generation"], 0)
+        self.assertEqual(coverage_receipt["experience"]["updated_at_run"], "000")
+        self.assertEqual(coverage_receipt["experience"]["conditioning"], [])
+        self.assertIsNone(coverage_receipt["components"]["predicted_gain"])
+
         context = build_gain_context(
             proposal_set,
             {"records": [], "experience": experience},

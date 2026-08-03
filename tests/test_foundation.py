@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,13 +27,20 @@ from hieraresearch.background import (  # noqa: E402
 )
 from hieraresearch.llm import (  # noqa: E402
     AgentEditSpec,
+    AnthropicMessagesBackend,
     InferenceContractError,
+    InferenceError,
+    InferenceRequestError,
     ModelGateway,
     PathPolicy,
 )
 from hieraresearch.models import IdeaProposal, RunIdentity  # noqa: E402
 from hieraresearch.process import ProcessResult, ProcessRunner  # noqa: E402
-from hieraresearch.toolchain import ToolFailure  # noqa: E402
+from hieraresearch.schemas import tuning_values_schema  # noqa: E402
+from hieraresearch.toolchain import (  # noqa: E402
+    ToolFailure,
+    ValidationRejected,
+)
 
 
 class StructuredStub:
@@ -76,7 +84,15 @@ class BackgroundToolchainStub:
 
     def validate_background_retrieval(self, run_dir: Path):
         if not (run_dir / "background_retrieval.json").is_file():
-            raise AssertionError("canonical background retrieval is missing")
+            raise ValidationRejected(
+                "background retrieval validation",
+                ProcessResult(
+                    args=("validator",),
+                    returncode=1,
+                    output='{"ok": false, "errors": ["manifest missing"]}',
+                    elapsed_seconds=0.0,
+                ),
+            )
 
     def validate_background(
         self,
@@ -126,6 +142,119 @@ class BackgroundModelStub:
 
 
 class FoundationTests(unittest.TestCase):
+    def test_anthropic_tuning_schema_uses_supported_array_cardinality(self) -> None:
+        class SchemaCheckingMessages:
+            def __init__(self):
+                self.schema = None
+
+            def create(self, **kwargs):
+                self.schema = kwargs["output_config"]["format"]["schema"]
+
+                def check(value):
+                    if isinstance(value, dict):
+                        if "minItems" in value:
+                            if value["minItems"] not in {0, 1}:
+                                raise ValueError("unsupported minItems")
+                        for child in value.values():
+                            check(child)
+                    elif isinstance(value, list):
+                        for child in value:
+                            check(child)
+
+                check(self.schema)
+                return SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[SimpleNamespace(type="text", text='{"ok": true}')],
+                    usage=None,
+                    _request_id="request-test",
+                )
+
+        messages = SchemaCheckingMessages()
+        backend = AnthropicMessagesBackend(
+            client=SimpleNamespace(messages=messages),
+        )
+
+        value, _ = backend.generate(
+            purpose="tuning_values:test",
+            model="test-model",
+            system_prompt="system",
+            prompt="prompt",
+            schema=tuning_values_schema(5),
+            max_tokens=100,
+        )
+
+        self.assertEqual(value, {"ok": True})
+        warm_configs = messages.schema["properties"]["warm_configs"]
+        self.assertEqual(warm_configs["minItems"], 1)
+        self.assertNotIn("maxItems", warm_configs)
+
+    def test_invalid_provider_request_is_nonretryable_for_exact_revision(self) -> None:
+        import anthropic
+        import httpx
+
+        class RejectingMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                del kwargs
+                self.calls += 1
+                request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+                response = httpx.Response(400, request=request)
+                raise anthropic.BadRequestError(
+                    "invalid JSON schema",
+                    response=response,
+                    body={
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "invalid JSON schema",
+                        },
+                    },
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.txt"
+            source.write_text("stable", encoding="utf-8")
+            messages = RejectingMessages()
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=AnthropicMessagesBackend(
+                    client=SimpleNamespace(messages=messages)
+                ),
+                edit_backend=UnusedEditor(),
+            )
+            request = {
+                "purpose": "tuning_values:001",
+                "schema_version": 1,
+                "system_prompt": "system",
+                "prompt": "prompt",
+                "schema": {"type": "object"},
+                "input_paths": [source],
+                "parser": lambda value: value,
+            }
+
+            with self.assertRaisesRegex(
+                InferenceRequestError, "rejected the request contract"
+            ):
+                gateway.infer(**request)
+            with self.assertRaisesRegex(
+                InferenceRequestError, "recorded non-retryable"
+            ):
+                gateway.infer(**request)
+
+            self.assertEqual(messages.calls, 1)
+
+            changed_request = {
+                **request,
+                "schema": {"type": "object", "additionalProperties": False},
+            }
+            with self.assertRaises(InferenceRequestError):
+                gateway.infer(**changed_request)
+            self.assertEqual(messages.calls, 2)
+
     def test_model_receipt_replays_exact_input_and_rejects_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -314,6 +443,42 @@ class FoundationTests(unittest.TestCase):
                 {str(authored.resolve()), str(derived.resolve())},
             )
 
+    def test_model_gateway_normalizes_edit_backend_setup_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            authored = root / "draft.py"
+
+            class BrokenEditor:
+                def edit(self, **kwargs):
+                    del kwargs
+                    raise ValueError("SDK options rejected")
+
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=StructuredStub({}),
+                edit_backend=BrokenEditor(),
+            )
+            with self.assertRaisesRegex(
+                InferenceError,
+                "edit backend failed: SDK options rejected",
+            ):
+                gateway.edit(
+                    AgentEditSpec(
+                        purpose="candidate_writer:001",
+                        schema_version=1,
+                        cwd=root,
+                        system_prompt="system",
+                        prompt="prompt",
+                        tools=("Write",),
+                        read_roots=(root,),
+                        write_paths=(authored,),
+                        input_paths=(authored,),
+                        immutable_input_paths=(),
+                    ),
+                    validate=lambda: authored,
+                )
+
     def test_agent_path_policy_enforces_exact_edit_and_readonly_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -417,6 +582,140 @@ class FoundationTests(unittest.TestCase):
             self.assertTrue(all(not induced for _, induced, _ in toolchain.validation_calls))
             self.assertTrue(
                 all(not provided for _, _, provided in toolchain.validation_calls)
+            )
+
+    def test_background_builder_does_not_research_on_retrieval_infrastructure_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "retrieval-infrastructure")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            atomic_write_json(
+                identity.run_dir / "background_retrieval.json",
+                {"schema_version": 3},
+            )
+
+            class UnavailableRetrievalValidator(BackgroundToolchainStub):
+                def validate_background_retrieval(self, run_dir):
+                    raise ToolFailure(
+                        "background retrieval validation",
+                        ProcessResult(
+                            args=("validator",),
+                            returncode=2,
+                            output="validator worker unavailable",
+                            elapsed_seconds=0.0,
+                        ),
+                    )
+
+            models = BackgroundModelStub()
+            builder = BackgroundBuilder(
+                identity,
+                UnavailableRetrievalValidator(),
+                models,
+                task_config={},
+            )
+
+            with self.assertRaisesRegex(ToolFailure, "worker unavailable"):
+                builder.ensure()
+
+            self.assertEqual(models.specs, [])
+
+    def test_background_builder_does_not_repair_validator_infrastructure_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "validator-infrastructure")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+
+            class UnavailableBackgroundValidator(BackgroundToolchainStub):
+                def validate_background(self, run_dir, *, induced, provided_baseline):
+                    super().validate_background(
+                        run_dir,
+                        induced=induced,
+                        provided_baseline=provided_baseline,
+                    )
+                    raise ToolFailure(
+                        "background validation",
+                        ProcessResult(
+                            args=("validator",),
+                            returncode=2,
+                            output="validator worker unavailable",
+                            elapsed_seconds=0.0,
+                        ),
+                    )
+
+            models = BackgroundModelStub()
+            builder = BackgroundBuilder(
+                identity,
+                UnavailableBackgroundValidator(),
+                models,
+                task_config={},
+            )
+
+            with self.assertRaisesRegex(ToolFailure, "worker unavailable"):
+                builder.ensure()
+
+            self.assertEqual(len(models.specs), 1)
+            self.assertEqual(models.specs[0].purpose, "background_research")
+
+    def test_existing_background_validator_infrastructure_is_not_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "existing-infrastructure")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            (identity.run_dir / "background.md").write_text(
+                "# existing background\n",
+                encoding="utf-8",
+            )
+            atomic_write_json(
+                identity.run_dir / "background_retrieval.json",
+                {"schema_version": 3},
+            )
+
+            class UnavailableBackgroundValidator(BackgroundToolchainStub):
+                def validate_background(self, run_dir, *, induced, provided_baseline):
+                    raise ToolFailure(
+                        "background validation",
+                        ProcessResult(
+                            args=("validator",),
+                            returncode=2,
+                            output="validator worker unavailable",
+                            elapsed_seconds=0.0,
+                        ),
+                    )
+
+            models = BackgroundModelStub()
+            builder = BackgroundBuilder(
+                identity,
+                UnavailableBackgroundValidator(),
+                models,
+                task_config={},
+            )
+
+            with self.assertRaisesRegex(ToolFailure, "worker unavailable"):
+                builder.ensure()
+
+            self.assertEqual(models.specs, [])
+            self.assertFalse(
+                (
+                    identity.run_dir
+                    / ".orchestrator"
+                    / "background_repair_diagnostic.json"
+                ).exists()
             )
 
     def test_background_builder_bounds_layered_repairs_across_derived_validation(self) -> None:
@@ -537,7 +836,7 @@ class FoundationTests(unittest.TestCase):
                         provided_baseline=provided_baseline,
                     )
                     if len(self.validation_calls) == 1:
-                        raise ToolFailure(
+                        raise ValidationRejected(
                             "background validation",
                             ProcessResult(
                                 args=("validator",),
@@ -595,6 +894,29 @@ class FoundationTests(unittest.TestCase):
                 f"background_research:repair:{MAX_BACKGROUND_REPAIR_ATTEMPTS}",
             )
             self.assertEqual(len(toolchain.retrieval_imports), 1)
+
+            resumed_models = BackgroundModelStub()
+            resumed = BackgroundBuilder(
+                identity,
+                toolchain,
+                resumed_models,
+                task_config={},
+            )
+            with self.assertRaisesRegex(ValueError, "registry remains invalid"):
+                resumed.ensure()
+
+            state = json.loads(
+                (
+                    identity.run_dir
+                    / ".orchestrator"
+                    / "background_authoring.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(resumed_models.specs, [])
+            self.assertEqual(
+                state["attempts_admitted"],
+                MAX_BACKGROUND_REPAIR_ATTEMPTS + 1,
+            )
 
     def test_frozen_background_rejects_stale_provided_baseline_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

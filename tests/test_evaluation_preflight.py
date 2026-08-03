@@ -43,6 +43,105 @@ def _run_dir(root: Path, *, budget: int) -> tuple[Path, Path]:
 
 
 class EvaluationBudgetTests(unittest.TestCase):
+    def test_attempt_reader_blocks_malformed_rows_outside_requested_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = _run_dir(Path(tmp), budget=4)
+            malformed = {
+                "schema_version": 1,
+                "kind": "score_attempt",
+                "attempt_id": "eval-000001",
+                "run_id": "other",
+                # A corrupt row cannot be ignored merely because it would not
+                # match the caller's phase/method filter.
+                "method": "warmstart",
+                "params_sha256": "sha256:" + "0" * 64,
+            }
+            (run_dir / "evaluation_attempts.jsonl").write_text(
+                json.dumps(malformed) + "\n"
+            )
+
+            with self.assertRaisesRegex(ValueError, "malformed objective"):
+                evaluation_budget.objective_attempt_receipts(
+                    candidate,
+                    phase="phase_a",
+                    method="warmstart",
+                )
+
+    def test_timed_eval_marks_only_a_returned_objective_reservation(self) -> None:
+        with mock.patch.object(
+            _common,
+            "reserve_evaluation",
+            side_effect=OSError("attempt log unavailable"),
+        ):
+            with self.assertRaises(OSError) as unreserved:
+                timed_eval(
+                    lambda _model, _params: 0.0,
+                    _plain_make_model,
+                    {},
+                    Path("/tmp/candidate.py"),
+                )
+        self.assertFalse(
+            _common.objective_slot_consumed(unreserved.exception)
+        )
+
+        with mock.patch.object(
+            _common,
+            "reserve_evaluation",
+            return_value={"kind": "score_attempt"},
+        ):
+            with self.assertRaises(RuntimeError) as reserved:
+                timed_eval(
+                    lambda _model, _params: (_ for _ in ()).throw(
+                        RuntimeError("objective failed")
+                    ),
+                    _plain_make_model,
+                    {},
+                    Path("/tmp/candidate.py"),
+                )
+        self.assertTrue(_common.objective_slot_consumed(reserved.exception))
+        self.assertEqual(
+            reserved.exception.objective_reservation,
+            {"kind": "score_attempt"},
+        )
+
+    def test_warmstart_failure_category_requires_traceback_attribution(self) -> None:
+        candidate = Path("/tmp/unit-candidate/train.py")
+        candidate_failure = {
+            "failure_receipt": {
+                "frames": [{"path": str(candidate), "line": 12}],
+            }
+        }
+        runtime_failure = {
+            "failure_receipt": {
+                "frames": [{"path": "/tmp/runtime/evaluator.py", "line": 7}],
+            }
+        }
+
+        self.assertEqual(
+            warmstart_eval._failure_category(
+                RuntimeError("candidate bug"),
+                candidate_failure,
+                candidate,
+            ),
+            "candidate_code_incompatibility",
+        )
+        self.assertEqual(
+            warmstart_eval._failure_category(
+                RuntimeError("runtime bug"),
+                runtime_failure,
+                candidate,
+            ),
+            "unknown_non_candidate_failure",
+        )
+        self.assertEqual(
+            warmstart_eval._failure_category(
+                TimeoutError("slow"),
+                candidate_failure,
+                candidate,
+            ),
+            "timeout_or_resource",
+        )
+
     def test_warm_config_selection_is_uniform_without_replacement_and_replayed(
         self,
     ) -> None:
@@ -164,7 +263,7 @@ class EvaluationBudgetTests(unittest.TestCase):
             candidate.write_text("DEFAULT_PARAMS = {'depth': 8}\n")
             brief_path = candidate.parent / "_candidate_brief.json"
 
-            with self.assertRaisesRegex(ValueError, "requires candidate brief"):
+            with self.assertRaises(OSError):
                 validate_provided_baseline_configs(candidate, [{"depth": 8}], 1)
 
             brief_path.write_text("{")
@@ -914,7 +1013,12 @@ def make_model(env, params):
             configs.write_text(json.dumps([{"x": 8}]))
             rejected = subprocess.run(command, capture_output=True, text=True)
 
-            self.assertEqual(rejected.returncode, 3)
+            self.assertEqual(rejected.returncode, 1)
+            rejected_payload = json.loads(rejected.stderr)
+            self.assertEqual(
+                rejected_payload["failure_kind"],
+                "candidate_preflight_validation",
+            )
             self.assertIn("literal DEFAULT_PARAMS", rejected.stderr)
             self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
 
