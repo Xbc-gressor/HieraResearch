@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import run_cfg  # noqa: E402
+from run_cfg import RunConfigError, read_framework_cfg  # noqa: E402
 
 
 class RunConfigTunerValidationTests(unittest.TestCase):
@@ -157,6 +158,33 @@ class RunConfigTunerValidationTests(unittest.TestCase):
                     "deep_tune_time_limit_seconds",
                 ):
                     self._read({"deep_tune_time_limit_seconds": value})
+
+
+class ProgressiveTunerKnobsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg_path = Path(self.tmp.name) / "framework_cfg.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, tuner: dict) -> None:
+        self.cfg_path.write_text(json.dumps({"tuner": tuner}))
+
+    def test_valid_progressive_knobs_parse(self):
+        self._write({"bout_trials": 8, "tuned_threshold": 16, "rewarm_proposals": 3})
+        cfg = read_framework_cfg(self.cfg_path)
+        self.assertEqual(cfg["tuner"]["bout_trials"], 8)
+        self.assertEqual(cfg["tuner"]["tuned_threshold"], 16)
+        self.assertEqual(cfg["tuner"]["rewarm_proposals"], 3)
+
+    def test_invalid_progressive_knobs_rejected(self):
+        for key in ("bout_trials", "tuned_threshold", "rewarm_proposals"):
+            for bad in (0, -1, 2.5, "8", True):
+                with self.subTest(key=key, bad=bad):
+                    self._write({key: bad})
+                    with self.assertRaises(RunConfigError):
+                        read_framework_cfg(self.cfg_path)
 
 
 if __name__ == "__main__":

@@ -2969,6 +2969,9 @@ def lineage_evidence(run_dir: Path, source_run_ids: list) -> dict:
 # configs are referenced from heterogeneous historical tasks, so their spread
 # reflects the reference quality, not the landscape — it is not comparable across
 # candidates' different methods. Pure read over the ledger; lower score is better.
+DEFAULT_BOUT_TRIALS = 8       # one progressive tuning bout's objective-attempt budget
+DEFAULT_TUNED_THRESHOLD = 16  # Phase-C attempts at which evaluation_depth becomes "tuned"
+DEFAULT_REWARM_PROPOSALS = 3  # max LLM-proposed configs a continuation bout may start from
 DEFAULT_N_MIN = 5             # P=80's smallest non-empty top-tier population
 DEFAULT_TOP_PERCENTILE = 80   # eligible iff the best untuned candidate is in the top (100-P)%
 

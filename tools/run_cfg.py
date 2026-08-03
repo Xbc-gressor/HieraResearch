@@ -107,6 +107,9 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
         "bo_patience_cap",
         "bo_patience_floor",
         "deep_tune_per_candidate_cap",
+        "bout_trials",
+        "tuned_threshold",
+        "rewarm_proposals",
     ):
         _validate_positive_int_override(
             tuner,
