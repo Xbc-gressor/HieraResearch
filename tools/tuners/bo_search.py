@@ -44,7 +44,7 @@ from _common import (  # noqa: E402
     ensure_deep_tune_time_remaining,
     is_config_infeasible_error,
     load_candidate_modules,
-    objective_slot_consumed,
+    objective_attempt_admitted,
     params_identity,
     prepare_phase_c_objective_attempt,
     prior_patience_state,
@@ -787,7 +787,7 @@ def main() -> int:
             study.stop()
             raise
         except Exception as exc:
-            if not objective_slot_consumed(exc):
+            if not objective_attempt_admitted(exc):
                 if objective_intent is not None:
                     cancel_phase_c_objective_attempt(
                         args.tune_report_json,

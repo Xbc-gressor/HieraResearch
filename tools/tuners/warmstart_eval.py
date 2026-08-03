@@ -68,6 +68,7 @@ from _common import (  # noqa: E402
     cast_params_to_search_space,
     is_finite_score,
     load_candidate_modules,
+    objective_attempt_admitted,
     objective_slot_consumed,
     read_tune_report,
     search_space_for_json,
@@ -454,6 +455,8 @@ def validate_provided_baseline_configs(
     brief_path = candidate_path.parent / "_candidate_brief.json"
     try:
         brief = json.loads(brief_path.read_text())
+    except OSError as exc:
+        raise ValueError(f"warmstart requires candidate brief {brief_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid candidate brief {brief_path}: {exc}") from exc
     schema_version = brief.get("schema_version") if isinstance(brief, dict) else None
@@ -570,7 +573,7 @@ def main() -> int:
             all_configs,
             args.k_eval,
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
     parameter_transfer = None
@@ -914,6 +917,10 @@ def main() -> int:
         report["phase_a"]["status"] = "crashed"
         report["phase_a"]["terminal_failure"] = terminal_failure
         report["phase_a"].pop("active_objective", None)
+        if preflight_enabled:
+            # The durable reservation proves the interrupted attempt's
+            # preflight passed; no terminal report may claim it still runs.
+            preflight_report["status"] = "ok"
         write_tune_report(args.tune_report_json, report)
         write_json(terminal_failure)
         return CRASHED
@@ -1130,7 +1137,7 @@ def main() -> int:
             except ObjectiveRecoveryError:
                 raise
             except Exception as exc:
-                if not objective_slot_consumed(exc):
+                if not objective_attempt_admitted(exc):
                     raise
                 trials_attempted += 1
                 report["phase_a"]["trials_attempted"] = trials_attempted
@@ -1176,7 +1183,7 @@ def main() -> int:
                     "crash_index": proposed_index,
                     "evaluation_position": i,
                     "crash_params": params,
-                    "objective_slot_consumed": True,
+                    "objective_slot_consumed": objective_slot_consumed(exc),
                     "failure_category": failure_category,
                     "candidate_execution_revision": candidate_code_revision,
                     **objective_fields,

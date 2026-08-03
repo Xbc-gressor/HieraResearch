@@ -104,6 +104,29 @@ class EvaluationBudgetTests(unittest.TestCase):
             {"kind": "score_attempt"},
         )
 
+    def test_timed_eval_marks_standalone_admission_without_a_slot(self) -> None:
+        with mock.patch.object(
+            _common,
+            "reserve_evaluation",
+            return_value=None,
+        ):
+            with self.assertRaises(RuntimeError) as standalone:
+                timed_eval(
+                    lambda _model, _params: (_ for _ in ()).throw(
+                        RuntimeError("objective failed")
+                    ),
+                    _plain_make_model,
+                    {},
+                    Path("/tmp/candidate.py"),
+                )
+        self.assertTrue(_common.objective_attempt_admitted(standalone.exception))
+        self.assertFalse(_common.objective_slot_consumed(standalone.exception))
+        self.assertFalse(
+            _common.objective_attempt_admitted(
+                _common.DeepTuneTimeExhausted("unrelated")
+            )
+        )
+
     def test_warmstart_failure_category_requires_traceback_attribution(self) -> None:
         candidate = Path("/tmp/unit-candidate/train.py")
         candidate_failure = {
@@ -263,7 +286,7 @@ class EvaluationBudgetTests(unittest.TestCase):
             candidate.write_text("DEFAULT_PARAMS = {'depth': 8}\n")
             brief_path = candidate.parent / "_candidate_brief.json"
 
-            with self.assertRaises(OSError):
+            with self.assertRaisesRegex(ValueError, "requires candidate brief"):
                 validate_provided_baseline_configs(candidate, [{"depth": 8}], 1)
 
             brief_path.write_text("{")

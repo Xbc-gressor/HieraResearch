@@ -861,6 +861,90 @@ class FoundationTests(unittest.TestCase):
             self.assertIn(diagnostic_path, repair_spec.input_paths)
             self.assertIn(str(diagnostic_path), repair_spec.prompt)
 
+    def test_background_builder_resumed_started_attempt_keeps_admission_and_diagnostic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "started-resume")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            expected_errors = ["contract error 1", "contract error 2"]
+
+            class RejectOnceToolchain(BackgroundToolchainStub):
+                def validate_background(self, run_dir, *, induced, provided_baseline):
+                    super().validate_background(
+                        run_dir,
+                        induced=induced,
+                        provided_baseline=provided_baseline,
+                    )
+                    if len(self.validation_calls) == 1:
+                        raise ValidationRejected(
+                            "background validation",
+                            ProcessResult(
+                                args=("validator",),
+                                returncode=1,
+                                output=json.dumps(
+                                    {"ok": False, "errors": expected_errors}
+                                ),
+                                elapsed_seconds=0.0,
+                            ),
+                        )
+
+            class InterruptedModels(BackgroundModelStub):
+                def edit(self, spec, *, validate):
+                    if self.specs:
+                        self.specs.append(spec)
+                        raise RuntimeError("worker killed mid-repair")
+                    return super().edit(spec, validate=validate)
+
+            models = InterruptedModels()
+            builder = BackgroundBuilder(
+                identity, RejectOnceToolchain(), models, task_config={}
+            )
+            with self.assertRaisesRegex(RuntimeError, "worker killed"):
+                builder.ensure()
+
+            state_path = (
+                identity.run_dir / ".orchestrator" / "background_authoring.json"
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["status"], "started")
+            self.assertEqual(state["attempts_admitted"], 2)
+            self.assertEqual(state["purpose"], "background_research:repair:1")
+            self.assertEqual(state["last_error_kind"], "validation_rejected")
+
+            # A killed writer may leave required artifacts missing; the resume
+            # must then rebuild the rejection from the authoring state alone.
+            (identity.run_dir / "background.md").unlink()
+            resumed_models = BackgroundModelStub()
+            BackgroundBuilder(
+                identity,
+                BackgroundToolchainStub(),
+                resumed_models,
+                task_config={},
+            ).ensure()
+
+            self.assertEqual(
+                [spec.purpose for spec in resumed_models.specs],
+                ["background_research:repair:1"],
+            )
+            final_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_state["status"], "completed")
+            self.assertEqual(final_state["attempts_admitted"], 2)
+            diagnostic = json.loads(
+                (
+                    identity.run_dir
+                    / ".orchestrator"
+                    / "background_repair_diagnostic.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(diagnostic["error_type"], "ValidationRejected")
+            self.assertEqual(diagnostic["validator_errors"], expected_errors)
+
     def test_background_builder_bounds_repairs_after_five_rejections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

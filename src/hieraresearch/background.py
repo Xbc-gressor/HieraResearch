@@ -15,6 +15,7 @@ from .artifacts import (
 )
 from .llm import AgentEditSpec, ModelGateway
 from .models import RunIdentity
+from .process import ProcessResult
 from .prompts import BACKGROUND_SYSTEM
 from .toolchain import ToolFailure, Toolchain, ValidationRejected
 
@@ -103,7 +104,7 @@ class BackgroundBuilder:
                 "initial_admitted": inferred_initial_attempt,
                 "repairs_admitted": 0,
                 "purpose": None,
-                "last_error": str(initial_error or ""),
+                **self._last_error_fields(initial_error),
             }
             atomic_write_json(authoring_state_path, state)
         elif state["status"] == "completed":
@@ -116,7 +117,7 @@ class BackgroundBuilder:
                 "status": "rejected",
                 "attempts_admitted": max(1, int(state["attempts_admitted"])),
                 "initial_admitted": True,
-                "last_error": str(initial_error),
+                **self._last_error_fields(initial_error),
             }
             atomic_write_json(authoring_state_path, state)
         last_error: BaseException | None = initial_error
@@ -209,12 +210,15 @@ class BackgroundBuilder:
                     + str(last_error)
                 )
             try:
+                # A resumed "started" state re-drives an attempt whose admission
+                # was already counted; only a fresh purpose consumes a new slot.
                 state = {
                     **state,
                     "status": "started",
-                    "attempts_admitted": int(state["attempts_admitted"]) + 1,
+                    "attempts_admitted": int(state["attempts_admitted"])
+                    + (0 if resuming_started else 1),
                     "purpose": purpose,
-                    "last_error": str(last_error or ""),
+                    **self._last_error_fields(last_error),
                 }
                 atomic_write_json(authoring_state_path, state)
                 self.models.edit(
@@ -258,7 +262,7 @@ class BackgroundBuilder:
                     {
                         **state,
                         "status": "completed",
-                        "last_error": "",
+                        **self._last_error_fields(None),
                     },
                 )
                 return
@@ -267,7 +271,7 @@ class BackgroundBuilder:
                 state = {
                     **state,
                     "status": "rejected",
-                    "last_error": str(exc),
+                    **self._last_error_fields(exc),
                 }
                 atomic_write_json(authoring_state_path, state)
         raise ValueError(f"background artifacts remain invalid: {last_error}")
@@ -282,11 +286,49 @@ class BackgroundBuilder:
         return True
 
     @staticmethod
+    def _last_error_fields(error: BaseException | None) -> dict[str, Any]:
+        """Durable, typed form of the last boundary rejection.
+
+        The validator output travels with the authoring state so a resumed
+        repair can rebuild the original exception instead of degrading it to
+        an untyped message.
+        """
+        if isinstance(error, ValidationRejected):
+            return {
+                "last_error": str(error),
+                "last_error_kind": "validation_rejected",
+                "last_error_label": error.label,
+                "last_error_returncode": error.result.returncode,
+                "last_error_output": error.result.output,
+            }
+        return {
+            "last_error": str(error or ""),
+            "last_error_kind": (
+                "artifact_error"
+                if isinstance(error, BackgroundArtifactError)
+                else ""
+            ),
+            "last_error_label": "",
+            "last_error_returncode": 0,
+            "last_error_output": "",
+        }
+
+    @staticmethod
     def _resumed_error(state: dict[str, Any]) -> BaseException | None:
-        """Rebuild the persisted rejection from its durable message."""
+        """Rebuild the persisted rejection with its original type when possible."""
         message = state["last_error"].strip()
         if not message:
             return None
+        if state.get("last_error_kind") == "validation_rejected":
+            return ValidationRejected(
+                state["last_error_label"],
+                ProcessResult(
+                    args=(),
+                    returncode=state["last_error_returncode"],
+                    output=state["last_error_output"],
+                    elapsed_seconds=0.0,
+                ),
+            )
         return BackgroundArtifactError(message)
 
     @staticmethod

@@ -296,11 +296,7 @@ class ExperimentCoordinator:
                 action.implemented = True
                 self.store.save(self.state)
         except CandidateBuildError as exc:
-            self.candidates.record_build_failure(action, exc)
-            action.resolved = True
-            self.store.save(self.state)
-            if self.candidates.is_provided_baseline(action.run_id or ""):
-                raise ValueError("provided baseline implementation could not be prepared") from exc
+            self._close_candidate_build_failure(action, exc, stage="implementation")
 
     def _build_candidate_contract(self) -> None:
         action = self._next_unresolved_action()
@@ -310,16 +306,16 @@ class ExperimentCoordinator:
             action.contract_ready = True
             self.store.save(self.state)
         except CandidateBuildError as exc:
-            self.candidates.record_build_failure(action, exc)
-            action.resolved = True
-            self.store.save(self.state)
-            if self.candidates.is_provided_baseline(action.run_id or ""):
-                raise ValueError("provided baseline tuning contract could not be prepared") from exc
+            self._close_candidate_build_failure(action, exc, stage="tuning_contract")
 
     def _evaluate_candidate(self) -> None:
         action = self._next_unresolved_action()
         assert self.candidates is not None
-        outcome = self.candidates.evaluate(action)
+        try:
+            outcome = self.candidates.evaluate(action)
+        except CandidateBuildError as exc:
+            self._close_candidate_build_failure(action, exc, stage="evaluation")
+            return
         action.resolved = True
         self.store.save(self.state)
         if self.candidates.is_provided_baseline(action.run_id or "") and outcome.status == "crash":
@@ -328,9 +324,36 @@ class ExperimentCoordinator:
     def _preflight_candidate(self) -> None:
         action = self._next_unresolved_action()
         assert self.candidates is not None
-        self.candidates.preflight(action)
-        action.preflight_ready = True
+        try:
+            self.candidates.preflight(action)
+            action.preflight_ready = True
+            self.store.save(self.state)
+        except CandidateBuildError as exc:
+            self._close_candidate_build_failure(action, exc, stage="preflight")
+
+    def _close_candidate_build_failure(
+        self,
+        action: RoundAction,
+        exc: CandidateBuildError,
+        *,
+        stage: str,
+    ) -> None:
+        """Close a candidate build failure and continue the round.
+
+        LLM-authored candidates will fail; that failure belongs to the
+        candidate, not the run.  Record the stage-tagged receipt, close the
+        ledger record as a crash, and resolve the action so the next
+        transition proceeds to the next candidate.  Only the provided
+        baseline is run-fatal: the experiment anchors on it.
+        """
+        assert self.candidates is not None
+        self.candidates.record_build_failure(action, exc, stage=stage)
+        action.resolved = True
         self.store.save(self.state)
+        if self.candidates.is_provided_baseline(action.run_id or ""):
+            raise ValueError(
+                f"provided baseline candidate failed at {stage}: {exc}"
+            ) from exc
 
     def _deep_tune(self) -> None:
         active = self.state.active_round
@@ -446,15 +469,25 @@ class ExperimentCoordinator:
         materialization_ready = self.candidates.materialization_is_ready(
             action, record
         )
-        # Keep corruption detection independent from stage readiness. A report
-        # is useful evidence that evaluation started, but only its own
-        # revision-bound receipts can authorize the next contract/preflight
-        # transition.
-        self.candidates.evaluation_has_started(action)
-        # A report proves that evaluation started, not that a current
-        # candidate contract or no-score preflight receipt still matches the
-        # candidate. Debug repairs can change those inputs after the report
-        # was written, so recovery must trust only revision-bound receipts.
+        # Receipts gate only pre-evaluation transitions. A durable Phase A
+        # report while the ledger record is still pending proves evaluation
+        # already started: the warmstart worker rewrites train.py at startup
+        # (apply_base_params), so every revision-bound receipt is stale by
+        # design. Deriving stage readiness from those receipts would route
+        # backwards into materialization/implementation/contract, which raise
+        # on the mutated candidate and block the run permanently. Route to
+        # EVALUATE_WARM_CONFIGS instead; evaluate() is terminal-first and
+        # idempotent and owns forward-completion, crash closure, and debug
+        # re-entry from there. evaluation_has_started still raises on a
+        # malformed report, so genuine corruption is not masked.
+        evaluation_started = self.candidates.evaluation_has_started(action)
+        if evaluation_started and record.get("status") == "pending":
+            action.materialized = True
+            action.implemented = True
+            action.contract_ready = True
+            action.preflight_ready = True
+            action.resolved = False
+            return
         action.contract_ready = self.candidates.contract_is_ready(action)
         action.preflight_ready = self.candidates.preflight_is_ready(action)
         action.implemented = (

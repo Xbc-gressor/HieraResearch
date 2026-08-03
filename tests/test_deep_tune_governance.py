@@ -306,6 +306,70 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             self.assertEqual(stage["trials"], [committed])
             budget["_phase_c_lock_handle"].close()
 
+    def test_budget_exhaustion_cancels_prepared_intent_without_erasing_reservation(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "budget-cancel"
+            candidate, report_path = self._fixture(run_dir)
+            seeded = _common.reserve_evaluation(
+                candidate,
+                params={"x0": 0.1},
+                phase="phase_c",
+                method="grid",
+            )
+            self.assertIsNotNone(seeded)
+            log_path = run_dir / "evaluation_attempts.jsonl"
+            log_before = log_path.read_text()
+
+            train_module = mock.Mock(
+                SEARCH_SPACE={"x0": ("float", 0.0, 1.0)},
+                BASE_PARAMS={"x0": 0.0},
+                make_model=object(),
+            )
+            cancel_spy = mock.Mock(
+                side_effect=grid_search.cancel_phase_c_objective_attempt
+            )
+            exhausted = _common.EvaluationBudgetExhausted(
+                used=1,
+                budget=1,
+                run_dir=run_dir,
+                scope="deep_tune_total",
+            )
+            with mock.patch(
+                "grid_search.load_candidate_modules",
+                return_value=(train_module, object()),
+            ), mock.patch(
+                "grid_search.resolve_score_fn", return_value=object()
+            ), mock.patch(
+                "grid_search.resolve_preflight_fn", return_value=None
+            ), mock.patch(
+                "grid_search.timed_eval", side_effect=exhausted
+            ), mock.patch.object(
+                grid_search, "cancel_phase_c_objective_attempt", cancel_spy
+            ), mock.patch(
+                "grid_search.write_json"
+            ) as write_result, mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "grid_search.py",
+                    "--candidate-path",
+                    str(candidate),
+                    "--tune-report-json",
+                    str(report_path),
+                ],
+            ):
+                self.assertEqual(grid_main(), 0)
+
+            cancel_spy.assert_called_once()
+            result = write_result.call_args.args[0]
+            self.assertEqual(result["status"], "budget_exhausted")
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
+            self.assertNotIn(_common.PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT, stage)
+            self.assertEqual(stage["trials"], [])
+            self.assertEqual(log_path.read_text(), log_before)
+
     def test_active_tuners_do_not_replay_recovered_orphan(self):
         class BOTrial:
             def __init__(

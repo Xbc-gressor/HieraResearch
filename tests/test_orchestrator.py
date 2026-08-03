@@ -65,9 +65,25 @@ def immutable_failure_ref(failure_id: str) -> dict[str, object]:
 
 
 def execution_revision_fixture() -> dict[str, object]:
+    """Exact schema-3 key shape of tune_tools._candidate_execution_revision.
+
+    The warmstart worker stamps this full object on
+    phase_a.candidate_code_revision and on every
+    terminal_failure.candidate_execution_revision; fixtures must use the real
+    producer shape so the consumer contract is tested against reality.
+    """
     revision = {
         "schema_version": 3,
         "structure_sha256": "sha256:" + "1" * 64,
+        "search_space": {"x": ["int", 1, 2]},
+        "search_space_keys": ["x"],
+        "search_space_sha256": "sha256:" + "3" * 64,
+        "prepare_sha256": "sha256:" + "4" * 64,
+        "evaluation_contract": {
+            "task_name": None,
+            "declaration": {"score_fn": "evaluate_config"},
+            "task_toml_sha256": None,
+        },
     }
     revision["revision_sha256"] = json_revision(revision)
     return revision
@@ -514,6 +530,339 @@ class DebugModelStub:
         )
         return validate()
 
+
+class MidEvaluationToolchainStub(DebugPreflightToolchainStub):
+    """Ledger, failure-evidence, and worker view for a mid-Phase-A restart."""
+
+    def __init__(
+        self,
+        *,
+        record_status: str = "pending",
+        receipts: list[dict] | None = None,
+        completion_score: float = 0.5,
+    ):
+        super().__init__()
+        self.record_status = record_status
+        self.receipts = list(receipts or [])
+        self.completion_score = completion_score
+        self.execution_revision = execution_revision_fixture()
+        self.projected: list[str] = []
+        self.scores: list[tuple[str, float]] = []
+        self.warmstart_calls = 0
+
+    def ledger_brief(self, run_dir: Path) -> dict:
+        del run_dir
+        return {
+            "phase": "running",
+            "pending_run_ids": ["001"],
+            "evaluations_attempted": 1,
+        }
+
+    def ledger_record(self, run_dir: Path, run_id: str) -> dict:
+        del run_dir
+        return {
+            "op": "fresh",
+            "source_run_ids": [],
+            "status": self.record_status,
+        }
+
+    def candidate_execution_revision(self, candidate_path: Path) -> dict:
+        del candidate_path
+        return self.execution_revision
+
+    def verify_failure_artifact(self, report_path: Path, failure_id: str) -> dict:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        terminal = report["phase_a"]["terminal_failure"]
+        if terminal["failure_ref"]["failure_id"] != failure_id:
+            raise AssertionError("failure verification identity mismatch")
+        return {
+            "failure_ref": terminal["failure_ref"],
+            "failure_receipt": terminal["failure_receipt"],
+        }
+
+    def objective_attempt_receipts(self, *args, **kwargs) -> list[dict]:
+        del args, kwargs
+        return list(self.receipts)
+
+    def budget_status(self, run_dir: Path) -> dict:
+        del run_dir
+        return {"per_candidate": [{"run_id": "001", "evals": 1}]}
+
+    def project_screening_report(
+        self, run_dir: Path, run_id: str, report_path: Path
+    ) -> None:
+        del run_dir, report_path
+        self.projected.append(run_id)
+
+    def record_score(self, run_dir: Path, run_id: str, score: float) -> dict:
+        del run_dir
+        self.scores.append((run_id, score))
+        return {"run_id": run_id, "status": "ok"}
+
+    def warmstart(
+        self,
+        candidate_path: Path,
+        configs_path: Path,
+        report_path: Path,
+        *,
+        k_eval: int,
+        task_config: dict,
+        output_path: Path,
+    ) -> ProcessResult:
+        del candidate_path, configs_path, k_eval, task_config, output_path
+        self.warmstart_calls += 1
+        atomic_write_json(
+            report_path,
+            {
+                "phase_a": {
+                    "status": "ok",
+                    "best_warm_score": self.completion_score,
+                }
+            },
+        )
+        return ProcessResult(
+            args=("warmstart",),
+            returncode=0,
+            output="phase A complete",
+            elapsed_seconds=0.1,
+        )
+
+
+def write_worker_mutated_candidate(
+    identity: RunIdentity,
+    *,
+    configs: list[dict] | None = None,
+    implementation_matches_current: bool = False,
+) -> Path:
+    """Durable candidate as an interrupted warmstart worker leaves it.
+
+    The worker creates/rewrites BASE_PARAMS at startup (apply_base_params),
+    so train.py no longer matches the receipts written before evaluation.
+    With implementation_matches_current the implementation receipt instead
+    binds the post-worker source: the constellation a config-only repair
+    leaves behind, whose receipt-derived resume routed into
+    BUILD_TUNING_CONTRACT instead of evaluation.
+    """
+    candidate_dir = identity.run_dir / "candidates" / "001"
+    task_dir = identity.repo_root / "tasks" / "toy"
+    candidate_dir.mkdir(parents=True)
+    task_dir.mkdir(parents=True)
+    (task_dir / "TASK.md").write_text("# task\n", encoding="utf-8")
+    (task_dir / "task.toml").write_text("", encoding="utf-8")
+    (candidate_dir / "prepare.py").write_text("# evaluator\n", encoding="utf-8")
+    candidate_path = candidate_dir / "train.py"
+    authored_source = "SEARCH_SPACE = {'x': ['int', 1, 2]}\n"
+    candidate_path.write_text(authored_source, encoding="utf-8")
+    atomic_write_json(
+        candidate_dir / "_candidate_brief.json",
+        {
+            "schema_version": 4,
+            "run_id": "001",
+            "op": "fresh",
+            "source_run_ids": [],
+            "implementation_source": {"kind": "generated"},
+        },
+    )
+    atomic_write_json(candidate_dir / "_warm_configs.json", configs or [{"x": 1}])
+    atomic_write_json(candidate_dir / "_search_space.json", {"x": ["int", 1, 2]})
+    atomic_write_json(
+        identity.run_dir / "framework_cfg.json", {"tuner": {"K_eval": 2}}
+    )
+    atomic_write_json(identity.run_dir / "ledger.json", {"records": {}})
+    input_revision = paths_revision(
+        (
+            candidate_dir / "_candidate_brief.json",
+            candidate_dir / "prepare.py",
+            task_dir / "TASK.md",
+            task_dir / "task.toml",
+            identity.run_dir / "framework_cfg.json",
+        )
+    )
+
+    def write_implementation_receipt() -> None:
+        atomic_write_json(
+            candidate_dir / CandidatePipeline.IMPLEMENTATION_RECEIPT,
+            {
+                "schema_version": 2,
+                "run_id": "001",
+                "source": "generated",
+                "candidate_revision": file_revision(candidate_path),
+                "input_revision": input_revision,
+            },
+        )
+
+    if not implementation_matches_current:
+        write_implementation_receipt()
+    # The warmstart worker publishes BASE_PARAMS at startup, before any
+    # objective work; every revision-bound receipt written earlier is stale
+    # from this line on.
+    candidate_path.write_text(
+        authored_source + "BASE_PARAMS = {'x': 1}\n", encoding="utf-8"
+    )
+    if implementation_matches_current:
+        write_implementation_receipt()
+    return candidate_dir
+
+
+def write_terminal_report(
+    candidate_dir: Path,
+    toolchain: MidEvaluationToolchainStub,
+    *,
+    failure_id: str,
+    crash_index: int,
+    crash_params: dict,
+) -> dict:
+    """Durable Phase-A crash terminal in the real producer shape."""
+    reservation = {
+        "schema_version": 1,
+        "kind": "score_attempt",
+        "attempt_id": "eval-000001",
+        "run_id": "001",
+        "phase": "phase_a",
+        "method": "warmstart",
+        "params_sha256": json_revision(crash_params),
+    }
+    terminal = {
+        "status": "crashed",
+        "phase": "a",
+        "crash_index": crash_index,
+        "crash_params": crash_params,
+        "objective_slot_consumed": True,
+        "failure_category": "candidate_code_incompatibility",
+        "candidate_execution_revision": toolchain.execution_revision,
+        "objective_attempt_id": "eval-000001",
+        "objective_reservation": reservation,
+        "failure_receipt": {"failure_id": failure_id, "frames": []},
+        "failure_ref": immutable_failure_ref(failure_id),
+    }
+    atomic_write_json(
+        candidate_dir / "_failures" / f"{failure_id}.json",
+        {"failure_id": failure_id},
+    )
+    atomic_write_json(
+        candidate_dir / "tune_report.json",
+        {
+            "phase_a": {
+                "status": "crashed",
+                "candidate_code_revision": toolchain.execution_revision,
+                "terminal_failure": terminal,
+            }
+        },
+    )
+    toolchain.receipts.append(reservation)
+    return terminal
+
+
+def restart_coordinator(
+    identity: RunIdentity,
+    toolchain: MidEvaluationToolchainStub,
+) -> ExperimentCoordinator:
+    """Fresh coordinator/pipeline over existing run artifacts (a restart)."""
+    coordinator = ExperimentCoordinator(
+        identity,
+        toolchain=toolchain,
+        models=object(),
+        controls=RunControls(),
+    )
+    coordinator.state = CoordinatorState(task_name="toy", tag="run")
+    coordinator.candidates = CandidatePipeline(
+        identity,
+        toolchain=toolchain,
+        models=object(),
+        task_config={},
+    )
+    return coordinator
+
+
+def candidate_failure_receipt(identity: RunIdentity, run_id: str) -> dict:
+    path = (
+        identity.run_dir
+        / ".orchestrator"
+        / "candidate_failures"
+        / f"{run_id}.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_failure_coordinator(
+    tmp: str,
+    toolchain: object,
+    *,
+    baseline: bool = False,
+) -> tuple[ExperimentCoordinator, RoundAction, RoundAction]:
+    """Coordinator with a two-candidate round over a build-failure stub."""
+    identity = RunIdentity(Path(tmp), "toy", "run")
+    failing = RoundAction(
+        op="fresh", run_id="000" if baseline else "001", admitted=True
+    )
+    following = RoundAction(op="fresh", run_id="002", admitted=True)
+    candidate_dir = identity.run_dir / "candidates" / str(failing.run_id)
+    candidate_dir.mkdir(parents=True)
+    atomic_write_json(
+        candidate_dir / "_candidate_brief.json",
+        {
+            "implementation_source": {
+                "kind": "provided_entrypoint" if baseline else "generated"
+            }
+        },
+    )
+    coordinator = ExperimentCoordinator(
+        identity,
+        toolchain=object(),
+        models=object(),
+        controls=RunControls(),
+    )
+    coordinator.state = CoordinatorState(
+        task_name="toy",
+        tag="run",
+        active_round=ActiveRound(
+            round_id=0,
+            actions=[failing, following],
+            admission_complete=True,
+        ),
+    )
+    coordinator.candidates = CandidatePipeline(
+        identity,
+        toolchain=toolchain,
+        models=object(),
+        task_config={},
+    )
+    return coordinator, failing, following
+
+
+def write_preflight_terminal_report(
+    identity: RunIdentity,
+    run_id: str,
+    *,
+    category: str,
+) -> None:
+    """Durable preflight terminal: crashed before any objective reservation."""
+    candidate_dir = identity.run_dir / "candidates" / run_id
+    candidate_dir.mkdir(parents=True)
+    revision = execution_revision_fixture()
+    terminal = {
+        "status": "crashed",
+        "phase": "preflight",
+        "crash_index": 0,
+        "crash_params": {"x": 1},
+        "objective_slot_consumed": False,
+        "objective_attempt_id": None,
+        "objective_reservation": None,
+        "failure_category": category,
+        "candidate_execution_revision": revision,
+        "failure_receipt": {"frames": []},
+        "failure_ref": immutable_failure_ref("fail-4444444444444444"),
+    }
+    atomic_write_json(
+        candidate_dir / "tune_report.json",
+        {
+            "phase_a": {
+                "status": "preflight_failed",
+                "candidate_code_revision": revision,
+                "terminal_failure": terminal,
+            }
+        },
+    )
 
 
 class OrchestratorBoundaryTests(unittest.TestCase):
@@ -1253,7 +1602,210 @@ class OrchestratorBoundaryTests(unittest.TestCase):
                         identity.run_dir / "candidates" / "001" / "tune_report.json",
                     )
 
-    def test_restart_does_not_promote_stale_report_to_contract_or_preflight(self) -> None:
+    def test_restart_mid_evaluation_forward_completes_without_reimplementation(
+        self,
+    ) -> None:
+        # Window (a): the worker published BASE_PARAMS and completed Phase A,
+        # then the coordinator restarted before observing the ledger close.
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            candidate_dir = write_worker_mutated_candidate(identity)
+            atomic_write_json(
+                candidate_dir / "tune_report.json",
+                {"phase_a": {"status": "ok", "best_warm_score": 0.25}},
+            )
+            toolchain = MidEvaluationToolchainStub()
+            coordinator = restart_coordinator(identity, toolchain)
+            pipeline = coordinator.candidates
+            probe = RoundAction(op="fresh", run_id="001", admitted=True)
+            # Fixture sanity: the worker rewrite staled the receipts, so
+            # receipt-derived inference would route backwards into
+            # re-implementation, which raises and blocks the run.
+            self.assertFalse(pipeline.implementation_is_ready(probe))
+
+            coordinator._reconcile_state()
+            active = coordinator.state.active_round
+            self.assertIsNotNone(active)
+            resumed = active.actions[0]
+            self.assertTrue(resumed.materialized)
+            self.assertTrue(resumed.implemented)
+            self.assertTrue(resumed.contract_ready)
+            self.assertTrue(resumed.preflight_ready)
+            self.assertFalse(resumed.resolved)
+            transition = next_transition(
+                coordinator.state,
+                ledger_exists=True,
+                ledger_brief=toolchain.ledger_brief(identity.run_dir),
+                has_provided_baseline=False,
+            )
+            self.assertIs(transition, Transition.EVALUATE_WARM_CONFIGS)
+
+            with patch.object(
+                pipeline,
+                "implement",
+                side_effect=AssertionError("must not re-implement"),
+            ), patch.object(
+                pipeline,
+                "build_contract",
+                side_effect=AssertionError("must not rebuild the contract"),
+            ):
+                coordinator._evaluate_candidate()
+
+            self.assertTrue(resumed.resolved)
+            self.assertEqual(toolchain.warmstart_calls, 0)
+            self.assertEqual(toolchain.projected, ["001"])
+            self.assertEqual(toolchain.scores, [("001", 0.25)])
+
+    def test_restart_after_code_repair_reenters_evaluation(self) -> None:
+        # Window (b): a debug code repair completed and authorized its retry,
+        # then the coordinator restarted before the retried worker ran.
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            candidate_dir = write_worker_mutated_candidate(identity)
+            toolchain = MidEvaluationToolchainStub()
+            terminal = write_terminal_report(
+                candidate_dir,
+                toolchain,
+                failure_id="fail-7777777777777777",
+                crash_index=0,
+                crash_params={"x": 1},
+            )
+            models = DebugModelStub(
+                parse_debug_response(
+                    {
+                        "verdict": "code_incompatible",
+                        "rationale": "the implementation rejects a legal value",
+                        "corrected_config": [],
+                        "repair_instructions": "accept the legal value",
+                    }
+                )
+            )
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=models,
+                task_config={},
+            )
+            action = RoundAction(op="fresh", run_id="001", admitted=True)
+            evidence = FailureEvidence.from_worker_payload("001", terminal)
+            repaired = pipeline._debug_once(
+                action,
+                evidence,
+                candidate_dir / "tune_report.json",
+                terminal=terminal,
+            )
+            self.assertTrue(repaired)
+            self.assertEqual(models.edit_calls, 1)
+
+            coordinator = restart_coordinator(identity, toolchain)
+            coordinator._reconcile_state()
+            active = coordinator.state.active_round
+            self.assertIsNotNone(active)
+            resumed = active.actions[0]
+            self.assertFalse(resumed.resolved)
+            transition = next_transition(
+                coordinator.state,
+                ledger_exists=True,
+                ledger_brief=toolchain.ledger_brief(identity.run_dir),
+                has_provided_baseline=False,
+            )
+            self.assertIs(transition, Transition.EVALUATE_WARM_CONFIGS)
+
+            resume_models = DebugModelStub(models.decision)
+            coordinator.candidates = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=resume_models,
+                task_config={},
+            )
+            coordinator._evaluate_candidate()
+
+            self.assertTrue(resumed.resolved)
+            self.assertEqual(toolchain.warmstart_calls, 1)
+            self.assertEqual(toolchain.scores, [("001", 0.5)])
+            self.assertEqual(resume_models.infer_calls, 0)
+            self.assertEqual(resume_models.edit_calls, 0)
+
+    def test_restart_after_config_repair_reenters_evaluation(self) -> None:
+        # Window (c): a config-only repair mutated just _warm_configs.json;
+        # the implementation receipt still matches, so receipt-derived
+        # inference would route into BUILD_TUNING_CONTRACT and die on the
+        # stale tuning-values state.
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            candidate_dir = write_worker_mutated_candidate(
+                identity,
+                configs=[{"x": 1}, {"x": 1}],
+                implementation_matches_current=True,
+            )
+            toolchain = MidEvaluationToolchainStub()
+            terminal = write_terminal_report(
+                candidate_dir,
+                toolchain,
+                failure_id="fail-8888888888888888",
+                crash_index=1,
+                crash_params={"x": 1},
+            )
+            models = DebugModelStub(
+                parse_debug_response(
+                    {
+                        "verdict": "config_invalid",
+                        "rationale": "x=1 diverges; move to the next grid value",
+                        "corrected_config": [{"key": "x", "value_json": "2"}],
+                        "repair_instructions": "",
+                    }
+                )
+            )
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=models,
+                task_config={},
+            )
+            action = RoundAction(op="fresh", run_id="001", admitted=True)
+            evidence = FailureEvidence.from_worker_payload("001", terminal)
+            repaired = pipeline._debug_once(
+                action,
+                evidence,
+                candidate_dir / "tune_report.json",
+                terminal=terminal,
+            )
+            self.assertTrue(repaired)
+            self.assertEqual(models.edit_calls, 0)
+            configs = json.loads(
+                (candidate_dir / "_warm_configs.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(configs, [{"x": 1}, {"x": 2}])
+
+            coordinator = restart_coordinator(identity, toolchain)
+            probe = RoundAction(op="fresh", run_id="001", admitted=True)
+            # Fixture sanity: receipts still authorize implementation but not
+            # the contract, so receipt-derived inference would return
+            # BUILD_TUNING_CONTRACT instead of evaluation.
+            self.assertTrue(coordinator.candidates.implementation_is_ready(probe))
+            self.assertFalse(coordinator.candidates.contract_is_ready(probe))
+
+            coordinator._reconcile_state()
+            active = coordinator.state.active_round
+            self.assertIsNotNone(active)
+            resumed = active.actions[0]
+            transition = next_transition(
+                coordinator.state,
+                ledger_exists=True,
+                ledger_brief=toolchain.ledger_brief(identity.run_dir),
+                has_provided_baseline=False,
+            )
+            self.assertIs(transition, Transition.EVALUATE_WARM_CONFIGS)
+
+            coordinator._evaluate_candidate()
+
+            self.assertTrue(resumed.resolved)
+            self.assertEqual(toolchain.warmstart_calls, 1)
+            self.assertEqual(toolchain.scores, [("001", 0.5)])
+
+    def test_restart_without_report_keeps_receipt_derived_stages(self) -> None:
+        # Negative: with no durable report, evaluation has not started and
+        # stage readiness stays receipt-derived.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             identity = RunIdentity(repo_root, "toy", "run")
@@ -1274,12 +1826,20 @@ class OrchestratorBoundaryTests(unittest.TestCase):
             atomic_write_json(
                 candidate_dir / CandidatePipeline.IMPLEMENTATION_RECEIPT,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "run_id": "001",
                     "candidate_revision": file_revision(candidate_dir / "train.py"),
+                    "input_revision": paths_revision(
+                        (
+                            candidate_dir / "_candidate_brief.json",
+                            candidate_dir / "prepare.py",
+                            repo_root / "tasks" / "toy" / "TASK.md",
+                            repo_root / "tasks" / "toy" / "task.toml",
+                            identity.run_dir / "framework_cfg.json",
+                        )
+                    ),
                 },
             )
-            atomic_write_json(candidate_dir / "tune_report.json", {"phase_a": {"status": "crashed"}})
 
             coordinator = ExperimentCoordinator(
                 identity,
@@ -1303,6 +1863,377 @@ class OrchestratorBoundaryTests(unittest.TestCase):
             self.assertFalse(action.contract_ready)
             self.assertFalse(action.preflight_ready)
             self.assertFalse(action.resolved)
+
+    def test_malformed_report_still_raises_during_restart_inference(self) -> None:
+        # Negative: the report-exists override must not mask corruption; a
+        # malformed report keeps raising instead of routing anywhere.
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            candidate_dir = write_worker_mutated_candidate(identity)
+            atomic_write_json(
+                candidate_dir / "tune_report.json",
+                {"phase_a": "corrupted"},
+            )
+            coordinator = restart_coordinator(
+                identity, MidEvaluationToolchainStub()
+            )
+            action = RoundAction(op="fresh", run_id="001", admitted=True)
+
+            with self.assertRaisesRegex(ArtifactError, "malformed Phase A report"):
+                coordinator._infer_candidate_stages(action, {"status": "pending"})
+
+    def test_contract_build_failure_closes_candidate_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = DebugPreflightToolchainStub()
+            coordinator, action, following = build_failure_coordinator(
+                tmp, toolchain
+            )
+            pipeline = coordinator.candidates
+
+            with patch.object(
+                pipeline,
+                "build_contract",
+                side_effect=CandidateBuildError("invalid staged schema"),
+            ):
+                coordinator._build_candidate_contract()
+
+            self.assertTrue(action.resolved)
+            self.assertFalse(action.contract_ready)
+            self.assertEqual(toolchain.crashes, ["001"])
+            self.assertIs(coordinator._next_unresolved_action(), following)
+            failure = candidate_failure_receipt(coordinator.identity, "001")
+            self.assertEqual(failure["status"], "crash")
+            self.assertEqual(failure["stage"], "tuning_contract")
+            self.assertEqual(failure["objective_calls"], 0)
+            self.assertIn("invalid staged schema", failure["error"])
+
+    def test_implementation_failure_closes_candidate_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = DebugPreflightToolchainStub()
+            coordinator, action, following = build_failure_coordinator(
+                tmp, toolchain
+            )
+            action.materialized = True
+            pipeline = coordinator.candidates
+
+            with patch.object(
+                pipeline,
+                "implement",
+                side_effect=CandidateBuildError("writer produced no valid source"),
+            ):
+                coordinator._materialize_and_implement()
+
+            self.assertTrue(action.resolved)
+            self.assertFalse(action.implemented)
+            self.assertEqual(toolchain.crashes, ["001"])
+            self.assertIs(coordinator._next_unresolved_action(), following)
+            failure = candidate_failure_receipt(coordinator.identity, "001")
+            self.assertEqual(failure["status"], "crash")
+            self.assertEqual(failure["stage"], "implementation")
+
+    def test_preflight_failure_closes_candidate_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = DebugPreflightToolchainStub()
+            coordinator, action, following = build_failure_coordinator(
+                tmp, toolchain
+            )
+            pipeline = coordinator.candidates
+
+            with patch.object(
+                pipeline,
+                "preflight",
+                side_effect=CandidateBuildError("no-score preflight rejected"),
+            ):
+                coordinator._preflight_candidate()
+
+            self.assertTrue(action.resolved)
+            self.assertFalse(action.preflight_ready)
+            self.assertEqual(toolchain.crashes, ["001"])
+            self.assertIs(coordinator._next_unresolved_action(), following)
+            failure = candidate_failure_receipt(coordinator.identity, "001")
+            self.assertEqual(failure["status"], "crash")
+            self.assertEqual(failure["stage"], "preflight")
+
+    def test_evaluation_build_failure_closes_candidate_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = DebugPreflightToolchainStub()
+            coordinator, action, following = build_failure_coordinator(
+                tmp, toolchain
+            )
+            pipeline = coordinator.candidates
+
+            with patch.object(
+                pipeline,
+                "evaluate",
+                side_effect=CandidateBuildError(
+                    "candidate 001 failed before any objective reservation; "
+                    "refusing to record an experimental crash"
+                ),
+            ):
+                coordinator._evaluate_candidate()
+
+            self.assertTrue(action.resolved)
+            self.assertEqual(toolchain.crashes, ["001"])
+            self.assertIs(coordinator._next_unresolved_action(), following)
+            failure = candidate_failure_receipt(coordinator.identity, "001")
+            self.assertEqual(failure["status"], "crash")
+            self.assertEqual(failure["stage"], "evaluation")
+
+    def test_provided_baseline_build_failure_stays_run_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = DebugPreflightToolchainStub()
+            coordinator, action, _ = build_failure_coordinator(
+                tmp, toolchain, baseline=True
+            )
+            action.materialized = True
+            pipeline = coordinator.candidates
+
+            with patch.object(
+                pipeline,
+                "implement",
+                side_effect=CandidateBuildError("seed copy rejected"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "provided baseline candidate failed at implementation",
+                ):
+                    coordinator._materialize_and_implement()
+
+            self.assertTrue(action.resolved)
+            self.assertEqual(toolchain.crashes, ["000"])
+            failure = candidate_failure_receipt(coordinator.identity, "000")
+            self.assertEqual(failure["status"], "crash")
+            self.assertEqual(failure["stage"], "implementation")
+
+    def test_provided_baseline_evaluation_failure_stays_run_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = DebugPreflightToolchainStub()
+            coordinator, action, _ = build_failure_coordinator(
+                tmp, toolchain, baseline=True
+            )
+            pipeline = coordinator.candidates
+
+            with patch.object(
+                pipeline,
+                "evaluate",
+                side_effect=CandidateBuildError(
+                    "candidate 000 failed before any objective reservation"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "provided baseline candidate failed at evaluation",
+                ):
+                    coordinator._evaluate_candidate()
+
+            self.assertTrue(action.resolved)
+            self.assertEqual(toolchain.crashes, ["000"])
+            failure = candidate_failure_receipt(coordinator.identity, "000")
+            self.assertEqual(failure["status"], "crash")
+            self.assertEqual(failure["stage"], "evaluation")
+
+    def test_debug_repair_invalid_edit_closes_candidate_as_crash(self) -> None:
+        class InvalidEditModelStub(DebugModelStub):
+            def edit(self, spec, *, validate):
+                self.edit_calls += 1
+                spec.write_paths[0].write_text("def broken(:\n", encoding="utf-8")
+                return validate()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "run")
+            task_dir = repo_root / "tasks" / "toy"
+            candidate_dir = identity.run_dir / "candidates" / "001"
+            task_dir.mkdir(parents=True)
+            candidate_dir.mkdir(parents=True)
+            (task_dir / "TASK.md").write_text("# task\n", encoding="utf-8")
+            (task_dir / "task.toml").write_text("", encoding="utf-8")
+            (candidate_dir / "prepare.py").write_text("", encoding="utf-8")
+            (candidate_dir / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
+            atomic_write_json(
+                candidate_dir / "_candidate_brief.json",
+                {"implementation_source": {"kind": "generated"}},
+            )
+            atomic_write_json(candidate_dir / "_warm_configs.json", [{"x": 1}])
+            atomic_write_json(
+                candidate_dir / "_search_space.json", {"x": ["int", 1, 2]}
+            )
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json", {"tuner": {"K_eval": 2}}
+            )
+            atomic_write_json(
+                candidate_dir / "_failures" / "fail-3333333333333333.json",
+                {"failure_id": "fail-3333333333333333"},
+            )
+
+            revision = execution_revision_fixture()
+            reservation = {
+                "schema_version": 1,
+                "kind": "score_attempt",
+                "attempt_id": "eval-000001",
+                "run_id": "001",
+                "phase": "phase_a",
+                "method": "warmstart",
+                "params_sha256": json_revision({"x": 1}),
+            }
+            terminal = {
+                "status": "crashed",
+                "phase": "a",
+                "crash_index": 0,
+                "crash_params": {"x": 1},
+                "objective_slot_consumed": True,
+                "failure_category": "candidate_code_incompatibility",
+                "candidate_execution_revision": revision,
+                "objective_attempt_id": "eval-000001",
+                "objective_reservation": reservation,
+                "failure_receipt": {
+                    "frames": [
+                        {"path": str(candidate_dir / "train.py"), "line": 1}
+                    ]
+                },
+                "failure_ref": immutable_failure_ref("fail-3333333333333333"),
+            }
+            atomic_write_json(
+                candidate_dir / "tune_report.json",
+                {
+                    "phase_a": {
+                        "status": "crashed",
+                        "trials_attempted": 1,
+                        "warm_start_configs": [],
+                        "candidate_code_revision": revision,
+                        "terminal_failure": terminal,
+                    }
+                },
+            )
+            toolchain = CrashClosureToolchainStub(attempts=1, receipts=[reservation])
+            models = InvalidEditModelStub(
+                parse_debug_response(
+                    {
+                        "verdict": "code_incompatible",
+                        "rationale": "the implementation rejects a legal value",
+                        "corrected_config": [],
+                        "repair_instructions": "accept the legal value",
+                    }
+                )
+            )
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=models,
+                task_config={},
+            )
+            action = RoundAction(op="fresh", run_id="001", admitted=True)
+
+            outcome = pipeline.evaluate(action)
+
+            self.assertEqual(outcome.status, "crash")
+            self.assertTrue(toolchain.crashed)
+            self.assertEqual(models.infer_calls, 1)
+            self.assertEqual(models.edit_calls, 1)
+            repair = json.loads(
+                (candidate_dir / CandidatePipeline.PHASE_A_REPAIR_RECEIPT).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(repair["status"], "rejected")
+            diagnostic = json.loads(
+                (
+                    identity.run_dir
+                    / ".orchestrator"
+                    / "candidate_contract_diagnostics"
+                    / "001-debug_repair.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(diagnostic["stage"], "debug_repair")
+            self.assertEqual(diagnostic["error_type"], "SourceValidationRejected")
+
+            resumed = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=models,
+                task_config={},
+            )
+            replay = resumed.evaluate(action)
+
+            self.assertEqual(replay.status, "crash")
+            self.assertEqual(models.infer_calls, 1)
+            self.assertEqual(models.edit_calls, 1)
+
+    def test_preflight_timeout_terminal_closes_candidate_via_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            write_preflight_terminal_report(
+                identity, "001", category="timeout_or_resource"
+            )
+            atomic_write_json(
+                identity.run_dir / "candidates" / "001" / "_candidate_brief.json",
+                {"implementation_source": {"kind": "generated"}},
+            )
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json", {"tuner": {"K_eval": 2}}
+            )
+            toolchain = CrashClosureToolchainStub(attempts=0)
+            coordinator = ExperimentCoordinator(
+                identity,
+                toolchain=object(),
+                models=object(),
+                controls=RunControls(),
+            )
+            action = RoundAction(op="fresh", run_id="001", admitted=True)
+            following = RoundAction(op="fresh", run_id="002", admitted=True)
+            coordinator.state = CoordinatorState(
+                task_name="toy",
+                tag="run",
+                active_round=ActiveRound(
+                    round_id=0,
+                    actions=[action, following],
+                    admission_complete=True,
+                ),
+            )
+            coordinator.candidates = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=object(),
+                task_config={},
+            )
+
+            coordinator._evaluate_candidate()
+
+            self.assertTrue(action.resolved)
+            self.assertTrue(toolchain.crashed)
+            self.assertIs(coordinator._next_unresolved_action(), following)
+            failure = candidate_failure_receipt(identity, "001")
+            self.assertEqual(failure["status"], "crash")
+            self.assertEqual(failure["stage"], "evaluation")
+            self.assertIn("before any objective reservation", failure["error"])
+
+    def test_preflight_unknown_terminal_with_attempts_records_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            write_preflight_terminal_report(
+                identity, "001", category="unknown_non_candidate_failure"
+            )
+            atomic_write_json(
+                identity.run_dir / "candidates" / "001" / "_candidate_brief.json",
+                {"implementation_source": {"kind": "generated"}},
+            )
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json", {"tuner": {"K_eval": 2}}
+            )
+            toolchain = CrashClosureToolchainStub(attempts=1)
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=object(),
+                task_config={},
+            )
+
+            outcome = pipeline.evaluate(
+                RoundAction(op="fresh", run_id="001", admitted=True)
+            )
+
+            self.assertEqual(outcome.status, "crash")
+            self.assertTrue(toolchain.crashed)
 
     def test_attempted_budget_exhaustion_closes_without_projecting_failed_phase_a(
         self,
@@ -1974,6 +2905,142 @@ class OrchestratorBoundaryTests(unittest.TestCase):
                 ArtifactError, "does not match its immutable artifact"
             ):
                 pipeline._phase_a_terminal_failure("001", report_path)
+
+    def test_producer_shape_terminal_revision_reaches_crash_close(self) -> None:
+        """A real warmstart crash artifact must not be rejected as malformed.
+
+        The worker stamps the full schema-3 execution revision from
+        tune_tools._candidate_execution_revision; a consumer written against
+        the old synthetic 2-key projection raised ArtifactError on every real
+        Phase-A crash instead of closing it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            candidate_dir = identity.run_dir / "candidates" / "001"
+            candidate_dir.mkdir(parents=True)
+            atomic_write_json(
+                candidate_dir / "_candidate_brief.json",
+                {"implementation_source": {"kind": "generated"}},
+            )
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"tuner": {"K_eval": 2}},
+            )
+            revision = execution_revision_fixture()
+            reservation = {
+                "schema_version": 1,
+                "kind": "score_attempt",
+                "attempt_id": "eval-000001",
+                "run_id": "001",
+                "phase": "phase_a",
+                "method": "warmstart",
+                "params_sha256": json_revision({"x": 1}),
+            }
+            terminal = {
+                "status": "crashed",
+                "phase": "a",
+                "crash_index": 0,
+                "crash_params": {"x": 1},
+                "objective_slot_consumed": True,
+                "failure_category": "process_interruption",
+                "candidate_execution_revision": revision,
+                "objective_attempt_id": "eval-000001",
+                "objective_reservation": reservation,
+                "failure_receipt": {"frames": []},
+                "failure_ref": immutable_failure_ref("fail-7777777777777777"),
+            }
+            atomic_write_json(
+                candidate_dir / "tune_report.json",
+                {
+                    "phase_a": {
+                        "status": "crashed",
+                        "trials_attempted": 1,
+                        "warm_start_configs": [],
+                        "candidate_code_revision": revision,
+                        "terminal_failure": terminal,
+                    }
+                },
+            )
+            toolchain = CrashClosureToolchainStub(
+                attempts=1, receipts=[reservation]
+            )
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=object(),
+                task_config={},
+            )
+
+            outcome = pipeline.evaluate(
+                RoundAction(op="fresh", run_id="001", admitted=True)
+            )
+
+            self.assertEqual(outcome.status, "crash")
+            self.assertTrue(toolchain.crashed)
+
+    def test_terminal_revision_rejects_non_producer_shapes(self) -> None:
+        """Accepting the real shape must not weaken the revision contract."""
+        legacy_projection = {
+            "structure_sha256": "sha256:" + "1" * 64,
+            "revision_sha256": "sha256:" + "2" * 64,
+        }
+        bad_digest = execution_revision_fixture()
+        bad_digest["structure_sha256"] = "sha256:not-hex"
+        mismatched_report = execution_revision_fixture()
+        mismatched_report["search_space"] = {"y": ["int", 1, 2]}
+        cases = (
+            ("legacy_two_key_projection", legacy_projection, legacy_projection),
+            ("non_sha256_structure_digest", bad_digest, bad_digest),
+            (
+                "terminal_report_mismatch",
+                execution_revision_fixture(),
+                mismatched_report,
+            ),
+        )
+        for name, terminal_revision, report_revision in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                identity = RunIdentity(Path(tmp), "toy", "run")
+                candidate_dir = identity.run_dir / "candidates" / "001"
+                candidate_dir.mkdir(parents=True)
+                report_path = candidate_dir / "tune_report.json"
+                atomic_write_json(
+                    report_path,
+                    {
+                        "phase_a": {
+                            "candidate_code_revision": report_revision,
+                            "terminal_failure": {
+                                "status": "crashed",
+                                "phase": "preflight",
+                                "crash_index": 0,
+                                "crash_params": {"x": 1},
+                                "objective_slot_consumed": False,
+                                "objective_attempt_id": None,
+                                "objective_reservation": None,
+                                "failure_category": (
+                                    "candidate_code_incompatibility"
+                                ),
+                                "candidate_execution_revision": (
+                                    terminal_revision
+                                ),
+                                "failure_receipt": {"frames": []},
+                                "failure_ref": immutable_failure_ref(
+                                    "fail-7777777777777777"
+                                ),
+                            },
+                        }
+                    },
+                )
+                pipeline = CandidatePipeline(
+                    identity,
+                    toolchain=CrashClosureToolchainStub(attempts=0),
+                    models=object(),
+                    task_config={},
+                )
+
+                with self.assertRaisesRegex(
+                    ArtifactError, "does not match its report"
+                ):
+                    pipeline._phase_a_terminal_failure("001", report_path)
 
     def test_stdout_only_worker_failure_is_rejected_without_crash(self) -> None:
         class PreflightFailureToolchain(CrashClosureToolchainStub):

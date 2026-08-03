@@ -58,6 +58,24 @@ MAX_IMPLEMENTATION_ATTEMPTS = 2
 PHASE_A_WORKER_RECOVERY_BACKOFF_SECONDS = 0.25
 MAX_PHASE_A_WORKER_TIMEOUTS = 2
 
+# Exact key set of the schema-3 execution-revision object produced by
+# tools/tuners/tune_tools.py::_candidate_execution_revision.  The warmstart
+# worker stamps it on phase_a.candidate_code_revision and on every
+# terminal_failure.candidate_execution_revision; the consumer must accept the
+# full producer shape, not a projection of it.
+EXECUTION_REVISION_KEYS = frozenset(
+    {
+        "schema_version",
+        "structure_sha256",
+        "search_space",
+        "search_space_keys",
+        "search_space_sha256",
+        "prepare_sha256",
+        "evaluation_contract",
+        "revision_sha256",
+    }
+)
+
 
 class CandidateBuildError(RuntimeError):
     pass
@@ -2058,6 +2076,7 @@ class CandidatePipeline:
         report_revision = phase_a.get("candidate_code_revision")
         if (
             not isinstance(terminal_revision, dict)
+            or set(terminal_revision) != EXECUTION_REVISION_KEYS
             or not _is_sha256(terminal_revision.get("structure_sha256"))
             or not _is_sha256(terminal_revision.get("revision_sha256"))
             or terminal_revision != report_revision
@@ -2233,6 +2252,16 @@ class CandidatePipeline:
             ):
                 return self._close_crash(action.run_id, report_path)
             return None
+        if category in {
+            "timeout_or_resource",
+            "unknown_non_candidate_failure",
+        }:
+            # A preflight terminal never consumes an objective slot (enforced
+            # by _phase_a_terminal_failure).  With earlier reservations this
+            # closes the crash directly; without any, _close_crash raises
+            # CandidateBuildError and the coordinator records an
+            # evaluation-stage candidate close.  Neither blocks the run.
+            return self._close_crash(action.run_id, report_path)
         if (
             terminal.get("objective_slot_consumed") is True
             and category
@@ -2301,15 +2330,24 @@ class CandidatePipeline:
         self,
         action: RoundAction,
         error: BaseException,
-    ) -> None:
-        """Record a candidate that failed before evaluation.
+        *,
+        stage: str,
+    ) -> CandidateOutcome:
+        """Close a candidate that failed before evaluation as a ledger crash.
 
         A build failure belongs to the candidate, not the run: the receipt
-        keeps the failure with the candidate so the coordinator can resolve
-        the action and continue the round.
+        records the failing stage and the ledger record is closed as a crash
+        so the coordinator can resolve the action and continue the round.
         """
         if action.run_id is None:
             raise ValueError("cannot close an action without run_id")
+        if stage not in {
+            "implementation",
+            "tuning_contract",
+            "preflight",
+            "evaluation",
+        }:
+            raise ValueError(f"invalid candidate build-failure stage: {stage}")
         receipt = (
             self.identity.run_dir
             / ".orchestrator"
@@ -2321,11 +2359,14 @@ class CandidatePipeline:
             {
                 "schema_version": 1,
                 "run_id": action.run_id,
+                "stage": stage,
                 "status": "crash",
                 "error": f"{type(error).__name__}: {error}",
                 "objective_calls": 0,
             },
         )
+        record = self.toolchain.record_crash(self.identity.run_dir, action.run_id)
+        return CandidateOutcome(status=str(record.get("status", "crash")))
 
     @staticmethod
     def _contract_diagnostic_payload(
@@ -2782,12 +2823,28 @@ class CandidatePipeline:
                 if callable(completed) and completed(edit_spec):
                     pass
                 elif file_revision(candidate_path) == repair["candidate_revision_before"]:
-                    self.models.edit(
-                        edit_spec,
-                        validate=lambda: self._validate_authored_python(
-                            candidate_path
-                        ),
-                    )
+                    try:
+                        self.models.edit(
+                            edit_spec,
+                            validate=lambda: self._validate_authored_python(
+                                candidate_path
+                            ),
+                        )
+                    except SourceValidationRejected as exc:
+                        # The repair reservation is consumed.  An invalid edit
+                        # leaves the candidate source half-repaired, so close
+                        # the candidate through the normal crash path instead
+                        # of letting a rejected repair strand the run on
+                        # resume without a completed edit receipt.
+                        self._write_contract_diagnostic(
+                            run_id,
+                            stage="debug_repair",
+                            error=exc,
+                        )
+                        self._write_phase_a_repair_status(
+                            run_id, repair, "rejected"
+                        )
+                        return False
                 else:
                     raise ArtifactError(
                         f"candidate {run_id} changed during repair without a completed edit receipt"

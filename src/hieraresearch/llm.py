@@ -230,6 +230,17 @@ class ModelGateway:
             "max_turns": spec.max_turns,
         }
         input_revision = json_revision(request)
+        failed = self.journal.nonretryable_failure(
+            purpose=spec.purpose,
+            schema_version=spec.schema_version,
+            input_revision=input_revision,
+            model=self.model,
+        )
+        if failed is not None:
+            raise InferenceRequestError(
+                f"recorded non-retryable {spec.purpose} request failure: {failed}"
+            )
+
         invocation = self.journal.begin(
             purpose=spec.purpose,
             schema_version=spec.schema_version,
@@ -279,7 +290,11 @@ class ModelGateway:
             self.journal.complete(invocation, response=response, metadata=metadata)
             return validated
         except BaseException as exc:
-            self.journal.fail(invocation, exc)
+            self.journal.fail(
+                invocation,
+                exc,
+                retryable=not isinstance(exc, InferenceRequestError),
+            )
             raise
 
     def completed_edit_matches(self, spec: AgentEditSpec) -> bool:

@@ -54,7 +54,7 @@ from _common import (  # noqa: E402
     is_config_infeasible_error,
     is_finite_score,
     load_candidate_modules,
-    objective_slot_consumed,
+    objective_attempt_admitted,
     params_identity,
     params_within_search_space,
     prepare_phase_c_objective_attempt,
@@ -721,7 +721,7 @@ def main() -> int:
             early_stop_reason = "evaluation_budget"
             break
         except Exception as exc:
-            if not objective_slot_consumed(exc):
+            if not objective_attempt_admitted(exc):
                 if objective_intent is not None:
                     cancel_phase_c_objective_attempt(
                         args.tune_report_json,
@@ -942,7 +942,7 @@ def main() -> int:
                 stop_now = True
                 break
             except Exception as exc:
-                if not objective_slot_consumed(exc):
+                if not objective_attempt_admitted(exc):
                     if objective_intent is not None:
                         cancel_phase_c_objective_attempt(
                             args.tune_report_json,

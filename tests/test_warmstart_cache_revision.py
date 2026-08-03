@@ -114,6 +114,7 @@ def evaluate_config(make_model, params):
             ]
             output = io.StringIO()
             evaluation_error = RuntimeError("candidate bug")
+            evaluation_error.objective_attempt_admitted = True
             evaluation_error.objective_slot_consumed = True
             failure = {
                 "error": "RuntimeError: candidate bug",
@@ -194,6 +195,50 @@ def evaluate_config(make_model, params):
             phase_a = json.loads(report_path.read_text())["phase_a"]
             self.assertEqual(phase_a["trials_attempted"], 0)
             self.assertEqual(phase_a["warm_start_configs"], [])
+
+    def test_standalone_candidate_crash_records_crashed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, configs_path, report_path = self._fixture(
+                Path(tmp),
+                provided=False,
+            )
+            # No framework_cfg.json anywhere above the candidate: the real
+            # timed_eval takes the unbudgeted standalone path, and a candidate
+            # exception must still become the recorded CRASHED receipt.
+            (candidate.parent / "prepare.py").write_text(
+                """
+def evaluate_config(make_model, params):
+    raise RuntimeError("candidate bug")
+""".lstrip()
+            )
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs_path),
+                "--tune-report-json",
+                str(report_path),
+            ]
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch("sys.stdout", new=output),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                self.assertEqual(warmstart_eval.main(), warmstart_eval.CRASHED)
+
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["status"], "crashed")
+            self.assertEqual(receipt["phase"], "a")
+            self.assertFalse(receipt["objective_slot_consumed"])
+            self.assertNotIn("objective_reservation", receipt)
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["phase_a"]["status"], "crashed")
+            self.assertFalse(
+                report["phase_a"]["terminal_failure"]["objective_slot_consumed"]
+            )
+            self.assertFalse((Path(tmp) / "evaluation_attempts.jsonl").exists())
 
     def test_preflight_crash_receipt_never_claims_an_objective_slot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

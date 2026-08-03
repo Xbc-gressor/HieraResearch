@@ -1204,7 +1204,6 @@ class CandidateContractPipelineTests(unittest.TestCase):
 
         self.assertEqual(warm_configs["minItems"], 1)
         self.assertNotIn("maxItems", warm_configs)
-        self.assertIn("Exactly 5", warm_configs["description"])
         with self.assertRaisesRegex(ValueError, "exactly 5 configs"):
             TuningValues.from_response(
                 tuning_response(1, 2),

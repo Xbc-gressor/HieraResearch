@@ -94,6 +94,17 @@ def objective_slot_consumed(error: BaseException) -> bool:
     return getattr(error, "objective_slot_consumed", False) is True
 
 
+def objective_attempt_admitted(error: BaseException) -> bool:
+    """Whether ``timed_eval`` admitted the objective before raising ``error``.
+
+    True once ``reserve_evaluation`` returned — with a durable receipt, or
+    with ``None`` on the unbudgeted standalone path where no reservation
+    state can be ambiguous. False only when the reservation helper itself
+    raised; callers must not fabricate a failed objective row for that case.
+    """
+    return getattr(error, "objective_attempt_admitted", False) is True
+
+
 class _PhaseCLock:
     """Small raw-fd owner; unlike ``open()``, GC never emits ResourceWarning."""
 
@@ -812,6 +823,10 @@ def timed_eval(
             setattr(exc, "objective_reservation", dict(reservation))
             if isinstance(exc, DeepTuneTimeExhausted):
                 exc.attempt_reserved = True
+        # Past admission every failure is a candidate failure: either a slot
+        # was durably consumed, or no run budget exists at all (standalone),
+        # where admission is deterministic and unaccounted by design.
+        setattr(exc, "objective_attempt_admitted", True)
         raise
 
 
