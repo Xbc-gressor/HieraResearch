@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 from background_contract import validate_registry  # noqa: E402
 from apply_base_params import apply as apply_base_params  # noqa: E402
 from got_graph import CRASH, Graph, render_incremental  # noqa: E402
-from ledger import _set_experience, _touch_dag_record  # noqa: E402
+from ledger import _load_ledger, _set_experience, _touch_dag_record  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
 from semantic_evidence import _json_sha256, build_semantic_edges  # noqa: E402
 from semantic_space import complete_point, derive_semantic_lineage, digest  # noqa: E402
@@ -89,7 +89,7 @@ class IncrementalDagTests(unittest.TestCase):
             ledger_path.write_text(json.dumps(data))
             _set_experience(
                 ledger_path,
-                data,
+                _load_ledger(ledger_path),
                 {"summary": "current"},
                 validated_dag_revision=7,
             )

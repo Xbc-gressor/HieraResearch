@@ -102,6 +102,8 @@ RECORD_FIELDS = (
     "elapsed_seconds",
     "applied",           # bool | null: tuned params applied to BASE_PARAMS
     "dag_revision",      # last score/status revision visible to the development DAG
+    "tuning_bouts",      # int: completed progressive-tuning bouts (0 = never tuned)
+    "last_bout_improved",  # bool | null: last bout beat its pre-bout incumbent
 )
 
 TUNING_FIELDS = (
@@ -121,6 +123,8 @@ TUNING_FIELDS = (
     "applied",
     "parameter_transfer",
     "applied_incumbent",
+    "tuning_bouts",
+    "last_bout_improved",
 )
 
 # Scores are always lower-is-better, so a crash is the worst possible score.
@@ -174,6 +178,15 @@ def _load_ledger(path: Path) -> dict:
         with open(path) as f:
             data = json.load(f)
         data.setdefault("records", [])
+        for record in data["records"]:
+            if not isinstance(record, dict):
+                continue
+            # Progressive-tuning fields, additive: a legacy one-shot-tuned
+            # record counts as one completed bout with unknown response.
+            record.setdefault(
+                "tuning_bouts", 1 if record.get("tune") else 0
+            )
+            record.setdefault("last_bout_improved", None)
         if data["records"] and not isinstance(data.get("search_space_state"), dict):
             raise ValueError(
                 f"{path}: record-bearing ledger requires search_space_state; "
@@ -237,6 +250,8 @@ def _new_record(run_id: str) -> dict:
     return {field: None for field in RECORD_FIELDS} | {
         "run_id": run_id,
         "tune": False,
+        "tuning_bouts": 0,
+        "last_bout_improved": None,
         "status": "pending",
     }
 

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import finalize_tuning  # noqa: E402
+import ledger  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
 from semantic_evidence import _json_sha256  # noqa: E402
 from tune_tools import _candidate_execution_revision  # noqa: E402
@@ -1150,6 +1151,46 @@ class TuningFinalizationTests(unittest.TestCase):
                     self.assertEqual(result["final_best_score"], 0.8)
                     stored = json.loads(ledger_path.read_text())
                     self.assertTrue(stored["records"][0]["tune"])
+
+
+class LedgerProgressiveFieldsTest(unittest.TestCase):
+    def test_new_record_carries_progressive_defaults(self):
+        record = ledger._new_record("001")
+        self.assertEqual(record["tuning_bouts"], 0)
+        self.assertIsNone(record["last_bout_improved"])
+
+    def test_legacy_records_normalize_on_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = Path(tmp) / "ledger.json"
+            legacy = {
+                "run_id": "001",
+                "semantic_point": {},
+                "policy_receipt": {},
+                "status": "keep",
+                "tune": True,
+                "final_best_score": 0.9,
+            }
+            fresh = {
+                "run_id": "002",
+                "semantic_point": {},
+                "policy_receipt": {},
+                "status": "keep",
+                "tune": False,
+                "final_best_score": 1.1,
+            }
+            ledger_path.write_text(json.dumps({
+                "task": "autoresearch-baseline",
+                "tag": "test",
+                "metric": "val_bpb",
+                "search_space_state": empty_search_space_state(),
+                "records": [legacy, fresh],
+            }))
+            data = ledger._load_ledger(ledger_path)
+            by_id = {r["run_id"]: r for r in data["records"]}
+            self.assertEqual(by_id["001"]["tuning_bouts"], 1)
+            self.assertIsNone(by_id["001"]["last_bout_improved"])
+            self.assertEqual(by_id["002"]["tuning_bouts"], 0)
+            self.assertIsNone(by_id["002"]["last_bout_improved"])
 
 
 if __name__ == "__main__":

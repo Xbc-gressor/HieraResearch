@@ -37,10 +37,12 @@ first.
 Other mutations remain:
 
 - `set-tuning` for Phase-A tuning metadata;
-- `finalize_tuning.py` for the completed deep-tuning close: it validates
-  terminal Phase C, applies the global best, and writes score/status/tuning
-  metadata plus `tune: true` together. `set-tuning --mark-tuned` is disabled,
-  so there is no second close path;
+- `finalize_tuning.py` for a completed tuning-bout close: it validates
+  terminal Phase C for the current bout, applies the global best (warm plus
+  every Phase-C trial across all bouts), and writes score/status/tuning
+  metadata (`tuning_bouts`, `last_bout_improved`, graded `evaluation_depth`)
+  together. A finalized candidate stays eligible for later bouts.
+  `set-tuning --mark-tuned` is disabled, so there is no second close path;
 - `record-run` for the lower-is-better score and keep/discard/crash state;
 - `set-experience` for a complete validated derived snapshot;
 - `set-phase` and `loop-state` for run control and the derived brief.
@@ -94,7 +96,9 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `idea` | self-contained complete solution, not merely a list of hypotheses |
 | `change` | implementation process relative to parents; it may be non-empty even when the point is unchanged |
 | `candidate_name`, `description`, `metric` | display metadata |
-| `tune` | whether decoupled deep tuning ran |
+| `tune` | derived bool: the candidate completed at least one tuning bout (`evaluation_depth` is not `screening`) |
+| `tuning_bouts` | completed progressive-tuning bouts; 0 for screening-only or legacy untuned records, 1 for legacy one-shot-tuned records |
+| `last_bout_improved` | whether the last bout produced a trial strictly better than its pre-bout incumbent; null when unknown/never tuned |
 | `status` | `pending`, `keep`, `discard`, `crash`, or evidence-neutral terminal `unevaluated` |
 | `unevaluated_receipt` | helper-owned exhausted-budget/zero-attempt proof; present only for `unevaluated` |
 | `best_warm_score`, `final_best_score` | inner-HPO and final candidate observations |
@@ -179,10 +183,16 @@ edges), or `comparator_covered` (at least two direct tuned edges). A direct
 edge is not merely a one-dimension final-vs-final or inherited-parameter
 comparison: it requires a validated same-child-code control/treatment pair
 whose configs differ only in the declared semantic switch, the pinned parent
-snapshot, and no shared-key reset. A direct edge is **tuned** when the child
-record's `evaluation_depth` is `tuned` (it has a scored Phase-C trial);
-screening-depth and legacy direct edges remain evidence but cannot drive
-contradiction gates. Ordinary schema-2 transfers declare the
+snapshot, and no shared-key reset.
+`evaluation_depth` is graded by cumulative Phase-C objective attempts:
+`screening` (0), `tuned_lightly` (1 to `tuner.tuned_threshold`−1, default 15),
+or `tuned` (≥ threshold, default 16). A direct edge is **tuned** when the
+child record's `evaluation_depth` is `tuned` and **lightly tuned** at
+`tuned_lightly`; screening-depth and legacy direct edges remain evidence but
+cannot drive contradiction gates. Contradiction-grade transitions require at
+least two direct tuned edges or at least three direct edges at
+`tuned_lightly` or deeper.
+Ordinary schema-2 transfers declare the
 semantic pair `unverified`, so they remain confounded. Legacy,
 multi-dimension, reset-bearing, unpaired, or independently tuned comparisons
 are also confounded.
