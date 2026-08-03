@@ -1661,6 +1661,12 @@ def cmd_set_phase(args) -> int:
             )
         budget = args.budget if args.budget is not None else _framework_budget(ledger_path)
         attempted = _evaluations_done(data, ledger_path)["evaluations_done"]
+        # Any positive remainder is still spendable: got_select's admission
+        # cap governs only NEW candidate admission, while an admitted
+        # candidate's Phase C reserves per trial and can consume the tail.
+        # Permitting completion here would discard real evaluations, and
+        # close_exhausted_stage already holds the matching strict line
+        # (it refuses to close a running stage while remaining > 0).
         if budget is None or attempted < budget:
             raise SystemExit(
                 "cannot mark completed before a configured evaluation budget is reached "

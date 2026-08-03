@@ -46,13 +46,15 @@ The tuner scripts and `ledger.py` infer the **task** from these paths themselves
 (via `task.toml`), so you never pass a task name. Scores are **always
 lower-is-better** (minimize) — there is no direction flag. Override a method's
 trial cap by passing its own flag (e.g. `--n-trials 50`); the scripts have sane
-defaults. Phase C is additionally bounded by deterministic allocation: at most
-`tuner.deep_tune_budget_fraction` of the global objective budget and at most
-`tuner.deep_tune_per_candidate_cap` attempts for one candidate. There is no
-Phase-C wall-clock limit — the budget is trial-denominated (`tuner.bo_n_trials`,
-adaptive patience, the two caps above); `per_runtime_limit` still bounds each
-single evaluation. Atomic reservation and the search scripts enforce these
-limits.
+defaults. Phase C is bounded per candidate by
+`tuner.deep_tune_per_candidate_cap` attempts. There is **no run-level Phase-C
+share by default**: `tuner.deep_tune_budget_fraction` is null unless a run
+explicitly sets one, because a fixed share capped the only mechanism that ever
+lowered a score (run 0802-sonnet-ex125-1 spent its 37 post-cap evaluations on
+screening, which improved nothing all run). There is no Phase-C wall-clock
+limit either — the budget is trial-denominated (`tuner.bo_n_trials`, adaptive
+patience, the per-candidate cap); `per_runtime_limit` still bounds each single
+evaluation. Atomic reservation and the search scripts enforce these limits.
 
 ## Pipeline
 

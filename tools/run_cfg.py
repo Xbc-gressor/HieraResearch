@@ -126,15 +126,16 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
                 "in [0, 100)"
             )
 
-    if "deep_tune_budget_fraction" in tuner:
+    if tuner.get("deep_tune_budget_fraction") is not None:
+        # null (or the key omitted) = no run-level Phase-C share, the default.
         value = tuner["deep_tune_budget_fraction"]
         if (
             not _is_finite_number(value)
             or not 0 <= float(value) <= 1
         ):
             raise RunConfigError(
-                f"{path}: tuner.deep_tune_budget_fraction must be a finite "
-                "number in [0, 1]"
+                f"{path}: tuner.deep_tune_budget_fraction must be null or a "
+                "finite number in [0, 1]"
             )
 
     _validate_positive_number_override(

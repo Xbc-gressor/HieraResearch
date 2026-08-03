@@ -249,7 +249,7 @@ is the screening score. The rest are **deferred**
 promoted). Diagnose + fix every crash in the sampled set inline, until they all
 score or you abandon.
 
-`K_eval` comes from `framework_cfg.json` `tuner.K_eval` (default **3**, minimum
+`K_eval` comes from `framework_cfg.json` `tuner.K_eval` (default **2**, minimum
 **2**); pass it as `--k-eval`. Do not encode priority in indices 1..K-1.
 `K_eval ≥ K`
 disables deferral. For a provided entrypoint, pass `--k-eval 1`; its only warm
@@ -263,7 +263,7 @@ uv --project <env.project> run python tools/tuners/warmstart_eval.py \
   --candidate-path <train_py> \
   --configs-json <candidate_dir>/_warm_configs.json \
   --tune-report-json <candidate_dir>/tune_report.json \
-  --k-eval <tuner.K_eval or 3>
+  --k-eval <tuner.K_eval or 2>
 ```
 
 Use `--project`, not `--directory`: it selects the task env without changing the

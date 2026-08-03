@@ -78,20 +78,43 @@ def _framework_budget(run_dir: Path) -> int | None:
 
 
 def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
+    """Phase-C allocation limits.
+
+    The run-level share is OFF by default. It was a 0.4 fraction with no
+    derivation, and run 0802-sonnet-ex125-1 showed what it actually bought:
+    the cap bound at evaluation 87 of 124, and every one of the 37 evaluations
+    after it went to screening, which produced *zero* score improvements all
+    run. Both improvements in that run came from Phase C. Three candidates
+    (013/016/018) then landed within noise of the incumbent and none could be
+    tuned, while the one candidate that was tuned early gained 0.0406 — more
+    than the 0.0145 gap to the hillclimb baseline. Same failure shape as the
+    removed Phase-C wall clock: a ceiling on the productive mechanism, chosen
+    without measurement, degrading the search silently.
+
+    `deep_tune_per_candidate_cap` stays on: it bounds a real observed failure
+    mode (one candidate consuming the whole budget) without capping the phase.
+    An explicit `deep_tune_budget_fraction` is still honored — including 0 to
+    disable deep tuning outright — so existing run configs keep working.
+    """
     path = Path(run_dir) / "framework_cfg.json"
     config = read_framework_cfg(path) if path.is_file() else {}
     tuner = config.get("tuner", {})
     tuner = tuner if isinstance(tuner, dict) else {}
-    fraction = float(tuner.get("deep_tune_budget_fraction", 0.4))
+    configured = tuner.get("deep_tune_budget_fraction")
+    fraction = None if configured is None else float(configured)
     return {
         "fraction": fraction,
         "total_cap": (
-            0
-            if fraction == 0
+            None
+            if fraction is None
             else (
-                None
-                if budget is None
-                else int(math.floor(budget * fraction))
+                0
+                if fraction == 0
+                else (
+                    None
+                    if budget is None
+                    else int(math.floor(budget * fraction))
+                )
             )
         ),
         "per_candidate_cap": int(

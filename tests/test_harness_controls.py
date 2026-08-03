@@ -485,12 +485,22 @@ entrypoint = "train.py"
             )
             self.assertEqual(json.loads(brief.stdout)["phase"], "completed")
 
+            # Any positive remainder still refuses completion: got_select's
+            # admission cap bounds only NEW candidates, while an admitted
+            # candidate's Phase C reserves per trial and can spend the tail.
             refused = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "ledger.py"), "set-phase",
+                 "--ledger", str(ledger_path), "--phase", "completed", "--budget", "4"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+
+            remainder = subprocess.run(
                 [sys.executable, str(ROOT / "tools" / "ledger.py"), "set-phase",
                  "--ledger", str(ledger_path), "--phase", "completed", "--budget", "3"],
                 capture_output=True, text=True,
             )
-            self.assertNotEqual(refused.returncode, 0)
+            self.assertNotEqual(remainder.returncode, 0)
 
             subprocess.run(
                 [sys.executable, str(ROOT / "tools" / "ledger.py"), "set-phase",

@@ -244,9 +244,9 @@ def cmd_decide(args) -> int:
         # Generated non-fresh candidates spend one slot on an inherited
         # fidelity control that is not incumbent-eligible. Reserve at least one
         # additional objective call for a selectable treatment/config.
-        k_eval = max(2, int(tuner_cfg.get("K_eval", 3)))
+        k_eval = max(2, int(tuner_cfg.get("K_eval", 2)))
     except (TypeError, ValueError):
-        k_eval = 3
+        k_eval = 2
     if isinstance(remaining, int):
         admission_cap = remaining // k_eval
         result["actions"] = result["actions"][:admission_cap]

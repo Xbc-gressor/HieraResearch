@@ -129,13 +129,19 @@ class RunConfigTunerValidationTests(unittest.TestCase):
         self.assertEqual(self._read(tuner)["tuner"], tuner)
 
     def test_deep_tune_budget_controls_are_bounded(self) -> None:
-        for value in (-0.1, 1.1, float("nan"), float("inf"), True, None):
+        for value in (-0.1, 1.1, float("nan"), float("inf"), True):
             with self.subTest(fraction=value):
                 with self.assertRaisesRegex(
                     run_cfg.RunConfigError,
                     "deep_tune_budget_fraction",
                 ):
                     self._read({"deep_tune_budget_fraction": value})
+        # null is the default: no run-level Phase-C share at all.
+        self.assertIsNone(
+            self._read({"deep_tune_budget_fraction": None})["tuner"][
+                "deep_tune_budget_fraction"
+            ]
+        )
         for key in ("deep_tune_per_candidate_cap",):
             for value in (0, -1, 1.5, True, None):
                 with self.subTest(key=key, value=value):
