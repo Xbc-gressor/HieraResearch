@@ -27,6 +27,7 @@ import ledger  # noqa: E402
 from _common import write_tune_report  # noqa: E402
 from tune_tools import (  # noqa: E402
     finalizable_tuning_result,
+    has_applied_close,
     has_validated_applied_close,
     validate_phase_a_candidate_state,
 )
@@ -185,7 +186,25 @@ def finalize(
     report = json.loads(report_before)
     if not isinstance(report, dict):
         raise ValueError("tune report must be a JSON object")
-    applied_close = has_validated_applied_close(report)
+    applied_close = has_applied_close(report)
+    if applied_close and not has_validated_applied_close(report):
+        # A continuation bout extended the stage list after an earlier close.
+        # That close is proven for the stages it covered (has_applied_close
+        # above), so the BASE_PARAMS rewrite it performed is legitimate and the
+        # warm-base requirement stays off — but its closing fields bind only
+        # that covered prefix, not the extended report, and would falsely fail
+        # the global-best consistency check. They are recomputed below against
+        # every stage.
+        report = {
+            key: value
+            for key, value in report.items()
+            if key
+            not in {
+                "final_best_params",
+                "final_best_score",
+                "applied_to_base_params",
+            }
+        }
     # Binds phase_a to the candidate on disk, including the SEARCH_SPACE
     # literal and execution revision.
     validate_phase_a_candidate_state(
@@ -206,6 +225,12 @@ def finalize(
     closed_report["final_best_params"] = result["best_params"]
     closed_report["final_best_score"] = result["best_score"]
     closed_report["applied_to_base_params"] = True
+    # Currency marker for has_validated_applied_close: this close covers every
+    # stage now in the report. A later bout appends past it, which is exactly
+    # what makes the stale-close handshake above live.
+    closed_report["last_finalized_stage_index"] = len(
+        closed_report.get("phase_c", {}).get("stages", [])
+    ) - 1
 
     # Render the exact target candidate/report off to the side, then validate
     # the complete prospective ledger record (including parameter-transfer and

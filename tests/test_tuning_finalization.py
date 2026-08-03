@@ -233,16 +233,15 @@ class TuningFinalizationTests(unittest.TestCase):
             record = json.loads(ledger_path.read_text())["records"][0]
             self.assertEqual(record["final_best_score"], 0.8)
             self.assertEqual(record["phase_c_method"], "grid")
-            self.assertEqual(record["evaluation_depth"], "tuned")
+            self.assertEqual(record["evaluation_depth"], "tuned_lightly")
 
     def test_phase_c_losing_to_warm_incumbent_still_records_tuned_depth(self) -> None:
         """Depth measures evaluation effort, not which row won the argmin.
 
         A Phase-C stage that scored trials but failed to beat the warm
-        incumbent is the most common Phase-C outcome.  The ledger contract
-        defines "tuned" as "it has a scored Phase-C trial"; demoting this
-        candidate to screening would silently strip its semantic-evidence
-        weight (direct_tuned_edges demotion, gain-direction abstention).
+        incumbent is the most common Phase-C outcome.  Depth is now graded —
+        one scored Phase-C trial promotes screening to "tuned_lightly";
+        "tuned" requires tuner.tuned_threshold attempts.
         """
         with tempfile.TemporaryDirectory() as tmp:
             candidate_path, report_path, ledger_path = self._fixture(
@@ -267,6 +266,123 @@ class TuningFinalizationTests(unittest.TestCase):
             record = json.loads(ledger_path.read_text())["records"][0]
             self.assertEqual(record["final_best_score"], 1.0)
             self.assertIsNone(record["phase_c_method"])
+            self.assertEqual(record["evaluation_depth"], "tuned_lightly")
+
+    def test_first_bout_close_records_progressive_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path, report_path, ledger_path = self._fixture(
+                Path(tmp), stage_status="ok"
+            )
+            result = finalize_tuning.finalize(
+                candidate_path=candidate_path,
+                report_path=report_path,
+                ledger_path=ledger_path,
+                run_id="001",
+                task_name="autoresearch-baseline",
+            )
+            self.assertEqual(result["final_best_score"], 0.8)
+            record = json.loads(ledger_path.read_text())["records"][0]
+            self.assertEqual(record["tuning_bouts"], 1)
+            self.assertIs(record["last_bout_improved"], True)
+            self.assertEqual(record["evaluation_depth"], "tuned_lightly")
+            self.assertIs(record["tune"], True)
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["last_finalized_stage_index"], 0)
+
+    def test_second_bout_close_recovers_best_across_bouts(self) -> None:
+        """A continuation bout closes against every stage, not just its own."""
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path, report_path, ledger_path = self._fixture(
+                Path(tmp), stage_status="ok"
+            )
+            finalize_tuning.finalize(
+                candidate_path=candidate_path,
+                report_path=report_path,
+                ledger_path=ledger_path,
+                run_id="001",
+                task_name="autoresearch-baseline",
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_c"]["stages"].append(
+                {
+                    "method": "grid",
+                    "bout_index": 1,
+                    "status": "ok",
+                    "trials": [{"params": {"x": 0.7}, "score": 0.7}],
+                    "elapsed_seconds": 1.0,
+                }
+            )
+            report_path.write_text(json.dumps(report, indent=2))
+            result = finalize_tuning.finalize(
+                candidate_path=candidate_path,
+                report_path=report_path,
+                ledger_path=ledger_path,
+                run_id="001",
+                task_name="autoresearch-baseline",
+            )
+            self.assertEqual(result["final_best_score"], 0.7)
+            record = json.loads(ledger_path.read_text())["records"][0]
+            self.assertEqual(record["tuning_bouts"], 2)
+            self.assertIs(record["last_bout_improved"], True)
+            self.assertEqual(record["evaluation_depth"], "tuned_lightly")
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["last_finalized_stage_index"], 1)
+            self.assertIn("'x': 0.7", candidate_path.read_text())
+
+    def test_non_improving_bout_marks_non_responder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path, report_path, ledger_path = self._fixture(
+                Path(tmp), stage_status="ok"
+            )
+            finalize_tuning.finalize(
+                candidate_path=candidate_path,
+                report_path=report_path,
+                ledger_path=ledger_path,
+                run_id="001",
+                task_name="autoresearch-baseline",
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_c"]["stages"].append(
+                {
+                    "method": "grid",
+                    "bout_index": 1,
+                    "status": "ok",
+                    "trials": [{"params": {"x": 1.9}, "score": 1.9}],
+                    "elapsed_seconds": 1.0,
+                }
+            )
+            report_path.write_text(json.dumps(report, indent=2))
+            result = finalize_tuning.finalize(
+                candidate_path=candidate_path,
+                report_path=report_path,
+                ledger_path=ledger_path,
+                run_id="001",
+                task_name="autoresearch-baseline",
+            )
+            self.assertEqual(result["final_best_score"], 0.8)  # bout 0's best
+            record = json.loads(ledger_path.read_text())["records"][0]
+            self.assertEqual(record["tuning_bouts"], 2)
+            self.assertIs(record["last_bout_improved"], False)
+
+    def test_depth_becomes_tuned_at_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path, report_path, ledger_path = self._fixture(
+                Path(tmp), stage_status="ok"
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_c"]["stages"][0]["trials"] = [
+                {"params": {"x": 1.5 + i / 100.0}, "score": 1.5 + i / 100.0}
+                for i in range(16)
+            ]
+            report_path.write_text(json.dumps(report, indent=2))
+            finalize_tuning.finalize(
+                candidate_path=candidate_path,
+                report_path=report_path,
+                ledger_path=ledger_path,
+                run_id="001",
+                task_name="autoresearch-baseline",
+            )
+            record = json.loads(ledger_path.read_text())["records"][0]
             self.assertEqual(record["evaluation_depth"], "tuned")
 
     def test_phase_a_ledger_ingestion_rejects_untrustworthy_reports(self) -> None:

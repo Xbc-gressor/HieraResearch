@@ -1063,7 +1063,7 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
     """Return the global best once Phase C reached a terminal state.
 
     Stage status records *how the search ended*; it does not gate *what the
-    search observed*.  Every finite trial row in the final stage is admissible
+    search observed*.  Every finite trial row in every stage is admissible
     evidence regardless of that status, because two other mechanisms already
     bind those rows to the candidate on disk:
 
@@ -1083,7 +1083,15 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
     to that stage, so it must be closed first (see ``close_exhausted_stage``).
     Earlier stages may be ``rejected`` when the deterministic fallback chain
     selected another method.
+
+    Bouts: stages are grouped by ``bout_index`` (legacy stages: bout 0). The
+    per-bout prefix/chain rules mirror the single-pass rules; finalization is
+    valid when every stage is terminal and the LAST bout's final stage is
+    finalizable (or that bout's whole chain was rejected). The best spans all
+    bouts, so a continuation close can never regress the score.
     """
+    from _common import stages_by_bout
+
     if not isinstance(report, dict):
         raise ValueError("tuning report is not finalizable: report must be an object")
     errors: list[str] = []
@@ -1124,15 +1132,12 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
         stages = []
 
     statuses: list[str | None] = []
-    methods: list[str | None] = []
     for index, stage in enumerate(stages):
         if not isinstance(stage, dict):
             errors.append(f"phase_c.stages[{index}] must be an object")
             statuses.append(None)
-            methods.append(None)
             continue
         method = stage.get("method")
-        methods.append(method if isinstance(method, str) else None)
         if method not in {"grid", "bo", "cmaes"}:
             errors.append(f"phase_c.stages[{index}].method is invalid")
         status = stage.get("status")
@@ -1151,28 +1156,46 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
                 f"phase_c.stages[{index}] is rejected but contains trial rows"
             )
 
-    if statuses:
-        for index, status in enumerate(statuses[:-1]):
-            if status != "rejected":
+    # A non-dict stage already failed above; grouping it would crash here, so
+    # the per-bout checks simply yield to that collected error.
+    bouts = (
+        stages_by_bout(stages)
+        if all(isinstance(stage, dict) for stage in stages)
+        else []
+    )
+    offset = 0
+    for bout in bouts:
+        for index, stage in enumerate(bout[:-1]):
+            if stage.get("status") != "rejected":
                 errors.append(
-                    f"phase_c.stages[{index}] precedes another stage but is not rejected"
+                    f"phase_c.stages[{offset + index}] precedes another stage "
+                    "of its bout but is not rejected"
                 )
+        offset += len(bout)
 
     search_space = phase_a.get("search_space")
     expected_methods: list[str] = []
     if isinstance(search_space, dict) and search_space:
         expected = select_method(len(search_space))
         expected_methods = [expected["method"], *expected["fallback"]]
-        if methods != expected_methods[:len(methods)]:
-            errors.append(
-                f"Phase-C method chain {methods!r} does not match deterministic "
-                f"chain {expected_methods!r}"
-            )
+        for bout in bouts:
+            bout_methods = [stage.get("method") for stage in bout]
+            if bout_methods != expected_methods[:len(bout_methods)]:
+                errors.append(
+                    f"Phase-C method chain {bout_methods!r} does not match "
+                    f"deterministic chain {expected_methods!r}"
+                )
 
+    # A chain is exhausted only when the LAST bout rejected every method —
+    # earlier bouts closed on their own finalizable stage and prove nothing
+    # about the continuation's chain.
+    last_bout = bouts[-1] if bouts else []
+    last_methods = [stage.get("method") for stage in last_bout]
+    last_statuses = [stage.get("status") for stage in last_bout]
     exhausted_rejections = bool(
         expected_methods
-        and methods == expected_methods
-        and statuses == ["rejected"] * len(expected_methods)
+        and last_methods == expected_methods
+        and last_statuses == ["rejected"] * len(expected_methods)
     )
     if statuses and (
         statuses[-1] not in _FINALIZABLE_STAGE_STATUSES
@@ -1185,6 +1208,8 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
             "was rejected"
         )
 
+    # The "final stage" the terminal-status receipt checks below bind to is the
+    # final stage of the LAST bout — the same object as stages[-1].
     final_stage = stages[-1] if stages else {}
     final_status = statuses[-1] if statuses else None
     final_trials = (
@@ -1195,19 +1220,30 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
     if not isinstance(final_trials, list):
         errors.append("final Phase-C stage trials must be a list")
         final_trials = []
-    finite_final = [
-        row
-        for row in final_trials
+    finite_phase_c_rows = [
+        (str(stage.get("method")), row)
+        for stage in stages
+        if isinstance(stage, dict) and isinstance(stage.get("trials"), list)
+        for row in stage["trials"]
         if isinstance(row, dict)
         and isinstance(row.get("params"), dict)
         and _is_finite_score(row.get("score"))
     ]
 
-    if final_status == "ok" and not finite_final:
-        errors.append("an ok Phase-C stage must contain a finite trial")
+    for index, stage in enumerate(stages):
+        if not isinstance(stage, dict) or stage.get("status") != "ok":
+            continue
+        ok_trials = stage.get("trials")
+        if not isinstance(ok_trials, list) or not any(
+            isinstance(row, dict) and _is_finite_score(row.get("score"))
+            for row in ok_trials
+        ):
+            errors.append(
+                f"phase_c.stages[{index}] is ok but must contain a finite trial"
+            )
     if exhausted_rejections and any(
-        isinstance(stage, dict) and stage.get("trials") not in (None, [])
-        for stage in stages
+        stage.get("trials") not in (None, [])
+        for stage in last_bout
     ):
         errors.append(
             "an exhausted rejected method chain cannot contain trial rows"
@@ -1274,15 +1310,13 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
     eligible_rows = []
     if warm_best is not None:
         eligible_rows.append(("warm_start", warm_best))
-    # Every finite row of the final stage competes with the Phase-A incumbent,
-    # whatever terminal status the stage carries (see the docstring for why
-    # those rows are already proven).  No status filter is needed here:
-    # `rejected` and `no_search_needed` stages are validated above to carry no
-    # trial rows, so `finite_final` is empty for them.
-    eligible_rows.extend(
-        (str(final_stage.get("method")), row)
-        for row in finite_final
-    )
+    # Every finite Phase-C row across ALL bouts competes with the Phase-A
+    # incumbent, whatever terminal status its stage carries (see the docstring
+    # for why those rows are already proven). A later bout is not trusted to
+    # beat earlier ones, so the argmin spans the whole history. No status
+    # filter is needed here: `rejected` stages are validated above to carry no
+    # trial rows, so they contribute nothing.
+    eligible_rows.extend(finite_phase_c_rows)
     if eligible_rows:
         source, best_row = min(
             eligible_rows, key=lambda item: float(item[1]["score"])
@@ -2591,6 +2625,7 @@ def summarize(report: dict) -> dict:
         "preflight_attempts": len(preflight_attempts),
         "preflight_failures": preflight_failures,
         "feasibility_rejections": feasibility_rejections,
+        "phase_c_attempted": phase_c_attempted,
         "elapsed_seconds": round(elapsed, 1),
     }
 
@@ -2632,7 +2667,7 @@ def tuning_record(report: dict) -> dict:
     # from Phase A, so a Phase-C observation that was never applied must not
     # claim a method or "tuned" depth here.  `finalized_tuning_record` recomputes
     # both fields at close: the method from the applied row's provenance, the
-    # depth from any scored Phase-C trial (the ledger contract's definition).
+    # depth graded from cumulative Phase-C attempts.
     phase_c_method = next(
         (
             stage.get("method")
@@ -2653,7 +2688,8 @@ def tuning_record(report: dict) -> dict:
         # Depth of the evaluation behind this record's scores: "tuned" when a
         # Phase-C observation backs them, "screening" otherwise (in this
         # pre-close view the same criterion as phase_c_method; the finalized
-        # record switches to the contract's scored-Phase-C-trial definition).
+        # record switches to cumulative Phase-C attempts, graded at
+        # tuner.tuned_threshold).
         # Only tuned children ground contradiction-grade semantic findings: a
         # screening rejection measures the hypothesis at one parameter point
         # and must not prune a space element (run 0730-ds-ex100-1: MTP rejected
@@ -2672,6 +2708,11 @@ def tuning_record(report: dict) -> dict:
         "feasibility_rejections": summary["feasibility_rejections"],
         "elapsed_seconds": summary["elapsed_seconds"],
         "applied": report.get("applied_to_base_params"),
+        # Phase-A/pre-close view: no bout has closed yet, so the progressive
+        # fields carry their pre-tuning values; `finalized_tuning_record`
+        # recomputes both from the closed report.
+        "tuning_bouts": 0,
+        "last_bout_improved": None,
         # Additive, durable comparator evidence.  The full self-hashed receipt
         # stays beside the compact control pointer and its actually scored row;
         # downstream code need not trust a best-score coincidence.
@@ -2679,32 +2720,87 @@ def tuning_record(report: dict) -> dict:
     }
 
 
-def finalized_tuning_record(report: dict) -> dict:
+# Phase-C attempts at which evaluation_depth becomes "tuned". Lives beside its
+# consumer: the §15 selection constants further down load too late for the
+# defaulted `finalized_tuning_record` parameter.
+DEFAULT_TUNED_THRESHOLD = 16
+
+
+def _evaluation_depth(phase_c_attempts: int, tuned_threshold: int) -> str:
+    """Graded evaluation depth: 0 attempts screening, 1..threshold-1 lightly
+    tuned, >=threshold fully tuned."""
+    if phase_c_attempts <= 0:
+        return "screening"
+    return "tuned" if phase_c_attempts >= tuned_threshold else "tuned_lightly"
+
+
+def _last_bout_improved(report: dict) -> bool | None:
+    """Whether the last bout produced a trial strictly better than its
+    pre-bout incumbent (warm best plus every earlier bout). None when the
+    report has no Phase-C stages."""
+    from _common import stages_by_bout
+
+    stages = report.get("phase_c", {}).get("stages", [])
+    bouts = stages_by_bout(stages)
+    if not bouts:
+        return None
+    phase_a = report.get("phase_a", {})
+    warm_best = phase_a.get("best_warm_score")
+    prior_best = float(warm_best) if _is_finite_score(warm_best) else None
+    for bout in bouts[:-1]:
+        for trial in bout:
+            for row in trial.get("trials", []):
+                if isinstance(row, dict) and _is_finite_score(row.get("score")):
+                    score = float(row["score"])
+                    if prior_best is None or score < prior_best:
+                        prior_best = score
+    current_best = None
+    for stage in bouts[-1]:
+        for row in stage.get("trials", []):
+            if isinstance(row, dict) and _is_finite_score(row.get("score")):
+                score = float(row["score"])
+                if current_best is None or score < current_best:
+                    current_best = score
+    if current_best is None:
+        return False
+    return prior_best is None or current_best < prior_best
+
+
+def load_tuned_threshold(ledger_path: Path) -> int:
+    """tuner.tuned_threshold for the run owning this ledger (default 16)."""
+    return int(
+        _run_cfg(Path(ledger_path), "tuner").get(
+            "tuned_threshold", DEFAULT_TUNED_THRESHOLD
+        )
+    )
+
+
+def finalized_tuning_record(
+    report: dict,
+    *,
+    tuned_threshold: int = DEFAULT_TUNED_THRESHOLD,
+) -> dict:
     """Ledger-ready tuning fields after the fail-closed completion check."""
     final = finalizable_tuning_result(report, require_applied=True)
+    summary = summarize(report)
     stages = report.get("phase_c", {}).get("stages", [])
-    scored_phase_c_trial = any(
-        isinstance(trial, dict) and _is_finite_score(trial.get("score"))
-        for stage in stages
-        if isinstance(stage, dict)
-        for trial in stage.get("trials", [])
-    )
+    from _common import stages_by_bout
+
     return {
         **tuning_record(report),
         "final_best_score": final["best_score"],
         # Provenance of the applied observation only: None when the Phase-A
         # incumbent wins the argmin, however much Phase C ran.
         "phase_c_method": final["phase_c_method"],
-        # Depth is evaluation effort, not the applied row's provenance.  The
-        # ledger contract defines "tuned" as "it has a scored Phase-C trial"
-        # (.claude/rules/ledger.md), so a deep-tuned candidate whose warm
-        # incumbent still wins — the most common Phase-C outcome — stays
-        # "tuned"; in a finalizable report every non-final stage is a rejected
-        # no-trial row, so any finite trial sits in a terminal stage.  Tying
-        # depth to phase_c_method instead would demote such candidates to
-        # "screening" and silently strip their semantic-evidence weight
-        # (direct_tuned_edges demotion, gain-direction abstention).
-        "evaluation_depth": "tuned" if scored_phase_c_trial else "screening",
+        # Depth is cumulative Phase-C evaluation EFFORT across bouts, not the
+        # applied row's provenance: a candidate whose warm incumbent still
+        # wins keeps the depth its admitted attempts earned. Graded:
+        # screening -> tuned_lightly -> tuned at tuner.tuned_threshold.
+        "evaluation_depth": _evaluation_depth(
+            summary["phase_c_attempted"], tuned_threshold
+        ),
+        "tuning_bouts": len(stages_by_bout(stages)),
+        "last_bout_improved": _last_bout_improved(report),
     }
 
 
@@ -3031,7 +3127,6 @@ def lineage_evidence(run_dir: Path, source_run_ids: list) -> dict:
 # reflects the reference quality, not the landscape — it is not comparable across
 # candidates' different methods. Pure read over the ledger; lower score is better.
 DEFAULT_BOUT_TRIALS = 8       # one progressive tuning bout's objective-attempt budget
-DEFAULT_TUNED_THRESHOLD = 16  # Phase-C attempts at which evaluation_depth becomes "tuned"
 DEFAULT_REWARM_PROPOSALS = 3  # max LLM-proposed configs a continuation bout may start from
 DEFAULT_N_MIN = 5             # P=80's smallest non-empty top-tier population
 DEFAULT_TOP_PERCENTILE = 80   # eligible iff the best untuned candidate is in the top (100-P)%

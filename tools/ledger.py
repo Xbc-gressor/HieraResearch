@@ -759,13 +759,22 @@ def _finalized_tuning_record_from_report(
     sys.path.insert(0, str(Path(__file__).resolve().parent / "tuners"))
     from tune_tools import (  # noqa: E402
         finalized_tuning_record,
+        load_tuned_threshold,
         validate_report_trial_rows,
     )
 
     report_path = Path(report_path).resolve()
     report = json.loads(report_path.read_text())
     validate_report_trial_rows(report, report_path.parent / "train.py")
-    fields = finalized_tuning_record(report)
+    # The report lives at <run_dir>/candidates/<run_id>/tune_report.json, so
+    # parent.parent.parent is the run dir; load_tuned_threshold only reads
+    # framework_cfg.json beside that ledger path and falls back to the default
+    # when absent.
+    ledger_guess = report_path.parent.parent.parent / "ledger.json"
+    fields = finalized_tuning_record(
+        report,
+        tuned_threshold=load_tuned_threshold(ledger_guess),
+    )
     fields["applied_incumbent"] = _applied_incumbent_from_report(
         report_path,
         require_final=True,
