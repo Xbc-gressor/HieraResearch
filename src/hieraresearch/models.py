@@ -7,6 +7,32 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .upstream import (
+    parse_optional_upstream_text,
+    parse_upstream_backoff_total_seconds,
+    parse_upstream_failure_streak,
+)
+
+
+def _parse_upstream_streak(value: dict[str, Any]) -> int:
+    return parse_upstream_failure_streak(
+        value.get("upstream_failure_streak"),
+        present="upstream_failure_streak" in value,
+    )
+
+
+def _parse_upstream_backoff_total(value: dict[str, Any]) -> float:
+    return parse_upstream_backoff_total_seconds(
+        value.get("upstream_backoff_total_seconds"),
+        present="upstream_backoff_total_seconds" in value,
+    )
+
+
+def _parse_upstream_text_field(value: dict[str, Any], field_name: str) -> str | None:
+    if field_name not in value:
+        return None
+    return parse_optional_upstream_text(value.get(field_name), field=field_name)
+
 
 class Transition(str, Enum):
     INITIALIZE = "initialize"
@@ -269,6 +295,12 @@ class CoordinatorState:
     last_transition: str | None = None
     stop_condition: str | None = None
     no_progress_cycles: int = 0
+    # Run-level upstream (502/503/...) recovery bookkeeping. Optional on disk so
+    # older state.json files remain readable without a schema bump.
+    upstream_failure_streak: int = 0
+    upstream_backoff_total_seconds: float = 0.0
+    upstream_last_error: str | None = None
+    upstream_last_decision: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -292,6 +324,14 @@ class CoordinatorState:
             last_transition=value.get("last_transition"),
             stop_condition=value.get("stop_condition"),
             no_progress_cycles=int(value.get("no_progress_cycles", 0)),
+            upstream_failure_streak=_parse_upstream_streak(value),
+            upstream_backoff_total_seconds=_parse_upstream_backoff_total(value),
+            upstream_last_error=_parse_upstream_text_field(
+                value, "upstream_last_error"
+            ),
+            upstream_last_decision=_parse_upstream_text_field(
+                value, "upstream_last_decision"
+            ),
         )
 
 

@@ -18,6 +18,36 @@ Use `--preflight-only` to validate the task environment without model calls or
 objective evaluation. A blocked run requires the explicit `--resume-blocked`
 flag before it can continue.
 
+## Upstream API failure recovery
+
+Transient provider/transport failures (HTTP 502/503 and related upstream
+signatures such as “temporarily unavailable” or “no available accounts”) are
+classified in `hieraresearch.upstream` and handled at the **coordinator**
+boundary:
+
+- the run stays `running`;
+- durable counters on `state.json` record streak, cumulative backoff seconds,
+  and the last upstream error/decision;
+- the process sleeps with capped exponential backoff, then re-derives the next
+  transition from artifacts (same restart safety as a process crash);
+- counters reset only after a **new completed model invocation receipt** is
+  observed (or on explicit `--resume-blocked`), never after a no-op artifact
+  validation or a purely deterministic transition;
+- a call-site `transport retry limit reached` message is coordinator-retryable
+  only when the nested cause is itself upstream; candidate authoring then
+  re-opens its local transport window on re-entry so backoff is not a pure
+  sleep loop;
+- the run hard-blocks only after the configured **failure streak** or
+  **cumulative backoff wall-clock** budget is exhausted (defaults: 8 failures /
+  2 hours). Exhaustion reasons are prefixed
+  `upstream_failure_streak_exhausted:` or
+  `upstream_backoff_wall_clock_exhausted:`.
+
+Contract rejections, invalid-request errors, artifact corruption, and objective
+budget exhaustion are **not** absorbed by this path. Manual `--resume-blocked`
+still clears a prior block and resets upstream counters for a fresh budget.
+Malformed upstream counter fields on disk are rejected rather than coerced.
+
 ## Durable protocol
 
 The coordinator derives transitions from the run artifacts and persists state

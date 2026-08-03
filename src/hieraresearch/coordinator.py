@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,12 @@ from .semantic import SemanticAdmission
 from .state_machine import next_transition
 from .toolchain import ToolFailure, Toolchain, read_task_config
 from .tuning import DeepTuner
+from .upstream import (
+    UpstreamBackoffPolicy,
+    decide_upstream_recovery,
+    is_retryable_upstream_failure,
+    upstream_fields_reset,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +45,11 @@ class RunControls:
     prepare_task: bool = True
     preflight_only: bool = False
     resume_blocked: bool = False
+    # Run-level upstream recovery (502/503/...). None = library defaults.
+    upstream_max_streak: int | None = None
+    upstream_max_backoff_total_seconds: float | None = None
+    upstream_base_backoff_seconds: float | None = None
+    upstream_max_single_backoff_seconds: float | None = None
 
 
 class ExperimentCoordinator:
@@ -45,6 +59,8 @@ class ExperimentCoordinator:
         toolchain: Toolchain,
         models: ModelGateway,
         controls: RunControls,
+        *,
+        sleep: Callable[[float], None] | None = None,
     ):
         self.identity = identity
         self.toolchain = toolchain
@@ -57,6 +73,25 @@ class ExperimentCoordinator:
         self.candidates: CandidatePipeline | None = None
         self.experience: ExperienceRefresh | None = None
         self.deep_tuner: DeepTuner | None = None
+        self._sleep = sleep or time.sleep
+        self._upstream_policy = self._policy_from_controls(controls)
+
+    @staticmethod
+    def _policy_from_controls(controls: RunControls) -> UpstreamBackoffPolicy:
+        kwargs: dict[str, Any] = {}
+        if controls.upstream_max_streak is not None:
+            kwargs["max_streak"] = controls.upstream_max_streak
+        if controls.upstream_max_backoff_total_seconds is not None:
+            kwargs["max_backoff_total_seconds"] = (
+                controls.upstream_max_backoff_total_seconds
+            )
+        if controls.upstream_base_backoff_seconds is not None:
+            kwargs["base_backoff_seconds"] = controls.upstream_base_backoff_seconds
+        if controls.upstream_max_single_backoff_seconds is not None:
+            kwargs["max_single_backoff_seconds"] = (
+                controls.upstream_max_single_backoff_seconds
+            )
+        return UpstreamBackoffPolicy(**kwargs)
 
     def run(self, *, max_transitions: int | None = None) -> dict[str, Any]:
         if max_transitions is not None and max_transitions <= 0:
@@ -66,12 +101,20 @@ class ExperimentCoordinator:
         except (ProcessInterrupted, KeyboardInterrupt) as exc:
             self._block(f"interrupted: {exc}")
             return self.status()
+        except InferenceError as exc:
+            # Retryable upstream should have been absorbed in the transition
+            # loop; reaching here means exhaustion escaped or a pre-loop path
+            # failed after recovery declined.
+            if is_retryable_upstream_failure(exc):
+                self._block(f"upstream_unrecoverable: {type(exc).__name__}: {exc}")
+            else:
+                self._block(f"{type(exc).__name__}: {exc}")
+            return self.status()
         except (
             ArtifactError,
             CandidateBuildError,
             ProcessError,
             ToolFailure,
-            InferenceError,
             ValueError,
         ) as exc:
             self._block(f"{type(exc).__name__}: {exc}")
@@ -120,7 +163,21 @@ class ExperimentCoordinator:
         self._build_services()
         self._mark(Transition.BUILD_BACKGROUND)
         assert self.background is not None
-        self.background.ensure()
+        while self.state.phase is CoordinatorPhase.RUNNING:
+            try:
+                completed_before = self._completed_invocation_count()
+                self.background.ensure()
+                # Reset only when a durable model invocation completed — a
+                # no-op ensure() on already-valid artifacts must not wipe the
+                # upstream budget after a crash mid-backoff.
+                self._maybe_clear_upstream_after_model_success(completed_before)
+                break
+            except InferenceError as exc:
+                if not self._recover_from_upstream(exc):
+                    raise
+                # Exhausted upstream budget → phase is BLOCKED; leave loop.
+        if self.state.phase is not CoordinatorPhase.RUNNING:
+            return self.status()
         self._reconcile_state()
 
         transitions = 0
@@ -153,7 +210,17 @@ class ExperimentCoordinator:
                     self.store.save(self.state)
                 break
             self._mark(transition)
-            self._execute(transition, brief)
+            completed_before = self._completed_invocation_count()
+            try:
+                self._execute(transition, brief)
+            except InferenceError as exc:
+                if not self._recover_from_upstream(exc):
+                    raise
+                # Failed attempt does not consume max_transitions; after
+                # backoff the same transition is re-derived from artifacts.
+                # If recovery blocked the run, the while-guard exits.
+                continue
+            self._maybe_clear_upstream_after_model_success(completed_before)
             transitions += 1
         return self.status()
 
@@ -516,9 +583,75 @@ class ExperimentCoordinator:
             return
         self.state.phase = CoordinatorPhase.RUNNING
         self.state.stop_condition = None
+        # Manual reopen gets a fresh upstream budget; counters from the prior
+        # blocked episode must not immediately re-trip exhaustion.
+        self._clear_upstream_recovery(save=False)
         self.store.save(self.state)
         if self.identity.ledger_path.exists():
             self.toolchain.set_phase(self.identity.run_dir, "running")
+
+    def _clear_upstream_recovery(self, *, save: bool) -> None:
+        if self.state is None:
+            return
+        for key, value in upstream_fields_reset().items():
+            setattr(self.state, key, value)
+        if save:
+            self.store.save(self.state)
+
+    def _completed_invocation_count(self) -> int:
+        """Count durable completed model receipts under .orchestrator/invocations."""
+        root = self.identity.run_dir / ".orchestrator" / "invocations"
+        if not root.is_dir():
+            return 0
+        count = 0
+        for receipt_path in root.glob("*/receipt.json"):
+            try:
+                payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and payload.get("status") == "completed":
+                count += 1
+        return count
+
+    def _maybe_clear_upstream_after_model_success(self, completed_before: int) -> None:
+        if self._completed_invocation_count() > completed_before:
+            self._clear_upstream_recovery(save=True)
+
+    def _recover_from_upstream(self, exc: InferenceError) -> bool:
+        """Backoff and stay running on retryable upstream faults.
+
+        Returns True when the caller should retry the interrupted work. Returns
+        False when the error is not an upstream transport fault (caller should
+        re-raise / outer handler blocks). When streak or wall-clock caps are
+        hit, blocks the run and returns True so the main loop observes BLOCKED
+        without re-raising.
+        """
+        if not is_retryable_upstream_failure(exc):
+            return False
+        if self.state is None:
+            return False
+
+        decision = decide_upstream_recovery(
+            current_streak=self.state.upstream_failure_streak,
+            current_backoff_total_seconds=self.state.upstream_backoff_total_seconds,
+            error=exc,
+            policy=self._upstream_policy,
+        )
+        self.state.upstream_failure_streak = decision.streak
+        self.state.upstream_last_error = f"{type(exc).__name__}: {exc}"[:500]
+        self.state.upstream_last_decision = decision.reason[:500]
+
+        if decision.action == "block":
+            self.state.upstream_backoff_total_seconds = decision.backoff_total_seconds
+            self.store.save(self.state)
+            self._block(decision.reason)
+            return True
+
+        self.state.upstream_backoff_total_seconds = decision.backoff_total_seconds
+        self.store.save(self.state)
+        if decision.sleep_seconds > 0:
+            self._sleep(decision.sleep_seconds)
+        return True
 
     def _has_provided_baseline(self) -> bool:
         if self.task_config is None:
@@ -580,5 +713,9 @@ class ExperimentCoordinator:
             if active is None
             else [action.run_id for action in active.actions],
             "stop_condition": state.stop_condition,
+            "upstream_failure_streak": state.upstream_failure_streak,
+            "upstream_backoff_total_seconds": state.upstream_backoff_total_seconds,
+            "upstream_last_error": state.upstream_last_error,
+            "upstream_last_decision": state.upstream_last_decision,
             "ledger": brief,
         }

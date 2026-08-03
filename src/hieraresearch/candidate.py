@@ -49,6 +49,7 @@ from .toolchain import (
     ValidationRejected,
     parse_json_output,
 )
+from .upstream import last_error_is_upstream_transport
 
 
 MAX_TUNING_SCHEMA_REPAIRS = 2
@@ -552,7 +553,20 @@ class CandidatePipeline:
                 raise ArtifactError(
                     "failed implementation state has no diagnostic artifact"
                 )
-            prior_index = int(state["attempts_admitted"]) - 1
+            # Coordinator outer backoff re-enters here after local transport
+            # exhaustion. Re-open one local window when the cause was upstream
+            # so the next attempt actually reaches the provider again.
+            if (
+                int(state["attempts_admitted"]) >= MAX_IMPLEMENTATION_ATTEMPTS
+                and last_error_is_upstream_transport(state.get("last_error"))
+            ):
+                state = {
+                    **state,
+                    "attempts_admitted": 0,
+                    "status": "infrastructure_failed",
+                }
+                atomic_write_json(state_path, state)
+            prior_index = max(int(state["attempts_admitted"]) - 1, 0)
             retry_purpose = state.get("purpose")
             if not isinstance(retry_purpose, str) or not retry_purpose:
                 retry_purpose = f"candidate_writer:{action.run_id}" + (
@@ -968,7 +982,17 @@ class CandidatePipeline:
                     last_error = exc
                     correction_needed = True
             elif status == "infrastructure_failed":
-                prior_index = int(state["attempts_admitted"]) - 1
+                if (
+                    int(state["attempts_admitted"]) >= MAX_TUNING_SCHEMA_REPAIRS + 1
+                    and last_error_is_upstream_transport(state.get("last_error"))
+                ):
+                    state = {
+                        **state,
+                        "attempts_admitted": 0,
+                        "status": "infrastructure_failed",
+                    }
+                    atomic_write_json(state_path, state)
+                prior_index = max(int(state["attempts_admitted"]) - 1, 0)
                 retry_purpose = state.get("purpose")
                 if not isinstance(retry_purpose, str) or not retry_purpose:
                     retry_purpose = (
@@ -1458,10 +1482,20 @@ class CandidatePipeline:
             and int(values_state.get("transport_failures", 0))
             >= MAX_TUNING_VALUES_TRANSPORT_FAILURES
         ):
-            raise InferenceError(
-                "tuning-values transport retry limit reached: "
-                + str(values_state.get("last_error", "unknown transport failure"))
-            )
+            if last_error_is_upstream_transport(values_state.get("last_error")):
+                # Outer coordinator recovery: clear local transport exhaustion
+                # so the next loop iteration issues a real provider call.
+                values_state = {
+                    **values_state,
+                    "transport_failures": 0,
+                    "status": "infrastructure_failed",
+                }
+                atomic_write_json(values_state_path, values_state)
+            else:
+                raise InferenceError(
+                    "tuning-values transport retry limit reached: "
+                    + str(values_state.get("last_error", "unknown transport failure"))
+                )
         replay_pending = values_state["status"] in {
             "started",
             "request_failed",

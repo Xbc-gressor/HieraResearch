@@ -443,6 +443,51 @@ class CandidateContractPipelineTests(unittest.TestCase):
                 second_models.edit_specs[0].prompt,
             )
 
+    def test_upstream_transport_exhaustion_reopens_after_outer_recovery(
+        self,
+    ) -> None:
+        """Coordinator backoff re-entry must issue another provider call on 502."""
+        upstream = InferenceError(
+            "Claude Messages request failed: Error code: 502 - "
+            "{'error': {'message': 'Upstream service temporarily unavailable', "
+            "'type': 'upstream_error'}, 'type': 'error'}"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, action, candidate_dir = self._case(
+                Path(tmp), train_source="SEED = True\n"
+            )
+            first_models = ScriptedModels(edit_sources=[upstream])
+            with self.assertRaisesRegex(InferenceError, "Error code: 502"):
+                CandidatePipeline(
+                    identity, self._toolchain(), first_models, {}
+                ).implement(action)
+
+            second_models = ScriptedModels(edit_sources=[upstream])
+            with self.assertRaisesRegex(InferenceError, "Error code: 502"):
+                CandidatePipeline(
+                    identity, self._toolchain(), second_models, {}
+                ).implement(action)
+
+            # Local window exhausted — without outer reopen this would raise
+            # retry-limit and never call the model.
+            recovered_models = ScriptedModels(edit_sources=["VALUE = 1\n"])
+            published = CandidatePipeline(
+                identity, self._toolchain(), recovered_models, {}
+            ).implement(action)
+
+            self.assertEqual(published, candidate_dir / "train.py")
+            self.assertEqual(len(recovered_models.edit_specs), 1)
+            self.assertEqual(
+                (candidate_dir / "train.py").read_text(encoding="utf-8"),
+                "VALUE = 1\n",
+            )
+            state = json.loads(
+                (candidate_dir / CandidatePipeline.IMPLEMENTATION_STATE).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(state["status"], "completed")
+
     def test_schema_transport_retry_resets_partial_draft_and_reuses_purpose(
         self,
     ) -> None:
