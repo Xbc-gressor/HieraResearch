@@ -51,6 +51,7 @@ class DeepTuner:
                     run_id,
                     candidate_path,
                     report_path,
+                    self.task_config,
                 )
                 if (
                     not isinstance(receipt, dict)

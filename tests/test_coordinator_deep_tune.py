@@ -78,8 +78,9 @@ class PinnedToolchain:
         run_id: str,
         candidate_path: Path,
         report_path: Path,
+        task_config: dict[str, object],
     ) -> dict[str, object]:
-        del run_dir, candidate_path, report_path
+        del run_dir, candidate_path, report_path, task_config
         self.finalized_run_ids.append(run_id)
         return {
             "status": "ok",

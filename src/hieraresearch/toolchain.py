@@ -174,6 +174,32 @@ class Toolchain:
         except ValueError as exc:
             raise ToolFailure(label or script, result) from exc
 
+    def _json_python_in_project(
+        self,
+        project: Path,
+        script: str,
+        *args: str,
+        timeout: float | None = None,
+        label: str | None = None,
+    ) -> Any:
+        result = self._run(
+            [
+                "uv",
+                "--directory",
+                str(project),
+                "run",
+                "python",
+                str(self.repo_root / script),
+                *map(str, args),
+            ],
+            timeout=timeout or self.helper_timeout,
+            label=label or script,
+        )
+        try:
+            return parse_json_output(result.output)
+        except ValueError as exc:
+            raise ToolFailure(label or script, result) from exc
+
     def _validation_python(
         self,
         script: str,
@@ -875,8 +901,17 @@ class Toolchain:
             check=False,
         )
 
-    def finalize_tuning(self, run_dir: Path, run_id: str, candidate_path: Path, report_path: Path) -> dict[str, Any]:
-        return self._json_python(
+    def finalize_tuning(
+        self,
+        run_dir: Path,
+        run_id: str,
+        candidate_path: Path,
+        report_path: Path,
+        task_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._task_project(task_config)
+        return self._json_python_in_project(
+            project,
             "tools/finalize_tuning.py",
             "--candidate-path",
             str(candidate_path),
