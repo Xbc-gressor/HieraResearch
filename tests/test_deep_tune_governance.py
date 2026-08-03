@@ -29,6 +29,8 @@ from _common import (  # noqa: E402
 from grid_search import main as grid_main  # noqa: E402
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
+    close_exhausted_stage,
+    finalizable_tuning_result,
     phase_c_action,
 )
 
@@ -308,12 +310,14 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             self.assertEqual(exhausted["action"], "finalize")
             self.assertEqual(exhausted["best_score"], 1.0)
 
-    def test_phase_c_action_stops_on_budget_exhaustion_and_rejects_bad_history(
+    def test_phase_c_action_finalizes_budget_exhaustion_and_rejects_bad_history(
         self,
     ):
         with tempfile.TemporaryDirectory() as tmp:
             candidate, report_path = self._fixture(Path(tmp))
             report = json.loads(report_path.read_text())
+            # A budget death with no trial of its own still finalizes — on the
+            # warm incumbent here, or on a better Phase-C row when one exists.
             report["phase_c"] = {
                 "stages": [
                     {
@@ -323,11 +327,19 @@ class DeepTuneGovernanceTest(unittest.TestCase):
                     }
                 ]
             }
-            stopped = phase_c_action(report, candidate)
+            closed = phase_c_action(report, candidate)
             self.assertEqual(
-                (stopped["action"], stopped["reason"]),
-                ("stop", "evaluation_budget_reached"),
+                (closed["action"], closed["reason"]),
+                ("finalize", "terminal_budget_exhausted"),
             )
+            self.assertEqual(closed["best_score"], 1.0)
+
+            report["phase_c"]["stages"][0]["trials"] = [
+                {"params": {"x0": 0.5}, "score": 0.5}
+            ]
+            with_trial = phase_c_action(report, candidate)
+            self.assertEqual(with_trial["action"], "finalize")
+            self.assertEqual(with_trial["best_score"], 0.5)
 
             report["phase_c"]["stages"][0] = {
                 "method": "grid",
@@ -689,6 +701,148 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             self.assertEqual(
                 write_result.call_args.args[0]["status"],
                 "time_exhausted",
+            )
+
+
+class CloseExhaustedStageTest(unittest.TestCase):
+    """The deterministic close for a stage no invocation will ever resume."""
+
+    def _run_fixture(self, root: Path, *, max_evaluations: int, phase_c_attempts: int):
+        run_dir = root / "runs" / "autoresearch-baseline" / "tag"
+        candidate = run_dir / "candidates" / "001" / "train.py"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_text(
+            "PARAM_SCHEMA = {'x0': 'float'}\n"
+            "SEARCH_SPACE = {'x0': ('float', 0.0, 1.0)}\n"
+            "BASE_PARAMS = {'x0': 0.0}\n"
+            "def make_model(params):\n"
+            "    return params\n"
+        )
+        (candidate.parent / "prepare.py").write_text(
+            "def evaluate_config(make_model, params):\n"
+            "    return 0.0\n"
+        )
+        (run_dir / "framework_cfg.json").write_text(
+            json.dumps(
+                {
+                    "max_evaluations": max_evaluations,
+                    "tuner": {
+                        "deep_tune_budget_fraction": 0.4,
+                        "deep_tune_per_candidate_cap": 2,
+                    },
+                }
+            )
+        )
+        rows = [{"schema_version": 1, "kind": "baseline", "evaluations": 0,
+                 "per_candidate": {}}]
+        for index in range(phase_c_attempts):
+            rows.append({
+                "schema_version": 1,
+                "kind": "score_attempt",
+                "attempt_id": f"eval-{index + 1:06d}",
+                "run_id": "001",
+                "phase": "phase_c",
+                "method": "grid",
+                "params_sha256": f"sha256:{index:064d}",
+            })
+        (run_dir / "evaluation_attempts.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        report = {
+            "phase_a": {
+                "status": "ok",
+                "candidate_code_revision": _candidate_execution_revision(candidate),
+                "search_space": {"x0": ["float", 0.0, 1.0]},
+                "warm_start_configs": [{"params": {"x0": 0.0}, "score": 1.0}],
+                "best_warm_params": {"x0": 0.0},
+                "best_warm_score": 1.0,
+            },
+            "phase_c": {
+                "stages": [
+                    {
+                        # First method of the 1-dim deterministic chain, so the
+                        # closed report is finalizable without a rejected prefix.
+                        "method": "grid",
+                        "status": "running",
+                        "trials": [{"params": {"x0": 0.5}, "score": 0.5}],
+                    }
+                ]
+            },
+        }
+        report_path = candidate.parent / "tune_report.json"
+        report_path.write_text(json.dumps(report))
+        return candidate, report_path
+
+    def test_refuses_while_the_budget_still_admits_a_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._run_fixture(
+                Path(tmp), max_evaluations=100, phase_c_attempts=1
+            )
+            with self.assertRaisesRegex(ValueError, "still.*admits a reservation"):
+                close_exhausted_stage(candidate, report_path)
+            # The refusal must not mutate the stage.
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
+            self.assertEqual(stage["status"], "running")
+
+    def test_closes_at_the_per_candidate_cap_and_frees_its_trials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._run_fixture(
+                Path(tmp), max_evaluations=100, phase_c_attempts=2
+            )
+            result = close_exhausted_stage(candidate, report_path)
+            self.assertEqual(result["action"], "closed")
+            self.assertEqual(result["budget_scope"], "deep_tune_candidate:001")
+            self.assertEqual(result["trials_at_close"], 1)
+
+            report = json.loads(report_path.read_text())
+            stage = report["phase_c"]["stages"][0]
+            self.assertEqual(stage["status"], "budget_exhausted")
+            self.assertTrue(stage["closed_without_invocation"])
+            self.assertEqual(stage["trials_at_close"], 1)
+
+            # The point of the close: the stranded 0.5 trial is now finalizable.
+            self.assertEqual(
+                finalizable_tuning_result(report)["best_score"], 0.5
+            )
+
+            # Idempotent.
+            again = close_exhausted_stage(candidate, report_path)
+            self.assertEqual(again["action"], "noop")
+
+    def test_closes_when_the_global_budget_is_spent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._run_fixture(
+                Path(tmp), max_evaluations=1, phase_c_attempts=1
+            )
+            result = close_exhausted_stage(candidate, report_path)
+            self.assertEqual(
+                (result["action"], result["budget_scope"]), ("closed", "global")
+            )
+
+    def test_phase_c_action_advises_the_close_instead_of_a_dead_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._run_fixture(
+                Path(tmp), max_evaluations=100, phase_c_attempts=2
+            )
+            report = json.loads(report_path.read_text())
+            # The candidate is at its per-candidate cap, so "run" advice could
+            # never succeed: the helper must route to the deterministic close
+            # itself rather than leaving it to prompt prose.
+            advice = phase_c_action(report, candidate)
+            self.assertEqual(advice["action"], "close_exhausted_stage")
+            self.assertEqual(advice["reason"], "evaluation_budget_reached")
+            self.assertEqual(advice["budget_scope"], "deep_tune_candidate:001")
+
+    def test_phase_c_action_still_resumes_a_stage_the_budget_can_fund(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._run_fixture(
+                Path(tmp), max_evaluations=100, phase_c_attempts=1
+            )
+            report = json.loads(report_path.read_text())
+            advice = phase_c_action(report, candidate)
+            self.assertEqual(
+                (advice["action"], advice["method"], advice["reason"]),
+                ("run", "grid", "resume_interrupted_stage"),
             )
 
 

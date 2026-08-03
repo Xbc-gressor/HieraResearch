@@ -196,7 +196,15 @@ class TuningFinalizationTests(unittest.TestCase):
                     for path, content in before.items():
                         self.assertEqual(path.read_bytes(), content)
 
-    def test_failed_stage_partial_trial_cannot_replace_warm_incumbent(self) -> None:
+    def test_failed_stage_partial_trial_is_finalized(self) -> None:
+        """A crashed last invocation must not discard the stage's proven rows.
+
+        Trial rows are durable and bound to the candidate on disk by
+        admission-time revision validation, so `failed` describes how the search
+        ended, not whether its observations count. Discarding them stranded real,
+        already-charged evaluations (run 0802-sonnet-ex125-1/007 lost a 1.050231
+        incumbent this way).
+        """
         with tempfile.TemporaryDirectory() as tmp:
             candidate_path, report_path, ledger_path = self._fixture(
                 Path(tmp), stage_status="failed"
@@ -219,12 +227,46 @@ class TuningFinalizationTests(unittest.TestCase):
                 task_name="autoresearch-baseline",
             )
 
+            # The stage's 0.8 trial beats the 1.0 warm incumbent and is applied.
+            self.assertEqual(result["final_best_score"], 0.8)
+            record = json.loads(ledger_path.read_text())["records"][0]
+            self.assertEqual(record["final_best_score"], 0.8)
+            self.assertEqual(record["phase_c_method"], "grid")
+            self.assertEqual(record["evaluation_depth"], "tuned")
+
+    def test_phase_c_losing_to_warm_incumbent_still_records_tuned_depth(self) -> None:
+        """Depth measures evaluation effort, not which row won the argmin.
+
+        A Phase-C stage that scored trials but failed to beat the warm
+        incumbent is the most common Phase-C outcome.  The ledger contract
+        defines "tuned" as "it has a scored Phase-C trial"; demoting this
+        candidate to screening would silently strip its semantic-evidence
+        weight (direct_tuned_edges demotion, gain-direction abstention).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path, report_path, ledger_path = self._fixture(
+                Path(tmp), stage_status="ok"
+            )
+            report = json.loads(report_path.read_text())
+            # The scored Phase-C trial loses to the 1.0 warm incumbent.
+            report["phase_c"]["stages"][0]["trials"] = [
+                {"params": {"x": 2.0}, "score": 1.5}
+            ]
+            report_path.write_text(json.dumps(report, indent=2))
+
+            result = finalize_tuning.finalize(
+                candidate_path=candidate_path,
+                report_path=report_path,
+                ledger_path=ledger_path,
+                run_id="001",
+                task_name="autoresearch-baseline",
+            )
+
             self.assertEqual(result["final_best_score"], 1.0)
             record = json.loads(ledger_path.read_text())["records"][0]
-            self.assertIsNone(record.get("phase_c_method"))
-            self.assertIsNone(record.get("phase_b_decision"))
-            self.assertIsNone(record.get("warm_percentile"))
             self.assertEqual(record["final_best_score"], 1.0)
+            self.assertIsNone(record["phase_c_method"])
+            self.assertEqual(record["evaluation_depth"], "tuned")
 
     def test_phase_a_ledger_ingestion_rejects_untrustworthy_reports(self) -> None:
         """A phase_a-only report must still agree with the candidate on disk."""

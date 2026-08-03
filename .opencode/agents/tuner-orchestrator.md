@@ -134,7 +134,8 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    Pure stdlib, **no uv env**. It validates Phase A, the candidate execution
    revision, `SEARCH_SPACE`, `BASE_PARAMS`, and the existing Phase-C method
    chain, then prints `{action, method, n_dims, method_chain, reason}`.
-   `action: stop` means return `tuned_run_id: none` with the printed reason;
+   `action: close_exhausted_stage` means the budget can never resume the
+   interrupted stage — run the deterministic close (below) and then finalize;
    `action: finalize` means skip directly to Finalize; `action: run` names the
    only legal primary, interrupted-stage resume, or fallback method.
 2. The returned method's search script takes these **default trial-cap args, which
@@ -174,6 +175,17 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    `<env.project>` is `task.toml`'s `env.project` (repo-root-relative, e.g.
    `tasks/tabular-model-search`) used as-is; script and `--candidate-path` /
    `--tune-report-json` paths stay absolute.
+
+   **Never wrap this call in an external timeout.** No `timeout N ...`, no
+   shell watchdog, no shortened tool timeout. A deep-tune stage legitimately
+   runs for hours, and each evaluation reserves its budget slot *before*
+   `score_fn` — so a kill mid-evaluation permanently spends that slot and
+   persists no trial. Run 0802-sonnet-ex125-1 lost 6 of 50 Phase-C slots this
+   way: one API error, one self-imposed `timeout` wrapper, and three
+   foreground calls hitting the Bash tool's 2-minute default. Run the script in
+   the background and poll, and let the script's own `per_runtime_limit` bound
+   each single evaluation — that is the only duration guard that exists, and it
+   is already correct.
    For a task declaring `evaluation.preflight_fn`, every proposed config first
    passes that isolated no-score hook. Rejections are recorded as feasibility
    evidence but do not reserve an objective slot. Immediately before `score_fn`,
@@ -191,11 +203,12 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    - **one terminal JSON object** — run `phase-c-action` again against the
      persisted report. Obey only its result: `action: run` runs the returned
      deterministic fallback and repeats this step; `action: finalize` proceeds
-     to Finalize; `action: stop` returns `tuned_run_id: none` with the printed
-     reason. A `failed` terminal status finalizes to the proven warm incumbent
-     and should add a short crash risk; `time_exhausted` may finalize finite
-     trials produced before the deadline. Never hand-construct a fallback or
-     close decision from the search script's status.
+     to Finalize; `action: close_exhausted_stage` runs the deterministic close
+     below and then finalizes. Any terminal status finalizes the best of the
+     proven warm incumbent and the stage's own finite trials — a `failed` or
+     `budget_exhausted` close should still add a short risk naming what
+     happened, but its scored trials remain eligible. Never hand-construct a
+     fallback or close decision from the search script's status.
 
 ### Finalize (apply + ledger close, in place — there is no re-run)
 
@@ -210,8 +223,9 @@ python tools/finalize_tuning.py \
 ```
 
 This command first proves that Phase A succeeded and every Phase-C stage is
-terminal, with the final stage `ok`, `failed`, `time_exhausted`, or
-`no_search_needed`, or with every method in the deterministic chain rejected.
+terminal — the final stage in any terminal state other than `rejected`, or every
+method in the deterministic chain rejected. A `running` final stage is **not**
+terminal; close it first (see below).
 Only then does it select the
 global warm/Phase-C best, AST-rewrite `BASE_PARAMS`, close the report, and write
 the score, keep/discard status, tuning metadata, strict attempt count, and
@@ -227,9 +241,33 @@ the risk. A partial report must leave the candidate untuned.
 > `phase_b_decision` stays `null` (the gate is `select-candidate` / Phase S, not a
 > per-candidate Phase B). The tuned score is **never worse** than
 > `best_warm_score`: finalization ranks the proven Phase-A incumbent together
-> with finite trials from a successful or time-bounded final Phase-C stage.
-> A failed final stage falls back to the warm best, so no "keep the better"
-> bookkeeping is needed and partial failed-stage rows cannot leak into `BASE_PARAMS`.
+> with every finite trial of the final Phase-C stage, whatever terminal status
+> that stage carries. Stage status records how the search ended, not whether its
+> observations count — a trial is already bound to the candidate on disk by
+> admission-time revision validation, so a `failed` or `budget_exhausted` stage's
+> rows stay eligible. `BASE_PARAMS` therefore only ever moves to a better score.
+
+### Closing a stage the budget can never resume
+
+A candidate at its deep-tune cap is never selected again, so an interrupted
+`running` stage would keep its durable trials — real, already-charged
+evaluations — stranded forever. `phase-c-action` detects this itself: for a
+`running` final stage the budget can never fund, it returns
+`action: close_exhausted_stage` instead of dead `run` advice. `select-candidate`
+reporting `deep_tune_budget_exhausted` or `all untuned candidates reached
+deep-tune per-candidate cap` is the same signal one step earlier. Either way,
+close any candidate still holding a nonterminal Phase-C stage, then finalize it:
+
+```
+python tools/tuners/tune_tools.py close-exhausted-stage \
+  --candidate-path <candidate_path> \
+  --tune-report-json <candidate_dir>/tune_report.json
+```
+
+It refuses while the budget still admits a reservation, and is a no-op on an
+already-terminal stage. On `action: closed`, run `finalize_tuning.py` above for
+that candidate. Report the closed candidate in `risks` with its
+`trials_at_close`.
 
 ## Output Format (back to caller)
 

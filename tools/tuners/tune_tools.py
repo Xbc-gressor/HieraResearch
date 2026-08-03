@@ -62,7 +62,7 @@ import tomllib
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/ for run_cfg
 
 from failure_artifacts import render_failure
-from evaluation_budget import budget_status  # noqa: E402
+from evaluation_budget import budget_status, find_run_dir  # noqa: E402
 from run_cfg import read_framework_cfg  # noqa: E402
 from semantic_evidence import unbound_primary_descendants  # noqa: E402
 
@@ -1052,28 +1052,37 @@ _TERMINAL_STAGE_STATUSES = {
     "no_search_needed",
     "time_exhausted",
 }
-_FINALIZABLE_STAGE_STATUSES = {
-    "ok",
-    "failed",
-    "no_search_needed",
-    "time_exhausted",
-}
+# Every terminal status except `rejected` can close a candidate.  A rejected
+# stage is a method the deterministic chain never ran, so it carries no
+# observation to finalize; the exhausted-chain path below handles a report whose
+# stages are all rejected.
+_FINALIZABLE_STAGE_STATUSES = _TERMINAL_STAGE_STATUSES - {"rejected"}
 
 
 def finalizable_tuning_result(report: dict, *, require_applied: bool = False) -> dict:
-    """Return the global best only when Phase C ended in a finalizable state.
+    """Return the global best once Phase C reached a terminal state.
 
-    Trial rows are intentionally durable before the search process exits.  A
-    killed search can therefore contain useful scores while lacking the
-    terminal stage metadata written after the optimizer returns.  Those partial
-    scores remain resumable evidence, but they must never be applied or mark the
-    candidate tuned.
+    Stage status records *how the search ended*; it does not gate *what the
+    search observed*.  Every finite trial row in the final stage is admissible
+    evidence regardless of that status, because two other mechanisms already
+    bind those rows to the candidate on disk:
 
+    * ``deep_tune_time_budget`` calls ``validate_candidate_execution_revision``
+      on every invocation before a trial can be appended, so all rows in a
+      stage share one pinned candidate/evaluator revision; and
+    * ``validate_report_trial_rows`` bounds-checks every row against the live
+      ``PARAM_SCHEMA``/``SEARCH_SPACE`` and rejects a finite score carrying a
+      non-ok status.
+
+    A killed search's rows are therefore proven observations, not suspect ones.
+    Discarding them used to lose real, already-paid-for evaluations whenever the
+    last invocation happened to complete nothing — an interrupted resume, a
+    budget death, or a run of crashing configs.
+
+    ``running`` is deliberately *not* terminal: a live process may still append
+    to that stage, so it must be closed first (see ``close_exhausted_stage``).
     Earlier stages may be ``rejected`` when the deterministic fallback chain
-    selected another method. A successful or time-bounded final stage admits
-    its finite trials; a failed final stage always falls back to the proven
-    Phase-A incumbent because an aggregate retry stage cannot attribute older
-    partial rows to its final failed invocation.
+    selected another method.
     """
     if not isinstance(report, dict):
         raise ValueError("tuning report is not finalizable: report must be an object")
@@ -1170,9 +1179,10 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
         and not exhausted_rejections
     ):
         errors.append(
-            "final Phase-C stage must end with status 'ok', 'failed', "
-            "'no_search_needed', or 'time_exhausted', unless every method in "
-            "the deterministic fallback chain was rejected"
+            "final Phase-C stage must end with status "
+            + ", ".join(repr(s) for s in sorted(_FINALIZABLE_STAGE_STATUSES))
+            + ", unless every method in the deterministic fallback chain "
+            "was rejected"
         )
 
     final_stage = stages[-1] if stages else {}
@@ -1264,14 +1274,15 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
     eligible_rows = []
     if warm_best is not None:
         eligible_rows.append(("warm_start", warm_best))
-    # A failed stage can contain durable partial rows from an interrupted retry.
-    # The aggregate schema cannot prove those rows belong to the terminal failed
-    # invocation, so the documented failed path always falls back to Phase A.
-    if final_status in {"ok", "time_exhausted"}:
-        eligible_rows.extend(
-            (str(final_stage.get("method")), row)
-            for row in finite_final
-        )
+    # Every finite row of the final stage competes with the Phase-A incumbent,
+    # whatever terminal status the stage carries (see the docstring for why
+    # those rows are already proven).  No status filter is needed here:
+    # `rejected` and `no_search_needed` stages are validated above to carry no
+    # trial rows, so `finite_final` is empty for them.
+    eligible_rows.extend(
+        (str(final_stage.get("method")), row)
+        for row in finite_final
+    )
     if eligible_rows:
         source, best_row = min(
             eligible_rows, key=lambda item: float(item[1]["score"])
@@ -1307,11 +1318,10 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
 
     return {
         **best,
+        # The applied observation's own provenance, not the stage's status: a
+        # Phase-C row that wins carries its method however the stage ended.
         "phase_c_method": (
-            final_stage.get("method")
-            if final_status == "ok"
-            or (final_status == "time_exhausted" and finite_final)
-            else None
+            None if best.get("source") in (None, "warm_start") else best["source"]
         ),
         "stage_statuses": statuses,
     }
@@ -1323,6 +1333,42 @@ def has_validated_applied_close(report: dict) -> bool:
         return False
     finalizable_tuning_result(report, require_applied=True)
     return True
+
+
+def _unresumable_budget_scope(candidate_path: Path) -> tuple[str | None, str]:
+    """Prove whether no Phase-C reservation can still be admitted for a candidate.
+
+    Returns ``(scope, detail)``: ``scope`` names the exhausted budget and is
+    ``None`` while any reservation remains admissible; ``detail`` records the
+    numbers behind the decision for refusals and receipts.  A candidate
+    outside a run directory has no evaluation budget to prove against, so it
+    always reads as resumable.
+    """
+    run_dir = find_run_dir(candidate_path)
+    if run_dir is None:
+        return None, "no enclosing run directory"
+    run_id = Path(candidate_path).parent.name
+    status_view = budget_status(run_dir)
+    deep = status_view.get("deep_tune") or {}
+    per_candidate = {
+        str(row.get("run_id")): row.get("evals", 0)
+        for row in deep.get("per_candidate", [])
+        if isinstance(row, dict)
+    }
+    candidate_used = per_candidate.get(run_id, 0)
+    candidate_cap = deep.get("per_candidate_cap")
+    detail = (
+        f"global remaining={status_view.get('remaining')!r}, "
+        f"deep-tune remaining={deep.get('remaining')!r}, "
+        f"candidate {run_id} used {candidate_used}/{candidate_cap!r}"
+    )
+    if isinstance(status_view.get("remaining"), int) and status_view["remaining"] <= 0:
+        return "global", detail
+    if isinstance(deep.get("remaining"), int) and deep["remaining"] <= 0:
+        return "deep_tune_total", detail
+    if isinstance(candidate_cap, int) and candidate_used >= candidate_cap:
+        return f"deep_tune_candidate:{run_id}", detail
+    return None, detail
 
 
 def phase_c_action(report: dict, candidate_path: Path) -> dict:
@@ -1381,6 +1427,18 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     final_stage = stages[-1]
     final_status = final_stage.get("status")
     if final_status == "running":
+        scope, _detail = _unresumable_budget_scope(candidate_path)
+        if scope is not None:
+            # The budget proves no invocation can ever resume this stage, so
+            # "run" advice cannot succeed; the deterministic close is the only
+            # legal move (prompt-only routing here stranded durable trials).
+            return {
+                **common,
+                "action": "close_exhausted_stage",
+                "method": methods[-1],
+                "reason": "evaluation_budget_reached",
+                "budget_scope": scope,
+            }
         return {
             **common,
             "action": "run",
@@ -1405,14 +1463,6 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             "reason": "method_chain_exhausted",
             "best_score": result["best_score"],
         }
-    if final_status == "budget_exhausted":
-        return {
-            **common,
-            "action": "stop",
-            "method": None,
-            "reason": "evaluation_budget_reached",
-        }
-
     result = finalizable_tuning_result(report)
     return {
         **common,
@@ -1420,6 +1470,80 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
         "method": None,
         "reason": f"terminal_{final_status}",
         "best_score": result["best_score"],
+    }
+
+
+def close_exhausted_stage(candidate_path: Path, report_path: Path) -> dict:
+    """Close a `running` Phase-C stage the evaluation budget can never resume.
+
+    An interrupted stage stays `running` until some invocation closes it, but a
+    candidate at its deep-tune cap is never selected again, so no invocation
+    ever comes.  Its durable trials — real, already-charged evaluations — would
+    be stranded forever.  This is the deterministic close for that state.
+
+    Admissible only when the reservation ledger proves no further Phase-C
+    reservation can be admitted for this candidate: the global cap, the
+    deep-tune total cap, or the per-candidate cap is spent.  Under that proof no
+    new trial can be appended, because `reserve_evaluation` would raise before
+    `score_fn`.  The residual risk is a straggler trial from an already-paid
+    reservation landing after the close, which `trials_at_close` makes
+    detectable rather than silent.
+
+    Idempotent: closing an already-terminal stage is a no-op receipt.
+    """
+    from _common import read_tune_report, set_stage_meta
+
+    candidate_path = Path(candidate_path)
+    report_path = Path(report_path)
+    report = read_tune_report(report_path)
+    stages = report.get("phase_c", {}).get("stages") if isinstance(report, dict) else None
+    if not isinstance(stages, list) or not stages:
+        raise ValueError("phase_c.stages must be a non-empty list to close")
+    final_stage = stages[-1]
+    if not isinstance(final_stage, dict):
+        raise ValueError("the final Phase-C stage must be an object")
+    method = final_stage.get("method")
+    status = final_stage.get("status")
+    trials = final_stage.get("trials") or []
+
+    if status != "running":
+        return {
+            "action": "noop",
+            "reason": f"final stage is already terminal (status={status!r})",
+            "method": method,
+            "status": status,
+            "trials_at_close": len(trials),
+        }
+
+    run_dir = find_run_dir(candidate_path)
+    if run_dir is None:
+        raise ValueError(
+            f"{candidate_path} is not inside a run directory; "
+            "no evaluation budget can prove this stage unresumable"
+        )
+    scope, detail = _unresumable_budget_scope(candidate_path)
+    if scope is None:
+        raise ValueError(
+            "refusing to close a running Phase-C stage while the budget still "
+            f"admits a reservation ({detail})"
+        )
+
+    set_stage_meta(
+        report_path,
+        method,
+        status="budget_exhausted",
+        closed_reason="evaluation_budget_reached",
+        budget_scope=scope,
+        trials_at_close=len(trials),
+        closed_without_invocation=True,
+    )
+    return {
+        "action": "closed",
+        "reason": "evaluation_budget_reached",
+        "method": method,
+        "status": "budget_exhausted",
+        "budget_scope": scope,
+        "trials_at_close": len(trials),
     }
 
 
@@ -2443,8 +2567,11 @@ def tuning_record(report: dict) -> dict:
                 and _is_finite_score(row.get("score"))
             ],
         }
-    # Only a successful stage with a finite observation establishes a tuning
-    # method. Rejected, failed, and fixed/no-search receipts remain method-null.
+    # Pre-close view only: until a candidate is finalized its scores still come
+    # from Phase A, so a Phase-C observation that was never applied must not
+    # claim a method or "tuned" depth here.  `finalized_tuning_record` recomputes
+    # both fields at close: the method from the applied row's provenance, the
+    # depth from any scored Phase-C trial (the ledger contract's definition).
     phase_c_method = next(
         (
             stage.get("method")
@@ -2462,10 +2589,11 @@ def tuning_record(report: dict) -> dict:
         # ledger tuning fields
         "best_warm_score": summary["best_warm_score"],
         "final_best_score": summary["final_best_score"],
-        # Depth of the evaluation behind this record's scores. "tuned" requires
-        # a successful Phase-C stage with a finite trial observation (same
-        # criterion as phase_c_method); everything else is "screening". Only
-        # tuned children ground contradiction-grade semantic findings: a
+        # Depth of the evaluation behind this record's scores: "tuned" when a
+        # Phase-C observation backs them, "screening" otherwise (in this
+        # pre-close view the same criterion as phase_c_method; the finalized
+        # record switches to the contract's scored-Phase-C-trial definition).
+        # Only tuned children ground contradiction-grade semantic findings: a
         # screening rejection measures the hypothesis at one parameter point
         # and must not prune a space element (run 0730-ds-ex100-1: MTP rejected
         # twice at screening while 011, worse than its own control at
@@ -2493,10 +2621,29 @@ def tuning_record(report: dict) -> dict:
 def finalized_tuning_record(report: dict) -> dict:
     """Ledger-ready tuning fields after the fail-closed completion check."""
     final = finalizable_tuning_result(report, require_applied=True)
+    stages = report.get("phase_c", {}).get("stages", [])
+    scored_phase_c_trial = any(
+        isinstance(trial, dict) and _is_finite_score(trial.get("score"))
+        for stage in stages
+        if isinstance(stage, dict)
+        for trial in stage.get("trials", [])
+    )
     return {
         **tuning_record(report),
         "final_best_score": final["best_score"],
+        # Provenance of the applied observation only: None when the Phase-A
+        # incumbent wins the argmin, however much Phase C ran.
         "phase_c_method": final["phase_c_method"],
+        # Depth is evaluation effort, not the applied row's provenance.  The
+        # ledger contract defines "tuned" as "it has a scored Phase-C trial"
+        # (.claude/rules/ledger.md), so a deep-tuned candidate whose warm
+        # incumbent still wins — the most common Phase-C outcome — stays
+        # "tuned"; in a finalizable report every non-final stage is a rejected
+        # no-trial row, so any finite trial sits in a terminal stage.  Tying
+        # depth to phase_c_method instead would demote such candidates to
+        # "screening" and silently strip their semantic-evidence weight
+        # (direct_tuned_edges demotion, gain-direction abstention).
+        "evaluation_depth": "tuned" if scored_phase_c_trial else "screening",
     }
 
 
@@ -3011,6 +3158,15 @@ def cmd_phase_c_action(args) -> int:
     return 0
 
 
+def cmd_close_exhausted_stage(args) -> int:
+    try:
+        result = close_exhausted_stage(args.candidate_path, args.tune_report_json)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    print(json.dumps(result))
+    return 0
+
+
 def cmd_select_best(args) -> int:
     report = json.loads(Path(args.tune_report_json).read_text())
     try:
@@ -3175,6 +3331,17 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--candidate-path", required=True, type=Path)
     pa.add_argument("--tune-report-json", required=True, type=Path)
     pa.set_defaults(func=cmd_phase_c_action)
+
+    ce = sub.add_parser(
+        "close-exhausted-stage",
+        help=(
+            "Close a running Phase-C stage the evaluation budget can never "
+            "resume, so its durable trials stay finalizable."
+        ),
+    )
+    ce.add_argument("--candidate-path", required=True, type=Path)
+    ce.add_argument("--tune-report-json", required=True, type=Path)
+    ce.set_defaults(func=cmd_close_exhausted_stage)
 
     sb = sub.add_parser(
         "select-best",
