@@ -495,14 +495,22 @@ def _deep_tune_time_budget_locked(
     # AST-only: reject a wrong/repeated fallback before importing candidate code
     # or admitting any preflight/objective work.
     from tune_tools import (
+        _TERMINAL_STAGE_STATUSES,
         _read_search_space,
+        has_applied_close,
+        has_validated_applied_close,
         select_method,
         validate_candidate_execution_revision,
         validate_phase_a_candidate_state,
     )
 
     try:
-        validate_phase_a_candidate_state(report, Path(ref_path))
+        bouts = stages_by_bout(stages)
+        validate_phase_a_candidate_state(
+            report,
+            Path(ref_path),
+            require_warm_base_applied=not has_applied_close(report),
+        )
         candidate_execution_revision = validate_candidate_execution_revision(
             report,
             Path(ref_path),
@@ -518,48 +526,70 @@ def _deep_tune_time_budget_locked(
         )
     position = method_chain.index(method)
 
-    methods = [stage.get("method") for stage in stages]
+    current = bouts[-1] if bouts else []
+    methods = [stage.get("method") for stage in current]
     if not all(isinstance(value, str) for value in methods):
         raise DeepTuneStageAdmissionError(
             f"phase_c stage methods must be strings: {methods!r}"
         )
     if len(methods) != len(set(methods)):
         raise DeepTuneStageAdmissionError(
-            f"phase_c contains duplicate method stages: {methods!r}"
+            f"phase_c bout contains duplicate method stages: {methods!r}"
         )
     expected_prefix = method_chain[:position]
     actual_prefix = methods[:position]
     if actual_prefix != expected_prefix or any(
-        stages[index].get("status") != "rejected"
-        for index in range(min(position, len(stages)))
+        current[index].get("status") != "rejected"
+        for index in range(min(position, len(current)))
     ):
         raise DeepTuneStageAdmissionError(
             f"method {method!r} requires rejected prefix {expected_prefix!r}; "
             f"found methods/statuses "
-            f"{[(stage.get('method'), stage.get('status')) for stage in stages]!r}"
+            f"{[(stage.get('method'), stage.get('status')) for stage in current]!r}"
         )
 
-    stage = next(
-        (item for item in stages if item.get("method") == method),
-        None,
+    current_terminal = bool(current) and all(
+        item.get("status") in _TERMINAL_STAGE_STATUSES for item in current
     )
-    if stage is None:
-        if len(stages) != position:
+    stage = None
+    bout_index = len(bouts) - 1 if bouts else 0
+    if current_terminal and method == method_chain[0]:
+        # The previous bout's chain closed out (finalizable or exhausted). A
+        # validated applied close lets a NEW bout restart the chain — the new
+        # stage reuses the method under the next bout_index.
+        if not has_validated_applied_close(report):
             raise DeepTuneStageAdmissionError(
-                f"method {method!r} is not the next Phase-C stage"
+                "the previous bout must be finalized "
+                "(tools/finalize_tuning.py) before a new bout starts"
             )
-        stage = {"method": method, "trials": []}
+        bout_index = len(bouts)
+        stage = {"method": method, "trials": [], "bout_index": bout_index}
         stages.append(stage)
     else:
-        if stages.index(stage) != position or len(stages) != position + 1:
-            raise DeepTuneStageAdmissionError(
-                f"method {method!r} is not the active final Phase-C stage"
-            )
-        if stage.get("status") != "running":
-            raise DeepTuneStageAdmissionError(
-                f"terminal Phase-C method {method!r} cannot be rerun "
-                f"(status={stage.get('status')!r})"
-            )
+        stage = next(
+            (item for item in current if item.get("method") == method),
+            None,
+        )
+        if stage is None:
+            if len(current) != position:
+                raise DeepTuneStageAdmissionError(
+                    f"method {method!r} is not the next Phase-C stage of its bout"
+                )
+            stage = {"method": method, "trials": []}
+            if bout_index > 0:
+                stage["bout_index"] = bout_index
+            stages.append(stage)
+        else:
+            if current.index(stage) != position or len(current) != position + 1:
+                raise DeepTuneStageAdmissionError(
+                    f"method {method!r} is not the active final Phase-C stage "
+                    "of its bout"
+                )
+            if stage.get("status") != "running":
+                raise DeepTuneStageAdmissionError(
+                    f"terminal Phase-C method {method!r} cannot be rerun "
+                    f"within its bout (status={stage.get('status')!r})"
+                )
 
     # Recover every abandoned invocation conservatively before calculating the
     # candidate-level total. A legal report has at most the active method here,
@@ -626,6 +656,7 @@ def _deep_tune_time_budget_locked(
         "started_monotonic": started_monotonic,
         "started_epoch": started_epoch,
         "candidate_execution_revision": candidate_execution_revision,
+        "bout_index": bout_index,
     }
 
 
@@ -995,6 +1026,35 @@ def write_tune_report(report_path: Path, report: dict) -> None:
     tmp.replace(report_path)
 
 
+def stage_bout_index(stage: dict) -> int:
+    """0-based bout a Phase-C stage belongs to (legacy unstamped stages: 0)."""
+    value = stage.get("bout_index", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def stages_by_bout(stages: list) -> list[list[dict]]:
+    """Group ordered stages into bouts. Bout indices must start at 0, be
+    contiguous, and never regress along the list."""
+    bouts: list[list[dict]] = []
+    for index, stage in enumerate(stages):
+        bout = stage_bout_index(stage)
+        if bout < len(bouts) - 1:
+            raise ValueError(
+                f"phase_c.stages[{index}] bout_index {bout} regresses below an "
+                "earlier bout"
+            )
+        if bout > len(bouts):
+            raise ValueError(
+                f"phase_c.stages[{index}] bout_index {bout} skips a bout"
+            )
+        if bout == len(bouts):
+            bouts.append([])
+        bouts[-1].append(stage)
+    return bouts
+
+
 def append_preflight_attempt(
     report_path: Path,
     *,
@@ -1026,13 +1086,14 @@ def append_preflight_attempt(
 
 
 def append_trial(report_path: Path, method: str, trial: dict) -> None:
-    """Append one trial to phase_c.stages[method].trials. Single-writer-safe
-    because tuner-orchestrator blocks on the subprocess.
+    """Append one trial to the LAST phase_c.stages[method] (the active stage of
+    that method's current bout; the same method recurs across bouts).
+    Single-writer-safe because tuner-orchestrator blocks on the subprocess.
     """
     report = read_tune_report(report_path)
     phase_c = report.setdefault("phase_c", {"stages": []})
     stages = phase_c.setdefault("stages", [])
-    stage = next((s for s in stages if s.get("method") == method), None)
+    stage = next((s for s in reversed(stages) if s.get("method") == method), None)
     if stage is None:
         stage = {"method": method, "trials": []}
         stages.append(stage)
@@ -1040,19 +1101,29 @@ def append_trial(report_path: Path, method: str, trial: dict) -> None:
     write_tune_report(report_path, report)
 
 
-def set_stage_meta(report_path: Path, method: str, **meta: Any) -> None:
+def set_stage_meta(
+    report_path: Path,
+    method: str,
+    *,
+    bout_index: int | None = None,
+    **meta: Any,
+) -> None:
     """Merge stage-level summary fields (status, elapsed_seconds, early_stopped)
-    into phase_c.stages[method] so a downstream summarizer can read them from
-    the report rather than the script's stdout. Creates the stage if missing
-    (e.g. a method that rejected before running any trial). Single-writer-safe
-    because tuner-orchestrator blocks on the subprocess.
+    into the LAST phase_c.stages[method] (the active stage of that method's
+    current bout; the same method recurs across bouts) so a downstream
+    summarizer can read them from the report rather than the script's stdout.
+    Creates the stage if missing (e.g. a method that rejected before running
+    any trial), stamping ``bout_index`` on it when a positive bout is given.
+    Single-writer-safe because tuner-orchestrator blocks on the subprocess.
     """
     report = read_tune_report(report_path)
     phase_c = report.setdefault("phase_c", {"stages": []})
     stages = phase_c.setdefault("stages", [])
-    stage = next((s for s in stages if s.get("method") == method), None)
+    stage = next((s for s in reversed(stages) if s.get("method") == method), None)
     if stage is None:
         stage = {"method": method, "trials": []}
+        if isinstance(bout_index, int) and not isinstance(bout_index, bool) and bout_index > 0:
+            stage["bout_index"] = bout_index
         stages.append(stage)
     status = meta.get("status")
     if status is not None and status != "running":
@@ -1272,29 +1343,28 @@ def prior_best_score(prior_trials: list[dict]) -> float | None:
     return min(scores) if scores else None
 
 
-def prior_patience_state(report_path: Path) -> tuple[float | None, int]:
-    """Replay the persisted trial sequence into (best_score, patience streak)
-    for PatienceMonitor seeding, so a resumed/restarted search continues the
-    patience counter instead of resetting it.
+def prior_patience_state(
+    report_path: Path,
+    bout_index: int | None = None,
+) -> tuple[float | None, int]:
+    """Replay persisted trials into (best_score, patience streak) for
+    PatienceMonitor seeding. The improvement bar is GLOBAL (warm screening
+    plus every bout's trials); the patience streak is scoped to one bout
+    (default: the current/max bout), so a continuation bout starts a fresh
+    window while still having to beat the run's best to reset.
 
-    Same traversal order as read_prior_trials (phase_a.warm_start_configs,
-    then phase_c.stages[*].trials), but keeps scoreless trials: over Phase-C
-    rows the counting rule mirrors PatienceMonitor — a finite score better
-    than the running best resets the streak; anything else (equal/worse score,
-    failed or preflight-rejected trial) increments it.
-
-    Only Phase-C rows increment the streak. Warm screening is a deliberate
-    spread over distinct numeric regimes, not a stalled optimizer. The
-    inherited config-0 fidelity control is not an incumbent, so it cannot set
-    ``best`` or reset patience; a Phase-C duplicate of its exact params counts
-    as a spent non-improving trial. The best selectable Phase-A row is the bar
-    a Phase-C trial must beat to reset.
+    Only Phase-C rows of the scoped bout increment the streak. Warm screening
+    is a deliberate spread over distinct numeric regimes, not a stalled
+    optimizer. The inherited config-0 fidelity control is not an incumbent, so
+    it cannot set ``best`` or reset patience; a Phase-C duplicate of its exact
+    params counts as a spent non-improving trial.
     """
     report = read_tune_report(report_path)
     phase_a = report.get("phase_a", {})
-    phase_c_trials: list[dict] = []
-    for stage in report.get("phase_c", {}).get("stages", []):
-        phase_c_trials.extend(stage.get("trials", []))
+    stages = report.get("phase_c", {}).get("stages", [])
+    if bout_index is None:
+        bout_index = max((stage_bout_index(s) for s in stages), default=0)
+
     best: float | None = None
     inherited_param_ids: set[str] = set()
     for trial in phase_a.get("warm_start_configs", []):
@@ -1307,22 +1377,40 @@ def prior_patience_state(report_path: Path) -> tuple[float | None, int]:
         score = trial.get("score")
         if is_finite_score(score) and (best is None or float(score) < best):
             best = float(score)
-    streak = 0
-    for trial in phase_c_trials:
-        score = trial.get("score")
+
+    def absorbs(trial: dict) -> bool:
+        """Whether the trial improves the running best (reset) or not."""
+        nonlocal best
         is_inherited_duplicate = (
             isinstance(trial.get("params"), dict)
             and params_identity(trial["params"]) in inherited_param_ids
         )
+        score = trial.get("score")
         if (
             not is_inherited_duplicate
             and is_finite_score(score)
             and (best is None or float(score) < best)
         ):
             best = float(score)
-            streak = 0
-        else:
-            streak += 1
+            return True
+        return False
+
+    # Earlier bouts only move the global bar; they never seed the streak.
+    for stage in stages:
+        if stage_bout_index(stage) >= bout_index:
+            continue
+        for trial in stage.get("trials", []):
+            absorbs(trial)
+
+    streak = 0
+    for stage in stages:
+        if stage_bout_index(stage) != bout_index:
+            continue
+        for trial in stage.get("trials", []):
+            if absorbs(trial):
+                streak = 0
+            else:
+                streak += 1
     return best, streak
 
 

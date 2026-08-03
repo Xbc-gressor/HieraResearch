@@ -1327,12 +1327,45 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
     }
 
 
-def has_validated_applied_close(report: dict) -> bool:
-    """Whether closing fields prove that BASE_PARAMS may differ from Phase A."""
+def last_finalized_stage_index(report: dict) -> int | None:
+    """Stage index the last finalize close covered (legacy closes: absent)."""
+    if not isinstance(report, dict):
+        return None
+    value = report.get("last_finalized_stage_index")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def has_applied_close(report: dict) -> bool:
+    """Whether a finalize close (any bout) applied its incumbent to BASE_PARAMS.
+
+    The closing fields must prove consistent with the stages they cover —
+    i.e. the stage prefix up to ``last_finalized_stage_index`` (legacy closes
+    without the field covered every stage, which is all a one-shot report can
+    have)."""
     if not isinstance(report, dict) or report.get("applied_to_base_params") is not True:
         return False
-    finalizable_tuning_result(report, require_applied=True)
+    stages = report.get("phase_c", {}).get("stages", [])
+    last = last_finalized_stage_index(report)
+    if last is None:
+        last = len(stages) - 1
+    phase_c = report.get("phase_c", {})
+    prefix_report = {
+        **report,
+        "phase_c": {**phase_c, "stages": stages[: last + 1]},
+    }
+    finalizable_tuning_result(prefix_report, require_applied=True)
     return True
+
+
+def has_validated_applied_close(report: dict) -> bool:
+    """Whether the applied close is CURRENT: it covers every stage in the report."""
+    if not has_applied_close(report):
+        return False
+    stages = report.get("phase_c", {}).get("stages", [])
+    last = last_finalized_stage_index(report)
+    return last is None or last == len(stages) - 1
 
 
 def _unresumable_budget_scope(candidate_path: Path) -> tuple[str | None, str]:
@@ -1377,7 +1410,7 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     validate_phase_a_candidate_state(
         report,
         candidate_path,
-        require_warm_base_applied=not applied_close,
+        require_warm_base_applied=not has_applied_close(report),
     )
     search_space = _read_search_space(candidate_path)
 
@@ -1400,31 +1433,39 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             "action": "run",
             "method": method_chain[0],
             "reason": "phase_c_not_started",
+            "bout_index": 0,
         }
     if not isinstance(stages, list) or not all(
         isinstance(stage, dict) for stage in stages
     ):
         raise ValueError("phase_c.stages must be a list of objects")
-    methods = [stage.get("method") for stage in stages]
-    if (
-        len(stages) > len(method_chain)
-        or methods != method_chain[:len(stages)]
-    ):
-        raise ValueError(
-            f"Phase-C method chain {methods!r} does not match "
-            f"{method_chain!r}"
-        )
-    if any(
-        stage.get("status") != "rejected"
-        or stage.get("trials") not in (None, [])
-        for stage in stages[:-1]
-    ):
-        raise ValueError(
-            "every Phase-C stage before the active/final stage must be an "
-            "empty rejected stage"
-        )
+    from _common import stages_by_bout
 
-    final_stage = stages[-1]
+    bouts = stages_by_bout(stages)
+    for bout in bouts:
+        bout_methods = [stage.get("method") for stage in bout]
+        if (
+            len(bout) > len(method_chain)
+            or bout_methods != method_chain[:len(bout)]
+        ):
+            raise ValueError(
+                f"Phase-C method chain {bout_methods!r} does not match "
+                f"{method_chain!r}"
+            )
+        if any(
+            stage.get("status") != "rejected"
+            or stage.get("trials") not in (None, [])
+            for stage in bout[:-1]
+        ):
+            raise ValueError(
+                "every Phase-C stage before its bout's active/final stage "
+                "must be an empty rejected stage"
+            )
+
+    current = bouts[-1]
+    bout_index = len(bouts) - 1
+    methods = [stage.get("method") for stage in current]
+    final_stage = current[-1]
     final_status = final_stage.get("status")
     if final_status == "running":
         scope, _detail = _unresumable_budget_scope(candidate_path)
@@ -1438,23 +1479,28 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
                 "method": methods[-1],
                 "reason": "evaluation_budget_reached",
                 "budget_scope": scope,
+                "bout_index": bout_index,
             }
         return {
             **common,
             "action": "run",
             "method": methods[-1],
             "reason": "resume_interrupted_stage",
+            "bout_index": bout_index,
         }
     if final_status == "rejected":
         if final_stage.get("trials") not in (None, []):
             raise ValueError("a rejected Phase-C stage cannot contain trials")
-        if len(stages) < len(method_chain):
+        if len(current) < len(method_chain):
             return {
                 **common,
                 "action": "run",
-                "method": method_chain[len(stages)],
+                "method": method_chain[len(current)],
                 "reason": "run_deterministic_fallback",
+                "bout_index": bout_index,
             }
+        if applied_close:
+            return _start_new_bout(common, method_chain, bout_index)
         result = finalizable_tuning_result(report)
         return {
             **common,
@@ -1462,7 +1508,10 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             "method": None,
             "reason": "method_chain_exhausted",
             "best_score": result["best_score"],
+            "bout_index": bout_index,
         }
+    if applied_close:
+        return _start_new_bout(common, method_chain, bout_index)
     result = finalizable_tuning_result(report)
     return {
         **common,
@@ -1470,6 +1519,18 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
         "method": None,
         "reason": f"terminal_{final_status}",
         "best_score": result["best_score"],
+        "bout_index": bout_index,
+    }
+
+
+def _start_new_bout(common: dict, method_chain: list, bout_index: int) -> dict:
+    """The previous bout is closed and finalized; begin the next one."""
+    return {
+        **common,
+        "action": "run",
+        "method": method_chain[0],
+        "reason": "start_new_bout",
+        "bout_index": bout_index + 1,
     }
 
 

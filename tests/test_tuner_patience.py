@@ -39,7 +39,18 @@ class PatienceMonitorTest(unittest.TestCase):
         self.assertFalse(monitor.update_failed())
 
 
-def _write_report(path: Path, warm_scores, stage_trials) -> None:
+def _write_report(
+    path: Path, warm_scores, stage_trials, bout_index: int | None = None
+) -> None:
+    stage = {
+        "method": "bo",
+        "trials": [
+            {"params": {"x": float(i)}, "score": s, "status": st}
+            for i, (s, st) in enumerate(stage_trials)
+        ],
+    }
+    if bout_index is not None:
+        stage["bout_index"] = bout_index
     write_tune_report(
         path,
         {
@@ -50,14 +61,40 @@ def _write_report(path: Path, warm_scores, stage_trials) -> None:
                 ]
             },
             "phase_c": {
-                "stages": [
-                    {"method": "bo", "trials": [
-                        {"params": {"x": float(i)}, "score": s, "status": st}
-                        for i, (s, st) in enumerate(stage_trials)
-                    ]}
-                ]
+                "stages": (
+                    [stage] if stage_trials or bout_index is not None else []
+                )
             },
         },
+    )
+
+
+def _write_two_bout_report(path: Path) -> None:
+    write_tune_report(
+        path,
+        {
+            "phase_a": {
+                "warm_start_configs": [{"params": {"x": 1.0}, "score": 1.07}]
+            },
+            "phase_c": {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "trials": [
+                            {"params": {"x": 2.0}, "score": 1.05},
+                            {"params": {"x": 3.0}, "score": None, "status": "failed"},
+                        ],
+                    },
+                    {
+                        "method": "bo",
+                        "bout_index": 1,
+                        "trials": [
+                            {"params": {"x": 4.0}, "score": 1.06},
+                        ],
+                    },
+                ]
+            },
+        }
     )
 
 
@@ -129,6 +166,27 @@ class PriorPatienceStateTest(unittest.TestCase):
         )
 
         self.assertEqual(prior_patience_state(self.report_path), (0.3, 1))
+
+
+class BoutPatienceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.report_path = Path(self.tmp.name) / "tune_report.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_streak_scoped_to_current_bout_best_is_global(self):
+        _write_two_bout_report(self.report_path)
+        best, streak = prior_patience_state(self.report_path)
+        self.assertEqual(best, 1.05)
+        self.assertEqual(streak, 1)  # only bout 1's non-improving trial counts
+
+    def test_explicit_earlier_bout_replays_that_bout(self):
+        _write_two_bout_report(self.report_path)
+        best, streak = prior_patience_state(self.report_path, bout_index=0)
+        self.assertEqual(best, 1.05)
+        self.assertEqual(streak, 1)  # bout 0: improvement then failed trial
 
 
 if __name__ == "__main__":

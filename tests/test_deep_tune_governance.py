@@ -704,6 +704,140 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             )
 
 
+class BoutAdmissionTest(unittest.TestCase):
+    def _fixture(self, root: Path):
+        run_dir = root / "run"
+        candidate_dir = run_dir / "candidates" / "001"
+        candidate_dir.mkdir(parents=True)
+        candidate = candidate_dir / "train.py"
+        candidate.write_text(
+            "PARAM_SCHEMA = {'x': 'float'}\n"
+            "SEARCH_SPACE = {'x': ('float', 0.0, 2.0)}\n"
+            "BASE_PARAMS = {'x': 1.0}\n"
+            "def make_model(params):\n"
+            "    return params\n"
+        )
+        (candidate_dir / "prepare.py").write_text(
+            "def evaluate_config(make_model, params):\n"
+            "    return float(params['x'])\n"
+        )
+        report_path = candidate_dir / "tune_report.json"
+        report = {
+            "phase_a": {
+                "status": "ok",
+                "warm_start_configs": [{"params": {"x": 1.0}, "score": 1.0}],
+                "best_warm_params": {"x": 1.0},
+                "best_warm_score": 1.0,
+                "trials_attempted": 1,
+                "elapsed_seconds": 1.0,
+                "search_space": {"x": ["float", 0.0, 2.0]},
+            },
+            "preflight": {"attempts": []},
+        }
+        report["phase_a"]["candidate_code_revision"] = (
+            _candidate_execution_revision(candidate)
+        )
+        report_path.write_text(json.dumps(report))
+        return candidate, report_path
+
+    def _close_bout_zero(self, candidate, report_path, *, improved: bool) -> None:
+        """Simulate a finalized bout 0 (warm incumbent stays best)."""
+        report = json.loads(report_path.read_text())
+        report["phase_c"] = {
+            "stages": [
+                {
+                    "method": "grid",
+                    "status": "ok",
+                    "trials": [
+                        {"params": {"x": 0.5 if improved else 1.5},
+                         "score": 0.5 if improved else 1.5}
+                    ],
+                    "elapsed_seconds": 1.0,
+                }
+            ]
+        }
+        best = 0.5 if improved else 1.0
+        report["final_best_params"] = {"x": best}
+        report["final_best_score"] = best
+        report["applied_to_base_params"] = True
+        report["last_finalized_stage_index"] = 0
+        report_path.write_text(json.dumps(report))
+        # finalize would have rewritten BASE_PARAMS to the applied winner
+        source = candidate.read_text().replace(
+            "BASE_PARAMS = {'x': 1.0}", f"BASE_PARAMS = {{'x': {best}}}"
+        )
+        candidate.write_text(source)
+
+    def test_new_bout_admitted_after_finalized_bout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            self._close_bout_zero(candidate, report_path, improved=False)
+            budget = deep_tune_time_budget(candidate, report_path, "grid")
+            try:
+                self.assertEqual(budget["bout_index"], 1)
+                report = json.loads(report_path.read_text())
+                stages = report["phase_c"]["stages"]
+                self.assertEqual(len(stages), 2)
+                self.assertEqual(stages[1].get("bout_index"), 1)
+                self.assertEqual(stages[1]["status"], "running")
+            finally:
+                budget["_phase_c_lock_handle"].close()
+
+    def test_new_bout_refused_when_previous_bout_not_finalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "grid",
+                        "status": "ok",
+                        "trials": [{"params": {"x": 1.5}, "score": 1.5}],
+                        "elapsed_seconds": 1.0,
+                    }
+                ]
+            }
+            report_path.write_text(json.dumps(report))
+            with self.assertRaisesRegex(
+                DeepTuneStageAdmissionError, "must be finalized"
+            ):
+                deep_tune_time_budget(candidate, report_path, "grid")
+
+    def test_terminal_rerun_within_same_bout_still_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "grid",
+                        "status": "ok",
+                        "trials": [{"params": {"x": 1.5}, "score": 1.5}],
+                        "elapsed_seconds": 1.0,
+                    },
+                    {
+                        "method": "grid",
+                        "bout_index": 1,
+                        "status": "rejected",
+                        "trials": [],
+                    },
+                    {
+                        "method": "bo",
+                        "bout_index": 1,
+                        "status": "ok",
+                        "trials": [{"params": {"x": 1.4}, "score": 1.4}],
+                        "elapsed_seconds": 1.0,
+                    },
+                ]
+            }
+            report_path.write_text(json.dumps(report))
+            # bo is the active final stage of bout 1 and terminal; re-admitting
+            # it is a same-bout rerun (only the PRIMARY method of a terminal
+            # bout can start a new bout, and that requires a finalized close).
+            with self.assertRaisesRegex(DeepTuneStageAdmissionError, "cannot be rerun"):
+                deep_tune_time_budget(candidate, report_path, "bo")
+
+
 class CloseExhaustedStageTest(unittest.TestCase):
     """The deterministic close for a stage no invocation will ever resume."""
 
