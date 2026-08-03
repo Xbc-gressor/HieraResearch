@@ -26,6 +26,10 @@ entrypoint = "train.py"
 score_fn = "evaluate_config"
 environment_preflight_fn = "preflight_environment"
 preflight_fn = "preflight_config"
+# Optional no-score resource oracle for the search-space clamp: same contract as
+# preflight_fn, but pinned to the worst-case training shape (T = MAX_SEQ_LEN).
+# Without it the clamp falls back to trusting preflight_fn's own shape.
+resource_probe_fn = "resource_probe_config"
 
 [result]
 metric = "val_bpb"

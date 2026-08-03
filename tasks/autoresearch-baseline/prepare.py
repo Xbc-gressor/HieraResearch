@@ -389,16 +389,39 @@ class PretrainEnv:
 
 
 class PreflightEnv(PretrainEnv):
-    """Candidate environment with validation access mechanically disabled."""
+    """Candidate environment with validation access mechanically disabled.
 
-    def __init__(self):
+    Two modes, both no-score:
+
+    * default (`resource_probe=False`) — the correctness check. The candidate
+      trains whatever first-step shape `run()` would use, which is what TASK.md
+      asks `preflight()` to mirror.
+    * `resource_probe=True` — the memory-envelope check. `T` is forced to
+      `MAX_SEQ_LEN` so the probe measures the worst-case training shape rather
+      than whichever shape the candidate happens to start with. A candidate
+      whose `run()` ramps sequence length (a curriculum) peaks far above its
+      own first step, and the framework's space clamp needs the upper bound,
+      not the opening one.
+
+    Both modes record the largest `(B, T)` actually requested so the caller can
+    tell whether the observed peak covers the worst case.
+    """
+
+    def __init__(self, resource_probe: bool = False):
         super().__init__()
+        self.resource_probe = bool(resource_probe)
+        self.max_requested_batch = 0
+        self.max_requested_seq_len = 0
 
         def train_only_dataloader(tokenizer, B, T, split, *args, **kwargs):
             if split != "train":
                 raise RuntimeError(
                     "candidate preflight may only request the training split"
                 )
+            if self.resource_probe:
+                T = self.max_seq_len
+            self.max_requested_batch = max(self.max_requested_batch, int(B))
+            self.max_requested_seq_len = max(self.max_requested_seq_len, int(T))
             return make_dataloader(tokenizer, B, T, split, *args, **kwargs)
 
         def validation_disabled(*_args, **_kwargs):
@@ -443,9 +466,9 @@ def preflight_environment() -> dict:
     }
 
 
-def preflight_config(make_model, params: dict) -> dict:
-    """Exercise candidate construction + one train step, never validation."""
-    env = PreflightEnv()
+def _run_no_score_probe(make_model, params: dict, *, resource_probe: bool) -> dict:
+    """Shared body of the two no-score probes; never calls score_fn."""
+    env = PreflightEnv(resource_probe=resource_probe)
     trainer = make_model(env, params)
     preflight = getattr(trainer, "preflight", None)
     if not callable(preflight):
@@ -457,7 +480,41 @@ def preflight_config(make_model, params: dict) -> dict:
         result = {}
     if not isinstance(result, dict):
         raise TypeError("trainer.preflight() must return a dict or None")
-    return {"status": "ok", "objective_calls": 0, **result}
+    probe_seq_len = env.max_requested_seq_len or None
+    return {
+        "status": "ok",
+        "objective_calls": 0,
+        **result,
+        # Self-describing envelope: what shape this peak was actually measured
+        # at, so a caller need not assume the probe covered the worst case.
+        "probe_seq_len": probe_seq_len,
+        "probe_batch_size": env.max_requested_batch or None,
+        "max_seq_len": env.max_seq_len,
+        "envelope_covers_worst_case": (
+            None if probe_seq_len is None else probe_seq_len >= env.max_seq_len
+        ),
+    }
+
+
+def preflight_config(make_model, params: dict) -> dict:
+    """Exercise candidate construction + one train step, never validation."""
+    return _run_no_score_probe(make_model, params, resource_probe=False)
+
+
+def resource_probe_config(make_model, params: dict) -> dict:
+    """Measure the worst-case training-shape memory envelope, never validation.
+
+    Same no-score contract as `preflight_config` — construction plus one real
+    training step, no `evaluate_bpb`, no score — but with `T` pinned to
+    `MAX_SEQ_LEN`. This is the framework's resource oracle: the search-space
+    clamp needs a peak that bounds the whole run, and a candidate's own first
+    step does not provide one when `run()` ramps sequence length.
+
+    Known limit: the envelope covers sequence length only. A candidate that
+    micro-batches inside its own `preflight()` can still report a peak below
+    what its full run reaches.
+    """
+    return _run_no_score_probe(make_model, params, resource_probe=True)
 
 
 def evaluate_config(make_model, params: dict) -> float:

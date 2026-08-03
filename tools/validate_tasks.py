@@ -134,6 +134,7 @@ def validate_task(task_dir: Path) -> list[str]:
         for key in (
             "score_fn",
             "preflight_fn",
+            "resource_probe_fn",
             "environment_preflight_fn",
         ):  # tuning_fn retired (single config->score surface)
             value = evaluation.get(key)

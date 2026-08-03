@@ -317,8 +317,8 @@ def resolve_score_fn(prepare_module: Any, candidate_path: Path):
     return getattr(prepare_module, fn_name)
 
 
-def _configured_preflight_name(candidate_path: Path) -> str | None:
-    """Return the declared candidate preflight symbol without importing code."""
+def _configured_probe_name(candidate_path: Path, key: str) -> str | None:
+    """Return a declared no-score probe symbol without importing candidate code."""
     task_name = _infer_task_name(Path(candidate_path))
     if not task_name:
         return None
@@ -328,12 +328,34 @@ def _configured_preflight_name(candidate_path: Path) -> str | None:
     configured = parse_task_toml(task_toml).get("evaluation", {})
     if not isinstance(configured, dict):
         raise RuntimeError("task.toml [evaluation] must be a table")
-    name = configured.get("preflight_fn") if isinstance(configured, dict) else None
+    name = configured.get(key)
     if name is None:
         return None
     if not isinstance(name, str) or not name:
-        raise RuntimeError("task.toml evaluation.preflight_fn must be a non-empty string")
+        raise RuntimeError(f"task.toml evaluation.{key} must be a non-empty string")
     return name
+
+
+def _configured_preflight_name(candidate_path: Path) -> str | None:
+    """Return the declared candidate preflight symbol without importing code."""
+    return _configured_probe_name(Path(candidate_path), "preflight_fn")
+
+
+def _configured_resource_probe_name(candidate_path: Path) -> str | None:
+    """Return the declared worst-case resource-probe symbol, if the task has one."""
+    return _configured_probe_name(Path(candidate_path), "resource_probe_fn")
+
+
+def _resolve_probe_fn(prepare_module: Any, candidate_path: Path, key: str):
+    name = _configured_probe_name(Path(candidate_path), key)
+    if name is None:
+        return None
+    if not hasattr(prepare_module, name):
+        raise RuntimeError(
+            f"prepare.py missing {key} {name!r} "
+            f"(task.toml [evaluation].{key})"
+        )
+    return getattr(prepare_module, name)
 
 
 def resolve_preflight_fn(prepare_module: Any, candidate_path: Path):
@@ -344,15 +366,19 @@ def resolve_preflight_fn(prepare_module: Any, candidate_path: Path):
     validation metric.  Tasks without the declaration keep the historical
     direct-evaluation behavior.
     """
-    name = _configured_preflight_name(candidate_path)
-    if name is None:
-        return None
-    if not hasattr(prepare_module, name):
-        raise RuntimeError(
-            f"prepare.py missing preflight fn {name!r} "
-            f"(task.toml [evaluation].preflight_fn)"
-        )
-    return getattr(prepare_module, name)
+    return _resolve_probe_fn(prepare_module, candidate_path, "preflight_fn")
+
+
+def resolve_resource_probe_fn(prepare_module: Any, candidate_path: Path):
+    """Return the optional task-owned worst-case resource probe.
+
+    Declared as ``evaluation.resource_probe_fn``, with the same no-score
+    contract as ``preflight_fn``.  It exists because a correctness preflight
+    measures whichever training shape ``run()`` starts with, which is not an
+    upper bound when a candidate ramps that shape mid-run.  Tasks without the
+    declaration leave the space clamp trusting ``preflight_fn`` as before.
+    """
+    return _resolve_probe_fn(prepare_module, candidate_path, "resource_probe_fn")
 
 
 def load_run_cfg(ref_path: Any, section: str) -> dict:
@@ -835,13 +861,27 @@ def timed_preflight(
     *,
     phase_time_limit_seconds: float | Callable[[], float] | None = None,
     expected_execution_revision: dict | None = None,
+    probe_mode: str = "preflight",
 ) -> dict | None:
-    """Run one task-owned no-score preflight in an isolated subprocess.
+    """Run one task-owned no-score probe in an isolated subprocess.
 
-    Returns ``None`` when the task has no ``evaluation.preflight_fn``.
-    Crucially, this function never reserves an objective evaluation slot.
+    ``probe_mode`` selects which task hook runs: ``"preflight"`` (the
+    correctness check, ``evaluation.preflight_fn``) or ``"resource"`` (the
+    worst-case memory envelope, ``evaluation.resource_probe_fn``).
+
+    Returns ``None`` when the task declares no hook for the requested mode, so
+    callers should choose the mode from the task's declarations rather than
+    treating the absence as a failure.  Crucially, neither mode ever reserves an
+    objective evaluation slot.
     """
-    if _configured_preflight_name(Path(candidate_path)) is None:
+    if probe_mode not in {"preflight", "resource"}:
+        raise ValueError(f"unknown probe_mode {probe_mode!r}")
+    configured = (
+        _configured_resource_probe_name(Path(candidate_path))
+        if probe_mode == "resource"
+        else _configured_preflight_name(Path(candidate_path))
+    )
+    if configured is None:
         return None
     preflight_one = str(Path(__file__).resolve().parent / "_preflight_one.py")
     phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
@@ -862,6 +902,7 @@ def timed_preflight(
                 str(candidate_path),
                 json.dumps(params),
                 json.dumps(expected_execution_revision),
+                probe_mode,
             ],
             limit=limit,
             label=(
@@ -1291,7 +1332,10 @@ SPACE_CLAMP_HEADROOM = 0.85
 SPACE_CLAMP_MAX_PROBES = 40
 SPACE_CLAMP_MAX_PULL_ROUNDS = 6
 SPACE_CLAMP_SCHEMA_VERSION = 2
-SPACE_CLAMP_ALGORITHM_VERSION = 2
+# 3: feasibility additionally requires the probe's own envelope receipt (a
+# half-context probe no longer certifies a full-context run). Bumping this
+# intentionally invalidates clamps cached under the weaker oracle.
+SPACE_CLAMP_ALGORITHM_VERSION = 3
 
 
 class _ClampProbeBudgetExceeded(Exception):
@@ -1379,11 +1423,17 @@ def clamp_search_space_to_preflight(
     feasible bound. Probes never consume objective budget; every probe is
     recorded as a preflight attempt with source 'space_clamp'.
 
-    A probe counts as feasible only when it passes AND reports peak_vram_mb
-    within `headroom` of the environment's total VRAM — a bare pass is not
-    enough, because a full training run peaks higher than preflight's single
-    step (the observed pass-preflight-then-OOM pattern). Without peak telemetry
-    the predicate degrades to pass/fail only.
+    A probe counts as feasible only when it passes, reports peak_vram_mb within
+    `headroom` of the environment's total VRAM, AND does not report
+    `envelope_covers_worst_case: false` — a bare pass is not enough, because a
+    full training run peaks higher than a single step, and a candidate that
+    ramps its training shape mid-run peaks higher than its own first step (the
+    observed pass-preflight-then-OOM pattern). Without peak telemetry the
+    predicate degrades to pass/fail only.
+
+    Probes prefer the task's `evaluation.resource_probe_fn`, which measures the
+    worst-case training shape, and fall back to `preflight_fn` when the task
+    declares none.
 
     No-op (returns search_space unchanged) when base params, task preflight,
     or VRAM telemetry are unavailable, or when the base point itself exceeds
@@ -1397,6 +1447,13 @@ def clamp_search_space_to_preflight(
     total_vram = _env_total_vram_mb(candidate_path)
     if total_vram is None:
         return search_space
+    # Prefer the worst-case envelope oracle; `probe()` falls back to the
+    # correctness preflight when the task declares no resource probe.
+    probe_mode = (
+        "resource"
+        if _configured_resource_probe_name(Path(candidate_path)) is not None
+        else "preflight"
+    )
 
     clampable = [
         key
@@ -1480,6 +1537,7 @@ def clamp_search_space_to_preflight(
             result = timed_preflight(
                 params,
                 candidate_path,
+                probe_mode=probe_mode,
                 **preflight_kwargs,
             )
         except DeepTuneTimeExhausted:
@@ -1506,11 +1564,23 @@ def clamp_search_space_to_preflight(
             result=result or {"status": "ok"},
         )
         peak = (result or {}).get("peak_vram_mb")
-        feasible = peak is None or float(peak) <= headroom * total_vram
+        # A probe whose own telemetry says it did not reach the worst-case
+        # training shape cannot certify feasibility, however low its peak: run
+        # 0802-sonnet-ex125-1/007 passed at 44.7 GB on a half-context first step
+        # and then OOMed at 74.9 GB once its curriculum reached full context.
+        # `None` (task reports no envelope) keeps the historical pass/fail
+        # behavior rather than blocking every task that lacks the field.
+        covers_worst_case = (result or {}).get("envelope_covers_worst_case")
+        feasible = (
+            covers_worst_case is not False
+            and (peak is None or float(peak) <= headroom * total_vram)
+        )
         probes.append({
             "label": label,
             "feasible": feasible,
             "peak_vram_mb": peak,
+            "envelope_covers_worst_case": covers_worst_case,
+            "probe_seq_len": (result or {}).get("probe_seq_len"),
             "elapsed_seconds": elapsed(),
         })
         if admission_check is not None:

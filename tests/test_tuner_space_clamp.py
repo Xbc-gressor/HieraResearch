@@ -30,7 +30,7 @@ SPACE = {
 BASE = {"device_batch_size": 128, "depth": 8, "matrix_lr": 0.04}
 
 
-def fake_preflight(params, candidate_path):
+def fake_preflight(params, candidate_path, **kwargs):
     """OOM above device_batch_size 150; peak telemetry scales with batch size."""
     if params["device_batch_size"] > 150:
         raise RuntimeError("CUDA out of memory")
@@ -69,7 +69,7 @@ class ClampTest(unittest.TestCase):
         return len(report.get("preflight", {}).get("attempts", []))
 
     def test_feasible_corner_costs_one_probe_and_changes_nothing(self):
-        def all_ok(params, candidate_path):
+        def all_ok(params, candidate_path, **kwargs):
             return {"status": "ok", "peak_vram_mb": 40000.0}
 
         clamped = self._run_clamp(preflight=all_ok)
@@ -99,7 +99,7 @@ class ClampTest(unittest.TestCase):
         self.assertEqual(self._probe_count(), probes_after_first)
 
     def test_legacy_or_unverified_cache_is_reprobed(self):
-        def all_ok(params, candidate_path):
+        def all_ok(params, candidate_path, **kwargs):
             return {"status": "ok", "peak_vram_mb": 40000.0}
 
         self._run_clamp(preflight=all_ok)
@@ -118,7 +118,7 @@ class ClampTest(unittest.TestCase):
         self.assertGreater(self._probe_count(), probes_after_first)
         receipt = json.loads(self.report_path.read_text())["search_space_clamp"]
         self.assertEqual(receipt["schema_version"], 2)
-        self.assertEqual(receipt["algorithm_version"], 2)
+        self.assertEqual(receipt["algorithm_version"], 3)
         self.assertEqual(receipt["outcome"], "already_feasible")
         self.assertTrue(receipt["corner_feasible"])
 
@@ -139,7 +139,7 @@ class ClampTest(unittest.TestCase):
     def test_peak_beyond_headroom_counts_as_infeasible(self):
         # Passes preflight (no exception) but peaks above the headroom: the
         # full-run OOM pattern. dbs 200 peaks at 0.9 * total -> infeasible.
-        def tight(params, candidate_path):
+        def tight(params, candidate_path, **kwargs):
             return {"status": "ok", "peak_vram_mb": params["device_batch_size"] * 360.0}
 
         clamped = self._run_clamp(preflight=tight)
@@ -148,7 +148,7 @@ class ClampTest(unittest.TestCase):
         self.assertGreaterEqual(clamped["device_batch_size"][2], 128)
 
     @staticmethod
-    def _bilinear_preflight(params, candidate_path):
+    def _bilinear_preflight(params, candidate_path, **kwargs):
         """OOM above 80 GB; peak scales with batch x depth (interaction)."""
         peak = 300.0 * params["device_batch_size"] * params["depth"] / 8
         if peak > 80000.0:
@@ -190,7 +190,7 @@ class ClampTest(unittest.TestCase):
     def test_admission_guard_runs_before_and_after_each_probe(self):
         checks = []
 
-        def all_ok(params, candidate_path):
+        def all_ok(params, candidate_path, **kwargs):
             checks.append("preflight")
             return {"status": "ok", "peak_vram_mb": 40000.0}
 
@@ -206,6 +206,78 @@ class ClampTest(unittest.TestCase):
             )
 
         self.assertEqual(checks, ["guard", "preflight", "guard"])
+
+    def test_sub_maximal_envelope_cannot_certify_feasibility(self):
+        """A probe that admits it measured the wrong shape is not evidence.
+
+        Run 0802-sonnet-ex125-1/007: a sequence-length curriculum's first step
+        passed at 44.7 GB, the clamp declared the corner feasible, and five full
+        evaluations then OOMed at 74.9 GB. A cheap peak plus
+        `envelope_covers_worst_case: false` must not widen the space.
+        """
+        def half_context(params, candidate_path, **kwargs):
+            # Comfortably inside the headroom, but only half the real shape.
+            return {
+                "status": "ok",
+                "peak_vram_mb": 40000.0,
+                "probe_seq_len": 1024,
+                "max_seq_len": 2048,
+                "envelope_covers_worst_case": False,
+            }
+
+        clamped = self._run_clamp(preflight=half_context)
+
+        # Nothing may be certified on that receipt: the corner is not feasible
+        # and no dim can be attributed, so the space collapses to base rather
+        # than being trusted at its upper bound.
+        receipt = json.loads(self.report_path.read_text())["search_space_clamp"]
+        self.assertFalse(receipt["corner_feasible"])
+        self.assertLessEqual(
+            clamped["device_batch_size"][2], SPACE["device_batch_size"][2]
+        )
+        self.assertIs(receipt["probes"][0]["envelope_covers_worst_case"], False)
+
+    def test_full_context_envelope_is_trusted(self):
+        """The same peak with a worst-case receipt does certify the corner."""
+        def full_context(params, candidate_path, **kwargs):
+            return {
+                "status": "ok",
+                "peak_vram_mb": 40000.0,
+                "probe_seq_len": 2048,
+                "max_seq_len": 2048,
+                "envelope_covers_worst_case": True,
+            }
+
+        clamped = self._run_clamp(preflight=full_context)
+        self.assertEqual(clamped, SPACE)
+        receipt = json.loads(self.report_path.read_text())["search_space_clamp"]
+        self.assertTrue(receipt["corner_feasible"])
+        self.assertEqual(receipt["outcome"], "already_feasible")
+
+    def test_resource_probe_is_preferred_when_the_task_declares_one(self):
+        """The clamp asks for the worst-case oracle, not the correctness one."""
+        modes = []
+
+        def record_mode(params, candidate_path, **kwargs):
+            modes.append(kwargs.get("probe_mode"))
+            return {
+                "status": "ok",
+                "peak_vram_mb": 40000.0,
+                "envelope_covers_worst_case": True,
+            }
+
+        with mock.patch.object(
+            _common, "_configured_preflight_name", return_value="preflight_config"
+        ), mock.patch.object(
+            _common,
+            "_configured_resource_probe_name",
+            return_value="resource_probe_config",
+        ), mock.patch.object(_common, "timed_preflight", side_effect=record_mode):
+            clamp_search_space_to_preflight(
+                SPACE, BASE, self.candidate_path, self.report_path
+            )
+
+        self.assertEqual(modes, ["resource"])
 
 
 class WithinSpaceTest(unittest.TestCase):

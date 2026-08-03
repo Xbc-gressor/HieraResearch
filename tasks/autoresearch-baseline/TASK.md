@@ -56,6 +56,13 @@ against that function by the tuner scripts.
   mechanically rejects validation and non-training dataloader access. A failure
   creates a feasibility receipt and is repaired/rejected before `score_fn`, so
   it is reported separately from the objective-call budget.
+- **Resource probe**: the framework additionally runs
+  `prepare.resource_probe_config(make_model, params)` — the same no-score
+  contract, but with the dataloader's `T` pinned to `env.max_seq_len` — to
+  measure the worst-case training-shape memory envelope. The search-space clamp
+  uses this probe, not `preflight_config`, because a candidate whose `run()`
+  ramps sequence length peaks well above its own first step. Both probes are
+  no-score and consume no objective budget.
 
 Rules:
 
@@ -71,7 +78,9 @@ Rules:
   as `crash`.
 - Keep `preflight()` behaviorally aligned with the construction and first
   training step used by `run()`; it may return resource telemetry such as peak
-  VRAM, but never `val_bpb` or another validation-derived value.
+  VRAM, but never `val_bpb` or another validation-derived value. The model must
+  be constructible at the full `env.max_seq_len` even when `run()` starts below
+  it, because the framework probes that shape for its memory envelope.
 - Keep the standalone
   `if __name__ == "__main__": evaluate_config(make_model, DEFAULT_PARAMS)`
   driver structurally unchanged. Candidate preflight reads `DEFAULT_PARAMS`, so
