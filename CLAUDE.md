@@ -2,9 +2,8 @@
 
 Multi-task autoresearch harness. Autonomous loops edit run-local candidate
 `train.py` files and minimize the task's configured metric. Claude Code
-(`.claude/`) and OpenCode (`.opencode/`) are the supported interactive runtimes;
-deterministic state, graph search, evaluation, and tuning live in `tools/` and
-are shared.
+(`.claude/`) is the supported interactive runtime; deterministic state, graph
+search, evaluation, and tuning live in `tools/` and are shared.
 
 The loop's current bar is beating `autoresearch-hillclimb` — the deliberately
 simple edit→run→keep/revert baseline — at matched evaluation budget. It does not
@@ -63,8 +62,9 @@ runs/<task-name>/<tag>/          local run artifacts (gitignored)
 ```
 
 Each task is its own uv project. Do not treat `tasks/*` as a uv workspace.
-`.opencode/` and `.kimi/` mirror `.claude/` for other runtimes — keep mirrored
-contracts synchronized when a shared agent protocol changes.
+`.opencode/` and `.kimi/` are deprecated runtime mirrors: unmaintained, free to
+drift, and not to be read as contracts. `.claude/` is canonical — do not sync
+changes into them.
 
 ## Reference Docs
 
@@ -105,7 +105,7 @@ changing what an agent does.
 | `idea-generator` | graph `SELECT` via `got_select`, then semantic point choice and record/receipt persistence | per round |
 | `candidate-writer` | implements one candidate's `train.py` from its own ledger record | per candidate |
 | `tunable-contract-extractor` | step 0+1: `PARAM_SCHEMA` refactor, warm configs, `SEARCH_SPACE`, screening evaluation | per candidate |
-| `tuner-orchestrator` | step 2: promotion gate, then deep-tune at most one selected candidate in place | once per round |
+| `tuner-orchestrator` | step 2: promotion gate, then one progressive-tuning bout for at most one selected candidate in place | once per round |
 | `experience-extractor` | regenerates the bounded belief snapshot and requests state transitions | per completed non-empty round |
 
 Orchestration rules that live in no single prompt:

@@ -2748,8 +2748,8 @@ def _last_bout_improved(report: dict) -> bool | None:
     warm_best = phase_a.get("best_warm_score")
     prior_best = float(warm_best) if _is_finite_score(warm_best) else None
     for bout in bouts[:-1]:
-        for trial in bout:
-            for row in trial.get("trials", []):
+        for stage in bout:
+            for row in stage.get("trials", []):
                 if isinstance(row, dict) and _is_finite_score(row.get("score")):
                     score = float(row["score"])
                     if prior_best is None or score < prior_best:

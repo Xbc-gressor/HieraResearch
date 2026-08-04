@@ -4,20 +4,28 @@
 run-lifecycle drift without changing a run. It has no external service
 dependency.
 
-## OpenCode
+## Claude Code
 
-Run from the OpenCode repository root:
+`.claude/settings.json` installs a main status line, subagent status lines, and a
+PreToolUse delegation guard. The status line is local and does not invoke a
+model. For historical or full-session attribution, point the monitor at a main
+JSONL transcript:
 
 ```bash
-python tools/harness_watch.py \
-  --run-dir runs/<task>/<tag> --watch 2
+python tools/harness_watch.py --source claude \
+  --transcript ~/.claude/projects/<project>/<session>.jsonl \
+  --run-dir runs/<task>/<tag>
 ```
 
-The default source is OpenCode's local SQLite store, opened read-only. The
-monitor selects the latest root session associated with the run and traverses
-all descendants. If multiple runs share a project, pin one with
-`--session <root-or-child-session-id>`. Use `--json` for machine-readable
-snapshots and `--all-sessions` for the complete tree.
+The monitor deduplicates streamed assistant updates by message id and includes
+discoverable subagent transcript directories. Claude's main status-line payload
+provides current context and cost; subagent status lines expose each task's
+reported token count and flag 50k or more. Historical attribution is incomplete
+when transcripts have been removed or moved.
+
+Claude hooks can deny a bad delegation before it starts, but do not rewrite
+post-tool results. Compact child receipts therefore remain prompt-plus-schema
+discipline, while the independent monitor exposes violations after the fact.
 
 The display separates fresh input, cache reads/writes, output, reasoning,
 processed input, and recorded cost. It also shows per-agent totals, current
@@ -36,41 +44,13 @@ Default alerts cover:
 
 Tune thresholds with `--max-root-context` and `--max-session-input`.
 
-The project-local `.opencode/plugins/hiera-guard.js` adds enforcement:
+## Deprecated: OpenCode
 
-- `tool.execute.before` rejects the observed writer/step-0+1 role collapse;
-- `tool.execute.after` replaces relevant child output with a validated receipt
-  before parent reinjection, regardless of whether the child followed its
-  output prompt;
-- `session.idle` warns in the TUI when the run still has work remaining.
-
-Child agents also have `task: deny`, so they cannot recursively delegate. The
-candidate writer additionally has no shell tool; `new_candidate.py` materializes
-its narrow `_candidate_brief.json` before launch.
-
-## Claude Code
-
-`.claude/settings.json` installs a main status line, subagent status lines, and a
-PreToolUse delegation guard. The status line is local and does not invoke a
-model. For historical or full-session attribution, point the monitor at a main
-JSONL transcript:
-
-```bash
-python tools/harness_watch.py --source claude \
-  --transcript ~/.claude/projects/<project>/<session>.jsonl \
-  --run-dir runs/<task>/<tag>
-```
-
-The monitor deduplicates streamed assistant updates by message id and includes
-discoverable subagent transcript directories. Claude's main status-line payload
-provides current context and cost; subagent status lines expose each task's
-reported token count and flag 50k or more. Historical Claude attribution is less
-complete than OpenCode when transcripts have been removed or moved.
-
-Claude hooks can deny a bad delegation before it starts, but do not offer the
-same reliable post-tool result rewriting used by the OpenCode plugin. Compact
-child receipts therefore remain prompt-plus-schema discipline on Claude, while
-the independent monitor exposes violations after the fact.
+The `--source opencode` path still exists in `tools/harness_watch.py` but is
+unmaintained, as are the `.opencode/` and `.kimi/` runtime mirrors. It reads
+OpenCode's local SQLite store read-only, selects the latest root session for the
+run, and traverses all descendants; `--session <root-or-child-session-id>` pins
+one when several runs share a project. Keep it only for reading old sessions.
 
 ## Artifact-only fallback
 

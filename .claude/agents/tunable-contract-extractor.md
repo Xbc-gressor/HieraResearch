@@ -31,7 +31,7 @@ Your work has **three segments**, each with its own discipline:
 
 Do them in order.
 
-**Skills you follow** (`.opencode/skills/`):
+**Skills you follow** (`.claude/skills/`):
 - `crash-diagnosis` — used in segment ③ to diagnose each preflight/eval-K failure (verdict:
   `config_invalid` / `code_incompatible` / `abandon`).
 
@@ -271,6 +271,21 @@ working directory, so repo-relative paths (`tools/...`, `runs/...`) keep
 resolving. Under `--directory` uv chdirs into the task dir first and those
 relative paths break.
 
+Launch it **detached**, not in the foreground and not via
+`run_in_background: true`: K_eval evaluations × `per_runtime_limit` can
+exceed both the harness's short foreground timeout and its background-task
+lifetime cap (run 0803-sonnet-ex125-1: background tasks killed exactly
+3600s after backgrounding). A kill mid-evaluation permanently burns the
+reserved objective slot with no trial row. Use
+`nohup <cmd> > <candidate_dir>/_warmstart.log 2>&1 & echo $!` — the log goes
+in the candidate directory, not `/tmp`, because run ids repeat across
+concurrent runs and a shared `/tmp` name would let two runs overwrite each
+other's only record. Keep the echoed PID and poll `tune_report.json` / the log
+with short commands (`tail`, `ps -p <pid>`). While that PID is alive the
+evaluator is still working, however long it takes — do not relaunch it. The
+evaluator is resumable — after any interruption (PID gone, no terminal JSON in
+the log), re-run the same command and it reuses already-scored configs.
+
 It creates `BASE_PARAMS`, pins schema-4 config 0, samples the remaining slots
 uniformly without replacement, and persists the mandatory indices, seed,
 permutation, and selected/deferred indices in
@@ -313,7 +328,7 @@ without a valid control.
 ### 3b. Diagnose + fix (the crash loop)
 
 **【crash-diagnosis skill】** Invoke `Skill(crash-diagnosis)` — or, if the Skill
-tool is unavailable, read `.opencode/skills/crash-diagnosis/SKILL.md` and follow it
+tool is unavailable, read `.claude/skills/crash-diagnosis/SKILL.md` and follow it
 — on the failing preflight/eval config + its `failure_receipt`. Retrieve full or ranged source
 through `tune_tools.py render-failure` only when the receipt is insufficient:
 

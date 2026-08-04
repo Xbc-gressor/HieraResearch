@@ -624,12 +624,12 @@ def main() -> int:
     # (proposed at step 0+1, not evaluated there): evaluate them up front so
     # the rare cmaes path doesn't lose them. Recorded + considered
     # for best (select-best ranks the whole report). PROPOSALS are charged to
-    # the cmaes `evals` budget — they displace search trials inside the bout
-    # cap, never add to it (spec §6) — while DEFERRED configs stay EXTRA
-    # (pre-paid step-0+1 savings), not charged. CMA-ES still seeds x0 from the
-    # best evaluated prior. Configs outside the (possibly clamped) box were
-    # skipped earlier — never attempted, no budget, no patience effect — and
-    # accounted via rewarm_skipped_outside_space /
+    # the cmaes `evals` budget per objective attempt — they displace search
+    # trials inside the bout cap, never add to it (spec §6) — while DEFERRED
+    # configs stay EXTRA (pre-paid step-0+1 savings), not charged. CMA-ES still
+    # seeds x0 from the best evaluated prior. Configs outside the (possibly
+    # clamped) box were skipped earlier — never attempted, no budget, no
+    # patience effect — and accounted via rewarm_skipped_outside_space /
     # deferred_skipped_outside_space.
     upfront_configs = [(params, True) for params in proposals_in_space]
     upfront_configs += [(params, False) for params in deferred_in_space]
@@ -654,8 +654,12 @@ def main() -> int:
             early_stop_reason = "time_budget"
             break
         if not preflight_ok:
-            if charge_to_budget:
-                evals += 1
+            # No budget charge, for either kind: preflight reserves no slot in
+            # evaluation_attempts.jsonl and never reaches score_fn, so a
+            # rejected proposal was never an objective attempt and must not
+            # displace one. `evals` is a pure budget gate in this finite loop
+            # (unlike the search loop below, where it also bounds iteration),
+            # so skipping the increment cannot stall progress here.
             identity = params_identity(params)
             attempted_identities.add(identity)
             known_infeasible.add(identity)

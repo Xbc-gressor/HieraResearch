@@ -85,9 +85,26 @@ temporarily ineligible. `budget_allocation.trial_cap` is
 
 - **`run_id` is `null`** → no candidate is eligible this round (below
   `N_min`; the top tier is tuned and no continuation responded; every tuned
-  candidate is a non-responder; or cap/budget exhaustion). Emit the Output
-  Format with `tuned_run_id: none` and `selection_reason` = the printed
-  `reason`, then **stop**. This is a valid no-op.
+  candidate is a non-responder; or cap/budget exhaustion). No new bout runs.
+  Before emitting the no-op, sweep for stranded work: for every ledger
+  candidate whose `tune_report.json` has a nonterminal (`running`) final
+  Phase-C stage, run `phase-c-action` on it and obey the result — `action:
+  run` (`resume_interrupted_stage`) relaunches that search detached (Phase C
+  step 3) and, when it finishes, Finalize that candidate;
+  `close_exhausted_stage` closes the stage and finalizes. Spent trials must
+  not sit uncommitted just because the gate moved on.
+
+  This is **recovery of already-charged trials, not a bout**: it commits
+  evaluations the run has already paid for, and it starts no new search on a
+  candidate the gate did not pick (`resume_interrupted_stage` continues an
+  existing stage; it never opens a bout). So it does not breach the
+  one-bout-per-round boundary, and `tuned_run_id` stays `none` — the field
+  names the candidate *selected for a bout*, and none was. Report each
+  recovered candidate in `risks` as `settled <run_id> (<trials> trials,
+  <terminal status>)`, listing all of them if several; that line is the
+  receipt. If nothing is stranded, emit the Output Format with
+  `tuned_run_id: none` and `selection_reason` = the printed `reason`, then
+  **stop**. This is a valid no-op.
 - **`run_id` is a candidate** → that is the bout you run. Derive its paths:
 
 | value | how |
@@ -199,24 +216,62 @@ never get proposals — they consume the deferred-config supply from step 0+1.
    `score_fn` — so a kill mid-evaluation permanently spends that slot and
    persists no trial. Run 0802-sonnet-ex125-1 lost 6 of 50 Phase-C slots this
    way: one API error, one self-imposed `timeout` wrapper, and three
-   foreground calls hitting the Bash tool's 2-minute default. Run the script
-   with `run_in_background: true` and poll, and let the script's own `per_runtime_limit` bound
-   each single evaluation — that is the only duration guard that exists, and it
-   is already correct.
+   foreground calls hitting the Bash tool's 2-minute default. Run
+   0803-sonnet-ex125-1 lost 2 more to the harness's own background-task
+   lifecycle: tasks launched with `run_in_background: true` were killed
+   exactly 3600s after entering background state, twice, mid-evaluation.
+   **Launch the search detached** so the harness task exits immediately and
+   the search process is reparented, escaping both the foreground timeout
+   and the background-task cap:
+   ```
+   nohup uv --directory <env.project> run python \
+     <repo_root>/tools/tuners/<method>_search.py \
+     --candidate-path <candidate_path> \
+     --tune-report-json <candidate_dir>/tune_report.json \
+     [method-specific args] > <candidate_dir>/_phase_c_<method>.log 2>&1 &
+     echo $!
+   ```
+   The log lives in the candidate directory, not `/tmp`: run ids repeat
+   across concurrent runs (`013` exists in every tag), so a shared `/tmp`
+   name would let two runs overwrite each other's only record of the
+   search. Keep the echoed PID — it is what distinguishes "still running"
+   from "died without finishing".
+
+   Poll by reading `tune_report.json` and that log with short commands
+   (`tail`, `ps -p <pid>`) — never with a long foreground `sleep` wrapper
+   around the search itself — and let the script's own `per_runtime_limit`
+   bound each single evaluation. That is the only duration guard that
+   exists, and it is already correct.
    For a task declaring `evaluation.preflight_fn`, every proposed config first
    passes that isolated no-score hook. Rejections are recorded as feasibility
    evidence but do not reserve an objective slot. Immediately before `score_fn`,
    the tuner atomically reserves from the strict run cap; it cannot overshoot
    the configured budget.
-4. Parse the stdout JSON:
-   - **interrupted / nonzero exit / no single terminal JSON object** — the
+4. Wait for the detached search to exit, then parse the terminal JSON **from
+   its log** — the backgrounding `&` means the launch command's own stdout is
+   empty by design, so an empty stdout proves nothing. The search is done when
+   `ps -p <pid>` reports no such process. While that PID is alive the search is
+   **not** interrupted, however long it takes: do not relaunch it, do not run
+   `phase-c-action` against its half-written report, and do not report
+   `phase_c_interrupted`. Keep polling.
+
+   Once the PID is gone, `tail` the log and classify:
+   - **no terminal JSON object** (crash, kill, or truncated log) — the
      search did not prove completion. Its already-written trials are partial
      evidence only. Do not select or apply them and do not update the ledger.
-     Return `tuned_run_id: none`,
-     `selection_reason: phase_c_interrupted`, `ledger_updated: false`, and one
-     short risk naming the interruption. The candidate stays untuned and the
-     stage remains nonterminal (`running` or absent), so a later invocation's
-     `phase-c-action` can resume it.
+     Do **not** defer the resume to a later invocation — a later round's
+     gate may never re-select this candidate, and its already-charged
+     trials would stay uncommitted. Run `phase-c-action` again against the
+     persisted report now and obey its result: `action: run`
+     (`resume_interrupted_stage`) relaunches the same search detached
+     (step 3), **once**; `action: close_exhausted_stage` runs the
+     deterministic close (below) and then Finalize; `action: finalize`
+     proceeds to Finalize. Only if that single immediate resume also
+     interrupts, return `tuned_run_id: none`,
+     `selection_reason: phase_c_interrupted`, `ledger_updated: false`, and
+     one short risk naming the interruption. The candidate stays untuned
+     and the stage remains nonterminal (`running` or absent), so a later
+     invocation's `phase-c-action` can still resume it.
    - **one terminal JSON object** — run `phase-c-action` again against the
      persisted report. Obey only its result: `action: run` runs the returned
      deterministic fallback and repeats this step; `action: finalize` proceeds
@@ -309,15 +364,19 @@ risks:                <one short line; "none notable" allowed>
 All trial/preflight counts and `elapsed_seconds` come from the finalizer output
 — do not recompute them. On a no-op
 (`tuned_run_id: none`), the numeric fields are `n/a`/`0` and `applied` is
-`false`.
+`false`. Those fields describe the *bout*, so they stay `n/a`/`0` even when the
+stranded-work sweep settled candidates — `risks` carries that receipt instead.
 
 ## Boundaries
 
 - **One bout per round, chosen by `select-candidate`.** Never override its
   choice, tune a candidate it did not pick, or run a second bout. `null` →
-  no-op. A tuned candidate stays eligible: `last_bout_improved` responders
-  re-enter the pool, and an ancestor remains eligible after child bindings
-  are captured (children stay bound to historical revisions).
+  no new bout. The one thing you may still do for an unselected candidate is
+  settle a nonterminal stage it already paid for (resume-to-terminal or
+  `close-exhausted-stage`, then finalize); that commits existing trials and
+  opens no bout. A tuned candidate stays eligible: `last_bout_improved`
+  responders re-enter the pool, and an ancestor remains eligible after child
+  bindings are captured (children stay bound to historical revisions).
 - **No warm-start here.** You do not propose or evaluate step-0+1 warm
   configs and do not write `phase_a`. Continuation re-warm proposals (Phase
   R) go only through `validate-proposals`, never by hand.

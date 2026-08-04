@@ -385,6 +385,111 @@ class FailureArtifactTests(unittest.TestCase):
             self.assertEqual(result["duplicate_scores_reused"], 1)
             self.assertEqual(result["best_score"], 0.5)
 
+    def test_cma_rejected_proposal_leaves_full_objective_allowance(self) -> None:
+        """A preflight-rejected re-warm proposal must not displace a search
+        trial: preflight reserves no budget slot and never reaches score_fn, so
+        `--max-evals` objective attempts must still be available after it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path = Path(tmp) / "train.py"
+            report_path = Path(tmp) / "tune_report.json"
+            candidate_path.write_text(
+                "PARAM_SCHEMA = {'x': 'int', 'y': 'int', 'z': 'int'}\n"
+                "SEARCH_SPACE = {\n"
+                "    'x': ('int', 1, 4),\n"
+                "    'y': ('int', 1, 4),\n"
+                "    'z': ('int', 1, 4),\n"
+                "}\n"
+                "BASE_PARAMS = {'x': 1, 'y': 1, 'z': 1}\n"
+                "def make_model(params):\n"
+                "    return params\n"
+            )
+            (candidate_path.parent / "prepare.py").write_text(
+                "def evaluate_config(make_model, params):\n"
+                "    return 0.5\n"
+                "def preflight_config(make_model, params):\n"
+                "    return {'status': 'ok'}\n"
+            )
+            write_tune_report(
+                report_path,
+                {
+                    "phase_a": {
+                        "status": "ok",
+                        "candidate_code_revision": _candidate_execution_revision(
+                            candidate_path
+                        ),
+                        "search_space": {
+                            "x": ["int", 1, 4],
+                            "y": ["int", 1, 4],
+                            "z": ["int", 1, 4],
+                        },
+                        "warm_start_configs": [
+                            {"params": {"x": 1, "y": 1, "z": 1}, "score": 0.5}
+                        ],
+                        "best_warm_params": {"x": 1, "y": 1, "z": 1},
+                        "best_warm_score": 0.5,
+                        "deferred_configs": [],
+                    },
+                    # One admitted re-warm proposal, which preflight will reject.
+                    "phase_c": {
+                        "stages": [
+                            {"method": "bo", "status": "rejected", "trials": []}
+                        ],
+                        "pending_proposals": [{"x": 4, "y": 4, "z": 4}],
+                        "pending_proposals_bout_index": 0,
+                    },
+                },
+            )
+
+            rejected = {"x": 4, "y": 4, "z": 4}
+
+            def preflight(params, *args, **kwargs):
+                if {k: params[k] for k in rejected} == rejected:
+                    raise ValueError("proposal is infeasible")
+                return {"status": "ok"}
+
+            strategy = mock.Mock()
+            strategy.stop.return_value = False
+            # Distinct fresh points, so neither is skipped as a duplicate of the
+            # warm incumbent.
+            strategy.ask.side_effect = [[[2.0, 2.0, 2.0]], [[3.0, 3.0, 3.0]]]
+            fake_cma = mock.Mock()
+            fake_cma.CMAEvolutionStrategy.return_value = strategy
+
+            with mock.patch.dict(sys.modules, {"cma": fake_cma}), mock.patch(
+                "cmaes_search.resolve_preflight_fn", return_value=object()
+            ), mock.patch(
+                "cmaes_search.clamp_search_space_to_preflight",
+                side_effect=lambda space, *a, **k: space,
+            ), mock.patch(
+                "cmaes_search.timed_preflight", side_effect=preflight
+            ), mock.patch(
+                "cmaes_search.timed_eval", return_value=0.25
+            ) as timed_eval_mock, mock.patch(
+                "cmaes_search.write_json"
+            ) as write_result, mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "cmaes_search.py",
+                    "--candidate-path",
+                    str(candidate_path),
+                    "--tune-report-json",
+                    str(report_path),
+                    "--max-evals",
+                    "2",
+                    "--popsize",
+                    "1",
+                ],
+            ):
+                self.assertEqual(cmaes_main(), 0)
+
+            result = write_result.call_args.args[0]
+            self.assertEqual(result["preflight_rejections"], 1)
+            # The rejection is recorded as feasibility evidence but charged no
+            # objective slot, so both --max-evals attempts remain spendable.
+            self.assertEqual(timed_eval_mock.call_count, 2)
+            self.assertEqual(result["trials_attempted"], 2)
+
     def test_bo_duplicate_proposal_reuses_score_without_evaluation(self) -> None:
         class Trial:
             def __init__(

@@ -1,6 +1,6 @@
 # autoresearch-automl
 
-由 Claude Code 或 OpenCode 驱动的自主 AutoML 实验框架。LLM runtime 负责角色隔离与判断，确定性的状态、图搜索、评估和调优由共享的 `tools/` 实现。
+由 Claude Code 驱动的自主 AutoML 实验框架。LLM runtime 负责角色隔离与判断，确定性的状态、图搜索、评估和调优由共享的 `tools/` 实现。
 
 ## 1. 框架功能
 
@@ -18,8 +18,7 @@
 - **`CLAUDE.md`**：Claude Code 打开项目时首先读取的入口文档。
 - **`.claude/agents/`**：用于复杂多步骤任务的专用子智能体（想法生成、代码编写、合约提取、调优编排）。
 - **`.claude/skills/`**：可复用的内联方法论（当前：崩溃诊断）。
-- **`AGENTS.md`**：OpenCode 打开项目时读取的精简 runtime 入口。
-- **`.opencode/agents/` / `.opencode/skills/`**：OpenCode 的主代理、子代理和内联方法论。
+- **`AGENTS.md`** 与 **`.opencode/` / `.kimi/`**：已弃用的非 Claude runtime 入口与镜像，不再维护，允许漂移，不作为合约阅读。
 - **`tools/`**：候选方案创建、账本管理、图搜索和调优的确定性脚本。
 - **`tasks/`**：独立任务包。每个都是独立的 uv 项目。
 - **`runs/`**：本地实验状态（候选方案、日志、账本、循环状态）。被 git 忽略；永不提交。
@@ -40,14 +39,7 @@
 
 ### 3.2 运行实验
 
-推荐用 OpenCode 启动完整实验：
-
-```bash
-opencode --agent autoresearch-experiment \
-  --model moonshotai/kimi-k3 --auto
-```
-
-也可以使用 Claude Code：
+用 Claude Code 启动完整实验：
 
 ```bash
 claude --agent autoresearch-experiment
@@ -66,7 +58,7 @@ tag: <你的运行标签>
 
 ### 4.1 核心文档
 
-**`CLAUDE.md` / `AGENTS.md`**：分别是 Claude Code 与 OpenCode 的项目入口。完整实验协议编码在对应 runtime 的 `autoresearch-experiment` 主代理中；任务语义来自 `TASK.md` 和 `task.toml`。
+**`CLAUDE.md`**：Claude Code 的项目入口。完整实验协议编码在 `.claude/agents/autoresearch-experiment.md` 主代理中；任务语义来自 `TASK.md` 和 `task.toml`。
 
 **`tasks/<task-name>/TASK.md`**：供人和 LLM 阅读的任务描述。包含 `## Evaluation Contract` 部分，描述：
 - 训练表面：候选方案在训练期间做什么
@@ -130,7 +122,7 @@ step 0+1: tunable-contract-extractor
     → finalize_tuning.py 验证终态后统一应用参数并原地关闭 report + ledger (无重新运行)
 ```
 
-使用 `opencode --agent autoresearch-experiment` 或 `claude --agent autoresearch-experiment` 时，主代理内部编码此协议。OpenCode 通过原生 `permission.task` 将调用闭包限制为六个角色；崩溃诊断使用 `crash-diagnosis` skill 内联。
+使用 `claude --agent autoresearch-experiment` 时，主代理内部编码此协议。`.claude/settings.json` 的 `Agent` PreToolUse guard 将调用闭包限制为六个角色；崩溃诊断使用 `crash-diagnosis` skill 内联。
 
 ### 4.3 两层搜索架构
 
@@ -148,25 +140,21 @@ step 0+1: tunable-contract-extractor
   ③ **评估 K 个配置**（warmstart_eval；顺序/可恢复）；**对每次崩溃内联 crash-diagnosis skill**（config-invalid → 修复配置；code-incompatible → 最小化修复代码 ≤10 次）；全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
   深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
 
-- **Step 2（解耦深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
-  - 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——门控：种群 ≥ N_min=10 且按 `best_warm_score` 的最佳未调优候选方案在前 20% —— 选择**一个**候选方案；不足 → 返回 `none`（有效的无操作）
-  - Phase C：基于维度的方法选择（grid n_dims≤2 / bo=多元 TPE ≥3；cmaes 仅作后备；见 HPO 基准 `dev_plan/hpo-benchmark-report.md`）；注入 step 1 热启动试验作为先验
-  - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后确定热启动 + Phase C 的全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与 `tune:true`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
+- **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
+  - 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——首个 bout 门控：种群 ≥ `N_min`（P=80 时推导为 5）且按 `best_warm_score` 的最佳未调优候选在前 20%；继续 bout 跳过百分位门控但要求上一 bout 有改进 —— 选择**一个** bout；无合格者 → 返回 `none`（有效的无操作）
+  - Phase C：基于维度的方法选择（grid n_dims≤2 / bo=多元 TPE ≥3；cmaes 仅作后备；见 HPO 基准 `dev_plan/hpo-benchmark-report.md`）；以全部历史 trial 为先验，每 bout 至多 `tuner.bout_trials`（默认 8）次客观评估
+  - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后在 warm incumbent 与**所有 bout 的全部 trial** 上取全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与分级 `evaluation_depth`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
+  详见 §5.7。
 
 **关键洞察**：没有单独的官方运行。有**一个全局 `config → score` 函数**（task.toml `[evaluation].score_fn`）。热启动评估和 Phase C 调优都调用它。调优后的最佳值就是候选方案的新分数。
 
 ## 5. 智能体
 
-智能体在两个 runtime 中保持相同的职责边界：
-
-```text
-.claude/agents/
-.opencode/agents/
-```
+智能体位于 `.claude/agents/`：
 
 当前智能体：`autoresearch-experiment`、`background-researcher`、`idea-generator`、`experience-extractor`、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator`。
 
-**重要约束**：`autoresearch-experiment` 必须作为 primary 启动，不能作为子代理嵌套。OpenCode 子代理均为 `task: deny`，`candidate-writer` 另外为 `bash: deny`；主代理只允许调用六个项目角色。
+**重要约束**：`autoresearch-experiment` 必须作为 primary 启动，不能作为子代理嵌套（Claude Code 子代理无法再派生子代理）。`.claude/settings.json` 通过 `tools/harness_guard.py` 的 `Agent` PreToolUse guard 强制这一点，并把主代理的调用闭包限制为六个项目角色。
 
 ### 5.1 autoresearch-experiment
 
@@ -199,7 +187,7 @@ step 0+1: tunable-contract-extractor
 
 来源、结构化负面指导 `g-*` 与每个假设继续使用同一组五轴范围：模型家族、数据情境、指标、干预机制、评估协议。只有直接覆盖假设的指导可影响资格；`unverified` / `contested` 负面只能提示。每个非基线假设保存 claim、比较项、重开条件、来源关系与独立文献可信度标签。绑定负面仍必须保留范围外 `scope_probe`，不会删除邻近机制。
 
-Search space registry 中的每个来源必须在 retrieval manifest 中存在成功且包含正文的 grounding visit（`section`、`preview`、`full_text` 或原样抓取的 `page`）；DeepXiv 的 `head` / `brief` 只用于筛选，不能作为证据。DeepXiv 的 `auto` 会先读取 `head`，再按检索问题选择并读取最多三个正文 section，必要时回退到 preview。只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 或 OpenCode 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
+Search space registry 中的每个来源必须在 retrieval manifest 中存在成功且包含正文的 grounding visit（`section`、`preview`、`full_text` 或原样抓取的 `page`）；DeepXiv 的 `head` / `brief` 只用于筛选，不能作为证据。DeepXiv 的 `auto` 会先读取 `head`，再按检索问题选择并读取最多三个正文 section，必要时回退到 preview。只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
 
 冻结语料的约定路径是 `tasks/<task>/background_corpus.json`；普通 open-world 开发可不提供，但 frozen / network-disabled 评测必须提供该文件或显式等价路径。
 
@@ -483,9 +471,9 @@ model = make_model(dataset, BASE_PARAMS)
 推荐的阅读顺序：
 
 1. **`README.md`**：理解整体结构
-2. **`CLAUDE.md` / `AGENTS.md`**：理解所用 runtime 如何进入项目
-3. **`.claude/agents/*.md` / `.opencode/agents/*.md`**：理解主代理与子代理的责任边界
-4. **`.claude/skills/*/SKILL.md` / `.opencode/skills/*/SKILL.md`**：理解可复用的方法论
+2. **`CLAUDE.md`**：理解 runtime 如何进入项目
+3. **`.claude/agents/*.md`**：理解主代理与子代理的责任边界
+4. **`.claude/skills/*/SKILL.md`**：理解可复用的方法论
 5. **`tools/*.py` 和 `tools/tuners/*.py`**：理解确定性执行层
 6. **`tasks/tabular-model-search/`**：理解当前主要验证任务
 
