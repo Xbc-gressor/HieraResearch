@@ -1,0 +1,39 @@
+name = "autoresearch-smoke"
+description = "Pipeline smoke fixture: autoresearch-baseline shrunk to a ~2-3 minute evaluation on a 24 GB GPU. Scores are not comparable to autoresearch-baseline."
+
+[env]
+type = "uv"
+project = "tasks/autoresearch-smoke"
+
+[run]
+working_dir = "tasks/autoresearch-smoke"
+prepare_command = "uv run python prepare.py"
+timeout_seconds = 600
+
+[seed]
+target_count = 1
+# Both experiment protocols admit this exact entrypoint as their observed
+# starting control.
+provided = ["train.py"]
+entrypoint = "train.py"
+
+# The single config->score evaluation function. Semantics + hard rules live in
+# TASK.md's `## Evaluation Contract`. score_fn(make_model, params) -> float,
+# lower-is-better; it is the ONE surface (warm-start eval + Phase C tuning) for
+# the experiment loop. The standalone `python train.py` run (manual/hillclimb)
+# still prints the summary parsed via [result].
+[evaluation]
+score_fn = "evaluate_config"
+environment_preflight_fn = "preflight_environment"
+preflight_fn = "preflight_config"
+
+[result]
+metric = "val_bpb"
+parser = "tools/parse_result.py"
+required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
+results_file = "ledger.json"
+
+[constraints]
+editable_files = ["train.py"]
+readonly_files = ["prepare.py"]
+allow_dependencies = false

@@ -32,107 +32,21 @@ class DelegationGuardTests(unittest.TestCase):
         prompt = "Write train.py only. Do not perform step 0+1 or warm-start evaluation."
         self.assertIsNone(harness_guard.delegation_violation("candidate-writer", prompt))
 
-    def test_compacts_valid_writer_receipt(self) -> None:
-        raw = """<task id=\"ses_test\" state=\"completed\"><task_result>
-status: written
-candidate_path: /tmp/run/candidates/001/train.py
-candidate_name: compact_tree
-wrote: true
-risk_flags: none
-confidence: high
-diff: this must never survive
-</task_result></task>"""
-        result = harness_guard.compact_task_result("candidate-writer", raw)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("child_session_id: ses_test", result)
-        self.assertNotIn("this must never survive", result)
-
-    def test_flags_writer_evaluation_overreach(self) -> None:
-        raw = """status: discard
-candidate_path: /tmp/run/candidates/001/train.py
-wrote: true
-best_warm: 0.2
-trials_completed: 3
-"""
-        result = harness_guard.compact_task_result("candidate-writer", raw)
-        self.assertIn("receipt_contract: invalid", result)
-        self.assertIn("scope_violation:", result)
-
-    def test_rejects_non_receipt_idea_output(self) -> None:
-        raw = """status: orchestration_only
-generation_run_ids: none
-actions: none
-risk_flags: invalid coordinator control output
-"""
-        result = harness_guard.compact_task_result("idea-generator", raw)
-        self.assertIn("receipt_contract: invalid", result)
-        self.assertIn("missing_fields:", result)
-
-    def test_accepts_budget_admission_no_action_receipt(self) -> None:
-        raw = """generation_run_ids: none
-selection_reason: objective_budget_admission_cap
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("idea-generator", raw)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("generation_run_ids: none", result)
-
-    def test_compacts_colon_delimited_semantic_receipts(self) -> None:
-        raw = """run_id: 004
-op: improve
-parents: 001
-point_id: point-first
-policy: coverage
-candidate: first
-ledger: /tmp/run/ledger.json
-
-run_id: 005
-op: improve
-parents: 001,003
-point_id: point-second
-policy: gain_uncertainty
-candidate: second
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("idea-generator", raw)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("run_id: 004; 005", result)
-        self.assertIn("op: improve; improve", result)
-        self.assertIn("point_id: point-first; point-second", result)
-
-        experience = """updated_at_run: 005
-generation: 2
-evidence_runs: 5
-search_space_state_revision: 3
-decision_ids: sdec-000003
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("experience-extractor", experience)
-        self.assertIn("receipt_contract: ok", result)
-
-    def test_compacts_experience_state_decision_receipt(self) -> None:
-        decided = """updated_at_run: 007
-generation: 2
-evidence_runs: 5
-search_space_state_revision: 3
-decision_ids: sdec-000003
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("experience-extractor", decided)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("search_space_state_revision: 3", result)
-        self.assertIn("decision_ids: sdec-000003", result)
-
-        noop = """updated_at_run: 007
-generation: 2
-evidence_runs: 5
-search_space_state_revision: 3
-decision_ids: none
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("experience-extractor", noop)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("decision_ids: none", result)
+    def test_rejects_removed_alternate_runtime_guard_flag(self) -> None:
+        removed_flag = "--" + "open" + "code-check"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "harness_guard.py"),
+                removed_flag,
+                "candidate-writer",
+            ],
+            input="Write train.py only.",
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized arguments", result.stderr)
 
 
 class LegacyResultParserTests(unittest.TestCase):
@@ -204,6 +118,21 @@ class LegacyResultParserTests(unittest.TestCase):
 
 
 class UsageAndLifecycleTests(unittest.TestCase):
+    def test_rejects_removed_alternate_runtime_watch_source(self) -> None:
+        removed_source = "open" + "code"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "harness_watch.py"),
+                "--source",
+                removed_source,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized arguments", result.stderr)
+
     def test_got_select_reserves_k_eval_capacity_before_admission(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

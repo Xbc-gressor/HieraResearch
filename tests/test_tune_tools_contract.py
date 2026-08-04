@@ -99,6 +99,21 @@ def make_model(params):
             {"SEARCH_SPACE", "BASE_PARAMS"},
         )
 
+    def test_lint_schema_reports_per_key_float_log_modes(self) -> None:
+        tmp, path = self._candidate(
+            """
+PARAM_SCHEMA = {"lr": ("float", "log"), "wd": "float", "depth": "int"}
+def make_model(params):
+    return params
+""".lstrip()
+        )
+        self.addCleanup(tmp.cleanup)
+
+        verdict = lint_schema(path)
+
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["float_log"], {"lr": True, "wd": False})
+
     def test_contract_rejects_schema_mode_and_invalid_log_bounds(self) -> None:
         tmp, path = self._candidate(
             """

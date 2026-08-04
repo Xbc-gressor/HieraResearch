@@ -7,10 +7,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import hieraresearch.upstream as upstream_module  # noqa: E402
 from hieraresearch.artifacts import atomic_write_json  # noqa: E402
 from hieraresearch.coordinator import ExperimentCoordinator, RunControls  # noqa: E402
 from hieraresearch.llm import (  # noqa: E402
@@ -112,9 +114,32 @@ class PolicyTests(unittest.TestCase):
             max_single_backoff_seconds=100.0,
             backoff_multiplier=2.0,
         )
-        self.assertEqual(backoff_sleep_seconds(1, policy), 30.0)
-        self.assertEqual(backoff_sleep_seconds(2, policy), 60.0)
-        self.assertEqual(backoff_sleep_seconds(3, policy), 100.0)
+        # Full jitter draws uniform(0, cap); pin the draw to the cap so the
+        # streak growth and per-attempt cap accounting stay exact.
+        with mock.patch.object(upstream_module, "random") as jitter:
+            jitter.uniform.side_effect = lambda low, high: high
+            self.assertEqual(backoff_sleep_seconds(1, policy), 30.0)
+            self.assertEqual(backoff_sleep_seconds(2, policy), 60.0)
+            self.assertEqual(backoff_sleep_seconds(3, policy), 100.0)
+            jitter.uniform.assert_has_calls(
+                [
+                    mock.call(0.0, 30.0),
+                    mock.call(0.0, 60.0),
+                    mock.call(0.0, 100.0),
+                ]
+            )
+
+    def test_backoff_sleep_is_jittered_within_cap(self) -> None:
+        policy = UpstreamBackoffPolicy(
+            base_backoff_seconds=30.0,
+            max_single_backoff_seconds=100.0,
+            backoff_multiplier=2.0,
+        )
+        for streak, cap in ((1, 30.0), (2, 60.0), (3, 100.0)):
+            samples = [backoff_sleep_seconds(streak, policy) for _ in range(60)]
+            self.assertTrue(all(0.0 <= sample <= cap for sample in samples))
+            # The draw must actually spread, not collapse to the cap.
+            self.assertGreater(len(set(samples)), 1)
 
     def test_streak_exhaustion_blocks(self) -> None:
         policy = UpstreamBackoffPolicy(
@@ -154,12 +179,16 @@ class PolicyTests(unittest.TestCase):
             base_backoff_seconds=40.0,
             max_single_backoff_seconds=40.0,
         )
-        decision = decide_upstream_recovery(
-            current_streak=0,
-            current_backoff_total_seconds=20.0,
-            error=_exc_503_accounts(),
-            policy=policy,
-        )
+        # Pin the jittered draw to the cap: the block decision must be made
+        # against the largest admissible sleep.
+        with mock.patch.object(upstream_module, "random") as jitter:
+            jitter.uniform.return_value = 40.0
+            decision = decide_upstream_recovery(
+                current_streak=0,
+                current_backoff_total_seconds=20.0,
+                error=_exc_503_accounts(),
+                policy=policy,
+            )
         self.assertEqual(decision.action, "block")
         self.assertIn("upstream_backoff_wall_clock_exhausted", decision.reason)
         self.assertEqual(decision.sleep_seconds, 0.0)
@@ -249,11 +278,13 @@ class CoordinatorUpstreamTests(unittest.TestCase):
             self.assertTrue(coordinator._recover_from_upstream(_exc_502()))
             self.assertEqual(coordinator.state.phase, CoordinatorPhase.RUNNING)
             self.assertEqual(coordinator.state.upstream_failure_streak, 1)
-            self.assertEqual(sleeps, [2.0])
+            self.assertEqual(len(sleeps), 1)
+            self.assertTrue(0.0 <= sleeps[0] <= 2.0)
 
             self.assertTrue(coordinator._recover_from_upstream(_exc_503_accounts()))
             self.assertEqual(coordinator.state.upstream_failure_streak, 2)
-            self.assertEqual(sleeps, [2.0, 2.0])
+            self.assertEqual(len(sleeps), 2)
+            self.assertTrue(0.0 <= sleeps[1] <= 2.0)
 
             self.assertTrue(coordinator._recover_from_upstream(_exc_502()))
             self.assertEqual(coordinator.state.phase, CoordinatorPhase.BLOCKED)
@@ -261,7 +292,7 @@ class CoordinatorUpstreamTests(unittest.TestCase):
                 "upstream_failure_streak_exhausted",
                 coordinator.state.stop_condition or "",
             )
-            self.assertEqual(sleeps, [2.0, 2.0])
+            self.assertEqual(len(sleeps), 2)
 
             state_path = coordinator.identity.run_dir / ".orchestrator" / "state.json"
             persisted = json.loads(state_path.read_text(encoding="utf-8"))

@@ -9,9 +9,11 @@ Subcommands:
                     relational invariants (key-set match, in-bounds defaults,
                     tuple shapes, make_model is a def) by AST. Exit 1 on any
                     hard error. The gate before a candidate may be tuned.
-- lint-schema     : candidate train.py -> {ok, keys, kinds, make_model_defined,
-                    make_model_called, errors[]}; schema-mode check (make_model +
-                    PARAM_SCHEMA) for step 0, before SEARCH_SPACE/BASE_PARAMS exist.
+- lint-schema     : candidate train.py -> {ok, keys, kinds, float_log,
+                    make_model_defined, make_model_called, errors[]}; schema-mode
+                    check (make_model + PARAM_SCHEMA) for step 0, before
+                    SEARCH_SPACE/BASE_PARAMS exist. float_log records each float
+                    key's schema log mode.
 - select-method   : candidate SEARCH_SPACE -> {n_dims, method, fallback}
 - phase-c-action  : candidate + tune_report -> deterministic resume action
                     (run method, finalize, or stop on exhausted allocation)
@@ -107,6 +109,15 @@ def _schema_kind(entry) -> str | None:
     return None
 
 
+def _schema_float_log(entry) -> bool:
+    """Whether a PARAM_SCHEMA entry declares log mode (``("float", "log")``)."""
+    return (
+        isinstance(entry, (tuple, list))
+        and len(entry) == 2
+        and entry[1] == "log"
+    )
+
+
 def _valid_categorical_value(value) -> bool:
     """Whether a categorical value is stable across AST, JSON, and samplers."""
     if value is None or type(value) in {bool, int, str}:
@@ -173,11 +184,7 @@ def _space_schema_mismatch(schema_entry, space_entry) -> str | None:
     if space_entry[0] != schema_kind:
         return f"kind {space_entry[0]!r} != schema kind {schema_kind!r}"
     if schema_kind == "float":
-        schema_log = (
-            isinstance(schema_entry, (tuple, list))
-            and len(schema_entry) == 2
-            and schema_entry[1] == "log"
-        )
+        schema_log = _schema_float_log(schema_entry)
         space_log = len(space_entry) == 4 and space_entry[3] == "log"
         if schema_log != space_log:
             return (
@@ -858,12 +865,14 @@ def lint_contract(train_path: Path, *, require_base_params: bool = True) -> dict
 def lint_schema(train_path: Path) -> dict:
     """Schema-mode contract lint (step 0, before SEARCH_SPACE/BASE_PARAMS exist):
     PARAM_SCHEMA is a valid kind/options declaration and make_model is a function.
-    Returns {ok, keys, kinds, make_model_defined, make_model_called, errors[]}."""
+    Returns {ok, keys, kinds, float_log, make_model_defined, make_model_called,
+    errors[]}. float_log maps each float-kind key to its schema log mode."""
     src = Path(train_path).read_text(errors="replace")
     try:
         tree = ast.parse(src)
     except SyntaxError as exc:
-        return {"ok": False, "keys": [], "kinds": {}, "make_model_defined": False,
+        return {"ok": False, "keys": [], "kinds": {}, "float_log": {},
+                "make_model_defined": False,
                 "make_model_called": False,
                 "errors": [{"code": "syntax_error", "detail": str(exc), "line": exc.lineno or 0}]}
     bindings = _module_bindings(tree)
@@ -917,6 +926,11 @@ def lint_schema(train_path: Path) -> dict:
             k: kind
             for k, value in schema.items()
             if (kind := _schema_kind(value)) is not None
+        } if isinstance(schema, dict) else {},
+        "float_log": {
+            k: _schema_float_log(value)
+            for k, value in schema.items()
+            if _schema_kind(value) == "float"
         } if isinstance(schema, dict) else {},
         "make_model_defined": make_model_defined,
         "make_model_called": make_model_called,

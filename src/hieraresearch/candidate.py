@@ -860,6 +860,7 @@ class CandidatePipeline:
                     "ok": True,
                     "keys": full_lint.get("keys", []),
                     "kinds": {},
+                    "float_log": {},
                     "make_model_defined": full_lint.get(
                         "make_model_defined", False
                     ),
@@ -2675,6 +2676,15 @@ class CandidatePipeline:
             )
         except InferenceContractError:
             return False
+        except InferenceError as exc:
+            if is_retryable_upstream_failure(exc):
+                # Transient provider fault: the coordinator's upstream backoff
+                # owns this retry.
+                raise
+            # Non-upstream inference failure degrades the same way as a
+            # malformed decision: the repair is skipped and the candidate
+            # closes as a crash, so the run continues.
+            return False
         decision_payload = {
             "verdict": decision.verdict.value,
             "rationale": decision.rationale,
@@ -3230,6 +3240,7 @@ class CandidatePipeline:
     ) -> TuningValues:
         keys = schema_lint.get("keys")
         kinds = schema_lint.get("kinds")
+        float_log = schema_lint.get("float_log")
         if not (
             isinstance(keys, list)
             and all(isinstance(key, str) and key for key in keys)
@@ -3239,6 +3250,17 @@ class CandidatePipeline:
             raise CandidateBuildError(
                 "provided defaults do not match the validated PARAM_SCHEMA"
             )
+        # lint-schema is the authoritative reader of PARAM_SCHEMA log modes.
+        # A lint receipt without per-key float log modes is stale; rejecting it
+        # is safer than silently rendering log floats as linear.
+        if not isinstance(float_log, dict) or not all(
+            isinstance(float_log.get(key), bool)
+            for key, kind in kinds.items()
+            if kind == "float"
+        ):
+            raise CandidateBuildError(
+                "validated PARAM_SCHEMA receipt lacks float log modes"
+            )
         space: dict[str, list[Any]] = {}
         for key in keys:
             value = defaults[key]
@@ -3247,7 +3269,11 @@ class CandidatePipeline:
             if kind == "int" and type(value) is int:
                 space[key] = ["int", value, value]
             elif kind == "float" and _finite_number(value):
-                space[key] = ["float", value, value]
+                space[key] = (
+                    ["float", value, value, "log"]
+                    if float_log.get(key)
+                    else ["float", value, value]
+                )
             elif kind == "categorical":
                 space[key] = ["categorical", [value]]
             else:

@@ -35,8 +35,13 @@ from hieraresearch.debug import (  # noqa: E402
     FailureEvidence,
     parse_debug_response,
 )
+from hieraresearch.llm import (  # noqa: E402
+    InferenceContractError,
+    InferenceError,
+)
 from hieraresearch.models import (  # noqa: E402
     ActiveRound,
+    CoordinatorPhase,
     CoordinatorState,
     RoundAction,
     RunIdentity,
@@ -1609,6 +1614,141 @@ class OrchestratorBoundaryTests(unittest.TestCase):
                         evidence,
                         identity.run_dir / "candidates" / "001" / "tune_report.json",
                     )
+
+    def test_debug_analyzer_inference_failure_degrades_without_blocking(self) -> None:
+        # Model-quality failures of the read-only analyzer degrade the debug
+        # unit of work: no repair is planned and the candidate still closes
+        # as a crash. Only transient upstream faults propagate so the
+        # coordinator backoff can own the retry.
+        class RaisingModels:
+            def __init__(self, error: BaseException) -> None:
+                self.error = error
+                self.infer_calls = 0
+
+            def infer(self, **kwargs):
+                del kwargs
+                self.infer_calls += 1
+                raise self.error
+
+        def run_case(tmp: str, error: BaseException, failure_id: str):
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "run")
+            task_dir = repo_root / "tasks" / "toy"
+            candidate_dir = identity.run_dir / "candidates" / "001"
+            task_dir.mkdir(parents=True)
+            candidate_dir.mkdir(parents=True)
+            (task_dir / "TASK.md").write_text("# task\n", encoding="utf-8")
+            (task_dir / "task.toml").write_text("", encoding="utf-8")
+            (candidate_dir / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
+            atomic_write_json(candidate_dir / "_warm_configs.json", [{"x": 1}])
+            atomic_write_json(
+                candidate_dir / "_search_space.json", {"x": ["int", 1, 2]}
+            )
+            evidence = FailureEvidence(
+                run_id="001",
+                phase="a",
+                crash_index=0,
+                crash_params={"x": 1},
+                failure_receipt={"type": "ValueError", "message": "bad x"},
+                failure_ref={"failure_id": failure_id},
+                objective_slot_consumed=True,
+                failure_category="candidate_code_incompatibility",
+            )
+            models = RaisingModels(error)
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=DebugPreflightToolchainStub(),
+                models=models,
+                task_config={},
+            )
+            return pipeline, evidence, candidate_dir, models
+
+        degrades = (
+            ("failure-contract", InferenceContractError("decision failed its schema")),
+            (
+                "failure-non-upstream",
+                InferenceError("Claude Agent SDK stopped with 'max_turns'"),
+            ),
+        )
+        for failure_id, error in degrades:
+            with (
+                self.subTest(failure_id=failure_id),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                pipeline, evidence, candidate_dir, models = run_case(
+                    tmp, error, failure_id
+                )
+                self.assertFalse(
+                    pipeline._debug_once(
+                        RoundAction(op="fresh", run_id="001", admitted=True),
+                        evidence,
+                        candidate_dir / "tune_report.json",
+                    )
+                )
+                self.assertEqual(models.infer_calls, 1)
+                self.assertFalse(
+                    (candidate_dir / pipeline.PHASE_A_REPAIR_RECEIPT).exists()
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, evidence, candidate_dir, models = run_case(
+                tmp,
+                InferenceError(
+                    "Claude Messages request failed: Error code: 502 - "
+                    "{'error': {'message': 'Upstream service temporarily unavailable', "
+                    "'type': 'upstream_error'}, 'type': 'error'}"
+                ),
+                "failure-upstream",
+            )
+            with self.assertRaises(InferenceError):
+                pipeline._debug_once(
+                    RoundAction(op="fresh", run_id="001", admitted=True),
+                    evidence,
+                    candidate_dir / "tune_report.json",
+                )
+            self.assertEqual(models.infer_calls, 1)
+            self.assertFalse(
+                (candidate_dir / pipeline.PHASE_A_REPAIR_RECEIPT).exists()
+            )
+
+    def test_experience_refresh_failure_blocks_with_explicit_reason(self) -> None:
+        # A terminally degraded refresh must not idle on no-op transitions:
+        # semantic admission is ledger-gated on a processed experience delta,
+        # so the coordinator blocks with the recorded reason and a resume
+        # admits one fresh attempt.
+        class FailedExperience:
+            def run(self, brief):
+                del brief
+                return {
+                    "status": "failed",
+                    "dag_revision": 3,
+                    "error": {
+                        "type": "ValidationRejected",
+                        "message": "evidence must trace terminal ledger runs",
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "run")
+            identity.run_dir.mkdir(parents=True)
+            coordinator = ExperimentCoordinator(
+                identity,
+                toolchain=object(),
+                models=object(),
+                controls=RunControls(),
+            )
+            coordinator.state = CoordinatorState(task_name="toy", tag="run")
+            coordinator.experience = FailedExperience()
+
+            coordinator._execute(Transition.REFRESH_EXPERIENCE, {"dag_revision": 3})
+
+            self.assertEqual(coordinator.state.phase, CoordinatorPhase.BLOCKED)
+            self.assertTrue(
+                coordinator.state.stop_condition.startswith(
+                    "experience_refresh_failed: dag-3: ValidationRejected: "
+                    "evidence must trace terminal ledger runs"
+                )
+            )
 
     def test_restart_mid_evaluation_forward_completes_without_reimplementation(
         self,

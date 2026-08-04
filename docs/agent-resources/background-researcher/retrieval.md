@@ -93,18 +93,17 @@ via `--visit-backend jina` and remains an optional live-web ablation.
 ## Runtime web fallback and record-visit
 
 If the local backends miss an evidence class, use targeted web search
-(`WebSearch` in Claude, `websearch` in OpenCode) for later versions,
-independent reproductions, official repositories, benchmark records, and
-primary artifacts. Use web fetch (`WebFetch` / `webfetch`) only after triage.
+(`WebSearch`) for later versions, independent reproductions, official
+repositories, benchmark records, and primary artifacts. Use `WebFetch` only
+after triage.
 After every successful fetch that will appear in the search-space registry,
 write the returned content to a temporary run-local file and append a receipt
-that retains and hashes that exact content, with the backend name matching
-your runtime (`claude-webfetch` or `opencode-webfetch`):
+that retains and hashes that exact content with the `claude-webfetch` backend:
 
 ```bash
 python tools/search_backends.py record-visit \
   --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --backend <claude-webfetch|opencode-webfetch> --view page --status success \
+  --backend claude-webfetch --view page --status success \
   --content-file <temporary-fetched-content> --url <url>
 ```
 

@@ -14,6 +14,7 @@ re-entry so backoff is not a pure sleep loop.
 from __future__ import annotations
 
 import math
+import random
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -158,12 +159,18 @@ def last_error_is_upstream_transport(last_error: object) -> bool:
 
 
 def backoff_sleep_seconds(streak_after_failure: int, policy: UpstreamBackoffPolicy) -> float:
-    """Exponential backoff for the given 1-based streak, capped per attempt."""
+    """Exponential backoff for the given 1-based streak, capped per attempt.
+
+    Full jitter spreads the sleep uniformly over [0, cap] so parallel runs
+    recovering from the same provider outage do not retry in lockstep. The
+    cap itself — and thus streak and wall-clock accounting — is unchanged.
+    """
     if streak_after_failure < 1:
         raise ValueError("streak_after_failure must be >= 1")
     exponent = streak_after_failure - 1
     raw = policy.base_backoff_seconds * (policy.backoff_multiplier**exponent)
-    return float(min(policy.max_single_backoff_seconds, raw))
+    cap = float(min(policy.max_single_backoff_seconds, raw))
+    return random.uniform(0.0, cap)
 
 
 def decide_upstream_recovery(

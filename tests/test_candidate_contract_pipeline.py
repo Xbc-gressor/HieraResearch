@@ -78,6 +78,25 @@ def make_model(params):
     return params["depth"]
 """
 
+PROVIDED_LOG_SCHEMA = """\
+DEFAULT_PARAMS = {
+    "depth": 3,
+    "embedding_lr": 0.001,
+    "weight_decay": 0.1,
+    "solver": "lbfgs",
+}
+
+PARAM_SCHEMA = {
+    "depth": "int",
+    "embedding_lr": ("float", "log"),
+    "weight_decay": "float",
+    "solver": ["categorical", ["lbfgs", "adam"]],
+}
+
+def make_model(params):
+    return params["depth"]
+"""
+
 
 def tuning_response(
     *values: int | float,
@@ -1260,6 +1279,49 @@ class CandidateContractPipelineTests(unittest.TestCase):
             )
             self.assertEqual(models.infer_calls, [])
             self.assertTrue(pipeline.contract_is_ready(action))
+
+    def test_provided_defaults_render_log_float_space_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, action, candidate_dir = self._case(
+                Path(tmp),
+                train_source=PROVIDED_LOG_SCHEMA,
+                provided=True,
+            )
+            models = ScriptedModels()
+            pipeline = CandidatePipeline(identity, self._toolchain(), models, {})
+
+            pipeline.build_contract(action)
+
+            space = json.loads(
+                (candidate_dir / "_search_space.json").read_text()
+            )
+            self.assertEqual(
+                space["embedding_lr"], ["float", 0.001, 0.001, "log"]
+            )
+            self.assertEqual(space["weight_decay"], ["float", 0.1, 0.1])
+            self.assertEqual(space["depth"], ["int", 3, 3])
+            self.assertEqual(space["solver"], ["categorical", ["lbfgs"]])
+            receipt = json.loads(
+                (candidate_dir / pipeline.TUNING_SCHEMA_RECEIPT).read_text()
+            )
+            self.assertEqual(
+                receipt["lint"]["float_log"],
+                {"embedding_lr": True, "weight_decay": False},
+            )
+            self.assertEqual(models.infer_calls, [])
+            self.assertTrue(pipeline.contract_is_ready(action))
+
+    def test_provided_tuning_values_reject_stale_lint_without_float_log(
+        self,
+    ) -> None:
+        defaults = {"embedding_lr": 0.001}
+        stale_lint = {
+            "keys": ["embedding_lr"],
+            "kinds": {"embedding_lr": "float"},
+        }
+
+        with self.assertRaisesRegex(CandidateBuildError, "float log modes"):
+            CandidatePipeline._provided_tuning_values(defaults, stale_lint)
 
     def test_provided_finalization_recovery_does_not_reread_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -21,6 +21,8 @@ from hieraresearch.artifacts import (  # noqa: E402
     paths_revision,
 )
 from hieraresearch.background import (  # noqa: E402
+    BACKGROUND_REGISTRY_MAX_TURNS,
+    BACKGROUND_RETRIEVAL_MAX_TURNS,
     BackgroundArtifactError,
     BackgroundBuilder,
     MAX_BACKGROUND_REPAIR_ATTEMPTS,
@@ -151,15 +153,41 @@ class BackgroundModelStub:
         return validate()
 
 
-def background_validator_commands(
+def retrieval_validator_commands(repo_root: Path, run_dir: Path) -> set[str]:
+    """Expected exact Bash commands for a background_retrieval edit spec."""
+    tools = repo_root.resolve() / "tools"
+    return {
+        exact_command_string(
+            [
+                sys.executable,
+                str(tools / "search_backends.py"),
+                "validate",
+                "--manifest",
+                str(run_dir / "background_retrieval.json"),
+            ]
+        ),
+        exact_command_string(
+            [
+                sys.executable,
+                str(tools / "search_backends.py"),
+                "import-external",
+                "--draft",
+                str(run_dir / "background_retrieval.draft.json"),
+                "--manifest",
+                str(run_dir / "background_retrieval.json"),
+            ]
+        ),
+    }
+
+
+def registry_validator_commands(
     repo_root: Path,
     run_dir: Path,
     *,
     induced: bool,
     provided_baseline: bool,
-    with_import: bool,
 ) -> set[str]:
-    """Expected exact Bash commands for a background_research edit spec."""
+    """Expected exact Bash commands for a background_registry edit spec."""
     tools = repo_root.resolve() / "tools"
     commands = {
         exact_command_string(
@@ -191,20 +219,6 @@ def background_validator_commands(
             ]
         ),
     }
-    if with_import:
-        commands.add(
-            exact_command_string(
-                [
-                    sys.executable,
-                    str(tools / "search_backends.py"),
-                    "import-external",
-                    "--draft",
-                    str(run_dir / "background_retrieval.draft.json"),
-                    "--manifest",
-                    str(run_dir / "background_retrieval.json"),
-                ]
-            )
-        )
     if induced:
         commands.add(
             exact_command_string(
@@ -776,26 +790,45 @@ class FoundationTests(unittest.TestCase):
             builder.ensure()
             builder.ensure()
 
-            self.assertEqual(len(models.specs), 1)
-            spec = models.specs[0]
-            self.assertEqual(spec.purpose, "background_research")
+            self.assertEqual(len(models.specs), 2)
+            retrieval_spec, registry_spec = models.specs
+            self.assertEqual(retrieval_spec.purpose, "background_retrieval")
+            self.assertEqual(registry_spec.purpose, "background_registry")
             self.assertEqual(
-                {path.name for path in spec.write_paths},
-                {"background.md", "background_retrieval.draft.json"},
+                {path.name for path in retrieval_spec.write_paths},
+                {"background_retrieval.draft.json"},
             )
             self.assertEqual(
-                {path.name for path in spec.derived_output_paths},
+                {path.name for path in retrieval_spec.derived_output_paths},
                 {"background_retrieval.json"},
             )
-            self.assertIn("Bash", spec.tools)
+            self.assertIn("WebSearch", retrieval_spec.tools)
+            self.assertIn("WebFetch", retrieval_spec.tools)
             self.assertEqual(
-                spec.allowed_commands,
-                background_validator_commands(
+                retrieval_spec.max_turns, BACKGROUND_RETRIEVAL_MAX_TURNS
+            )
+            self.assertEqual(
+                retrieval_spec.allowed_commands,
+                retrieval_validator_commands(repo_root, identity.run_dir),
+            )
+            self.assertEqual(
+                {path.name for path in registry_spec.write_paths},
+                {"background.md"},
+            )
+            self.assertEqual(registry_spec.derived_output_paths, ())
+            self.assertNotIn("WebSearch", registry_spec.tools)
+            self.assertNotIn("WebFetch", registry_spec.tools)
+            self.assertIn("Bash", registry_spec.tools)
+            self.assertEqual(
+                registry_spec.max_turns, BACKGROUND_REGISTRY_MAX_TURNS
+            )
+            self.assertEqual(
+                registry_spec.allowed_commands,
+                registry_validator_commands(
                     repo_root,
                     identity.run_dir,
                     induced=False,
                     provided_baseline=False,
-                    with_import=True,
                 ),
             )
             self.assertEqual(len(toolchain.validation_calls), 2)
@@ -809,7 +842,7 @@ class FoundationTests(unittest.TestCase):
                 all(not provided for _, _, provided in toolchain.validation_calls)
             )
 
-    def test_background_research_spec_allowlists_exact_validator_commands(self) -> None:
+    def test_background_stage_specs_allowlist_exact_validator_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             identity = RunIdentity(repo_root, "toy", "induced-provided")
@@ -834,23 +867,34 @@ class FoundationTests(unittest.TestCase):
 
             builder.ensure()
 
-            self.assertEqual(len(models.specs), 1)
-            spec = models.specs[0]
-            self.assertEqual(spec.purpose, "background_research")
-            self.assertIn("Bash", spec.tools)
+            self.assertEqual(len(models.specs), 2)
+            retrieval_spec, registry_spec = models.specs
+            self.assertEqual(retrieval_spec.purpose, "background_retrieval")
+            self.assertEqual(registry_spec.purpose, "background_registry")
             self.assertEqual(
-                spec.allowed_commands,
-                background_validator_commands(
+                {path.name for path in registry_spec.write_paths},
+                {"background.md", "dimension_catalog.json", "baseline_mechanisms.json"},
+            )
+            self.assertIn("Bash", retrieval_spec.tools)
+            self.assertEqual(
+                retrieval_spec.allowed_commands,
+                retrieval_validator_commands(repo_root, identity.run_dir),
+            )
+            for command in sorted(retrieval_spec.allowed_commands):
+                self.assertIn(command, retrieval_spec.prompt)
+            self.assertIn("import-external", retrieval_spec.prompt)
+            self.assertEqual(
+                registry_spec.allowed_commands,
+                registry_validator_commands(
                     repo_root,
                     identity.run_dir,
                     induced=True,
                     provided_baseline=True,
-                    with_import=True,
                 ),
             )
-            for command in sorted(spec.allowed_commands):
-                self.assertIn(command, spec.prompt)
-            self.assertIn("import-external", spec.prompt)
+            for command in sorted(registry_spec.allowed_commands):
+                self.assertIn(command, registry_spec.prompt)
+            self.assertNotIn("import-external", registry_spec.prompt)
             self.assertEqual(
                 toolchain.validation_calls, [(identity.run_dir, True, True)]
             )
@@ -936,8 +980,10 @@ class FoundationTests(unittest.TestCase):
             with self.assertRaisesRegex(ToolFailure, "worker unavailable"):
                 builder.ensure()
 
-            self.assertEqual(len(models.specs), 1)
-            self.assertEqual(models.specs[0].purpose, "background_research")
+            self.assertEqual(
+                [spec.purpose for spec in models.specs],
+                ["background_retrieval", "background_registry"],
+            )
 
     def test_existing_background_validator_infrastructure_is_not_repaired(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1022,9 +1068,10 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(
                 [spec.purpose for spec in models.specs],
                 [
-                    "background_research",
-                    "background_research:repair:1",
-                    "background_research:repair:2",
+                    "background_retrieval",
+                    "background_retrieval:repair:1",
+                    "background_registry",
+                    "background_registry:repair:1",
                 ],
             )
             self.assertEqual(len(toolchain.retrieval_imports), 2)
@@ -1034,7 +1081,7 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(final_spec.derived_output_paths, ())
             self.assertNotIn("WebSearch", final_spec.tools)
             self.assertNotIn("WebFetch", final_spec.tools)
-            self.assertIn("is frozen for this repair", final_spec.prompt)
+            self.assertIn("is frozen for this stage", final_spec.prompt)
 
     def test_background_builder_reuses_valid_retrieval_during_registry_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1069,7 +1116,7 @@ class FoundationTests(unittest.TestCase):
 
             self.assertEqual(len(models.specs), 1)
             spec = models.specs[0]
-            self.assertEqual(spec.purpose, "background_research:repair:1")
+            self.assertEqual(spec.purpose, "background_registry:repair:1")
             self.assertEqual(
                 {path.name for path in spec.write_paths}, {"background.md"}
             )
@@ -1079,12 +1126,11 @@ class FoundationTests(unittest.TestCase):
             self.assertIn("Bash", spec.tools)
             self.assertEqual(
                 spec.allowed_commands,
-                background_validator_commands(
+                registry_validator_commands(
                     repo_root,
                     identity.run_dir,
                     induced=False,
                     provided_baseline=False,
-                    with_import=False,
                 ),
             )
             self.assertEqual(toolchain.retrieval_imports, [])
@@ -1178,7 +1224,7 @@ class FoundationTests(unittest.TestCase):
 
             class InterruptedModels(BackgroundModelStub):
                 def edit(self, spec, *, validate):
-                    if self.specs:
+                    if spec.purpose == "background_registry:repair:1":
                         self.specs.append(spec)
                         raise RuntimeError("worker killed mid-repair")
                     return super().edit(spec, validate=validate)
@@ -1194,9 +1240,12 @@ class FoundationTests(unittest.TestCase):
                 identity.run_dir / ".orchestrator" / "background_authoring.json"
             )
             state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["schema_version"], 2)
+            self.assertEqual(state["stage"], "registry")
             self.assertEqual(state["status"], "started")
-            self.assertEqual(state["attempts_admitted"], 2)
-            self.assertEqual(state["purpose"], "background_research:repair:1")
+            self.assertEqual(state["stages"]["retrieval"]["attempts_admitted"], 1)
+            self.assertEqual(state["stages"]["registry"]["attempts_admitted"], 2)
+            self.assertEqual(state["purpose"], "background_registry:repair:1")
             self.assertEqual(state["last_error_kind"], "validation_rejected")
 
             # A killed writer may leave required artifacts missing; the resume
@@ -1212,11 +1261,11 @@ class FoundationTests(unittest.TestCase):
 
             self.assertEqual(
                 [spec.purpose for spec in resumed_models.specs],
-                ["background_research:repair:1"],
+                ["background_registry:repair:1"],
             )
             final_state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(final_state["status"], "completed")
-            self.assertEqual(final_state["attempts_admitted"], 2)
+            self.assertEqual(final_state["stages"]["registry"]["attempts_admitted"], 2)
             diagnostic = json.loads(
                 (
                     identity.run_dir
@@ -1253,11 +1302,14 @@ class FoundationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "registry remains invalid"):
                 builder.ensure()
 
-            self.assertEqual(len(models.specs), MAX_BACKGROUND_REPAIR_ATTEMPTS + 1)
-            self.assertEqual(models.specs[0].purpose, "background_research")
+            self.assertEqual(
+                len(models.specs), MAX_BACKGROUND_REPAIR_ATTEMPTS + 2
+            )
+            self.assertEqual(models.specs[0].purpose, "background_retrieval")
+            self.assertEqual(models.specs[1].purpose, "background_registry")
             self.assertEqual(
                 models.specs[-1].purpose,
-                f"background_research:repair:{MAX_BACKGROUND_REPAIR_ATTEMPTS}",
+                f"background_registry:repair:{MAX_BACKGROUND_REPAIR_ATTEMPTS}",
             )
             self.assertEqual(len(toolchain.retrieval_imports), 1)
 
@@ -1280,7 +1332,7 @@ class FoundationTests(unittest.TestCase):
             )
             self.assertEqual(resumed_models.specs, [])
             self.assertEqual(
-                state["attempts_admitted"],
+                state["stages"]["registry"]["attempts_admitted"],
                 MAX_BACKGROUND_REPAIR_ATTEMPTS + 1,
             )
 
@@ -1313,7 +1365,11 @@ class FoundationTests(unittest.TestCase):
 
             self.assertEqual(
                 [spec.purpose for spec in models.specs],
-                ["background_research", "background_research:repair:1"],
+                [
+                    "background_retrieval",
+                    "background_retrieval:repair:1",
+                    "background_registry",
+                ],
             )
             # An inference failure is not a validator rejection: the repair
             # prompt carries the error text but no stale diagnostic reference.
@@ -1325,7 +1381,8 @@ class FoundationTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(state["status"], "completed")
-            self.assertEqual(state["attempts_admitted"], 2)
+            self.assertEqual(state["stages"]["retrieval"]["attempts_admitted"], 2)
+            self.assertEqual(state["stages"]["registry"]["attempts_admitted"], 1)
 
     def test_background_builder_reraises_upstream_inference_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1363,7 +1420,9 @@ class FoundationTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(state["status"], "started")
-            self.assertEqual(state["attempts_admitted"], 1)
+            self.assertEqual(state["stage"], "retrieval")
+            self.assertEqual(state["stages"]["retrieval"]["attempts_admitted"], 1)
+            self.assertEqual(state["stages"]["registry"]["attempts_admitted"], 0)
 
     def test_background_builder_bounds_non_upstream_inference_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1389,14 +1448,170 @@ class FoundationTests(unittest.TestCase):
                 builder.ensure()
 
             self.assertEqual(len(models.specs), MAX_BACKGROUND_REPAIR_ATTEMPTS + 1)
+            self.assertEqual(models.specs[0].purpose, "background_retrieval")
+            self.assertEqual(
+                models.specs[-1].purpose,
+                f"background_retrieval:repair:{MAX_BACKGROUND_REPAIR_ATTEMPTS}",
+            )
             state = json.loads(
                 (
                     identity.run_dir / ".orchestrator" / "background_authoring.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(state["attempts_admitted"], MAX_BACKGROUND_REPAIR_ATTEMPTS + 1)
+            self.assertEqual(
+                state["stages"]["retrieval"]["attempts_admitted"],
+                MAX_BACKGROUND_REPAIR_ATTEMPTS + 1,
+            )
+            self.assertEqual(state["stages"]["registry"]["attempts_admitted"], 0)
             self.assertEqual(state["last_error_kind"], "inference")
             self.assertEqual(state["status"], "rejected")
+
+    def test_background_builder_rejects_v1_authoring_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "v1-state")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            atomic_write_json(
+                identity.run_dir / ".orchestrator" / "background_authoring.json",
+                {
+                    "schema_version": 1,
+                    "kind": "background_authoring",
+                    "status": "ready",
+                    "input_revision": "sha256:" + "0" * 64,
+                    "attempts_admitted": 0,
+                    "initial_admitted": False,
+                    "repairs_admitted": 0,
+                    "purpose": None,
+                    "last_error": "",
+                    "last_error_kind": "",
+                    "last_error_label": "",
+                    "last_error_returncode": 0,
+                    "last_error_output": "",
+                },
+            )
+            models = BackgroundModelStub()
+            builder = BackgroundBuilder(
+                identity,
+                BackgroundToolchainStub(identity.repo_root),
+                models,
+                task_config={},
+            )
+
+            with self.assertRaisesRegex(BackgroundArtifactError, "schema_version 1"):
+                builder.ensure()
+
+            self.assertEqual(models.specs, [])
+
+    def test_background_registry_stage_state_requires_canonical_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "registry-without-manifest")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+
+            class InterruptedModels(BackgroundModelStub):
+                def edit(self, spec, *, validate):
+                    if spec.purpose == "background_registry":
+                        self.specs.append(spec)
+                        raise RuntimeError("worker killed before registry write")
+                    return super().edit(spec, validate=validate)
+
+            builder = BackgroundBuilder(
+                identity,
+                BackgroundToolchainStub(identity.repo_root),
+                InterruptedModels(),
+                task_config={},
+            )
+            with self.assertRaisesRegex(RuntimeError, "worker killed"):
+                builder.ensure()
+
+            state = json.loads(
+                (
+                    identity.run_dir / ".orchestrator" / "background_authoring.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["stage"], "registry")
+
+            # The registry stage never writes the manifest; its loss beside a
+            # registry-stage state is contradictory and must surface loudly.
+            (identity.run_dir / "background_retrieval.json").unlink()
+            resumed_models = BackgroundModelStub()
+            resumed = BackgroundBuilder(
+                identity,
+                BackgroundToolchainStub(identity.repo_root),
+                resumed_models,
+                task_config={},
+            )
+            with self.assertRaisesRegex(
+                BackgroundArtifactError, "lacks a valid canonical retrieval manifest"
+            ):
+                resumed.ensure()
+
+            self.assertEqual(resumed_models.specs, [])
+
+    def test_background_builder_resumes_interrupted_retrieval_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "retrieval-resume")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+
+            class InterruptedModels(BackgroundModelStub):
+                def edit(self, spec, *, validate):
+                    if spec.purpose == "background_retrieval":
+                        self.specs.append(spec)
+                        raise RuntimeError("worker killed mid-retrieval")
+                    return super().edit(spec, validate=validate)
+
+            builder = BackgroundBuilder(
+                identity,
+                BackgroundToolchainStub(identity.repo_root),
+                InterruptedModels(),
+                task_config={},
+            )
+            with self.assertRaisesRegex(RuntimeError, "worker killed"):
+                builder.ensure()
+
+            state_path = (
+                identity.run_dir / ".orchestrator" / "background_authoring.json"
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["stage"], "retrieval")
+            self.assertEqual(state["status"], "started")
+            self.assertEqual(state["stages"]["retrieval"]["attempts_admitted"], 1)
+
+            resumed_models = BackgroundModelStub()
+            BackgroundBuilder(
+                identity,
+                BackgroundToolchainStub(identity.repo_root),
+                resumed_models,
+                task_config={},
+            ).ensure()
+
+            # The interrupted admission is re-driven without consuming a new
+            # slot; the registry stage is admitted only after retrieval passes.
+            self.assertEqual(
+                [spec.purpose for spec in resumed_models.specs],
+                ["background_retrieval", "background_registry"],
+            )
+            final_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_state["status"], "completed")
+            self.assertEqual(
+                final_state["stages"]["retrieval"]["attempts_admitted"], 1
+            )
+            self.assertEqual(
+                final_state["stages"]["registry"]["attempts_admitted"], 1
+            )
 
     def test_frozen_background_rejects_stale_provided_baseline_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

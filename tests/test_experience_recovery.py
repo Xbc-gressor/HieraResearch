@@ -16,14 +16,15 @@ sys.path.insert(0, str(ROOT / "tests"))
 import hieraresearch.experience as experience_module  # noqa: E402
 from hieraresearch.artifacts import ArtifactError, atomic_write_json  # noqa: E402
 from hieraresearch.experience import ExperienceRefresh  # noqa: E402
+from hieraresearch.llm import InferenceContractError, InferenceError  # noqa: E402
 from hieraresearch.models import (  # noqa: E402
     CoordinatorState,
     RunIdentity,
     Transition,
 )
-from hieraresearch.process import ProcessRunner  # noqa: E402
+from hieraresearch.process import ProcessResult, ProcessRunner  # noqa: E402
 from hieraresearch.state_machine import next_transition  # noqa: E402
-from hieraresearch.toolchain import Toolchain  # noqa: E402
+from hieraresearch.toolchain import Toolchain, ValidationRejected  # noqa: E402
 from fixtures import background_text, fixture_registry, record  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
 from semantic_space import complete_point, space_receipt  # noqa: E402
@@ -110,6 +111,31 @@ class InterruptFirstStoreToolchain(Toolchain):
         if self.store_calls == 1:
             raise SimulatedKill("killed before experience store")
         return super().store_experience(run_dir, output)
+
+
+class RejectingToolchain(RecoveryToolchain):
+    def validate_experience(self, run_dir, output):
+        del run_dir, output
+        self.validation_calls += 1
+        raise ValidationRejected(
+            "validate-experience",
+            ProcessResult(
+                args=("validate-experience",),
+                returncode=1,
+                output="rejected: evidence cites an unknown run",
+                elapsed_seconds=0.0,
+            ),
+        )
+
+
+class FailingModels:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.calls = 0
+
+    def infer(self, **kwargs):
+        self.calls += 1
+        raise self.error
 
 
 def stale_brief() -> dict:
@@ -340,6 +366,123 @@ class ExperienceRecoveryTests(unittest.TestCase):
             self.assertEqual(models.calls, 1)
             self.assertEqual(toolchain.store_calls, 1)
             self.assertEqual(toolchain.apply_calls, 0)
+
+    def test_second_strike_rejection_degrades_to_a_terminal_failed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "smoke")
+            models = RecordingModels()
+            toolchain = RejectingToolchain()
+            refresh = ExperienceRefresh(identity, toolchain, models)
+
+            result = refresh.run(stale_brief())
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["dag_revision"], 3)
+            self.assertEqual(result["error"]["type"], "ValidationRejected")
+            self.assertEqual(models.calls, 2)
+            self.assertEqual(toolchain.validation_calls, 2)
+            self.assertEqual(toolchain.store_calls, 0)
+            self.assertEqual(toolchain.apply_calls, 0)
+            self.assertEqual(toolchain.stored_experience, {"dag_revision": 2})
+            receipt_path = (
+                identity.run_dir / ".orchestrator" / "experience-refresh-dag-3.json"
+            )
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["status"], "completed")
+            self.assertEqual(receipt["completion_mode"], "failed")
+            self.assertEqual(receipt["error"]["type"], "ValidationRejected")
+            self.assertIn("unknown run", receipt["error"]["message"])
+            self.assertFalse(refresh.has_pending(stale_brief()))
+
+            # Re-entry (an explicit resume after the coordinator blocked on the
+            # failure) admits one fresh attempt instead of idling forever.
+            again = refresh.run(stale_brief())
+
+            self.assertEqual(again["status"], "failed")
+            self.assertEqual(models.calls, 4)
+            self.assertEqual(toolchain.validation_calls, 4)
+            self.assertEqual(
+                json.loads(receipt_path.read_text())["completion_mode"], "failed"
+            )
+
+            later_brief = {
+                **stale_brief(),
+                "dag_revision": 4,
+                "experience_dag_delta": 2,
+            }
+            later = refresh.run(later_brief)
+
+            self.assertEqual(later["status"], "failed")
+            self.assertEqual(models.calls, 6)
+            later_receipt = json.loads(
+                (
+                    identity.run_dir
+                    / ".orchestrator"
+                    / "experience-refresh-dag-4.json"
+                ).read_text()
+            )
+            self.assertEqual(later_receipt["status"], "completed")
+            self.assertEqual(later_receipt["completion_mode"], "failed")
+            self.assertFalse(refresh.has_pending(later_brief))
+            self.assertFalse(refresh.has_pending(stale_brief()))
+
+    def test_model_quality_inference_failures_degrade_to_failed_receipts(self) -> None:
+        cases = (
+            InferenceContractError("structured snapshot failed its schema"),
+            InferenceError("Claude Agent SDK stopped with 'max_turns'"),
+        )
+        for error in cases:
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                identity = RunIdentity(Path(tmp), "toy", "smoke")
+                models = FailingModels(error)
+                toolchain = RecoveryToolchain()
+                refresh = ExperienceRefresh(identity, toolchain, models)
+
+                result = refresh.run(stale_brief())
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error"]["type"], type(error).__name__)
+                self.assertEqual(models.calls, 1)
+                self.assertEqual(toolchain.store_calls, 0)
+                self.assertEqual(toolchain.apply_calls, 0)
+                receipt = json.loads(
+                    (
+                        identity.run_dir
+                        / ".orchestrator"
+                        / "experience-refresh-dag-3.json"
+                    ).read_text()
+                )
+                self.assertEqual(receipt["status"], "completed")
+                self.assertEqual(receipt["completion_mode"], "failed")
+                self.assertEqual(receipt["error"]["type"], type(error).__name__)
+                self.assertFalse(refresh.has_pending(stale_brief()))
+
+    def test_upstream_inference_error_reraises_without_a_failed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "smoke")
+            upstream = InferenceError(
+                "Claude Messages request failed: Error code: 502 - "
+                "{'error': {'message': 'Upstream service temporarily unavailable', "
+                "'type': 'upstream_error'}, 'type': 'error'}"
+            )
+            models = FailingModels(upstream)
+            toolchain = RecoveryToolchain()
+            refresh = ExperienceRefresh(identity, toolchain, models)
+
+            with self.assertRaises(InferenceError):
+                refresh.run(stale_brief())
+
+            self.assertEqual(models.calls, 1)
+            self.assertEqual(toolchain.store_calls, 0)
+            self.assertFalse(
+                (
+                    identity.run_dir / ".orchestrator" / "experience-refresh-dag-3.json"
+                ).exists()
+            )
+            self.assertFalse(refresh.has_pending(stale_brief()))
 
 
 if __name__ == "__main__":

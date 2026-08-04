@@ -268,7 +268,18 @@ class ExperimentCoordinator:
             if brief is None:
                 raise ValueError("experience refresh requires a ledger brief")
             assert self.experience is not None
-            self.experience.run(brief)
+            outcome = self.experience.run(brief)
+            if outcome.get("status") == "failed":
+                # Model-quality failure at the refresh boundary: semantic
+                # admission is ledger-gated on a processed experience delta,
+                # so the truthful terminal state is an explicit block with the
+                # recorded reason. A resume admits one fresh attempt.
+                error = outcome.get("error") or {}
+                self._block(
+                    "experience_refresh_failed: "
+                    f"dag-{outcome.get('dag_revision')}: "
+                    f"{error.get('type', 'unknown')}: {error.get('message', '')}"
+                )
         elif transition is Transition.COMPLETE:
             self.toolchain.set_phase(self.identity.run_dir, "completed")
             self.state.phase = CoordinatorPhase.COMPLETED
