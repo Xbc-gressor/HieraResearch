@@ -563,6 +563,16 @@ def _deep_tune_time_budget_locked(
                 "(tools/finalize_tuning.py) before a new bout starts"
             )
         bout_index = len(bouts)
+        # Re-warm proposals are scoped to one bout. validate-proposals tags
+        # its list with the bout it targets (pending_proposals_bout_index);
+        # the orchestrator validates BEFORE launching the search, so the list
+        # written for THIS bout carries this same bout_index and survives.
+        # Anything else — consumed leftovers from an earlier bout, or a
+        # pre-tagging list — is stale and dropped here, before the report is
+        # persisted, so it can never leak into the new bout.
+        if phase_c.get("pending_proposals_bout_index") != bout_index:
+            phase_c.pop("pending_proposals", None)
+            phase_c.pop("pending_proposals_bout_index", None)
         stage = {"method": method, "trials": [], "bout_index": bout_index}
         stages.append(stage)
     else:
@@ -1214,9 +1224,15 @@ def read_deferred_configs(report_path: Path) -> list[dict]:
 def read_pending_proposals(report_path: Path) -> list[dict]:
     """LLM re-warm configs admitted by `tune_tools.py validate-proposals` for a
     continuation bout. Search scripts attempt them FIRST (before deferred
-    configs); they consume the bout's trial budget like any other trial. The
-    list is overwritten wholesale by the next validate-proposals call, so
-    unconsumed leftovers never leak into a later bout."""
+    configs); they consume the bout's trial budget like any other trial.
+
+    Lifecycle: validate-proposals writes the list wholesale together with a
+    `pending_proposals_bout_index` tag naming the bout it targets, before the
+    search launches. New-bout admission (`deep_tune_time_budget`) drops list
+    and tag when the tag does not match the bout being admitted, so leftovers
+    from an earlier bout never leak into a later one. At consumption each
+    config is deduped against attempted-config identities, so a resumed bout
+    never re-attempts one."""
     phase_c = read_tune_report(report_path).get("phase_c", {})
     if not isinstance(phase_c, dict):
         return []

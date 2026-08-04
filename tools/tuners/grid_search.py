@@ -217,7 +217,10 @@ def main() -> int:
     # Evaluate validated LLM re-warm proposals FIRST (admitted by
     # validate-proposals for a continuation bout), then the deferred warm
     # configs (proposed at step 0+1 but not evaluated there), then the grid
-    # sweep. They count as normal trials. Configs outside the (possibly
+    # sweep. They count as normal trials: for grid, proposals, deferred and
+    # grid points alike draw down the same --max-trials objective-attempt
+    # budget (the orchestrator clamps it to the bout's trial_cap), so up-front
+    # configs displace sweep points. Configs outside the (possibly
     # clamped) box are skipped — never attempted, no budget, no patience
     # effect — and accounted via rewarm_skipped_outside_space /
     # deferred_skipped_outside_space.
@@ -307,6 +310,16 @@ def main() -> int:
     failure_refs = []
 
     for params in param_dicts:
+        # The bout cap bounds the whole sweep: stop once --max-trials
+        # OBJECTIVE attempts are spent (preflight rejections never reach
+        # score_fn, so they are not counted here). The fresh-oversized-grid
+        # rejection above only covers the grid itself; this bound is what
+        # keeps proposals + deferred + grid points inside the bout's
+        # trial_cap.
+        if trials_attempted >= args.max_trials:
+            early_stopped = True
+            early_stop_reason = "max_trials"
+            break
         try:
             ensure_deep_tune_time_remaining(time_budget)
         except DeepTuneTimeExhausted:

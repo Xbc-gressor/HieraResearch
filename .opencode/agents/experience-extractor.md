@@ -166,6 +166,7 @@ exactly this shape; do not add undeclared evidence or status collections:
       "evidence_edge_ids": ["sedge-000-002", "sedge-004-006"],
       "comparator_coverage": {
         "direct_tuned_edges": 2,
+        "direct_lightly_tuned_edges": 0,
         "direct_noncrash_edges": 0,
         "confounded_noncrash_edges": 0,
         "crash_edges": 0

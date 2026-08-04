@@ -96,7 +96,7 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `idea` | self-contained complete solution, not merely a list of hypotheses |
 | `change` | implementation process relative to parents; it may be non-empty even when the point is unchanged |
 | `candidate_name`, `description`, `metric` | display metadata |
-| `tune` | derived bool: the candidate completed at least one tuning bout (`evaluation_depth` is not `screening`) |
+| `tune` | derived bool: set true at every bout close (the candidate completed at least one tuning bout); independent of `evaluation_depth`, which is computed separately from cumulative Phase-C attempts — a zero-objective-attempt bout closes with `tune: true` and depth `screening` |
 | `tuning_bouts` | completed progressive-tuning bouts; 0 for screening-only or legacy untuned records, 1 for legacy one-shot-tuned records |
 | `last_bout_improved` | whether the last bout produced a trial strictly better than its pre-bout incumbent; null when unknown/never tuned |
 | `status` | `pending`, `keep`, `discard`, `crash`, or evidence-neutral terminal `unevaluated` |

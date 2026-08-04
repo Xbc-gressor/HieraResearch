@@ -65,15 +65,16 @@ Admission gates per pool:
   non-responder rule below. No percentile re-check; pool membership was
   earned at first-bout admission.
 
-Ranking key among eligible candidates: `(non_responder, n_bouts, score)`,
-ascending, where
+Ranking among eligible candidates is pool-ordered, fresh pool first:
 
-- `non_responder` is true when the candidate's last completed bout produced
-  no trial strictly better than its pre-bout incumbent. Never-tuned
+- A continuation whose last completed bout produced no trial strictly
+  better than its pre-bout incumbent is a **non-responder** and is excluded
+  from selection entirely — never re-selected, never re-tuned. Never-tuned
   candidates are responders by definition.
-- `n_bouts` is the count of completed bouts.
-- `score` is `best_warm_score` for 0-bout candidates and `final_best_score`
-  for ≥1-bout candidates.
+- Fresh candidates (0 completed bouts) rank by `best_warm_score`, best
+  first.
+- Continuations rank by `(n_bouts, score)`, ascending: fewest completed
+  bouts first, then best `final_best_score` within the same bout count.
 
 **Like-for-like guarantee** (workspace AGENTS.md invariant): score
 comparisons only ever occur inside an equal `(non_responder, n_bouts)`
@@ -87,8 +88,8 @@ Consequences, all deliberate:
 - The whole percentile-admitted cohort receives a first bout before any
   second bout happens (evidence coverage; motivation 1).
 - Continuations favor responders with the best tuned scores (exploitation).
-- Non-responders fall behind fresh candidates; budget is redirected to
-  candidates that respond to tuning (motivation 2).
+- Non-responders are never re-selected; budget is redirected to candidates
+  that respond to tuning (motivation 2).
 
 `budget_allocation.trial_cap` becomes
 `min(bout_trials, cap_remaining, global_remaining)`.

@@ -371,9 +371,12 @@ python tools/ledger.py record-run --ledger <run_dir>/ledger.json --run-id <run_i
 ```
 
 `<best_warm_score>` is `phase_a.best_warm_score` from your `tune_report.json`.
-**Never pass `--mark-tuned`** — only the deep-tuner marks `tune: true`; marking it
-here would make `select-candidate` treat every candidate as already tuned. Return
-the success verdict.
+**Never pass `--mark-tuned`** — only the deep-tuner marks `tune: true`. A spurious
+`tune: true` here normalizes on read to one phantom bout with
+`last_bout_improved: null`, which `select-candidate` treats as a
+continuation-eligible responder: the candidate bypasses the first-bout
+percentile gate and draws bout budget it never earned. Return the success
+verdict.
 
 ### 3d. Abandon → record the candidate crashed
 

@@ -623,12 +623,21 @@ def main() -> int:
     # Validated LLM re-warm proposals first, then the deferred warm configs
     # (proposed at step 0+1, not evaluated there): evaluate them up front so
     # the rare cmaes path doesn't lose them. Recorded + considered
-    # for best (select-best ranks the whole report); they are EXTRA — not charged to
-    # the cmaes `evals` budget (cmaes still seeds x0 from the best evaluated prior).
-    # Deferred configs outside the (possibly clamped) box are skipped — never
-    # attempted, no budget, no patience effect — and accounted via
+    # for best (select-best ranks the whole report). PROPOSALS are charged to
+    # the cmaes `evals` budget — they displace search trials inside the bout
+    # cap, never add to it (spec §6) — while DEFERRED configs stay EXTRA
+    # (pre-paid step-0+1 savings), not charged. CMA-ES still seeds x0 from the
+    # best evaluated prior. Configs outside the (possibly clamped) box were
+    # skipped earlier — never attempted, no budget, no patience effect — and
+    # accounted via rewarm_skipped_outside_space /
     # deferred_skipped_outside_space.
-    for d_params in [*proposals_in_space, *deferred_in_space]:
+    upfront_configs = [(params, True) for params in proposals_in_space]
+    upfront_configs += [(params, False) for params in deferred_in_space]
+    for d_params, charge_to_budget in upfront_configs:
+        if charge_to_budget and evals >= args.max_evals:
+            # Proposals displace the evals budget; once it is spent the
+            # remaining proposals are dropped (deferred extras still run).
+            continue
         try:
             ensure_deep_tune_time_remaining(time_budget)
         except DeepTuneTimeExhausted:
@@ -645,6 +654,8 @@ def main() -> int:
             early_stop_reason = "time_budget"
             break
         if not preflight_ok:
+            if charge_to_budget:
+                evals += 1
             identity = params_identity(params)
             attempted_identities.add(identity)
             known_infeasible.add(identity)
@@ -706,6 +717,8 @@ def main() -> int:
             break
         except Exception as exc:
             trials_attempted += 1
+            if charge_to_budget:
+                evals += 1
             identity = params_identity(params)
             attempted_identities.add(identity)
             if is_config_infeasible_error(exc):
@@ -730,6 +743,8 @@ def main() -> int:
                 break
             continue
         trials_attempted += 1
+        if charge_to_budget:
+            evals += 1
         append_trial(args.tune_report_json, "cmaes", {"params": params, "score": score})
         identity = params_identity(params)
         attempted_identities.add(identity)

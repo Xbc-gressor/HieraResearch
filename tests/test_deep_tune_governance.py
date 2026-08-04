@@ -22,6 +22,7 @@ from _common import (  # noqa: E402
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
     ensure_deep_tune_time_remaining,
+    read_pending_proposals,
     set_stage_meta,
     timed_eval,
     timed_preflight,
@@ -770,6 +771,50 @@ class BoutAdmissionTest(unittest.TestCase):
         )
         candidate.write_text(source)
 
+    def _finalize_active_bout(
+        self, candidate, report_path, *, x, score, best
+    ) -> None:
+        """Close the running stage admission created, then finalize its bout."""
+        report = json.loads(report_path.read_text())
+        stage = report["phase_c"]["stages"][-1]
+        stage.pop(DEEP_TUNE_INVOCATION_STARTED_AT, None)
+        stage["status"] = "ok"
+        stage["trials"] = [{"params": {"x": x}, "score": score}]
+        stage["elapsed_seconds"] = 1.0
+        report["final_best_params"] = {"x": best}
+        report["final_best_score"] = best
+        report["applied_to_base_params"] = True
+        report["last_finalized_stage_index"] = (
+            len(report["phase_c"]["stages"]) - 1
+        )
+        report_path.write_text(json.dumps(report))
+        source = candidate.read_text()
+        start = source.index("BASE_PARAMS = ")
+        end = source.index("\n", start)
+        candidate.write_text(
+            source[:start] + f"BASE_PARAMS = {{'x': {best}}}" + source[end:]
+        )
+
+    def _run_validate_proposals_cli(
+        self, tmp, candidate, report_path, proposals
+    ) -> dict:
+        proposals_path = Path(tmp) / "proposals.json"
+        proposals_path.write_text(json.dumps(proposals))
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "tuners" / "tune_tools.py"),
+                "validate-proposals",
+                "--candidate-path", str(candidate),
+                "--tune-report-json", str(report_path),
+                "--proposals-json", str(proposals_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
     def test_new_bout_admitted_after_finalized_bout(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidate, report_path = self._fixture(Path(tmp))
@@ -842,6 +887,8 @@ class BoutAdmissionTest(unittest.TestCase):
     def test_validate_proposals_accepts_valid_and_rejects_rest(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidate, report_path = self._fixture(Path(tmp))
+            # Continuation-only: a finalized bout must exist first.
+            self._close_bout_zero(candidate, report_path, improved=False)
             proposals = [
                 {"x": 0.5},                    # valid, novel
                 {"x": 1.0},                    # already attempted (warm row)
@@ -863,15 +910,27 @@ class BoutAdmissionTest(unittest.TestCase):
     def test_validate_proposals_all_rejected_is_not_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidate, report_path = self._fixture(Path(tmp))
+            self._close_bout_zero(candidate, report_path, improved=False)
             result = validate_proposals(candidate, report_path, [{"x": 1.0}])
             self.assertFalse(result["ok"])
             self.assertEqual(result["accepted"], [])
 
-    def test_validate_proposals_cli_writes_pending_proposals(self):
+    def test_validate_proposals_rejected_before_first_bout(self):
+        """Re-warm proposals scope to continuations: no finalized bout, no admission."""
         with tempfile.TemporaryDirectory() as tmp:
             candidate, report_path = self._fixture(Path(tmp))
+            proposals = [{"x": 0.5}, {"x": 0.75}]
+            result = validate_proposals(candidate, report_path, proposals)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["proposed_count"], 2)
+            self.assertEqual(result["accepted"], [])
+            self.assertEqual(
+                [r["reason"] for r in result["rejected"]],
+                ["first_bout_has_no_rewarm"] * 2,
+            )
+            # The CLI exits 1 and writes nothing to the report.
             proposals_path = Path(tmp) / "proposals.json"
-            proposals_path.write_text(json.dumps([{"x": 0.5}, {"x": 9.0}]))
+            proposals_path.write_text(json.dumps(proposals))
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -884,11 +943,171 @@ class BoutAdmissionTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.returncode, 1)
+            self.assertNotIn("phase_c", json.loads(report_path.read_text()))
+
+    def test_validate_proposals_fails_closed_on_inconsistent_close(self):
+        """An applied_to_base_params claim without finalizable provenance is an
+        error, not a rejection: has_applied_close raises and it propagates."""
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            report = json.loads(report_path.read_text())
+            report["applied_to_base_params"] = True  # forged close
+            report_path.write_text(json.dumps(report))
+            with self.assertRaisesRegex(ValueError, "not finalizable"):
+                validate_proposals(candidate, report_path, [{"x": 0.25}])
+
+    def test_validate_proposals_cli_writes_pending_proposals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            self._close_bout_zero(candidate, report_path, improved=False)
+            result = self._run_validate_proposals_cli(
+                tmp, candidate, report_path, [{"x": 0.5}, {"x": 9.0}]
+            )
+            self.assertTrue(result["ok"])
             report = json.loads(report_path.read_text())
             self.assertEqual(
                 report["phase_c"]["pending_proposals"], [{"x": 0.5}]
             )
+            # The list is tagged with the bout it targets (the next new bout).
+            self.assertEqual(
+                report["phase_c"]["pending_proposals_bout_index"], 1
+            )
+
+    def test_stale_pending_proposals_cleared_at_new_bout_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            self._close_bout_zero(candidate, report_path, improved=False)
+            self._run_validate_proposals_cli(
+                tmp, candidate, report_path, [{"x": 0.6}]
+            )
+            # Bout 1 admission keeps THIS bout's freshly validated proposals:
+            # the orchestrator validates before launching the search, so the
+            # clear must not wipe the list written for the bout now starting.
+            budget = deep_tune_time_budget(candidate, report_path, "grid")
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["phase_c"]["pending_proposals"], [{"x": 0.6}])
+            self.assertEqual(report["phase_c"]["pending_proposals_bout_index"], 1)
+            budget["_phase_c_lock_handle"].close()
+            # Bout 1 attempts the proposal and finalizes; the consumed list
+            # stays in the report (nothing deletes it at consumption).
+            self._finalize_active_bout(
+                candidate, report_path, x=0.6, score=0.6, best=0.6
+            )
+            # Bout 2 starts with no new validate-proposals call: the leftover
+            # from bout 1 must be cleared at admission, never re-consumed.
+            budget = deep_tune_time_budget(candidate, report_path, "grid")
+            try:
+                self.assertEqual(budget["bout_index"], 2)
+                report = json.loads(report_path.read_text())
+                self.assertNotIn("pending_proposals", report["phase_c"])
+                self.assertNotIn(
+                    "pending_proposals_bout_index", report["phase_c"]
+                )
+                self.assertEqual(read_pending_proposals(report_path), [])
+            finally:
+                budget["_phase_c_lock_handle"].close()
+
+    def test_fresh_proposals_for_new_bout_survive_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            self._close_bout_zero(candidate, report_path, improved=False)
+            self._run_validate_proposals_cli(
+                tmp, candidate, report_path, [{"x": 0.6}]
+            )
+            budget = deep_tune_time_budget(candidate, report_path, "grid")
+            budget["_phase_c_lock_handle"].close()
+            # The proposal is never attempted (the bout closes on another
+            # trial), so the tagged list is a genuine leftover.
+            self._finalize_active_bout(
+                candidate, report_path, x=1.8, score=1.8, best=1.0
+            )
+            # A fresh validate-proposals for bout 2 rewrites the list with the
+            # new tag; admission must keep it, not clear it as stale.
+            self._run_validate_proposals_cli(
+                tmp, candidate, report_path, [{"x": 0.7}]
+            )
+            budget = deep_tune_time_budget(candidate, report_path, "grid")
+            try:
+                self.assertEqual(budget["bout_index"], 2)
+                report = json.loads(report_path.read_text())
+                self.assertEqual(
+                    report["phase_c"]["pending_proposals"], [{"x": 0.7}]
+                )
+                self.assertEqual(
+                    report["phase_c"]["pending_proposals_bout_index"], 2
+                )
+            finally:
+                budget["_phase_c_lock_handle"].close()
+
+    def test_continuation_bout_proposals_displace_search_trials(self):
+        """A continuation bout spends at most trial_cap objective attempts:
+        proposals first, then deferred, then the grid sweep."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate, report_path = self._fixture(root)
+            report = json.loads(report_path.read_text())
+            report["phase_a"]["deferred_configs"] = [
+                {"params": {"x": 0.25}},
+                {"params": {"x": 1.75}},
+            ]
+            report_path.write_text(json.dumps(report))
+            self._close_bout_zero(candidate, report_path, improved=False)
+            self._run_validate_proposals_cli(
+                tmp, candidate, report_path, [{"x": 0.5}, {"x": 0.75}]
+            )
+            train_module = mock.Mock(
+                SEARCH_SPACE={"x": ("float", 0.0, 2.0)},
+                BASE_PARAMS={"x": 1.0},
+                make_model=object(),
+            )
+
+            with mock.patch(
+                "grid_search.load_candidate_modules",
+                return_value=(train_module, object()),
+            ), mock.patch(
+                "grid_search.resolve_score_fn", return_value=object()
+            ), mock.patch(
+                "grid_search.resolve_preflight_fn", return_value=None
+            ), mock.patch(
+                "grid_search.timed_eval",
+                # Improving scores keep patience from firing before the cap.
+                side_effect=[0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6],
+            ) as timed_eval_mock, mock.patch(
+                "grid_search.write_json"
+            ) as write_result, mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "grid_search.py",
+                    "--candidate-path",
+                    str(candidate),
+                    "--tune-report-json",
+                    str(report_path),
+                    "--resolution",
+                    "3",
+                    "--max-trials",
+                    "5",
+                ],
+            ):
+                self.assertEqual(grid_main(), 0)
+
+            # trial_cap (5) bounds the whole bout: 2 proposals + 2 deferred +
+            # 1 grid point. The unseen grid sweep had 2 more points
+            # ({0.0, 2.0}); without the cap the bout would spend 6.
+            attempted = [
+                call.args[2] for call in timed_eval_mock.call_args_list
+            ]
+            self.assertEqual(len(attempted), 5)
+            self.assertEqual(
+                attempted[:4],
+                [{"x": 0.5}, {"x": 0.75}, {"x": 0.25}, {"x": 1.75}],
+            )
+            self.assertIn(attempted[4], ({"x": 0.0}, {"x": 2.0}))
+            result = write_result.call_args.args[0]
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["trials_attempted"], 5)
+            self.assertEqual(result["early_stop_reason"], "max_trials")
 
 
 class CloseExhaustedStageTest(unittest.TestCase):

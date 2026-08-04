@@ -3025,6 +3025,13 @@ def validate_proposals(
 ) -> dict:
     """Validate LLM re-warm proposals for a continuation tuning bout.
 
+    Continuation-only (spec §6): proposals re-warm the NEXT bout, which
+    exists only after an earlier bout closed applied. When the report has no
+    finalized bout yet, every proposal is rejected with reason
+    ``first_bout_has_no_rewarm`` and nothing is written. An inconsistent
+    close makes ``has_applied_close`` raise ValueError; that propagates
+    (fail closed).
+
     Deterministic disposal of LLM-proposed configs: each proposal must be a
     param dict with the exact SEARCH_SPACE key set, in-bounds values, and a
     novel config identity (against every attempted config and earlier
@@ -3035,17 +3042,28 @@ def validate_proposals(
         attempted_config_identities,
         cast_params_to_search_space,
         params_identity,
+        read_tune_report,
     )
 
     candidate_path = Path(candidate_path)
     report_path = Path(report_path)
+    if not isinstance(proposals, list):
+        proposals = []
+    if not has_applied_close(read_tune_report(report_path)):
+        return {
+            "ok": False,
+            "proposed_count": len(proposals),
+            "accepted": [],
+            "rejected": [
+                {"index": index, "reason": "first_bout_has_no_rewarm"}
+                for index in range(len(proposals))
+            ],
+        }
     search_space = _read_search_space(candidate_path)
     schema = _read_param_schema(candidate_path)
     seen = attempted_config_identities(report_path, search_space)
     accepted: list = []
     rejected: list = []
-    if not isinstance(proposals, list):
-        proposals = []
     for index, params in enumerate(proposals):
         if not isinstance(params, dict):
             rejected.append({"index": index, "reason": "params_must_be_object"})
@@ -3548,11 +3566,23 @@ def cmd_validate_proposals(args) -> int:
         args.candidate_path, args.tune_report_json, proposals
     )
     if result["accepted"]:
-        from _common import read_tune_report, write_tune_report
+        from _common import (
+            read_tune_report,
+            stages_by_bout,
+            write_tune_report,
+        )
 
         report = read_tune_report(args.tune_report_json)
-        report.setdefault("phase_c", {}).setdefault("stages", [])
-        report["phase_c"]["pending_proposals"] = result["accepted"]
+        phase_c = report.setdefault("phase_c", {})
+        phase_c.setdefault("stages", [])
+        phase_c["pending_proposals"] = result["accepted"]
+        # Tag the list with the bout it targets: the next new bout this
+        # report can admit. New-bout admission clears lists whose tag does
+        # not match, so leftovers from an earlier bout are never re-consumed
+        # while this bout's freshly validated list survives.
+        phase_c["pending_proposals_bout_index"] = len(
+            stages_by_bout(phase_c["stages"])
+        )
         write_tune_report(args.tune_report_json, report)
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1

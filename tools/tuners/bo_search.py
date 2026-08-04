@@ -495,8 +495,8 @@ def main() -> int:
 
     # Deferred warm configs (proposed at step 0+1 but not evaluated there): enqueue
     # them as the FIRST trials so BO evaluates them before TPE. They are EXTRA points
-    # on top of the TPE budget (n_trials += n_enqueued), so deep-search depth is
-    # unchanged — the saving was purely the evals skipped on un-promoted candidates.
+    # on top of the TPE budget (n_trials += n_deferred_enqueued), so deep-search depth
+    # is unchanged — the saving was purely the evals skipped on un-promoted candidates.
     # Deferred warm configs outside the (possibly clamped) box are skipped —
     # never attempted, no budget, no patience effect; the clamp marked that
     # region infeasible. The skip is accounted via deferred_skipped_outside_space.
@@ -505,13 +505,47 @@ def main() -> int:
     )
     # Validated LLM re-warm proposals go ahead of even the deferred configs;
     # enqueue order is preserved, so they become the first WAITING trials.
+    # Unlike deferred configs they are NOT extra: they displace TPE draws
+    # inside the bout's trial budget (spec §6), so their count never extends
+    # n_trials. Rejection receipts stay distinct per class.
     proposals_in_space, proposals_outside = split_configs_by_space(
         read_pending_proposals(args.tune_report_json), search_space
     )
     try:
-        n_enqueued = _enqueue_unique_deferred(
+        n_proposals_enqueued = _enqueue_unique_deferred(
             study,
-            proposals_in_space + deferred_in_space,
+            proposals_in_space,
+            search_space,
+            distributions,
+        )
+    except DeferredConfigError as exc:
+        set_stage_meta(
+            args.tune_report_json,
+            "bo",
+            bout_index=time_budget["bout_index"],
+            status="failed",
+            rejected_priors=rejected_priors,
+            infeasible_priors_injected=n_infeasible_injected,
+            infeasible_prior_rejections=len(infeasible_rejections),
+            rewarm_proposal_rejections=exc.rejections,
+        )
+        write_json(
+            {
+                "method": "bo",
+                "status": "failed",
+                "reason": str(exc),
+                "prior_trials_injected": n_priors_injected,
+                "rejected_priors": rejected_priors,
+                "infeasible_priors_injected": n_infeasible_injected,
+                "infeasible_prior_rejections": infeasible_rejections,
+                "rewarm_proposal_rejections": exc.rejections,
+            }
+        )
+        return 0
+    try:
+        n_deferred_enqueued = _enqueue_unique_deferred(
+            study,
+            deferred_in_space,
             search_space,
             distributions,
         )
@@ -550,10 +584,13 @@ def main() -> int:
         infeasible_prior_rejections=len(infeasible_rejections),
         deferred_rejections=[],
         deferred_skipped_outside_space=len(deferred_outside),
-        rewarm_proposals_enqueued=len(proposals_in_space),
+        rewarm_proposals_enqueued=n_proposals_enqueued,
         rewarm_skipped_outside_space=len(proposals_outside),
     )
-    n_trials = n_trials + n_enqueued
+    # Only the deferred extras enlarge the TPE budget; enqueued proposals
+    # consume the first of the existing n_trials slots.
+    n_enqueued = n_proposals_enqueued + n_deferred_enqueued
+    n_trials = n_trials + n_deferred_enqueued
 
     # Seed best AND streak from the persisted trial history: a restarted study
     # continues the patience window instead of getting a fresh one.
@@ -843,7 +880,7 @@ def main() -> int:
     model_driven_trials = 0
     random_fallback_trials = 0
     for index, run_trial in enumerate(study.trials[completes:]):
-        if index >= n_enqueued:  # enqueued deferred are not sampler draws
+        if index >= n_enqueued:  # enqueued proposals/deferred are not sampler draws
             if completes >= n_startup:
                 model_driven_trials += 1
             else:
