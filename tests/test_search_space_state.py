@@ -40,7 +40,10 @@ from search_space_state import (  # noqa: E402
     validate_point_eligibility,
     validate_search_space_state,
 )
-from semantic_evidence import build_semantic_edges  # noqa: E402
+from semantic_evidence import (  # noqa: E402
+    build_semantic_edges,
+    target_evaluation_state,
+)
 from semantic_search import (  # noqa: E402
     build_proposal_set,
     cmd_select,
@@ -584,6 +587,102 @@ class ExperienceTransitionTests(unittest.TestCase):
         second = append_experience_transitions(self.registry, self.ledger)
         self.assertEqual(second[0]["from_status"], "deprioritized")
         self.assertEqual(second[0]["to_status"], "pruned")
+
+    def _regrade_lightly(self, *run_ids: str) -> None:
+        """Re-grade fixture comparator children as lightly tuned in place."""
+        for record in self.ledger["records"]:
+            if record["run_id"] in run_ids:
+                record["evaluation_depth"] = "tuned_lightly"
+
+    def _third_lightly_edge(self) -> None:
+        """Add a third matched pair and grade its child tuned_lightly."""
+        self.advance_dag_cursor()
+        self._regrade_lightly(self.additional_evidence_run_ids[-1])
+
+    def test_deprioritize_allows_three_lightly_tuned_edges(self) -> None:
+        # Zero tuned + three lightly-tuned agreeing direct edges clear the
+        # contradiction-grade depth bar: unpromising/med deprioritizes.
+        self._regrade_lightly("001", "003")
+        self._third_lightly_edge()
+        experience = self.experience(generation=1)
+        entry = experience["hypothesis_evidence"][0]
+        entry["recommended_status"] = "deprioritized"
+        entry["confidence"] = "med"
+        entry["comparator_coverage"] = {
+            "direct_tuned_edges": 0,
+            "direct_lightly_tuned_edges": 3,
+            "direct_noncrash_edges": 0,
+            "confounded_noncrash_edges": 0,
+            "crash_edges": 0,
+        }
+        self.ledger["experience"] = experience
+        first = append_experience_transitions(self.registry, self.ledger)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["from_status"], "active")
+        self.assertEqual(first[0]["to_status"], "deprioritized")
+        self.assertEqual(first[0]["schema_version"], 3)
+        self.assertEqual(
+            validate_search_space_state(self.registry, self.ledger), []
+        )
+
+    def test_prune_allows_two_tuned_or_three_lightly(self) -> None:
+        # Legacy: two tuned direct edges still carry the two-stage prune.
+        self.ledger["experience"] = self.experience(generation=1)
+        first = append_experience_transitions(self.registry, self.ledger)
+        self.assertEqual(first[0]["to_status"], "deprioritized")
+        self.advance_dag_cursor()
+        self.ledger["experience"] = self.experience(generation=2)
+        second = append_experience_transitions(self.registry, self.ledger)
+        self.assertEqual(second[0]["from_status"], "deprioritized")
+        self.assertEqual(second[0]["to_status"], "pruned")
+
+        # Depth-aware: three lightly-tuned direct edges (zero tuned) at high
+        # confidence carry the same two-stage prune.
+        self.setUp()
+        self._regrade_lightly("001", "003")
+        self._third_lightly_edge()
+        self.ledger["experience"] = self.experience(generation=1)
+        first = append_experience_transitions(self.registry, self.ledger)
+        self.assertEqual(first[0]["to_status"], "deprioritized")
+        self._third_lightly_edge()
+        self.ledger["experience"] = self.experience(generation=2)
+        second = append_experience_transitions(self.registry, self.ledger)
+        self.assertEqual(second[0]["from_status"], "deprioritized")
+        self.assertEqual(second[0]["to_status"], "pruned")
+
+    def test_two_lightly_tuned_edges_do_not_transition(self) -> None:
+        # Exactly two lightly-tuned direct edges (zero tuned) cover the
+        # comparator but stay below the contradiction-grade depth bar, so the
+        # recommendation is gated out and the target stays active.
+        self._regrade_lightly("001", "003")
+        self.assertEqual(
+            target_evaluation_state(
+                self.ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_run_ids=["000", "001", "002", "003"],
+                evidence_edge_ids=["sedge-000-001", "sedge-002-003"],
+            ),
+            "comparator_covered",
+        )
+        experience = self.experience(generation=1)
+        entry = experience["hypothesis_evidence"][0]
+        entry["comparator_coverage"] = {
+            "direct_tuned_edges": 0,
+            "direct_lightly_tuned_edges": 2,
+            "direct_noncrash_edges": 0,
+            "confounded_noncrash_edges": 0,
+            "crash_edges": 0,
+        }
+        self.ledger["experience"] = experience
+        self.assertEqual(
+            append_experience_transitions(self.registry, self.ledger), []
+        )
+        self.assertEqual(self.ledger["search_space_state"]["revision"], 0)
+        replayed = replay_search_space_state(
+            self.registry, self.ledger["search_space_state"]
+        )
+        self.assertEqual(replayed["hypotheses"]["hyp-data-filtered"], "active")
 
     def test_mixed_matched_control_directions_cannot_contract_target(self) -> None:
         # Keep two direct controls but make the second one favor the selected

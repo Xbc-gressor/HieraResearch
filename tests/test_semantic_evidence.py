@@ -21,6 +21,7 @@ from semantic_evidence import (  # noqa: E402
     edge_observation,
     experience_cited_ids,
     mechanical_gain_direction,
+    normalize_coverage,
     render_target_evidence,
     target_evaluation_state,
     validate_parameter_transfer_binding,
@@ -444,6 +445,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             ),
             {
                 "direct_tuned_edges": 0,
+                "direct_lightly_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 1,
                 "crash_edges": 0,
@@ -460,6 +462,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         both = ["sedge-000-001", "sedge-002-003"]
         expected = {
             "direct_tuned_edges": 2,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
@@ -480,7 +483,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             comparator_coverage(
                 ledger, both, target_kind="hypothesis", target_id="hyp-model-linear"
             ),
-            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             comparator_coverage(
@@ -489,7 +492,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
                 target_kind="hypothesis",
                 target_id="hyp-data-filtered",
             ),
-            {"direct_tuned_edges": 1, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 1, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             comparator_coverage(
@@ -498,8 +501,175 @@ class SemanticEdgeObservationTests(unittest.TestCase):
                 target_kind="hypothesis",
                 target_id="hyp-data-filtered",
             ),
-            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
+
+    def test_lightly_tuned_edges_have_their_own_bucket(self) -> None:
+        # A direct comparator whose child is tuned_lightly increments
+        # direct_lightly_tuned_edges, not direct_tuned_edges and not
+        # direct_noncrash_edges.
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        _append(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append(
+            records,
+            "001",
+            ["000"],
+            filtered,
+            status="discard",
+            score=0.50,
+            dag_revision=2,
+            depth="tuned_lightly",
+        )
+        ledger = {"records": records, "dag_revision": 2}
+        self.assertEqual(
+            comparator_coverage(
+                ledger,
+                ["sedge-000-001"],
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+            ),
+            {
+                "direct_tuned_edges": 0,
+                "direct_lightly_tuned_edges": 1,
+                "direct_noncrash_edges": 0,
+                "confounded_noncrash_edges": 0,
+                "crash_edges": 0,
+            },
+        )
+
+    def test_comparator_covered_accepts_two_lightly_tuned_edges(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        _append(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append(
+            records,
+            "001",
+            ["000"],
+            filtered,
+            status="discard",
+            score=0.50,
+            dag_revision=2,
+            depth="tuned_lightly",
+        )
+        _append(records, "002", [], baseline, status="keep", score=0.41, dag_revision=3)
+        _append(
+            records,
+            "003",
+            ["002"],
+            filtered,
+            status="discard",
+            score=0.52,
+            dag_revision=4,
+            depth="tuned_lightly",
+        )
+        ledger = {"records": records, "dag_revision": 4}
+        edges = ["sedge-000-001", "sedge-002-003"]
+
+        def state(run_ids: list[str], edge_ids: list[str]) -> str:
+            return target_evaluation_state(
+                ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_run_ids=run_ids,
+                evidence_edge_ids=edge_ids,
+            )
+
+        self.assertEqual(state(["000", "001", "002", "003"], edges), "comparator_covered")
+        # One tuned plus one lightly-tuned direct edge also covers.
+        records[3]["evaluation_depth"] = "tuned"
+        self.assertEqual(state(["000", "001", "002", "003"], edges), "comparator_covered")
+        # A single lightly-tuned edge is a non-crash observation, not a failure.
+        records[3]["evaluation_depth"] = "tuned_lightly"
+        self.assertEqual(state([], ["sedge-000-001"]), "observed")
+
+    def test_mechanical_gain_direction_depth_bar(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
+        )
+        records: list[dict] = []
+        _append(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append(records, "001", ["000"], filtered, status="keep", score=0.30, dag_revision=2)
+        _append(records, "002", [], baseline, status="keep", score=0.41, dag_revision=3)
+        _append(records, "003", ["002"], filtered, status="keep", score=0.31, dag_revision=4)
+        _append(records, "004", [], baseline, status="keep", score=0.42, dag_revision=5)
+        _append(records, "005", ["004"], filtered, status="keep", score=0.32, dag_revision=6)
+        ledger = {"records": records, "dag_revision": 6}
+        edges = ["sedge-000-001", "sedge-002-003", "sedge-004-005"]
+
+        def direction(edge_ids: list[str]) -> str:
+            return mechanical_gain_direction(
+                ledger,
+                target_kind="hypothesis",
+                target_id="hyp-data-filtered",
+                evidence_edge_ids=edge_ids,
+            )
+
+        # Legacy: two agreeing tuned controls orient a direction.
+        self.assertEqual(direction(edges[:2]), "positive")
+        # Two agreeing lightly-tuned controls stay below the bar and abstain.
+        for run_id in ("001", "003", "005"):
+            records[int(run_id)]["evaluation_depth"] = "tuned_lightly"
+        self.assertEqual(direction(edges[:2]), "none")
+        # Three agreeing lightly-tuned controls clear the depth bar.
+        self.assertEqual(direction(edges), "positive")
+        # Mixed tuned/lightly-tuned controls also orient in numbers.
+        records[1]["evaluation_depth"] = "tuned"
+        self.assertEqual(direction(edges), "positive")
+
+    def test_legacy_coverage_receipts_normalize(self) -> None:
+        # The four-key (schema-2) and three-key (schema-1) coverage shapes read
+        # forward with direct_lightly_tuned_edges at 0.
+        four_key = {
+            "direct_tuned_edges": 2,
+            "direct_noncrash_edges": 1,
+            "confounded_noncrash_edges": 1,
+            "crash_edges": 0,
+        }
+        self.assertEqual(
+            normalize_coverage(four_key),
+            {
+                "direct_tuned_edges": 2,
+                "direct_lightly_tuned_edges": 0,
+                "direct_noncrash_edges": 1,
+                "confounded_noncrash_edges": 1,
+                "crash_edges": 0,
+            },
+        )
+        three_key = {
+            "direct_noncrash_edges": 1,
+            "confounded_noncrash_edges": 1,
+            "crash_edges": 0,
+        }
+        self.assertEqual(
+            normalize_coverage(three_key),
+            {
+                "direct_tuned_edges": 0,
+                "direct_lightly_tuned_edges": 0,
+                "direct_noncrash_edges": 1,
+                "confounded_noncrash_edges": 1,
+                "crash_edges": 0,
+            },
+        )
+        five_key = {
+            "direct_tuned_edges": 1,
+            "direct_lightly_tuned_edges": 2,
+            "direct_noncrash_edges": 0,
+            "confounded_noncrash_edges": 0,
+            "crash_edges": 0,
+        }
+        self.assertEqual(normalize_coverage(five_key), five_key)
+        self.assertIsNone(normalize_coverage({"direct_tuned_edges": 1}))
 
     def test_gain_direction_uses_repeated_control_scores_not_final_tuning(self) -> None:
         registry = fixture_registry()
@@ -881,6 +1051,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             ),
             {
                 "direct_tuned_edges": 0,
+                "direct_lightly_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -909,6 +1080,7 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             block["comparator_coverage"],
             {
                 "direct_tuned_edges": 0,
+                "direct_lightly_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -936,13 +1108,13 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             comparator_coverage(
                 ledger, edge_ids, target_kind="hypothesis", target_id="hyp-model-multibranch"
             ),
-            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 0},
         )
         self.assertEqual(
             comparator_coverage(
                 ledger, edge_ids, target_kind="hypothesis", target_id="hyp-data-filtered"
             ),
-            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 1},
+            {"direct_tuned_edges": 0, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 1},
         )
 
     def test_target_evaluation_state_machine(self) -> None:
@@ -1053,15 +1225,15 @@ class TargetEvidenceViewTests(unittest.TestCase):
         self.assertEqual(block["evidence_edge_ids"], ["sedge-000-001", "sedge-002-003"])
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["available_comparator_coverage"],
-            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["omitted_edge_counts"],
-            {"direct_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 0, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["edges"],
@@ -1090,15 +1262,15 @@ class TargetEvidenceViewTests(unittest.TestCase):
         )
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_tuned_edges": 3, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 1},
+            {"direct_tuned_edges": 3, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 1},
         )
         self.assertEqual(
             block["available_comparator_coverage"],
-            {"direct_tuned_edges": 4, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
+            {"direct_tuned_edges": 4, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
         )
         self.assertEqual(
             block["omitted_edge_counts"],
-            {"direct_tuned_edges": 1, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 0},
+            {"direct_tuned_edges": 1, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 1, "crash_edges": 0},
         )
         self.assertEqual(block["evidence_run_ids"], ["002", "003", "004", "005", "006"])
         self.assertEqual(block["evaluation_state"], "comparator_covered")
@@ -1116,15 +1288,15 @@ class TargetEvidenceViewTests(unittest.TestCase):
         )
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(
             block["available_comparator_coverage"],
-            {"direct_tuned_edges": 4, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
+            {"direct_tuned_edges": 4, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
         )
         self.assertEqual(
             block["omitted_edge_counts"],
-            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
+            {"direct_tuned_edges": 2, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 2, "crash_edges": 1},
         )
         self.assertEqual(view["bounds"]["max_edges_per_target"], 2)
         self.assertLessEqual(len(block["edges"]), view["bounds"]["max_edges_per_target"])
@@ -1196,7 +1368,7 @@ class TargetEvidenceViewTests(unittest.TestCase):
         self.assertEqual(block["evidence_edge_ids"], ["sedge-000-001", "sedge-002-003"])
         self.assertEqual(
             block["comparator_coverage"],
-            {"direct_tuned_edges": 2, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
+            {"direct_tuned_edges": 2, "direct_lightly_tuned_edges": 0, "direct_noncrash_edges": 0, "confounded_noncrash_edges": 0, "crash_edges": 0},
         )
         self.assertEqual(block["evaluation_state"], "comparator_covered")
 

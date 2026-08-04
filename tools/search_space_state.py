@@ -32,6 +32,7 @@ from typing import Any
 from semantic_evidence import (
     COVERAGE_KEYS,
     TERMINAL_STATUSES,
+    _contradiction_depth_bar,
     comparator_coverage,
     edge_observation,
     mechanical_gain_direction,
@@ -42,12 +43,14 @@ from semantic_space import dimension_map, hypothesis_map, selected_assignments
 
 
 STATE_SCHEMA_VERSION = 1
-DECISION_SCHEMA_VERSION = 2
-# Decision schema 2 carries the four-key `comparator_coverage` that split
-# `direct_tuned_edges` out of `direct_noncrash_edges`. Schema-1 receipts are
-# append-only history and stay valid: their three-key coverage normalizes
-# forward on read. New decisions are always written at the current version.
-READABLE_DECISION_SCHEMA_VERSIONS = {1, 2}
+DECISION_SCHEMA_VERSION = 3
+# Decision schema 3 carries the five-key `comparator_coverage` that split
+# `direct_lightly_tuned_edges` out of the direct bucket (schema 2 had four
+# keys, schema 1 three). Schema-1/2 receipts are append-only history and stay
+# valid: their coverage normalizes forward on read with the newer
+# direct-depth buckets at 0. New decisions are always written at the current
+# version.
+READABLE_DECISION_SCHEMA_VERSIONS = {1, 2, 3}
 RUNTIME_STATUSES = {"active", "deprioritized", "pruned"}
 LEGAL_TRANSITIONS = {
     ("active", "deprioritized"),
@@ -492,7 +495,7 @@ def _effective_recommendation(
         belief.get("assessment") == "unpromising"
         and belief.get("confidence") in {"med", "high"}
         and evaluation_state == "comparator_covered"
-        and coverage["direct_tuned_edges"] >= 2
+        and _contradiction_depth_bar(coverage)
         and (
             target_kind != "hypothesis"
             or mechanical_direction == "negative"
@@ -506,7 +509,7 @@ def _effective_recommendation(
     prune_ok = (
         belief.get("confidence") == "high"
         and evaluation_state == "comparator_covered"
-        and coverage["direct_tuned_edges"] >= 2
+        and _contradiction_depth_bar(coverage)
     )
     return "pruned" if prune_ok else "deprioritized"
 

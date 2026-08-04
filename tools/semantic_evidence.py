@@ -55,8 +55,21 @@ MAX_RUNS_PER_TARGET = 5
 MAX_COMPARATOR_GAIN_ADJUSTMENT = 0.15
 MAX_EVIDENCE_UNCERTAINTY_ADJUSTMENT = 0.10
 
+# Contradiction-grade depth bar: >=MIN_EDGES_PER_TARGET direct tuned edges, or
+# >=DEPTH_BAR_LIGHT_MIN direct edges at tuned_lightly or deeper.
+DEPTH_BAR_LIGHT_MIN = 3
+
+
+def _contradiction_depth_bar(coverage: dict) -> bool:
+    """Whether a coverage receipt clears the contradiction-grade depth bar."""
+    tuned = coverage.get("direct_tuned_edges", 0)
+    light = coverage.get("direct_lightly_tuned_edges", 0)
+    return tuned >= MIN_EDGES_PER_TARGET or (tuned + light) >= DEPTH_BAR_LIGHT_MIN
+
+
 COVERAGE_KEYS = (
     "direct_tuned_edges",
+    "direct_lightly_tuned_edges",
     "direct_noncrash_edges",
     "confounded_noncrash_edges",
     "crash_edges",
@@ -69,15 +82,26 @@ LEGACY_COVERAGE_KEYS = (
     "confounded_noncrash_edges",
     "crash_edges",
 )
+# Coverage shape before `direct_lightly_tuned_edges` split lightly-tuned
+# direct comparators into their own bucket. Schema-2 artifacts and decision
+# receipts carry exactly these four keys.
+SCHEMA_2_COVERAGE_KEYS = (
+    "direct_tuned_edges",
+    "direct_noncrash_edges",
+    "confounded_noncrash_edges",
+    "crash_edges",
+)
 
 
 def normalize_coverage(raw: Any) -> dict[str, int] | None:
-    """Read either coverage shape, or return None if it is neither.
+    """Read any known coverage shape, or return None if it is none of them.
 
-    A legacy three-key map is read forward with ``direct_tuned_edges`` at 0:
-    it predates the depth split, so none of its direct edges are known to be
-    tuned and the conservative reading is that none were. Callers must treat
-    the result as backward-readable evidence, never as a recomputed claim.
+    Legacy maps are read forward with the newer direct-depth buckets at 0: the
+    three-key shape predates the tuned split and the four-key shape predates
+    the lightly-tuned split, so their direct edges are not known to be tuned
+    (or lightly tuned) and the conservative reading is that none were.
+    Callers must treat the result as backward-readable evidence, never as a
+    recomputed claim.
     """
     if not isinstance(raw, dict):
         return None
@@ -93,11 +117,22 @@ def normalize_coverage(raw: Any) -> dict[str, int] | None:
 
     if set(raw) == set(COVERAGE_KEYS):
         return _counts(COVERAGE_KEYS)
+    if set(raw) == set(SCHEMA_2_COVERAGE_KEYS):
+        counts = _counts(SCHEMA_2_COVERAGE_KEYS)
+        if counts is None:
+            return None
+        return {
+            "direct_tuned_edges": counts["direct_tuned_edges"],
+            "direct_lightly_tuned_edges": 0,
+            "direct_noncrash_edges": counts["direct_noncrash_edges"],
+            "confounded_noncrash_edges": counts["confounded_noncrash_edges"],
+            "crash_edges": counts["crash_edges"],
+        }
     if set(raw) == set(LEGACY_COVERAGE_KEYS):
         counts = _counts(LEGACY_COVERAGE_KEYS)
         if counts is None:
             return None
-        return {"direct_tuned_edges": 0, **counts}
+        return {"direct_tuned_edges": 0, "direct_lightly_tuned_edges": 0, **counts}
     return None
 DIRECT_COMPARATOR_CAPABILITY_KEY = "direct_comparator_capability"
 DIRECT_COMPARATOR_CAPABILITY = {
@@ -354,7 +389,7 @@ def acquisition_conditioning(
                 }.get(direction, "none")
             comparator_gain = (
                 item.get("evaluation_state") == "comparator_covered"
-                and coverage["direct_tuned_edges"] >= MIN_EDGES_PER_TARGET
+                and _contradiction_depth_bar(coverage)
                 and direction in {"positive", "negative"}
             )
             rendered.append(
@@ -511,7 +546,7 @@ def validate_conditioned_adjustment(
             "comparator_gain"
             if (
                 item.get("evaluation_state") == "comparator_covered"
-                and coverage["direct_tuned_edges"] >= MIN_EDGES_PER_TARGET
+                and _contradiction_depth_bar(coverage)
                 and item.get("gain_direction") in {"positive", "negative"}
             )
             else "uncertainty_only"
@@ -1604,13 +1639,16 @@ def _coverage_category(
     if "crash" in statuses:
         return "crash_edges"
     if matched_inherited_control(ledger, receipt) is not None:
-        # A direct comparator is contradiction-grade only when the child was
-        # deep-tuned: screening-only children measure the hypothesis at one
-        # parameter point. Legacy records without evaluation_depth read as
-        # screening and fail closed into the weaker category.
+        # A direct comparator is contradiction-grade when the child was
+        # deep-tuned, intermediate at `tuned_lightly`; legacy records without
+        # evaluation_depth read as screening and fail closed into the weaker
+        # category.
         child = records.get(str(receipt.get("child_run_id")), {})
-        if child.get("evaluation_depth") == "tuned":
+        depth = child.get("evaluation_depth")
+        if depth == "tuned":
             return "direct_tuned_edges"
+        if depth == "tuned_lightly":
+            return "direct_lightly_tuned_edges"
         return "direct_noncrash_edges"
     return "confounded_noncrash_edges"
 
@@ -1643,23 +1681,26 @@ def mechanical_gain_direction(
     """Orient repeated paired semantic-control deltas for one hypothesis.
 
     A negative target-present score effect is mechanically favorable because
-    scores are lower-is-better.  At least two direct controls must agree in
-    sign.  Mixed, zero, legacy final-vs-final, reset-bearing, and crash edges
-    all abstain.
+    scores are lower-is-better.  Direct controls must clear the contradiction
+    depth bar and agree in sign: at least two tuned, or at least three at
+    tuned_lightly or deeper.  Mixed, zero, legacy final-vs-final,
+    reset-bearing, and crash edges all abstain.
     """
     if target_kind != "hypothesis":
         return "none"
     records = _records_by_id(ledger)
     index = edge_index(ledger)
-    oriented_effects: list[float] = []
+    oriented_effects: list[tuple[float, bool]] = []
     for edge_id in dict.fromkeys(str(value) for value in evidence_edge_ids):
         receipt = index.get(edge_id)
         if receipt is None:
             continue
-        # Only tuned-child controls orient a direction: screening-depth
-        # controls measure one parameter point and abstain here.
+        # Tuned-child controls orient a direction at full weight;
+        # tuned_lightly controls orient only in numbers (the depth bar).
+        # Screening-depth controls measure one parameter point and abstain.
         child = records.get(str(receipt.get("child_run_id")), {})
-        if child.get("evaluation_depth") != "tuned":
+        depth = child.get("evaluation_depth")
+        if depth not in {"tuned", "tuned_lightly"}:
             continue
         matched = matched_inherited_control(ledger, receipt)
         if matched is None:
@@ -1669,15 +1710,21 @@ def mechanical_gain_direction(
             continue
         change = changes[0]
         delta = float(matched["semantic_delta"])
+        is_tuned = depth == "tuned"
         if change.get("to_hypothesis_id") == target_id:
-            oriented_effects.append(delta)
+            oriented_effects.append((delta, is_tuned))
         elif change.get("from_hypothesis_id") == target_id:
-            oriented_effects.append(-delta)
-    if len(oriented_effects) < MIN_EDGES_PER_TARGET:
+            oriented_effects.append((-delta, is_tuned))
+    strong = [effect for effect, is_tuned in oriented_effects if is_tuned]
+    effects = [effect for effect, _ in oriented_effects]
+    if not (
+        len(strong) >= MIN_EDGES_PER_TARGET
+        or len(effects) >= DEPTH_BAR_LIGHT_MIN
+    ):
         return "none"
-    if all(effect < -1e-12 for effect in oriented_effects):
+    if all(effect < -1e-12 for effect in effects):
         return "positive"
-    if all(effect > 1e-12 for effect in oriented_effects):
+    if all(effect > 1e-12 for effect in effects):
         return "negative"
     return "none"
 
@@ -1805,8 +1852,7 @@ def validate_conditioning_against_ledger(
             "comparator_gain"
             if (
                 expected_state == "comparator_covered"
-                and expected_coverage["direct_tuned_edges"]
-                >= MIN_EDGES_PER_TARGET
+                and _contradiction_depth_bar(expected_coverage)
                 and expected_direction in {"positive", "negative"}
             )
             else "uncertainty_only"
@@ -1867,10 +1913,14 @@ def target_evaluation_state(
         target_kind=target_kind,
         target_id=target_id,
     )
-    if coverage["direct_tuned_edges"] >= 2:
+    if (
+        coverage["direct_tuned_edges"] + coverage["direct_lightly_tuned_edges"]
+        >= MIN_EDGES_PER_TARGET
+    ):
         return "comparator_covered"
     noncrash_observation = (
         coverage["direct_tuned_edges"]
+        + coverage["direct_lightly_tuned_edges"]
         + coverage["direct_noncrash_edges"]
         + coverage["confounded_noncrash_edges"]
         > 0
@@ -1926,7 +1976,11 @@ def _target_block(
     # Direct comparators first, strongest depth first; each pool is already
     # recency-sorted. Screening-depth direct edges remain displayable direct
     # evidence — they just cannot drive contradiction gates.
-    direct = pools["direct_tuned_edges"] + pools["direct_noncrash_edges"]
+    direct = (
+        pools["direct_tuned_edges"]
+        + pools["direct_lightly_tuned_edges"]
+        + pools["direct_noncrash_edges"]
+    )
     confounded = pools["confounded_noncrash_edges"]
     crash = pools["crash_edges"]
 

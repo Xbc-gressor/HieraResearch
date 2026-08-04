@@ -178,8 +178,9 @@ target-related runs), `evidence_edge_ids` (0–5 unique persisted
 target-touching edges), `comparator_coverage`, `confidence`, `uncertainty`,
 and optional `reopen_when`. `evaluation_state` is mechanical: `unevaluated`
 (no cited terminal runs or edges), `failed` (cited evidence is crash-only),
-`observed` (a non-crash observation but fewer than two direct tuned
-edges), or `comparator_covered` (at least two direct tuned edges). A direct
+`observed` (a non-crash observation but fewer than two direct
+edges at `tuned_lightly` or deeper), or `comparator_covered` (at least two
+direct edges at `tuned_lightly` or deeper). A direct
 edge is not merely a one-dimension final-vs-final or inherited-parameter
 comparison: it requires a validated same-child-code control/treatment pair
 whose configs differ only in the declared semantic switch, the pinned parent
@@ -206,13 +207,16 @@ Recommendation gates are exact and identical for both levels:
   `confidence: low`, and `recommended_status: active`; a crash alone never
   contradicts a semantic element.
 - `deprioritized` requires `assessment: unpromising`, `confidence: med` or
-  `high`, `evaluation_state: comparator_covered`, at least two direct
-  tuned edges, and a non-empty `reopen_when`.
+  `high`, `evaluation_state: comparator_covered`, at least two direct tuned
+  edges or at least three direct edges at `tuned_lightly` or deeper, and a
+  non-empty `reopen_when`.
 - `pruned` requires `assessment: unpromising`, `confidence: high`,
-  `evaluation_state: comparator_covered`, at least two direct tuned
-  edges, and a non-empty `reopen_when`.
+  `evaluation_state: comparator_covered`, at least two direct tuned edges
+  or at least three direct edges at `tuned_lightly` or deeper, and a
+  non-empty `reopen_when`.
 - Every `promising` or `unpromising` claim requires
-  `comparator_covered` with at least two direct tuned edges.
+  `comparator_covered` with at least two direct tuned edges or at least
+  three direct edges at `tuned_lightly` or deeper.
 
 `unpromising` means that another outer-search evaluation has low expected
 marginal value after considering attribution, consistency, mechanism,

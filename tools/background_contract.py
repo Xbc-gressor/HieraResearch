@@ -46,6 +46,7 @@ from semantic_evidence import (
     MAX_HYPOTHESIS_TARGETS,
     MAX_RUNS_PER_TARGET,
     SemanticEvidenceError,
+    _contradiction_depth_bar,
     comparator_coverage,
     edge_index,
     mechanical_gain_direction,
@@ -2271,7 +2272,7 @@ def _validate_target_evidence(
         if confidence not in EXPERIENCE_CONFIDENCE:
             errors.append(f"{target}.confidence must be low, med, or high")
 
-        direct_edges = expected_coverage["direct_tuned_edges"]
+        depth_bar = _contradiction_depth_bar(expected_coverage)
         mechanical_direction = mechanical_gain_direction(
             ledger,
             target_kind=target_kind,
@@ -2289,7 +2290,7 @@ def _validate_target_evidence(
             assessment == "unpromising"
             and confidence in {"med", "high"}
             and state == "comparator_covered"
-            and direct_edges >= 2
+            and depth_bar
             and _nonempty(item.get("reopen_when"))
         ):
             errors.append(
@@ -2302,7 +2303,7 @@ def _validate_target_evidence(
             assessment == "unpromising"
             and confidence == "high"
             and state == "comparator_covered"
-            and direct_edges >= 2
+            and depth_bar
             and _nonempty(item.get("reopen_when"))
         ):
             errors.append(
@@ -2312,7 +2313,7 @@ def _validate_target_evidence(
                 "and a non-empty reopen_when"
             )
         if assessment in {"promising", "unpromising"} and not (
-            state == "comparator_covered" and direct_edges >= 2
+            state == "comparator_covered" and depth_bar
         ):
             errors.append(
                 f"{target} assessment promising or unpromising requires "
