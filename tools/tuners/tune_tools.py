@@ -3147,13 +3147,24 @@ def select_candidate(
     *,
     n_min: int = DEFAULT_N_MIN,
     top_percentile: float = DEFAULT_TOP_PERCENTILE,
+    bout_trials: int | None = None,
     budget_allocation: dict | None = None,
 ) -> dict:
-    """Which candidate to deep-tune next (§15.4), or none. Eligible iff the
-    population (non-crash, has best_warm_score) is >= n_min AND the best untuned
-    candidate has no unresolved primary descendants and its best_warm_score ranks
-    in the top (100-top_percentile)% across all candidates. Greedy on
-    best_warm_score. Returns {run_id|None, reason, ...}."""
+    """Which candidate receives the next tuning bout (progressive §15), or none.
+
+    Eligible: non-crash, finite best_warm_score, lifetime Phase-C attempts
+    below the per-candidate cap, no unresolved primary descendant. First
+    bouts additionally require the legacy gate: population >= n_min AND the
+    best untuned candidate in the top (100-top_percentile)% by warm score.
+    Continuations (tuning_bouts >= 1) skip the percentile gate but require
+    `last_bout_improved` not False — a non-responder is never re-tuned.
+
+    Ranking is like-for-like: fresh candidates (0 bouts, warm scores) always
+    precede continuations; continuations order by (tuning_bouts,
+    final_best_score) — fewest bouts first (evidence coverage), then best
+    tuned score. Warm and tuned scores are never compared against each
+    other. Returns {run_id|None, reason, bout_index, is_continuation, ...}.
+    """
     if (
         not isinstance(n_min, int)
         or isinstance(n_min, bool)
@@ -3167,6 +3178,12 @@ def select_candidate(
         or not 0 <= float(top_percentile) < 100
     ):
         raise ValueError("top_percentile must be finite and in [0, 100)")
+    if bout_trials is not None and (
+        not isinstance(bout_trials, int)
+        or isinstance(bout_trials, bool)
+        or bout_trials <= 0
+    ):
+        raise ValueError("bout_trials must be a positive integer or None")
 
     cands = [r for r in ledger.get("records", [])
              if r.get("status") != "crash" and _is_finite_score(r.get("best_warm_score"))]
@@ -3218,53 +3235,116 @@ def select_candidate(
     if n < n_min:
         return {"run_id": None, "n_candidates": n,
                 "reason": f"population {n} < n_min {n_min} (breadth first)"}
-    all_raw_untuned = [record for record in cands if not record.get("tune")]
-    raw_untuned = [
-        record
-        for record in all_raw_untuned
-        if (
+
+    def cap_ok(record: dict) -> bool:
+        return (
             not isinstance(per_candidate_cap, int)
             or per_candidate_deep.get(str(record.get("run_id")), 0)
             < per_candidate_cap
         )
-    ]
-    untuned = [
-        record
-        for record in raw_untuned
-        if not _has_unresolved_primary_descendant(
+
+    def eligible(record: dict) -> bool:
+        return cap_ok(record) and not _has_unresolved_primary_descendant(
             ledger, str(record.get("run_id"))
         )
+
+    fresh = [r for r in cands if not r.get("tune") and eligible(r)]
+    continuations = [
+        r
+        for r in cands
+        if r.get("tune")
+        and r.get("last_bout_improved") is not False
+        and _is_finite_score(r.get("final_best_score"))
+        and eligible(r)
     ]
-    if not untuned:
-        if all_raw_untuned and not raw_untuned:
-            return {
-                "run_id": None,
-                "n_candidates": n,
-                "reason": "all untuned candidates reached deep-tune per-candidate cap",
-                **(
-                    {"budget_allocation": allocation_receipt}
-                    if allocation_receipt is not None
-                    else {}
-                ),
-            }
-        if raw_untuned:
-            return {
-                "run_id": None,
-                "n_candidates": n,
-                "reason": (
-                    "all untuned candidates have unresolved primary descendants"
-                ),
-            }
-        return {"run_id": None, "n_candidates": n, "reason": "all candidates already tuned"}
-    best = min(untuned, key=lambda r: r["best_warm_score"])
-    value = best["best_warm_score"]
-    # percentile = fraction of OTHER candidates strictly worse (higher score);
-    # high percentile = among the best (matches ledger.py percentile semantics).
-    worse = sum(1 for r in cands if r is not best and r["best_warm_score"] > value)
-    pct = 100.0 * worse / (n - 1) if n > 1 else 100.0
-    common = {"best_warm_score": value, "percentile": round(pct), "n_candidates": n}
+    non_responders = [
+        r
+        for r in cands
+        if r.get("tune") and r.get("last_bout_improved") is False and eligible(r)
+    ]
+
+    selected = None
+    is_continuation = False
+    pct = None
+    if fresh:
+        best_fresh = min(fresh, key=lambda r: r["best_warm_score"])
+        value = best_fresh["best_warm_score"]
+        # percentile = fraction of OTHER candidates strictly worse (higher
+        # score); high percentile = among the best (warm-vs-warm, including
+        # tuned candidates' historical warm scores, as before).
+        worse = sum(1 for r in cands if r is not best_fresh and r["best_warm_score"] > value)
+        pct = 100.0 * worse / (n - 1) if n > 1 else 100.0
+        if pct >= top_percentile:
+            selected = best_fresh
+    if selected is None and continuations:
+        selected = min(
+            continuations,
+            key=lambda r: (
+                int(r.get("tuning_bouts") or 1),
+                float(r["final_best_score"]),
+            ),
+        )
+        is_continuation = True
+
+    if selected is None:
+        if fresh and pct is not None and non_responders and not continuations:
+            reason = (
+                f"best untuned percentile {pct:.0f} < {top_percentile:.0f} and "
+                "all tuned candidates are non-responders (last bout improved "
+                "nothing)"
+            )
+        elif fresh and pct is not None:
+            reason = (
+                f"best untuned percentile {pct:.0f} < {top_percentile:.0f} "
+                f"(top {100 - top_percentile:.0f}% already tuned)"
+            )
+        elif non_responders and not continuations:
+            reason = (
+                "all tuned candidates are non-responders (last bout improved "
+                "nothing); no first-bout candidate available"
+            )
+        elif any(not cap_ok(r) for r in cands) and not any(
+            cap_ok(r) for r in cands
+        ):
+            reason = "all candidates reached deep-tune per-candidate cap"
+        elif cands:
+            reason = "all candidates have unresolved primary descendants"
+        else:
+            reason = "no candidates"
+        result = {"run_id": None, "n_candidates": n, "reason": reason}
+        if pct is not None:
+            result["percentile"] = round(pct)
+        if allocation_receipt is not None:
+            result["budget_allocation"] = allocation_receipt
+        return result
+
+    tuning_bouts = int(
+        selected.get("tuning_bouts") or (1 if selected.get("tune") else 0)
+    )
+    if is_continuation:
+        reason = (
+            f"continuation: responder with fewest bouts ({tuning_bouts}) and "
+            "best tuned score"
+        )
+    else:
+        reason = (
+            f"best untuned in top {100 - top_percentile:.0f}% "
+            f"(percentile {pct:.0f} >= {top_percentile:.0f})"
+        )
+    result = {
+        "run_id": selected.get("run_id"),
+        "reason": reason,
+        "is_continuation": is_continuation,
+        "bout_index": tuning_bouts,
+        "tuning_bouts": tuning_bouts,
+        "last_bout_improved": selected.get("last_bout_improved"),
+        "best_warm_score": selected.get("best_warm_score"),
+        "final_best_score": selected.get("final_best_score"),
+        "percentile": round(pct) if pct is not None else None,
+        "n_candidates": n,
+    }
     if allocation_receipt is not None:
-        candidate_used = per_candidate_deep.get(str(best.get("run_id")), 0)
+        candidate_used = per_candidate_deep.get(str(selected.get("run_id")), 0)
         caps = [
             value
             for value in (
@@ -3275,22 +3355,17 @@ def select_candidate(
                     if isinstance(per_candidate_cap, int)
                     else None
                 ),
+                bout_trials,
             )
             if isinstance(value, int)
         ]
-        allocation_receipt = {
+        result["budget_allocation"] = {
             **allocation_receipt,
             "candidate_attempts": candidate_used,
+            "bout_trials": bout_trials,
             "trial_cap": min(caps) if caps else None,
         }
-        common["budget_allocation"] = allocation_receipt
-    if pct >= top_percentile:
-        return {"run_id": best.get("run_id"),
-                "reason": f"best untuned in top {100 - top_percentile:.0f}% (percentile {pct:.0f} >= {top_percentile:.0f})",
-                **common}
-    return {"run_id": None,
-            "reason": f"best untuned percentile {pct:.0f} < {top_percentile:.0f} (top {100 - top_percentile:.0f}% already tuned)",
-            **common}
+    return result
 
 
 # ---------- CLI ----------
@@ -3450,11 +3525,13 @@ def cmd_select_candidate(args) -> int:
         n_min = int(rc["n_min"])
     else:
         n_min = math.ceil(100.0 / (100.0 - top_p)) if top_p < 100 else DEFAULT_N_MIN
+    bout = int(rc.get("bout_trials", DEFAULT_BOUT_TRIALS))
     try:
         result = select_candidate(
             ledger,
             n_min=n_min,
             top_percentile=top_p,
+            bout_trials=bout,
             budget_allocation=budget_status(led.parent),
         )
     except ValueError as exc:

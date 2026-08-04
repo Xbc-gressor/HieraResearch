@@ -32,6 +32,7 @@ from tune_tools import (  # noqa: E402
     close_exhausted_stage,
     finalizable_tuning_result,
     phase_c_action,
+    select_candidate,
 )
 
 
@@ -978,6 +979,129 @@ class CloseExhaustedStageTest(unittest.TestCase):
                 (advice["action"], advice["method"], advice["reason"]),
                 ("run", "grid", "resume_interrupted_stage"),
             )
+
+
+def _candidate_record(
+    run_id: str,
+    warm: float,
+    *,
+    tune: bool = False,
+    bouts: int = 0,
+    improved: bool | None = None,
+    final: float | None = None,
+) -> dict:
+    return {
+        "run_id": run_id,
+        "status": "keep",
+        "best_warm_score": warm,
+        "tune": tune,
+        "tuning_bouts": bouts,
+        "last_bout_improved": improved,
+        "final_best_score": final if final is not None else warm,
+    }
+
+
+class ProgressiveSelectCandidateTest(unittest.TestCase):
+    def _ledger(self, records) -> dict:
+        return {"records": records}
+
+    def test_first_bout_still_requires_percentile_gate(self):
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.30),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertEqual(result["run_id"], "001")
+        self.assertIs(result["is_continuation"], False)
+        self.assertEqual(result["bout_index"], 0)
+
+    def test_continuation_selected_when_fresh_fails_gate(self):
+        # Fresh candidates carry the WORST warm scores, so the best fresh
+        # warm percentile is 50 (< 80) and the gate refuses a first bout.
+        ledger = self._ledger([
+            _candidate_record("001", 1.30),
+            _candidate_record("002", 1.20),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.00),
+            # tuned responder: continuation pools ignore warm rank
+            _candidate_record("005", 0.95, tune=True, bouts=1,
+                              improved=True, final=0.80),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertEqual(result["run_id"], "005")
+        self.assertIs(result["is_continuation"], True)
+        self.assertEqual(result["bout_index"], 1)
+
+    def test_fresh_first_bout_beats_continuation(self):
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.40, tune=True, bouts=1,
+                              improved=True, final=0.70),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertEqual(result["run_id"], "001")
+        self.assertIs(result["is_continuation"], False)
+
+    def test_continuation_ranks_fewest_bouts_then_tuned_score(self):
+        # Fresh warm scores are worst (best fresh percentile 50 < 80), so the
+        # choice falls to continuations: fewer bouts beats better tuned score.
+        ledger = self._ledger([
+            _candidate_record("001", 1.30),
+            _candidate_record("002", 1.20),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.00, tune=True, bouts=2,
+                              improved=True, final=0.60),
+            _candidate_record("005", 0.95, tune=True, bouts=1,
+                              improved=True, final=0.90),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertEqual(result["run_id"], "005")  # fewer bouts wins over better score
+
+    def test_non_responders_never_selected(self):
+        # Fresh gate fails (percentile 50) and the only tuned candidate did
+        # not improve in its last bout.
+        ledger = self._ledger([
+            _candidate_record("001", 1.30),
+            _candidate_record("002", 1.20),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.00),
+            _candidate_record("005", 0.95, tune=True, bouts=1,
+                              improved=False, final=0.70),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertIsNone(result["run_id"])
+        self.assertIn("non-responder", result["reason"])
+
+    def test_trial_cap_includes_bout_trials(self):
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.30),
+        ])
+        allocation = {
+            "remaining": 100,
+            "deep_tune": {
+                "remaining": None,
+                "total_cap": None,
+                "per_candidate_cap": 20,
+                "per_candidate": [],
+                "time_limit_seconds": None,
+            },
+        }
+        result = select_candidate(
+            ledger, n_min=5, top_percentile=80.0,
+            bout_trials=8, budget_allocation=allocation,
+        )
+        self.assertEqual(result["run_id"], "001")
+        self.assertEqual(result["budget_allocation"]["trial_cap"], 8)
 
 
 if __name__ == "__main__":
