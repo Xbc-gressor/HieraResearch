@@ -30,7 +30,7 @@ Three structural problems:
 | Evidence representation | Graded depth levels: `screening` → `tuned_lightly` → `tuned` |
 | Bout size | Fixed from config (`tuner.bout_trials`, default 8); lifetime per-candidate cap retained |
 | LLM startup configs | Full re-warm per continuation bout, proposed inline by `tuner-orchestrator`, admitted only through the deterministic validation path, consuming bout budget |
-| Mirror sync | `.opencode` is canonical; `.claude`/`.kimi` mirrors may drift (workspace AGENTS.md updated first) |
+| Mirror sync | `.claude` is canonical; `.opencode`/`.kimi` mirrors may drift (workspace AGENTS.md updated first) |
 | Light-evidence bar for pruning | ≥2 edges at `tuned`, or ≥3 edges at `tuned_lightly`+ |
 
 ## Design
@@ -203,10 +203,10 @@ New config knobs (`tasks/framework_cfg.example.json`, `tuner` section):
 **Step 0 (before any implementation):** update `/home/woden/spark/AGENTS.md`
 and its twin `/home/woden/spark/CLAUDE.md` (its own rule: apply edits to
 both) — relax the "keep mirrored runtime contracts synchronized" line to
-name `.opencode` as canonical, and note progressive tuning as the step-2
+name `.claude` as canonical, and note progressive tuning as the step-2
 schema so the workspace guide cannot contradict the work.
 
-Agent contracts (`.opencode` canonical; `.claude`/`.kimi` intentionally not
+Agent contracts (`.claude` canonical; `.opencode`/`.kimi` intentionally not
 re-synced):
 
 - `tuner-orchestrator.md`: rewritten around bouts — "one invocation = at
@@ -220,7 +220,7 @@ re-synced):
 
 Docs: repo `AGENTS.md` (subagent-table row and any depth-flag wording),
 `README_ZH.md` §5.7, `docs/search-space.md` inner-loop paragraph,
-`.opencode/rules/ledger.md` (new fields).
+`rules/ledger.md` in the canonical runtime (new fields).
 
 Tests (extend existing files; no new validators, per workspace change
 discipline):

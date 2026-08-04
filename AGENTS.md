@@ -82,8 +82,9 @@ tasks/<task-name>/                independent uv task projects
 runs/<task-name>/<tag>/           local experiment artifacts (gitignored)
 ```
 
-`.claude/` and `.kimi/` mirror `.opencode/` for other runtimes, but
-`.opencode/` is canonical and the mirrors may drift.
+`.opencode/` and `.kimi/` mirror `.claude/` for other runtimes, but
+`.claude/` is canonical and the mirrors may drift (sync to them is no
+longer a priority).
 
 The experiment primary agent may invoke exactly these six subagents through
 OpenCode's `Task` tool:

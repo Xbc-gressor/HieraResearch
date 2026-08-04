@@ -31,7 +31,7 @@ Your work has **three segments**, each with its own discipline:
 
 Do them in order.
 
-**Skills you follow** (`.claude/skills/`):
+**Skills you follow** (`.opencode/skills/`):
 - `crash-diagnosis` — used in segment ③ to diagnose each preflight/eval-K failure (verdict:
   `config_invalid` / `code_incompatible` / `abandon`).
 
@@ -313,7 +313,7 @@ without a valid control.
 ### 3b. Diagnose + fix (the crash loop)
 
 **【crash-diagnosis skill】** Invoke `Skill(crash-diagnosis)` — or, if the Skill
-tool is unavailable, read `.claude/skills/crash-diagnosis/SKILL.md` and follow it
+tool is unavailable, read `.opencode/skills/crash-diagnosis/SKILL.md` and follow it
 — on the failing preflight/eval config + its `failure_receipt`. Retrieve full or ranged source
 through `tune_tools.py render-failure` only when the receipt is insufficient:
 
@@ -354,9 +354,12 @@ python tools/ledger.py record-run --ledger <run_dir>/ledger.json --run-id <run_i
 ```
 
 `<best_warm_score>` is `phase_a.best_warm_score` from your `tune_report.json`.
-**Never pass `--mark-tuned`** — only the deep-tuner marks `tune: true`; marking it
-here would make `select-candidate` treat every candidate as already tuned. Return
-the success verdict.
+**Never pass `--mark-tuned`** — only the deep-tuner marks `tune: true`. A spurious
+`tune: true` here normalizes on read to one phantom bout with
+`last_bout_improved: null`, which `select-candidate` treats as a
+continuation-eligible responder: the candidate bypasses the first-bout
+percentile gate and draws bout budget it never earned. Return the success
+verdict.
 
 ### 3d. Abandon → record the candidate crashed
 
