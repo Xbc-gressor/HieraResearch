@@ -53,6 +53,7 @@ from _common import (  # noqa: E402
     load_candidate_modules,
     prior_patience_state,
     read_deferred_configs,
+    read_pending_proposals,
     search_space_for_json,
     set_stage_meta,
     split_configs_by_space,
@@ -105,6 +106,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "grid",
+            bout_index=time_budget["bout_index"],
             status="time_exhausted",
             elapsed_seconds=elapsed_seconds,
             early_stopped=True,
@@ -189,7 +191,8 @@ def main() -> int:
     # grid already passed that admission once; continue from its unseen points
     # and let the atomic remaining allocation stop it exactly.
     if total > args.max_trials and not existing_grid_trials:
-        set_stage_meta(args.tune_report_json, "grid", status="rejected")
+        set_stage_meta(args.tune_report_json, "grid", status="rejected",
+                       bout_index=time_budget["bout_index"])
         write_json({
             "method": "grid",
             "status": "rejected",
@@ -211,10 +214,12 @@ def main() -> int:
     rng = random.Random(args.seed)
     rng.shuffle(combos)
 
-    # Evaluate the deferred warm configs FIRST (proposed at step 0+1 but not
-    # evaluated there), then the grid sweep. They count as normal trials.
-    # Deferred configs outside the (possibly clamped) box are skipped — never
-    # attempted, no budget, no patience effect — and accounted via
+    # Evaluate validated LLM re-warm proposals FIRST (admitted by
+    # validate-proposals for a continuation bout), then the deferred warm
+    # configs (proposed at step 0+1 but not evaluated there), then the grid
+    # sweep. They count as normal trials. Configs outside the (possibly
+    # clamped) box are skipped — never attempted, no budget, no patience
+    # effect — and accounted via rewarm_skipped_outside_space /
     # deferred_skipped_outside_space.
     deferred_in_space, deferred_outside = split_configs_by_space(
         read_deferred_configs(args.tune_report_json), search_space
@@ -223,13 +228,24 @@ def main() -> int:
         args.tune_report_json,
         search_space,
     )
+    proposals_in_space, proposals_outside = split_configs_by_space(
+        read_pending_proposals(args.tune_report_json), search_space
+    )
+    proposals = [
+        cast_params_to_search_space(dict(p), search_space)
+        for p in proposals_in_space
+    ]
+    proposals, proposals_skipped_seen, seen = deduplicate_configs(
+        proposals,
+        seen=attempted_identities,
+    )
     deferred = [
         cast_params_to_search_space(dict(p), search_space)
         for p in deferred_in_space
     ]
     deferred, deferred_skipped_seen, seen = deduplicate_configs(
         deferred,
-        seen=attempted_identities,
+        seen=seen,
     )
     grid_configs = [
         cast_params_to_search_space(dict(zip(keys, combo)), search_space)
@@ -239,7 +255,7 @@ def main() -> int:
         grid_configs,
         seen=seen,
     )
-    param_dicts = deferred + grid_configs
+    param_dicts = proposals + deferred + grid_configs
 
     # Seed best AND streak from the persisted trial history: a restarted search
     # continues the patience window instead of getting a fresh one.
@@ -250,6 +266,10 @@ def main() -> int:
         start_since=prior_streak,
     )
     set_stage_meta(args.tune_report_json, "grid", status="running",
+                   bout_index=time_budget["bout_index"],
+                   rewarm_proposals_enqueued=len(proposals),
+                   rewarm_skipped_outside_space=len(proposals_outside),
+                   rewarm_skipped_already_seen=proposals_skipped_seen,
                    deferred_skipped_outside_space=len(deferred_outside),
                    deferred_skipped_already_seen=deferred_skipped_seen,
                    grid_skipped_already_seen=grid_skipped_seen)
@@ -456,6 +476,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "grid",
+            bout_index=time_budget["bout_index"],
             status="budget_exhausted",
             elapsed_seconds=stage_elapsed,
             early_stopped=True,
@@ -484,6 +505,7 @@ def main() -> int:
     if best_params is None:
         # Every combo errored — surface a failed stage instead of "ok" with a null best.
         set_stage_meta(args.tune_report_json, "grid", status="failed",
+                       bout_index=time_budget["bout_index"],
                        elapsed_seconds=stage_elapsed, early_stopped=early_stopped)
         write_json({
             "method": "grid",
@@ -504,6 +526,7 @@ def main() -> int:
     set_stage_meta(
         args.tune_report_json,
         "grid",
+        bout_index=time_budget["bout_index"],
         status="ok",
         elapsed_seconds=stage_elapsed,
         early_stopped=early_stopped,

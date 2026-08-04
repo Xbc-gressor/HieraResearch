@@ -44,6 +44,7 @@ from _common import (  # noqa: E402
     params_identity,
     prior_patience_state,
     read_deferred_configs,
+    read_pending_proposals,
     read_prior_infeasible_trials,
     read_prior_trials,
     search_space_for_json,
@@ -331,6 +332,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "bo",
+            bout_index=time_budget["bout_index"],
             status="time_exhausted",
             elapsed_seconds=elapsed_seconds,
             early_stopped=True,
@@ -375,6 +377,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "bo",
+            bout_index=time_budget["bout_index"],
             status="rejected",
             elapsed_seconds=deep_tune_stage_elapsed(time_budget),
         )
@@ -500,10 +503,15 @@ def main() -> int:
     deferred_in_space, deferred_outside = split_configs_by_space(
         read_deferred_configs(args.tune_report_json), search_space
     )
+    # Validated LLM re-warm proposals go ahead of even the deferred configs;
+    # enqueue order is preserved, so they become the first WAITING trials.
+    proposals_in_space, proposals_outside = split_configs_by_space(
+        read_pending_proposals(args.tune_report_json), search_space
+    )
     try:
         n_enqueued = _enqueue_unique_deferred(
             study,
-            deferred_in_space,
+            proposals_in_space + deferred_in_space,
             search_space,
             distributions,
         )
@@ -511,6 +519,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "bo",
+            bout_index=time_budget["bout_index"],
             status="failed",
             rejected_priors=rejected_priors,
             infeasible_priors_injected=n_infeasible_injected,
@@ -533,6 +542,7 @@ def main() -> int:
     set_stage_meta(
         args.tune_report_json,
         "bo",
+        bout_index=time_budget["bout_index"],
         status="running",
         prior_trials_injected=n_priors_injected,
         rejected_priors=rejected_priors,
@@ -540,6 +550,8 @@ def main() -> int:
         infeasible_prior_rejections=len(infeasible_rejections),
         deferred_rejections=[],
         deferred_skipped_outside_space=len(deferred_outside),
+        rewarm_proposals_enqueued=len(proposals_in_space),
+        rewarm_skipped_outside_space=len(proposals_outside),
     )
     n_trials = n_trials + n_enqueued
 
@@ -846,6 +858,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "bo",
+            bout_index=time_budget["bout_index"],
             status="budget_exhausted",
             elapsed_seconds=stage_elapsed,
             early_stopped=True,
@@ -884,6 +897,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "bo",
+            bout_index=time_budget["bout_index"],
             status="failed",
             elapsed_seconds=stage_elapsed,
             early_stopped=True,
@@ -918,6 +932,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "bo",
+            bout_index=time_budget["bout_index"],
             status="failed",
             elapsed_seconds=stage_elapsed,
             early_stopped=early_stopped["flag"],
@@ -942,6 +957,7 @@ def main() -> int:
     set_stage_meta(
         args.tune_report_json,
         "bo",
+        bout_index=time_budget["bout_index"],
         status="ok",
         elapsed_seconds=stage_elapsed,
         early_stopped=early_stopped["flag"],

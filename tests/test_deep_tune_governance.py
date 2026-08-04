@@ -33,6 +33,7 @@ from tune_tools import (  # noqa: E402
     finalizable_tuning_result,
     phase_c_action,
     select_candidate,
+    validate_proposals,
 )
 
 
@@ -837,6 +838,57 @@ class BoutAdmissionTest(unittest.TestCase):
             # bout can start a new bout, and that requires a finalized close).
             with self.assertRaisesRegex(DeepTuneStageAdmissionError, "cannot be rerun"):
                 deep_tune_time_budget(candidate, report_path, "bo")
+
+    def test_validate_proposals_accepts_valid_and_rejects_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            proposals = [
+                {"x": 0.5},                    # valid, novel
+                {"x": 1.0},                    # already attempted (warm row)
+                {"x": 9.0},                    # outside SEARCH_SPACE
+                {"x": 0.5},                    # duplicate of the accepted one
+                "not-a-dict",                  # malformed
+            ]
+            result = validate_proposals(candidate, report_path, proposals)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["proposed_count"], 5)
+            self.assertEqual(result["accepted"], [{"x": 0.5}])
+            reasons = [r["reason"] for r in result["rejected"]]
+            self.assertEqual(
+                reasons,
+                ["already_attempted", "out_of_space", "already_attempted",
+                 "params_must_be_object"],
+            )
+
+    def test_validate_proposals_all_rejected_is_not_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            result = validate_proposals(candidate, report_path, [{"x": 1.0}])
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["accepted"], [])
+
+    def test_validate_proposals_cli_writes_pending_proposals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = self._fixture(Path(tmp))
+            proposals_path = Path(tmp) / "proposals.json"
+            proposals_path.write_text(json.dumps([{"x": 0.5}, {"x": 9.0}]))
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "tuners" / "tune_tools.py"),
+                    "validate-proposals",
+                    "--candidate-path", str(candidate),
+                    "--tune-report-json", str(report_path),
+                    "--proposals-json", str(proposals_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            report = json.loads(report_path.read_text())
+            self.assertEqual(
+                report["phase_c"]["pending_proposals"], [{"x": 0.5}]
+            )
 
 
 class CloseExhaustedStageTest(unittest.TestCase):

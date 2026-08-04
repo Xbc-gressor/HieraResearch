@@ -55,6 +55,7 @@ from _common import (  # noqa: E402
     params_within_search_space,
     prior_patience_state,
     read_deferred_configs,
+    read_pending_proposals,
     read_prior_infeasible_trials,
     read_prior_trials,
     read_tune_report,
@@ -229,6 +230,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "cmaes",
+            bout_index=time_budget["bout_index"],
             status="time_exhausted",
             elapsed_seconds=elapsed_seconds,
             early_stopped=True,
@@ -261,6 +263,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "cmaes",
+            bout_index=time_budget["bout_index"],
             status="rejected",
             elapsed_seconds=deep_tune_stage_elapsed(time_budget),
         )
@@ -366,13 +369,28 @@ def main() -> int:
             continue
         known_infeasible.add(params_identity(normalized))
     known_infeasible.difference_update(known_scores)
+    # Validated LLM re-warm proposals (admitted by validate-proposals for a
+    # continuation bout) are attempted ahead of the deferred warm configs; the
+    # chained `seen` set keeps a proposal equal to a deferred config from
+    # being attempted twice.
+    proposals_in_space, proposals_outside = split_configs_by_space(
+        read_pending_proposals(args.tune_report_json), search_space
+    )
+    proposals_in_space = [
+        cast_params_to_search_space(dict(params), search_space)
+        for params in proposals_in_space
+    ]
+    proposals_in_space, proposals_skipped_seen, seen = deduplicate_configs(
+        proposals_in_space,
+        seen=attempted_identities,
+    )
     deferred_in_space = [
         cast_params_to_search_space(dict(params), search_space)
         for params in deferred_in_space
     ]
     deferred_in_space, deferred_skipped_seen, _ = deduplicate_configs(
         deferred_in_space,
-        seen=attempted_identities,
+        seen=seen,
     )
 
     # A clamp can collapse every coordinate to one value. CMA-ES cannot
@@ -407,6 +425,7 @@ def main() -> int:
             set_stage_meta(
                 args.tune_report_json,
                 "cmaes",
+                bout_index=time_budget["bout_index"],
                 status="no_search_needed",
                 elapsed_seconds=terminal_elapsed,
                 early_stopped=True,
@@ -456,6 +475,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "cmaes",
+            bout_index=time_budget["bout_index"],
             status="failed",
             elapsed_seconds=terminal_elapsed,
             early_stopped=True,
@@ -487,10 +507,14 @@ def main() -> int:
     set_stage_meta(
         args.tune_report_json,
         "cmaes",
+        bout_index=time_budget["bout_index"],
         status="running",
         prior_trials_seen=len(prior_trials),
         rejected_priors=rejected_priors,
         deferred_skipped_already_seen=deferred_skipped_seen,
+        rewarm_proposals_enqueued=len(proposals_in_space),
+        rewarm_skipped_outside_space=len(proposals_outside),
+        rewarm_skipped_already_seen=proposals_skipped_seen,
     )
 
     try:
@@ -596,14 +620,15 @@ def main() -> int:
         ensure_deep_tune_time_remaining(time_budget)
         return True
 
-    # Deferred warm configs (proposed at step 0+1, not evaluated there): evaluate
-    # them up front so the rare cmaes path doesn't lose them. Recorded + considered
+    # Validated LLM re-warm proposals first, then the deferred warm configs
+    # (proposed at step 0+1, not evaluated there): evaluate them up front so
+    # the rare cmaes path doesn't lose them. Recorded + considered
     # for best (select-best ranks the whole report); they are EXTRA — not charged to
     # the cmaes `evals` budget (cmaes still seeds x0 from the best evaluated prior).
     # Deferred configs outside the (possibly clamped) box are skipped — never
     # attempted, no budget, no patience effect — and accounted via
     # deferred_skipped_outside_space.
-    for d_params in deferred_in_space:
+    for d_params in [*proposals_in_space, *deferred_in_space]:
         try:
             ensure_deep_tune_time_remaining(time_budget)
         except DeepTuneTimeExhausted:
@@ -906,6 +931,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "cmaes",
+            bout_index=time_budget["bout_index"],
             status="budget_exhausted",
             elapsed_seconds=stage_elapsed,
             early_stopped=True,
@@ -944,6 +970,7 @@ def main() -> int:
         set_stage_meta(
             args.tune_report_json,
             "cmaes",
+            bout_index=time_budget["bout_index"],
             status="failed",
             elapsed_seconds=stage_elapsed,
             early_stopped=True,
@@ -978,6 +1005,7 @@ def main() -> int:
         # Every evaluated trial errored — surface a failed stage instead of
         # writing the seed defaults as if they were a real "ok" best.
         set_stage_meta(args.tune_report_json, "cmaes", status="failed",
+                       bout_index=time_budget["bout_index"],
                        elapsed_seconds=stage_elapsed, early_stopped=early_stopped)
         write_json({
             "method": "cmaes",
@@ -1001,6 +1029,7 @@ def main() -> int:
     set_stage_meta(
         args.tune_report_json,
         "cmaes",
+        bout_index=time_budget["bout_index"],
         status="ok",
         elapsed_seconds=stage_elapsed,
         early_stopped=early_stopped,

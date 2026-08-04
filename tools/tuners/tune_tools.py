@@ -3018,6 +3018,72 @@ def check_search_space(authoritative_schema: dict, proposed: dict, configs: list
     return {"ok": True, "finalized_space": finalized, "expansions": expansions, "errors": []}
 
 
+def validate_proposals(
+    candidate_path: Path,
+    report_path: Path,
+    proposals: list,
+) -> dict:
+    """Validate LLM re-warm proposals for a continuation tuning bout.
+
+    Deterministic disposal of LLM-proposed configs: each proposal must be a
+    param dict with the exact SEARCH_SPACE key set, in-bounds values, and a
+    novel config identity (against every attempted config and earlier
+    accepted proposals). PARAM_SCHEMA compatibility is implied by the
+    in-bounds check for numeric kinds but checked explicitly for
+    categoricals. Returns {ok, proposed_count, accepted, rejected}."""
+    from _common import (
+        attempted_config_identities,
+        cast_params_to_search_space,
+        params_identity,
+    )
+
+    candidate_path = Path(candidate_path)
+    report_path = Path(report_path)
+    search_space = _read_search_space(candidate_path)
+    schema = _read_param_schema(candidate_path)
+    seen = attempted_config_identities(report_path, search_space)
+    accepted: list = []
+    rejected: list = []
+    if not isinstance(proposals, list):
+        proposals = []
+    for index, params in enumerate(proposals):
+        if not isinstance(params, dict):
+            rejected.append({"index": index, "reason": "params_must_be_object"})
+            continue
+        violations = _bounds_violations(params, search_space)
+        if violations:
+            rejected.append(
+                {"index": index, "reason": "out_of_space", "violations": violations}
+            )
+            continue
+        schema_bad = [
+            key
+            for key in search_space
+            if key in schema
+            and _valid_schema_entry(schema[key])
+            and not _schema_accepts_value(schema[key], params[key])
+        ]
+        if schema_bad:
+            rejected.append(
+                {"index": index, "reason": "schema_incompatible", "keys": schema_bad}
+            )
+            continue
+        identity = params_identity(
+            cast_params_to_search_space(dict(params), search_space)
+        )
+        if identity in seen:
+            rejected.append({"index": index, "reason": "already_attempted"})
+            continue
+        seen.add(identity)
+        accepted.append(params)
+    return {
+        "ok": bool(accepted),
+        "proposed_count": len(proposals),
+        "accepted": accepted,
+        "rejected": rejected,
+    }
+
+
 # ---------- lineage evidence (parent candidates -> hyperparam->performance) ----------
 
 # How many whole configs to surface per parent: the best TOP_K by score plus
@@ -3476,6 +3542,22 @@ def cmd_check_search_space(args) -> int:
     return 0 if result["ok"] else 1
 
 
+def cmd_validate_proposals(args) -> int:
+    proposals = json.loads(Path(args.proposals_json).read_text())
+    result = validate_proposals(
+        args.candidate_path, args.tune_report_json, proposals
+    )
+    if result["accepted"]:
+        from _common import read_tune_report, write_tune_report
+
+        report = read_tune_report(args.tune_report_json)
+        report.setdefault("phase_c", {}).setdefault("stages", [])
+        report["phase_c"]["pending_proposals"] = result["accepted"]
+        write_tune_report(args.tune_report_json, report)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
 def cmd_lineage_evidence(args) -> int:
     ids = [x.strip() for x in args.source_run_ids.split(",") if x.strip()]
     print(json.dumps(lineage_evidence(args.run_dir, ids), indent=2))
@@ -3611,6 +3693,18 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("--configs-json", required=True, type=Path,
                     help="JSON list of proposed warm-config param dicts")
     cs.set_defaults(func=cmd_check_search_space)
+
+    vpr = sub.add_parser(
+        "validate-proposals",
+        help=(
+            "Validate LLM re-warm configs for a continuation bout; on any "
+            "acceptance, write the accepted list to phase_c.pending_proposals."
+        ),
+    )
+    vpr.add_argument("--candidate-path", required=True, type=Path)
+    vpr.add_argument("--tune-report-json", required=True, type=Path)
+    vpr.add_argument("--proposals-json", required=True, type=Path)
+    vpr.set_defaults(func=cmd_validate_proposals)
 
     le = sub.add_parser("lineage-evidence",
                         help="Assemble per-hyperparam (value, score) evidence from parent candidates.")

@@ -1211,6 +1211,21 @@ def read_deferred_configs(report_path: Path) -> list[dict]:
     return [c["params"] for c in phase_a.get("deferred_configs", []) if c.get("params")]
 
 
+def read_pending_proposals(report_path: Path) -> list[dict]:
+    """LLM re-warm configs admitted by `tune_tools.py validate-proposals` for a
+    continuation bout. Search scripts attempt them FIRST (before deferred
+    configs); they consume the bout's trial budget like any other trial. The
+    list is overwritten wholesale by the next validate-proposals call, so
+    unconsumed leftovers never leak into a later bout."""
+    phase_c = read_tune_report(report_path).get("phase_c", {})
+    if not isinstance(phase_c, dict):
+        return []
+    proposals = phase_c.get("pending_proposals", [])
+    if not isinstance(proposals, list):
+        return []
+    return [p for p in proposals if isinstance(p, dict)]
+
+
 def read_attempted_configs(report_path: Path) -> list[dict]:
     """Every config already evaluated or rejected by preflight.
 
