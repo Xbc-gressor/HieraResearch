@@ -82,8 +82,8 @@ tasks/<task-name>/                independent uv task projects
 runs/<task-name>/<tag>/           local experiment artifacts (gitignored)
 ```
 
-`.claude/` and `.kimi/` mirror `.opencode/` for other runtimes — keep mirrored
-contracts synchronized when a shared agent protocol changes.
+`.claude/` and `.kimi/` mirror `.opencode/` for other runtimes, but
+`.opencode/` is canonical and the mirrors may drift.
 
 The experiment primary agent may invoke exactly these six subagents through
 OpenCode's `Task` tool:
@@ -94,7 +94,7 @@ OpenCode's `Task` tool:
 | `idea-generator` | graph `SELECT` via `got_select`, then semantic point choice and record/receipt persistence | per round |
 | `candidate-writer` | implements one candidate's `train.py` from its own ledger record | per candidate |
 | `tunable-contract-extractor` | step 0+1: `PARAM_SCHEMA` refactor, warm configs, `SEARCH_SPACE`, screening evaluation | per candidate |
-| `tuner-orchestrator` | step 2: promotion gate, then deep-tune at most one selected candidate in place | once per round |
+| `tuner-orchestrator` | step 2: progressive tuning gate, then at most one tuning bout (first or continuation) in place | once per round |
 | `experience-extractor` | regenerates the bounded belief snapshot and requests state transitions | per completed non-empty round |
 
 Each agent's prompt is authoritative for its own contract. The allow-list is
@@ -105,8 +105,9 @@ collapse and replaces rich child output with compact receipts before it returns
 to the primary context.
 
 Step 2 is decoupled from step 0+1 (design §15): every candidate stops at step
-0+1, then `tuner-orchestrator` runs once for the whole round and picks at most
-one candidate. A `none` selection is a valid no-op.
+0+1, then `tuner-orchestrator` runs once for the whole round and runs at most
+one tuning bout — a first bout on a gated untuned candidate or a continuation
+bout on a responder. A `none` selection is a valid no-op.
 
 ## Context and state discipline
 

@@ -258,15 +258,16 @@ Step 0+1：在候选 `train.py` 准备好后运行，在一个子智能体中完
 
 ### 5.7 tuner-orchestrator
 
-Step 2（解耦深度调优，设计 §15）：**每轮在整个运行上运行一次**，而非每个候选方案。**无热启动**——`phase_a`（热配置 + `best_warm_score`）是 step 0+1（extractor）输出用作输入。
+Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运行一次**，每次至多运行**一个调优 bout**（`tuner.bout_trials` 次客观评估，默认 8）。**无热启动**——`phase_a` 是 step 0+1（extractor）输出用作输入。
 
 流程：
 
-1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——门控：种群 ≥ `N_min=10` 且按 `best_warm_score` 的最佳未调优候选方案在前 20%（贪婪选择最佳未调优）→ 选择**一个**候选方案
-2. Phase C：所选候选方案的基于维度的方法选择（`grid`/`bo`/`cmaes`），使用 step 1 热试验作为先验
-3. Finalize：运行 `tools/finalize_tuning.py`；它先验证 Phase C 已终止，再确定全局最佳、写回 `BASE_PARAMS`、关闭 `tune_report.json`，并一次性更新 ledger（**无重新运行**；可安全重试）。若搜索进程被杀死或 report 非终态，则不应用参数且不更新 ledger。
+1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——首个 bout 门控：种群 ≥ `N_min`（P=80 时推导为 5）且按 `best_warm_score` 的最佳未调优候选在前 20%；继续 bout 跳过百分位门控但要求上一 bout 有改进（`last_bout_improved`），无响应者不再调优。首个 bout 优先于继续 bout（证据覆盖优先）；继续 bout 之间按 bout 数最少、再按调优后最佳分数排序（warm 分与调优分互不比较）→ 选择**一个** bout
+2. Phase R（仅继续 bout）：orchestrator 依据已有 trial 历史提出至多 `tuner.rewarm_proposals`（默认 3）个配置，经 `tune_tools.py validate-proposals` 确定性校验（在空间内、schema 兼容、去重）后写入 `phase_c.pending_proposals`，由搜索脚本在 bout 预算内**优先**评估
+3. Phase C：按维度确定性选择方法（`grid`/`bo`/`cmaes`），以全部历史 trial 为先验续搜
+4. Finalize：运行 `tools/finalize_tuning.py`；它验证当前 bout 的 Phase C 已终止，在 warm  incumbent 与**所有 bout 的全部 trial** 上取全局最佳、写回 `BASE_PARAMS`、关闭 report，并一次性更新 ledger（`tuning_bouts`、`last_bout_improved`、分级 `evaluation_depth`；**无重新运行**；可按 bout 安全重试）。若搜索进程被杀死或 report 非终态，则不应用参数且不更新 ledger。
 
-资格不足（种群太小或顶层已调优）返回 `none`——有效的无操作。
+资格不足（种群太小、顶层已调优且无响应继续、或预算/上限耗尽）返回 `none`——有效的无操作。
 
 ## 6. Skills
 

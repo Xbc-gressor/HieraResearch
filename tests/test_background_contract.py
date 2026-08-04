@@ -31,7 +31,11 @@ from semantic_space import (  # noqa: E402
     resolve_dimension_strategy,
     validate_catalog,
 )
-from tests.fixtures import belief_ledger, fixture_registry  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    attach_matched_transfer,
+    belief_ledger,
+    fixture_registry,
+)
 
 
 def _hypothesis(registry: dict, hypothesis_id: str) -> dict:
@@ -500,6 +504,29 @@ def _comparator_covered_entry() -> dict:
     }
 
 
+def _lightly_tuned_covered_entry() -> dict:
+    """Cites the three lightly tuned comparisons of `_lightly_tuned_ledger`."""
+    return {
+        "target_id": "hyp-data-filtered",
+        "evaluation_state": "comparator_covered",
+        "assessment": "unpromising",
+        "recommended_status": "pruned",
+        "claim": "All three lightly tuned comparisons were worse than their matched baseline parents.",
+        "evidence_run_ids": ["000", "001", "002", "003", "004"],
+        "evidence_edge_ids": ["sedge-000-001", "sedge-002-003", "sedge-004-005"],
+        "comparator_coverage": {
+            "direct_tuned_edges": 0,
+            "direct_lightly_tuned_edges": 3,
+            "direct_noncrash_edges": 0,
+            "confounded_noncrash_edges": 0,
+            "crash_edges": 0,
+        },
+        "confidence": "high",
+        "uncertainty": "Each child stopped short of full tuning, so residual tuning headroom remains.",
+        "reopen_when": "A later direct comparison improves over its parent.",
+    }
+
+
 def _observed_entry() -> dict:
     return {
         "target_id": "hyp-data-filtered",
@@ -536,6 +563,37 @@ def _crash_ledger(registry: dict) -> dict:
     ledger["records"].append(record)
     ledger["dag_revision"] = 5
     return ledger
+
+
+def _lightly_tuned_ledger(registry: dict) -> dict:
+    """Three matched comparisons against ``hyp-data-filtered``, lightly tuned.
+
+    Same shape as ``belief_ledger`` but with three pairs whose children carry
+    ``evaluation_depth: tuned_lightly``: zero direct tuned edges and three
+    direct edges at tuned_lightly or deeper, so the contradiction depth bar
+    clears on the lightly-tuned side alone.
+    """
+    baseline = complete_point(registry)
+    filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+    records = []
+    for index in range(3):
+        base = {
+            "run_id": f"{2 * index:03d}", "source_run_ids": [],
+            "semantic_point": baseline, "semantic_edges": [], "status": "keep",
+            "final_best_score": 0.40 + index * 0.01,
+            "evaluation_depth": "tuned", "dag_revision": 2 * index + 1,
+        }
+        child = {
+            "run_id": f"{2 * index + 1:03d}", "source_run_ids": [base["run_id"]],
+            "semantic_point": filtered, "status": "discard",
+            "final_best_score": 0.50 + index * 0.01,
+            "evaluation_depth": "tuned_lightly", "dag_revision": 2 * index + 2,
+        }
+        records.append(base)
+        child["semantic_edges"] = build_semantic_edges(records, child)
+        records.append(child)
+        attach_matched_transfer(base, child)
+    return {"records": records, "dag_revision": 6}
 
 
 def _failed_entry() -> dict:
@@ -638,6 +696,17 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 experience[field] = [entry]
                 self.assertEqual(validate_experience(experience, registry, ledger), [])
 
+    def test_accepts_depth_bar_via_lightly_tuned_edges(self) -> None:
+        """Three direct edges at tuned_lightly (zero tuned) clear the bar."""
+        registry = fixture_registry()
+        experience = _base_experience()
+        experience["updated_at_run"] = "005"
+        experience["hypothesis_evidence"] = [_lightly_tuned_covered_entry()]
+        self.assertEqual(
+            validate_experience(experience, registry, _lightly_tuned_ledger(registry)),
+            [],
+        )
+
     def test_rejects_claims_beyond_their_cited_receipts(self) -> None:
         """Citations must resolve, touch the target, and match recomputation."""
         unknown_target = _comparator_covered_entry()
@@ -733,9 +802,13 @@ class ExperienceSchema3Tests(unittest.TestCase):
         )
 
         cases = [
-            # Contraction needs two direct tuned edges, not one.
+            # Contraction needs the depth bar, not one direct edge.
             ("comparator_covered", single_edge),
-            ("at least two direct tuned edges", no_edge),
+            (
+                "at least two direct tuned edges, or at least three direct "
+                "edges at tuned_lightly or deeper",
+                no_edge,
+            ),
             ("deprioritized requires", variant(deprioritized, assessment="mixed")),
             ("deprioritized requires", variant(deprioritized, confidence="low")),
             ("deprioritized requires", variant(deprioritized, reopen_when=None)),

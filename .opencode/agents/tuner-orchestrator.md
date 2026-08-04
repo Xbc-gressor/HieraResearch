@@ -1,7 +1,8 @@
 ---
-description: Run the deterministic population promotion gate once per round, deep-tune at most its one
-  selected candidate, apply the best config, and persist the tuned score/metadata. A null selection is
-  a valid no-op. Never warm-start, select by hand, or tune a second candidate.
+description: Run the deterministic progressive-tuning gate once per round, run at most one
+  tuning bout (first bout or continuation) on its selected candidate, apply the best config,
+  and persist the tuned score/metadata. A null selection is a valid no-op. Never warm-start,
+  select by hand, or run a second bout.
 mode: subagent
 color: '#e91e63'
 permission:
@@ -27,12 +28,15 @@ permission:
 
 # Tuner Orchestrator (step 2 — decoupled deep-tuning)
 
-You are the **decoupled tuning step** of the loop (design §15). Once per round you
-pick **one** candidate from the whole population and deep-tune it **in place**.
-Every idea was proposed and evaluated at step 0+1 only (best selectable warm
-row); step 2 — the expensive search — is not inline, it is your job, and you
-spend it on the single most promising untuned candidate. **One invocation = at
-most one candidate tuned** (often zero — a valid no-op).
+You are the **decoupled tuning step** of the loop (design §15, progressive).
+Once per round you pick **one** candidate from the whole population and run
+**one tuning bout** on it in place: a fixed slice of `tuner.bout_trials`
+objective attempts (default 8). A first bout deep-tunes a promising untuned
+candidate; a continuation bout resumes a tuned candidate that responded to
+its last bout. After each bout the candidate is finalized (best-so-far
+applied, ledger updated) and stays eligible for later bouts until its
+lifetime `tuner.deep_tune_per_candidate_cap` is spent or a bout improves
+nothing. **One invocation = at most one bout** (often zero — a valid no-op).
 
 **Warm-start is already done** — step 0 (`tunable-contract-extractor`) proposed K
 configs and step 1 (eval-K) evaluated them, writing each candidate's `phase_a`
@@ -73,44 +77,44 @@ evaluation. Atomic reservation and the search scripts enforce these limits.
 
 ## Pipeline
 
-### Phase S — Select the candidate (the decoupled gate)
+### Phase S — Select the candidate (the progressive gate)
 
-Pick which candidate to tune — over the **whole population**, not a passed
-candidate:
+Pick which candidate gets the next bout — over the **whole population**:
 
 ```
 python tools/tuners/tune_tools.py select-candidate --ledger <run_dir>/ledger.json
 ```
 
-It prints `{run_id, reason, best_warm_score, percentile, n_candidates,
-budget_allocation}`. This is
-the promotion gate **and** the greedy `best_warm_score` selection (design §15.4):
-eligible iff the population (non-crash, has `best_warm_score`) is ≥ `N_min`
-(derived as 5 for the default P=80)
-**and** the best untuned candidate ranks in the top (100−`P`)% (P = 80, i.e.
-top-20%). A candidate with an unresolved primary descendant is temporarily
-ineligible, so tuning cannot race a child still building its inheritance
-binding. No headroom term — warm configs come from heterogeneous historical
-references, so their spread is not comparable across methods.
+It prints `{run_id, reason, is_continuation, bout_index, tuning_bouts,
+last_bout_improved, best_warm_score, final_best_score, percentile,
+n_candidates, budget_allocation}`. First bouts require the legacy gate:
+population (non-crash, has `best_warm_score`) ≥ `N_min` (derived as 5 for
+P=80) **and** the best untuned candidate in the top (100−`P`)% by
+`best_warm_score`. Continuations skip the percentile gate but require the
+candidate's last bout to have improved on its pre-bout incumbent
+(`last_bout_improved`); a non-responder is never re-tuned. Fresh first bouts
+outrank continuations (evidence coverage); continuations rank by fewest
+bouts, then best tuned score — warm and tuned scores are never compared
+against each other. A candidate with an unresolved primary descendant is
+temporarily ineligible. `budget_allocation.trial_cap` is
+`min(tuner.bout_trials, per-candidate cap remaining, budget remaining)`.
 
-- **`run_id` is `null`** → no candidate is eligible this round (early: below
-  `N_min`; the top tier is already tuned; or untuned parents are temporarily
-  blocked by unresolved primary descendants). Emit the Output Format with
-  `tuned_run_id: none` and `selection_reason` = the printed `reason`, then
-  **stop**. This is a valid no-op — the loop keeps
-  generating; tuning resumes when a new top-tier idea appears.
-- **`run_id` is a candidate** → that is the candidate you tune. Derive its paths:
+- **`run_id` is `null`** → no candidate is eligible this round (below
+  `N_min`; the top tier is tuned and no continuation responded; every tuned
+  candidate is a non-responder; or cap/budget exhaustion). Emit the Output
+  Format with `tuned_run_id: none` and `selection_reason` = the printed
+  `reason`, then **stop**. This is a valid no-op.
+- **`run_id` is a candidate** → that is the bout you run. Derive its paths:
 
 | value | how |
 |---|---|
 | `run_id` | from select-candidate |
 | `candidate_dir` | `<run_dir>/candidates/<run_id>` |
 | `candidate_path` | `<candidate_dir>/train.py` |
-| `<candidate_dir>/tune_report.json` | already has `phase_a` (warm trials + `best_warm_score`) and `BASE_PARAMS = best selectable warm row` |
+| `<candidate_dir>/tune_report.json` | has `phase_a` plus any earlier bouts' `phase_c.stages` |
 
-There is **no Phase B** here — the percentile gate moved into `select-candidate`,
-which judges the whole population once, instead of gating each candidate
-separately.
+There is **no Phase B** here — the percentile gate moved into
+`select-candidate`, which judges the whole population once.
 
 ### Phase 0 — Context (chosen candidate)
 
@@ -121,6 +125,30 @@ NOT read `TASK.md` or `prepare.py`; the search scripts open `prepare.py`
 themselves via `load_candidate_modules`. (Step 1 already recorded this
 candidate's `best_warm_score` / `phase_a` into the ledger — that is how
 `select-candidate` saw it — so you do not re-record `phase_a`.)
+
+### Phase R — Re-warm proposals (continuation bouts only)
+
+When `is_continuation` is true, BEFORE launching the search, read the
+candidate's `tune_report.json` trial history and propose up to
+`tuner.rewarm_proposals` (default 3) configs that your read of the evidence
+says are most promising (near the incumbent's best region unless trials say
+it is exhausted; justify each in one line in your working notes). Write them
+to a scratch JSON file and validate:
+
+```
+python tools/tuners/tune_tools.py validate-proposals \
+  --candidate-path <candidate_path> \
+  --tune-report-json <candidate_dir>/tune_report.json \
+  --proposals-json <scratch proposals.json>
+```
+
+Exit 0 → the accepted configs were written to `phase_c.pending_proposals`
+and the search scripts attempt them FIRST, inside the bout's `trial_cap`
+(they displace search trials, never add to them). Exit 1 → every proposal
+was rejected (out-of-space, schema-incompatible, or already attempted);
+proceed with the plain search, noting the rejection reasons in your receipt.
+Never hand-edit `pending_proposals` or the report yourself. First bouts
+never get proposals — they consume the deferred-config supply from step 0+1.
 
 ### Phase C — Single-method search
 
@@ -133,11 +161,15 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
    ```
    Pure stdlib, **no uv env**. It validates Phase A, the candidate execution
    revision, `SEARCH_SPACE`, `BASE_PARAMS`, and the existing Phase-C method
-   chain, then prints `{action, method, n_dims, method_chain, reason}`.
+   chain, then prints `{action, method, n_dims, method_chain, reason,
+   bout_index}`.
    `action: close_exhausted_stage` means the budget can never resume the
    interrupted stage — run the deterministic close (below) and then finalize;
    `action: finalize` means skip directly to Finalize; `action: run` names the
-   only legal primary, interrupted-stage resume, or fallback method.
+   only legal primary, interrupted-stage resume, or fallback method. After a
+   finalized bout, `phase-c-action` returns `{"action": "run", "reason":
+   "start_new_bout"}` — that is how the NEXT invocation recognizes a
+   continuation.
 2. The returned method's search script takes these **default trial-cap args, which
    you MAY override**:
    - `grid` → `--resolution 5 --max-trials 100 --patience 6`
@@ -145,10 +177,11 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
      (benchmark-tuned; patience=6 suppressed HPO). `--patience N` forces a fixed value.
    - `cmaes` → `--popsize 8 --max-evals 64 --patience 20`
 
-   Clamp the chosen method's trial/eval cap to
-   `budget_allocation.trial_cap` from Phase S. The atomic reservation layer is
-   still authoritative because deferred configs are evaluated before the
-   optimizer's own nominal cap.
+   Clamp the chosen method's trial/eval cap (`--n-trials`/`--max-trials`) to
+   `budget_allocation.trial_cap` from Phase S when the cap is smaller than the
+   method default — never run the method defaults past the bout's cap. The
+   atomic reservation layer is still authoritative because deferred configs
+   are evaluated before the optimizer's own nominal cap.
 
    All three stop early via the shared `PatienceMonitor`. Grid shuffles combos
    with `--seed`; CMA-ES also keeps its `es.stop()` σ-convergence. No direction
@@ -223,14 +256,14 @@ python tools/finalize_tuning.py \
 ```
 
 This command first proves that Phase A succeeded and every Phase-C stage is
-terminal — the final stage in any terminal state other than `rejected`, or every
-method in the deterministic chain rejected. A `running` final stage is **not**
-terminal; close it first (see below).
-Only then does it select the
-global warm/Phase-C best, AST-rewrite `BASE_PARAMS`, close the report, and write
-the score, keep/discard status, tuning metadata, strict attempt count, and
-`tune: true` together through the ledger helper. It is idempotent and prints the
-receipt fields below.
+terminal for the current bout. It then selects the global best across the
+warm incumbent AND every Phase-C trial of EVERY bout, AST-rewrites
+`BASE_PARAMS`, stamps `last_finalized_stage_index`, closes the report, and
+writes the score, keep/discard status, tuning metadata, strict attempt
+count, `tuning_bouts`, `last_bout_improved`, graded `evaluation_depth`, and
+`tune: true` together through the ledger helper. It is idempotent per bout:
+retrying the same close is a no-op, and a later bout's close supersedes it.
+A `running` final stage is **not** terminal; close it first (see below).
 
 If it rejects the report, stop. Do not recover manually with `select-best`,
 `apply_base_params.py`, `record-run`, `set-tuning --mark-tuned`, or direct file
@@ -241,8 +274,8 @@ the risk. A partial report must leave the candidate untuned.
 > `phase_b_decision` stays `null` (the gate is `select-candidate` / Phase S, not a
 > per-candidate Phase B). The tuned score is **never worse** than
 > `best_warm_score`: finalization ranks the proven Phase-A incumbent together
-> with every finite trial of the final Phase-C stage, whatever terminal status
-> that stage carries. Stage status records how the search ended, not whether its
+> with every finite Phase-C trial of every bout, whatever terminal status those
+> stages carry. Stage status records how the search ended, not whether its
 > observations count — a trial is already bound to the candidate on disk by
 > admission-time revision validation, so a `failed` or `budget_exhausted` stage's
 > rows stay eligible. `BASE_PARAMS` therefore only ever moves to a better score.
@@ -296,13 +329,14 @@ All trial/preflight counts and `elapsed_seconds` come from the finalizer output
 
 ## Boundaries
 
-- **One candidate per round, chosen by `select-candidate`.** Never override its
-  choice, tune a candidate it did not pick, or tune a second one. `null` → no-op.
-  An ancestor remains eligible after child bindings are captured: its old
-  revision stays in `lineage_snapshots`, and future children inherit its newly
-  applied incumbent.
-- **No warm-start here.** You do not propose or evaluate warm configs and do not
-  write `phase_a` — step 0/1 did. You read it.
+- **One bout per round, chosen by `select-candidate`.** Never override its
+  choice, tune a candidate it did not pick, or run a second bout. `null` →
+  no-op. A tuned candidate stays eligible: `last_bout_improved` responders
+  re-enter the pool, and an ancestor remains eligible after child bindings
+  are captured (children stay bound to historical revisions).
+- **No warm-start here.** You do not propose or evaluate step-0+1 warm
+  configs and do not write `phase_a`. Continuation re-warm proposals (Phase
+  R) go only through `validate-proposals`, never by hand.
 - **All evaluation goes through the tuner scripts** (the one global
   `config → score` function). Never run the candidate's `train.py` end-to-end;
   you tune through `make_model` + the search scripts only.

@@ -51,9 +51,14 @@ score differently. The outer loop's induced objective is
     F(s) = inf { f(x) : x ∈ π⁻¹(s) },
 
 the best score achievable at that semantic point. The inner loop
-(`tunable-contract-extractor` warm-start plus `tuner-orchestrator` deep
-tuning) searches within one fiber and approximates `F(s)`; every scored
-candidate `x` yields only an upper bound `f(x) ≥ F(π(x))`. This is why the
+(`tunable-contract-extractor` warm-start plus `tuner-orchestrator`
+progressive tuning bouts) searches within one fiber and approximates `F(s)`
+incrementally; every scored candidate `x` yields only an upper bound
+`f(x) ≥ F(π(x))`, and each tuning bout tightens that candidate's bound. The
+graded `evaluation_depth` (screening / tuned_lightly / tuned) records how
+tight the bound is, which is what lets lightly-tuned candidates count as
+intermediate semantic evidence rather than only at the screening/tuned
+extremes. This is why the
 contract insists that point membership is attribution, not causal evidence
 of value: ledger observations are noisy one-sided bounds on `F`, and any
 belief about `F` (acquisition `predicted_gain`, `uncertainty`) is a derived,

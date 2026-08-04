@@ -1072,7 +1072,7 @@ class ProgressiveSelectCandidateTest(unittest.TestCase):
 
     def test_continuation_selected_when_fresh_fails_gate(self):
         # Fresh candidates carry the WORST warm scores, so the best fresh
-        # warm percentile is 50 (< 80) and the gate refuses a first bout.
+        # warm percentile is 75 (< 80) and the gate refuses a first bout.
         ledger = self._ledger([
             _candidate_record("001", 1.30),
             _candidate_record("002", 1.20),
@@ -1116,7 +1116,7 @@ class ProgressiveSelectCandidateTest(unittest.TestCase):
         self.assertEqual(result["run_id"], "005")  # fewer bouts wins over better score
 
     def test_non_responders_never_selected(self):
-        # Fresh gate fails (percentile 50) and the only tuned candidate did
+        # Fresh gate fails (percentile 75) and the only tuned candidate did
         # not improve in its last bout.
         ledger = self._ledger([
             _candidate_record("001", 1.30),

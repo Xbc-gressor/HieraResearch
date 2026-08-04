@@ -143,7 +143,12 @@ def main(argv: list[str]) -> int:
             if isinstance(trial, dict) and _finite(trial.get("score")) is not None
         )
         depth = record.get("evaluation_depth")
-        if depth not in {"tuned", "screening"}:
+        if depth == "tuned_lightly":
+            # Graded depth is valid stored state; this report only
+            # distinguishes tuned vs screening, so lightly tuned displays on
+            # the tuned side instead of being re-derived.
+            depth = "tuned"
+        elif depth not in {"tuned", "screening"}:
             depth = "tuned" if scored_trials > 0 else "screening"
         methods = ",".join(str(stage.get("method")) for stage in stages) or "-"
         trials_total = sum(len(stage.get("trials", [])) for stage in stages)

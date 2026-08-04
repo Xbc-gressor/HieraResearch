@@ -2079,9 +2079,11 @@ TARGET_EVIDENCE_OPTIONAL = {"reopen_when"}
 TARGET_ASSESSMENTS = {"unknown", "promising", "mixed", "unpromising"}
 TARGET_RECOMMENDATIONS = {"active", "deprioritized", "pruned"}
 EXPERIENCE_CONFIDENCE = {"low", "med", "high"}
-# Schema 4 split `direct_tuned_edges` out of `direct_noncrash_edges` in every
-# target's `comparator_coverage`. Schema 3 stays readable: its three-key
-# coverage normalizes forward with `direct_tuned_edges` at 0.
+# Schema 4 split direct comparators by tuning depth in every target's
+# `comparator_coverage`: `direct_tuned_edges` and `direct_lightly_tuned_edges`
+# sit ahead of the screening-depth `direct_noncrash_edges`. Older shapes stay
+# readable: the three-key and four-key coverages normalize forward with the
+# newer depth buckets at 0.
 EXPERIENCE_SCHEMA_VERSION = 4
 READABLE_EXPERIENCE_SCHEMA_VERSIONS = {3, 4}
 
@@ -2296,7 +2298,8 @@ def _validate_target_evidence(
             errors.append(
                 f"{target}.recommended_status deprioritized requires assessment "
                 "unpromising, confidence med or high, evaluation_state "
-                "comparator_covered, at least two direct tuned edges, "
+                "comparator_covered, at least two direct tuned edges, or at "
+                "least three direct edges at tuned_lightly or deeper, "
                 "and a non-empty reopen_when"
             )
         if recommended == "pruned" and not (
@@ -2309,7 +2312,8 @@ def _validate_target_evidence(
             errors.append(
                 f"{target}.recommended_status pruned requires assessment "
                 "unpromising, confidence high, evaluation_state "
-                "comparator_covered, at least two direct tuned edges, "
+                "comparator_covered, at least two direct tuned edges, or at "
+                "least three direct edges at tuned_lightly or deeper, "
                 "and a non-empty reopen_when"
             )
         if assessment in {"promising", "unpromising"} and not (
@@ -2318,7 +2322,8 @@ def _validate_target_evidence(
             errors.append(
                 f"{target} assessment promising or unpromising requires "
                 "comparator_covered evaluation_state with at least two direct "
-                "tuned edges"
+                "tuned edges, or at least three direct edges at tuned_lightly "
+                "or deeper"
             )
         if target_kind == "hypothesis" and assessment in {
             "promising",
