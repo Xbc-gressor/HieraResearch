@@ -415,6 +415,10 @@ class CrashClosureToolchainStub:
         self.crashed = False
         self.attempts = attempts
         self.receipts = list(receipts or [])
+        self._delegate = Toolchain(ROOT, ProcessRunner(), helper_timeout=30.0)
+
+    def validate_candidate_source(self, candidate_path: Path) -> None:
+        self._delegate.validate_candidate_source(candidate_path)
 
     def budget_status(self, run_dir: Path) -> dict:
         del run_dir
@@ -458,11 +462,15 @@ class CrashClosureToolchainStub:
 
 class DebugPreflightToolchainStub:
     def __init__(self):
+        self._delegate = Toolchain(ROOT, ProcessRunner(), helper_timeout=30.0)
         self.preflight_calls: list[tuple[Path, Path, int]] = []
         self.inheritance_calls = 0
         self.search_space_checks = 0
         self.base_params_calls: list[tuple[Path, Path]] = []
         self.crashes: list[str] = []
+
+    def validate_candidate_source(self, candidate_path: Path) -> None:
+        self._delegate.validate_candidate_source(candidate_path)
 
     def record_crash(self, run_dir: Path, run_id: str) -> dict:
         del run_dir

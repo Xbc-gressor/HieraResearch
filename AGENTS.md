@@ -78,8 +78,9 @@ bounded inputs, input revision hashes, and a recorded outcome.
 - candidate failure diagnosis is read-only structured inference;
 - an accepted repair is applied by a separate bounded edit and then checked by
   Python syntax, contract/search-space validation, and no-score preflight;
-- editing calls have exact write paths and a pre-tool policy that denies shell
-  access and rejects reads outside their declared roots.
+- editing calls have exact write paths and a pre-tool policy that rejects reads
+  outside their declared roots and denies shell access except for exact
+  deterministic validator commands allow-listed per invocation.
 
 The model may propose semantic content or code, but Python decides admission,
 budgets, evaluation, tuning, ledger mutation, finalization, and stop conditions.

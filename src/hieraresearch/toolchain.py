@@ -99,6 +99,16 @@ def parse_json_output(output: str) -> Any:
     raise ValueError("command output does not end with a complete JSON value")
 
 
+def exact_command_string(args: Iterable[str]) -> str:
+    """Render an argv vector as one exact Bash string for agent edit boundaries.
+
+    The agent-side PathPolicy allow-lists Bash by string equality, so this
+    rendering must stay byte-identical to the argv the subprocess adapter
+    runs for the same check.
+    """
+    return shlex.join([str(arg) for arg in args])
+
+
 def read_task_config(repo_root: Path, task_name: str) -> dict[str, Any]:
     path = Path(repo_root) / "tasks" / task_name / "task.toml"
     try:
@@ -159,6 +169,12 @@ class Toolchain:
             output_path=output_path,
             label=label or script,
             check=check,
+        )
+
+    def _python_command(self, script: str, *args: str) -> str:
+        """Exact Bash string of the `_python` invocation for the same check."""
+        return exact_command_string(
+            [sys.executable, str(self.repo_root / script), *map(str, args)]
         )
 
     def _json_python(
@@ -299,18 +315,14 @@ class Toolchain:
             raise ToolFailure("environment preflight", result)
         return payload
 
-    def validate_background(self, run_dir: Path, *, induced: bool, provided_baseline: bool = False) -> None:
-        if induced:
-            self._validation_python(
-                "tools/background_contract.py",
-                "catalog",
-                "--path",
-                str(run_dir / "dimension_catalog.json"),
-                label="dimension catalog validation",
-                rejection_kind="dimension_catalog_validation",
-            )
-        self.validate_background_retrieval(run_dir)
+    @staticmethod
+    def _dimension_catalog_validate_args(run_dir: Path) -> tuple[str, ...]:
+        return ("catalog", "--path", str(run_dir / "dimension_catalog.json"))
 
+    @staticmethod
+    def _background_validate_args(
+        run_dir: Path, *, provided_baseline: bool
+    ) -> tuple[str, ...]:
         args = [
             "validate",
             "--background",
@@ -322,33 +334,83 @@ class Toolchain:
             args.extend(
                 ["--baseline-mechanisms", str(run_dir / "baseline_mechanisms.json")]
             )
+        return tuple(args)
+
+    def validate_background(self, run_dir: Path, *, induced: bool, provided_baseline: bool = False) -> None:
+        if induced:
+            self._validation_python(
+                "tools/background_contract.py",
+                *self._dimension_catalog_validate_args(run_dir),
+                label="dimension catalog validation",
+                rejection_kind="dimension_catalog_validation",
+            )
+        self.validate_background_retrieval(run_dir)
+
         self._validation_python(
             "tools/background_contract.py",
-            *args,
+            *self._background_validate_args(run_dir, provided_baseline=provided_baseline),
             label="background validation",
             rejection_kind="background_validation",
         )
 
+    def dimension_catalog_validate_command(self, run_dir: Path) -> str:
+        return self._python_command(
+            "tools/background_contract.py",
+            *self._dimension_catalog_validate_args(run_dir),
+        )
+
+    def background_validate_command(
+        self, run_dir: Path, *, provided_baseline: bool
+    ) -> str:
+        return self._python_command(
+            "tools/background_contract.py",
+            *self._background_validate_args(run_dir, provided_baseline=provided_baseline),
+        )
+
+    @staticmethod
+    def _background_retrieval_validate_args(run_dir: Path) -> tuple[str, ...]:
+        return ("validate", "--manifest", str(run_dir / "background_retrieval.json"))
+
     def validate_background_retrieval(self, run_dir: Path) -> None:
         self._validation_python(
             "tools/search_backends.py",
-            "validate",
-            "--manifest",
-            str(run_dir / "background_retrieval.json"),
+            *self._background_retrieval_validate_args(run_dir),
             label="background retrieval validation",
             rejection_kind="retrieval_validation",
         )
 
-    def import_background_retrieval(self, run_dir: Path, draft_path: Path) -> dict[str, Any]:
-        return self._json_validation_python(
+    def background_retrieval_validate_command(self, run_dir: Path) -> str:
+        return self._python_command(
             "tools/search_backends.py",
+            *self._background_retrieval_validate_args(run_dir),
+        )
+
+    @staticmethod
+    def _background_retrieval_import_args(
+        run_dir: Path, draft_path: Path
+    ) -> tuple[str, ...]:
+        return (
             "import-external",
             "--draft",
             str(draft_path),
             "--manifest",
             str(run_dir / "background_retrieval.json"),
+        )
+
+    def import_background_retrieval(self, run_dir: Path, draft_path: Path) -> dict[str, Any]:
+        return self._json_validation_python(
+            "tools/search_backends.py",
+            *self._background_retrieval_import_args(run_dir, draft_path),
             label="background retrieval import",
             rejection_kind="retrieval_draft_validation",
+        )
+
+    def background_retrieval_import_command(
+        self, run_dir: Path, draft_path: Path
+    ) -> str:
+        return self._python_command(
+            "tools/search_backends.py",
+            *self._background_retrieval_import_args(run_dir, draft_path),
         )
 
     def background_catalog_receipt(self, catalog_path: Path | None = None) -> dict[str, str]:
@@ -564,14 +626,40 @@ class Toolchain:
         self._python("tools/new_candidate.py", *args, label="candidate materialization")
         return self.repo_root / "runs" / task_name / tag / "candidates" / run_id
 
+    @staticmethod
+    def _candidate_source_validate_args(candidate_path: Path) -> tuple[str, ...]:
+        return ("--path", str(candidate_path))
+
+    def validate_candidate_source(self, candidate_path: Path) -> None:
+        self._validation_python(
+            "tools/validate_candidate_source.py",
+            *self._candidate_source_validate_args(candidate_path),
+            label="candidate source validation",
+            rejection_kind="candidate_source_validation",
+        )
+
+    def candidate_source_validate_command(self, candidate_path: Path) -> str:
+        return self._python_command(
+            "tools/validate_candidate_source.py",
+            *self._candidate_source_validate_args(candidate_path),
+        )
+
+    @staticmethod
+    def _lint_schema_args(candidate_path: Path) -> tuple[str, ...]:
+        return ("lint-schema", "--candidate-path", str(candidate_path))
+
     def lint_schema(self, candidate_path: Path) -> dict[str, Any]:
         return self._json_validation_python(
             "tools/tuners/tune_tools.py",
-            "lint-schema",
-            "--candidate-path",
-            str(candidate_path),
+            *self._lint_schema_args(candidate_path),
             label="candidate schema lint",
             rejection_kind="candidate_schema_validation",
+        )
+
+    def lint_schema_command(self, candidate_path: Path) -> str:
+        return self._python_command(
+            "tools/tuners/tune_tools.py",
+            *self._lint_schema_args(candidate_path),
         )
 
     def provided_baseline_defaults(self, candidate_path: Path) -> dict[str, Any]:

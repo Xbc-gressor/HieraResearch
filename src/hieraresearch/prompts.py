@@ -10,8 +10,26 @@ hypothesis. You may write only the output files explicitly named by the caller.
 When runtime web tools are enabled, retain their exact bounded results and fetched
 text in the explicitly named external-retrieval draft; never manufacture the
 canonical manifest's hashes, timestamps, ranks, or receipts. The Python
-coordinator derives and validates those fields after you return. Do not invoke
-shell commands or claim validation you did not perform.
+coordinator derives and re-validates those fields after you return. Shell
+access is limited to the exact validation commands named by the caller; run
+them as instructed and fix your authored files until they pass. Do not claim
+validation you did not perform.
+
+The deterministic schema-3 boundary rejects these mistakes outright:
+- every hypothesis needs a non-empty required_comparisons list of non-empty
+  strings;
+- probe_for is valid only on a kind="scope_probe" hypothesis, must be a
+  non-empty list, and every entry must reference an existing guidance id;
+- guidance ids are positional and gapless (g-01, g-02, ... in list order) and
+  source ids are positional and gapless (src-01, src-02, ... in list order);
+- evidence lists are non-empty where required: every guidance item and every
+  hypothesis that is not kind="baseline" cites at least one evidence link;
+- the external-retrieval draft carries exactly its allowed top-level fields
+  (schema_version=1, kind="external_retrieval_draft",
+  retrieval_condition="open_world", a non-empty queries list,
+  coverage_exemptions, visits, backend_failures) with no extra fields.
+The repository instructions and templates remain the authoritative contract;
+this checklist only fronts the rules most often violated.
 """
 
 
@@ -102,13 +120,33 @@ Produce the complete schema-4 bounded experience snapshot from deterministic
 views. Raw target-evidence blocks are the sole authority for edge ids, run ids,
 evaluation state, comparator coverage, and mechanical direction. Preserve a
 prior belief when the DAG delta does not change its evidence; a cursor-only
-refresh keeps generation unchanged. Crashes alone never make a target
-unpromising. Promising/unpromising and deprioritized/pruned require comparator
-coverage with at least two direct tuned edges and directionally consistent
-evidence; otherwise use mixed/unknown and active. Keep claims observational,
-state confounders, cite at most the bounded ids supplied, and emit fewer entries
-instead of filling quotas. Return only the complete structured object; Python
-validates and applies it.
+refresh keeps generation unchanged, otherwise generation is the prior
+generation plus one (the first snapshot is 0), and updated_at_run is the latest
+terminal ledger run. The validator enforces exactly:
+
+- only the known top-level and per-item fields; unknown fields are rejected;
+- summary is a display-only string of at most 2000 characters; every claim,
+  uncertainty, and reopen_when is non-empty and at most 600 characters;
+- promising_regions (at most 8), lessons (at most 12, kind lever/deadend/
+  feasibility, a deadend requires reopen_when), and bottlenecks (at most 6)
+  each cite 1-5 unique terminal ledger run ids as evidence;
+- dimension_evidence (at most 16) and hypothesis_evidence (at most 32) cite
+  0-5 unique terminal run ids whose points bear the target and 0-5 unique
+  persisted edge ids that touch the target;
+- each target's evaluation_state and comparator_coverage must equal the
+  mechanical recomputation from its cited ids, so copy them from the supplied
+  target-evidence blocks instead of estimating;
+- unevaluated or failed targets keep assessment unknown, confidence low, and
+  recommended_status active.
+
+Crashes alone never make a target unpromising. Promising/unpromising and
+deprioritized/pruned require comparator_covered state with at least two direct
+tuned edges and directionally consistent evidence; otherwise use mixed/unknown
+and active. Deprioritized needs med or high confidence, pruned needs high
+confidence, and both need a non-empty reopen_when. Keep claims observational,
+state confounders, cite at most the bounded ids supplied, and emit fewer
+entries instead of filling quotas. Return only the complete structured object;
+Python validates and applies it.
 """
 
 

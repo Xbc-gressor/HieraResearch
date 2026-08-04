@@ -9,7 +9,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence, TypeVar
+from typing import Any, Callable, Iterable, Protocol, Sequence, TypeVar
 
 from .artifacts import (
     InvocationJournal,
@@ -85,6 +85,7 @@ class AgentEditSpec:
     input_paths: tuple[Path, ...]
     immutable_input_paths: tuple[Path, ...]
     derived_output_paths: tuple[Path, ...] = ()
+    allowed_commands: frozenset[str] = frozenset()
     max_turns: int = 24
 
     def __post_init__(self) -> None:
@@ -96,6 +97,12 @@ class AgentEditSpec:
                 "agent-authored and Python-derived outputs must be disjoint: "
                 + ", ".join(map(str, overlap))
             )
+        commands = frozenset(command.strip() for command in self.allowed_commands)
+        if "" in commands:
+            raise ValueError("allowed commands must be non-empty strings")
+        if commands and "Bash" not in self.tools:
+            raise ValueError("allowed_commands requires Bash in the invocation's tools")
+        object.__setattr__(self, "allowed_commands", commands)
 
 
 class ModelGateway:
@@ -207,6 +214,7 @@ class ModelGateway:
             read_roots=spec.read_roots,
             write_paths=spec.write_paths,
             allowed_tools=spec.tools,
+            allowed_commands=spec.allowed_commands,
         )
         input_path_revision = paths_revision(spec.input_paths)
         immutable_revision = paths_revision(spec.immutable_input_paths)
@@ -224,6 +232,7 @@ class ModelGateway:
             "derived_output_paths": [
                 str(path.resolve()) for path in spec.derived_output_paths
             ],
+            "allowed_commands": sorted(spec.allowed_commands),
             "input_paths": [str(path.resolve()) for path in spec.input_paths],
             "input_path_revision": input_path_revision,
             "immutable_input_revision": immutable_revision,
@@ -416,11 +425,15 @@ class PathPolicy:
         read_roots: Sequence[Path],
         write_paths: Sequence[Path],
         allowed_tools: Sequence[str],
+        allowed_commands: Iterable[str] = (),
     ):
         self.cwd = Path(cwd).resolve()
         self.read_roots = tuple(Path(path).resolve() for path in read_roots)
         self.write_paths = frozenset(Path(path).resolve() for path in write_paths)
         self.allowed_tools = frozenset(allowed_tools)
+        self.allowed_commands = frozenset(
+            command.strip() for command in allowed_commands if command.strip()
+        )
 
     @staticmethod
     def _within(path: Path, root: Path) -> bool:
@@ -445,6 +458,11 @@ class PathPolicy:
             return False, f"tool {tool_name} is outside this invocation's allow-list"
         if tool_name in self.WEB_TOOLS:
             return True, "web tool allowed for this invocation"
+        if tool_name == "Bash":
+            command = tool_input.get("command")
+            if isinstance(command, str) and command.strip() in self.allowed_commands:
+                return True, "exact allow-listed validator command"
+            return False, "bash command is not an exact allow-listed validator command"
         if tool_name in self.WRITE_TOOLS:
             path = self._resolve(tool_input.get("file_path"))
             if path is None or path not in self.write_paths:

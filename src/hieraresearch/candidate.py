@@ -49,7 +49,7 @@ from .toolchain import (
     ValidationRejected,
     parse_json_output,
 )
-from .upstream import last_error_is_upstream_transport
+from .upstream import is_retryable_upstream_failure, last_error_is_upstream_transport
 
 
 MAX_TUNING_SCHEMA_REPAIRS = 2
@@ -276,9 +276,38 @@ def _read_json(path: Path) -> Any:
         raise ValueError(f"invalid JSON artifact {path}: {exc}") from exc
 
 
+def _validation_error_messages(exc: ValidationRejected) -> str:
+    """Rejection messages from a typed validator receipt, unwrapped."""
+    try:
+        payload = parse_json_output(exc.result.output)
+    except ValueError:
+        return str(exc)
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if (
+        isinstance(errors, list)
+        and errors
+        and all(isinstance(error, str) for error in errors)
+    ):
+        return "; ".join(errors)
+    return str(exc)
+
+
 def _bounded_text(path: Path, limit: int = 80_000) -> str:
     text = path.read_text(encoding="utf-8", errors="replace")
     return text if len(text) <= limit else text[:limit] + "\n[truncated]"
+
+
+def _bounded_diagnostic_text(path: Path, *, head: int = 3000, tail: int = 3000) -> str:
+    """Inline a durable diagnostic for a tool-less Messages correction call.
+
+    The file remains the durable receipt; the prompt carries the same bounded
+    head/tail shape as ToolFailure's rendered validator output because the
+    correction model cannot read paths.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    if len(text) <= head + tail:
+        return text
+    return text[:head] + "\n...[bounded diagnostic omitted]...\n" + text[-tail:]
 
 
 class CandidatePipeline:
@@ -636,12 +665,15 @@ class CandidatePipeline:
                     str(state.get("last_error", "the prior repair did not complete"))
                 )
 
+        validate_command = self.toolchain.candidate_source_validate_command(draft_path)
         prompt = (
             f"Implement candidate {action.run_id} in the staged Python file "
             f"{draft_path}. The frozen canonical path is {candidate_path}.\n"
             f"Operation: {action.op}; numeric parents: {action.parents or 'none'}.\n"
             "Read _candidate_brief.json first. The only authorized write is the "
-            "staged Python file; Python publishes it after validation."
+            "staged Python file; Python publishes it after validation. Before "
+            "finishing, run this exact source validation with the Bash tool and "
+            f"fix the staged file until it exits 0: {validate_command}"
         )
         while admitted < MAX_IMPLEMENTATION_ATTEMPTS:
             if retry_purpose is not None:
@@ -681,9 +713,10 @@ class CandidatePipeline:
                         cwd=self.identity.repo_root,
                         system_prompt=CANDIDATE_WRITER_SYSTEM,
                         prompt=attempt_prompt,
-                        tools=("Read", "Glob", "Grep", "Write", "Edit"),
+                        tools=("Read", "Glob", "Grep", "Write", "Edit", "Bash"),
                         read_roots=tuple([*read_roots, diagnostic_path]),
                         write_paths=(draft_path,),
+                        allowed_commands=frozenset({validate_command}),
                         input_paths=tuple(input_paths),
                         immutable_input_paths=tuple(
                             path for path in input_paths if path != draft_path
@@ -727,16 +760,32 @@ class CandidatePipeline:
                     stage="implementation",
                     error=exc,
                 )
-                atomic_write_json(
-                    state_path,
-                    {
-                        **state,
-                        "status": "infrastructure_failed",
-                        "last_error_type": type(exc).__name__,
-                        "last_error": str(exc),
-                    },
-                )
-                raise
+                if is_retryable_upstream_failure(exc):
+                    # Transient provider fault: the coordinator's upstream
+                    # backoff owns the retry and may reopen this local window.
+                    atomic_write_json(
+                        state_path,
+                        {
+                            **state,
+                            "status": "infrastructure_failed",
+                            "last_error_type": type(exc).__name__,
+                            "last_error": str(exc),
+                        },
+                    )
+                    raise
+                # Non-upstream inference failure (max turns, SDK error result,
+                # request/contract rejection): the admitted attempt is consumed
+                # and the loop continues like a rejected authoring attempt.
+                last_error = exc
+                repair_needed = True
+                state = {
+                    **state,
+                    "status": "rejected",
+                    "draft_revision": file_revision(draft_path),
+                    "last_error_type": type(exc).__name__,
+                    "last_error": str(exc),
+                }
+                atomic_write_json(state_path, state)
         if state.get("status") == "infrastructure_failed":
             raise InferenceError(
                 "candidate writer transport retry limit reached: "
@@ -1040,6 +1089,7 @@ class CandidatePipeline:
         fixed_input_paths = [candidate_path, draft_path, *context_paths]
         for parent in action.parents:
             read_roots.append(self.candidate_dir(parent) / "train.py")
+        lint_command = self.toolchain.lint_schema_command(draft_path)
         base_prompt = (
             f"Prepare the code-side tuning schema for candidate {action.run_id} "
             f"in the staged Python file {draft_path}. The frozen source is "
@@ -1048,7 +1098,9 @@ class CandidatePipeline:
             "Read the candidate brief, task evaluation contract, and readonly "
             "prepare.py. Edit only the staged Python file; Python publishes it "
             "only after validation. The exact PARAM_SCHEMA literal grammar in "
-            "the system instructions is a hard AST contract."
+            "the system instructions is a hard AST contract. Before finishing, "
+            "run this exact schema lint with the Bash tool and fix the staged "
+            f"file until it exits 0: {lint_command}"
         )
         admitted = int(state["attempts_admitted"])
         if state["status"] == "started":
@@ -1135,9 +1187,10 @@ class CandidatePipeline:
                         cwd=self.identity.repo_root,
                         system_prompt=CONTRACT_BUILDER_SYSTEM,
                         prompt=prompt,
-                        tools=("Read", "Glob", "Grep", "Write", "Edit"),
+                        tools=("Read", "Glob", "Grep", "Write", "Edit", "Bash"),
                         read_roots=tuple(current_read_roots),
                         write_paths=(draft_path,),
+                        allowed_commands=frozenset({lint_command}),
                         input_paths=tuple(input_paths),
                         immutable_input_paths=tuple(
                             path for path in input_paths if path != draft_path
@@ -1172,14 +1225,43 @@ class CandidatePipeline:
                 )
                 continue
             except InferenceError as exc:
+                if is_retryable_upstream_failure(exc):
+                    # Transient provider fault: the coordinator's upstream
+                    # backoff owns the retry and may reopen this local window.
+                    state = {
+                        **state,
+                        "status": "infrastructure_failed",
+                        "last_error_type": type(exc).__name__,
+                        "last_error": str(exc),
+                    }
+                    atomic_write_json(state_path, state)
+                    raise
+                # Non-upstream inference failure: consume the admitted attempt
+                # and continue as a correction with a truthful diagnostic.
+                last_error = exc
+                correction_needed = True
+                diagnostic = self._contract_diagnostic_payload(
+                    action.run_id,
+                    stage="schema",
+                    error=exc,
+                )
                 state = {
                     **state,
-                    "status": "infrastructure_failed",
+                    "status": "rejected",
+                    "draft_revision": (
+                        file_revision(draft_path) if draft_path.is_file() else None
+                    ),
                     "last_error_type": type(exc).__name__,
                     "last_error": str(exc),
+                    "diagnostic": diagnostic,
                 }
                 atomic_write_json(state_path, state)
-                raise
+                self._write_contract_diagnostic(
+                    action.run_id,
+                    stage="schema",
+                    payload=diagnostic,
+                )
+                continue
 
             state = {
                 **state,
@@ -1587,9 +1669,10 @@ class CandidatePipeline:
                     rejected_space = _bounded_text(rejected_space_path, 30_000)
                 prompt += (
                     "\n\nThe prior structured values failed deterministic validation. "
-                    f"Use the complete Python-owned diagnostic at {diagnostic_path} "
-                    "and correct the values once without changing PARAM_SCHEMA or code.\n"
-                    "Rejected normalized warm configs:\n"
+                    "Correct the values once using the complete Python-owned diagnostic "
+                    "below; do not change PARAM_SCHEMA or code.\nDiagnostic:\n"
+                    + _bounded_diagnostic_text(diagnostic_path)
+                    + "\nRejected normalized warm configs:\n"
                     + rejected_configs
                     + "\nRejected normalized search space:\n"
                     + rejected_space
@@ -1645,18 +1728,28 @@ class CandidatePipeline:
                 )
                 continue
             except InferenceError as exc:
+                upstream = is_retryable_upstream_failure(exc)
                 values_state = {
                     **values_state,
                     "status": "infrastructure_failed",
                     "transport_failures": int(
                         values_state.get("transport_failures", 0)
                     )
-                    + 1,
+                    + (1 if upstream else 0),
                     "last_error_type": type(exc).__name__,
                     "last_error": str(exc),
                 }
                 atomic_write_json(values_state_path, values_state)
-                raise
+                if upstream:
+                    # Transient provider fault: the local transport window and
+                    # the coordinator's upstream backoff own this retry.
+                    raise
+                # Non-upstream inference failure: the candidate, not the run,
+                # owns this crash. The admitted attempt produced no proposal,
+                # so a re-entry replays it without a new admission.
+                raise CandidateBuildError(
+                    f"tuning values failed for {action.run_id}: {exc}"
+                ) from exc
 
             configs = proposal.warm_configs
             if provided_defaults is not None:
@@ -4328,19 +4421,20 @@ class CandidatePipeline:
             self.identity.run_dir / "framework_cfg.json",
         )
 
-    @staticmethod
-    def _validate_authored_python(path: Path) -> Path:
+    def _validate_authored_python(self, path: Path) -> Path:
         try:
-            return CandidatePipeline._validate_python(path)
+            return self._validate_python(path)
         except (ValueError, SyntaxError) as exc:
             raise SourceValidationRejected(str(exc)) from exc
 
-    @staticmethod
-    def _validate_python(path: Path) -> Path:
-        if not path.is_file():
-            raise ValueError(f"candidate writer did not create {path}")
-        source = path.read_text(encoding="utf-8", errors="strict")
-        if not source.strip():
-            raise ValueError(f"candidate source is empty: {path}")
-        compile(source, str(path), "exec")
+    def _validate_python(self, path: Path) -> Path:
+        """Strict authored-source gate shared with the agent's Bash boundary.
+
+        Delegates to tools/validate_candidate_source.py so the post-call gate
+        and the editor's allow-listed command are one deterministic code path.
+        """
+        try:
+            self.toolchain.validate_candidate_source(path)
+        except ValidationRejected as exc:
+            raise ValueError(_validation_error_messages(exc)) from exc
         return path

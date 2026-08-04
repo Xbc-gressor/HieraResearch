@@ -39,7 +39,9 @@ from hieraresearch.process import ProcessResult, ProcessRunner  # noqa: E402
 from hieraresearch.schemas import tuning_values_schema  # noqa: E402
 from hieraresearch.toolchain import (  # noqa: E402
     ToolFailure,
+    Toolchain,
     ValidationRejected,
+    exact_command_string,
 )
 
 
@@ -62,8 +64,9 @@ class UnusedEditor:
         raise AssertionError(f"unexpected edit: {kwargs}")
 
 
-class BackgroundToolchainStub:
-    def __init__(self):
+class BackgroundToolchainStub(Toolchain):
+    def __init__(self, repo_root: Path):
+        super().__init__(repo_root, ProcessRunner(), helper_timeout=30.0)
         self.validation_calls: list[tuple[Path, bool, bool]] = []
         self.retrieval_imports: list[tuple[Path, Path]] = []
 
@@ -136,9 +139,85 @@ class BackgroundModelStub:
                         "kind": "external_retrieval_draft",
                     },
                 )
-            else:  # pragma: no cover - catalog/provided variants are not in this slice test
+            elif path.name == "dimension_catalog.json":
+                atomic_write_json(
+                    path,
+                    {"schema_version": 1, "kind": "test-dimension-catalog"},
+                )
+            elif path.name == "baseline_mechanisms.json":
+                atomic_write_json(path, {})
+            else:  # pragma: no cover - guard for unexpected authored outputs
                 raise AssertionError(f"unexpected background output: {path}")
         return validate()
+
+
+def background_validator_commands(
+    repo_root: Path,
+    run_dir: Path,
+    *,
+    induced: bool,
+    provided_baseline: bool,
+    with_import: bool,
+) -> set[str]:
+    """Expected exact Bash commands for a background_research edit spec."""
+    tools = repo_root.resolve() / "tools"
+    commands = {
+        exact_command_string(
+            [
+                sys.executable,
+                str(tools / "search_backends.py"),
+                "validate",
+                "--manifest",
+                str(run_dir / "background_retrieval.json"),
+            ]
+        ),
+        exact_command_string(
+            [
+                sys.executable,
+                str(tools / "background_contract.py"),
+                "validate",
+                "--background",
+                str(run_dir / "background.md"),
+                "--retrieval-manifest",
+                str(run_dir / "background_retrieval.json"),
+                *(
+                    [
+                        "--baseline-mechanisms",
+                        str(run_dir / "baseline_mechanisms.json"),
+                    ]
+                    if provided_baseline
+                    else []
+                ),
+            ]
+        ),
+    }
+    if with_import:
+        commands.add(
+            exact_command_string(
+                [
+                    sys.executable,
+                    str(tools / "search_backends.py"),
+                    "import-external",
+                    "--draft",
+                    str(run_dir / "background_retrieval.draft.json"),
+                    "--manifest",
+                    str(run_dir / "background_retrieval.json"),
+                ]
+            )
+        )
+    if induced:
+        commands.add(
+            exact_command_string(
+                [
+                    sys.executable,
+                    str(tools / "background_contract.py"),
+                    "catalog",
+                    "--path",
+                    str(run_dir / "dimension_catalog.json"),
+                ]
+            )
+        )
+    return commands
 
 
 class FoundationTests(unittest.TestCase):
@@ -514,6 +593,141 @@ class FoundationTests(unittest.TestCase):
             )
             self.assertFalse(policy.decision("Bash", {"command": "true"})[0])
 
+    def test_agent_path_policy_allows_only_exact_bash_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = (
+                f"{sys.executable} {root / 'tools' / 'check.py'} validate "
+                f"--manifest {root / 'run' / 'manifest.json'}"
+            )
+            policy = PathPolicy(
+                cwd=root,
+                read_roots=(root,),
+                write_paths=(root / "run" / "background.md",),
+                allowed_tools=("Read", "Write", "Bash"),
+                allowed_commands={command},
+            )
+
+            self.assertTrue(policy.decision("Bash", {"command": command})[0])
+            self.assertTrue(
+                policy.decision("Bash", {"command": f"  {command}  "})[0]
+            )
+            self.assertFalse(
+                policy.decision("Bash", {"command": f"{command} --strict"})[0]
+            )
+            self.assertFalse(
+                policy.decision("Bash", {"command": f"{command} && rm -rf {root}"})[0]
+            )
+            self.assertFalse(
+                policy.decision(
+                    "Bash",
+                    {
+                        "command": (
+                            f"{sys.executable} {root / 'tools' / 'check.py'} "
+                            f"validate --manifest {root / 'other' / 'manifest.json'}"
+                        )
+                    },
+                )[0]
+            )
+            self.assertFalse(policy.decision("Bash", {"command": command[:-3]})[0])
+            self.assertFalse(policy.decision("Bash", {"command": ""})[0])
+            self.assertFalse(policy.decision("Bash", {})[0])
+
+            without_commands = PathPolicy(
+                cwd=root,
+                read_roots=(root,),
+                write_paths=(),
+                allowed_tools=("Bash",),
+            )
+            self.assertFalse(
+                without_commands.decision("Bash", {"command": command})[0]
+            )
+
+    def test_agent_edit_spec_requires_bash_tool_for_allowed_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft = root / "draft.py"
+            with self.assertRaisesRegex(ValueError, "Bash"):
+                AgentEditSpec(
+                    purpose="guarded",
+                    schema_version=1,
+                    cwd=root,
+                    system_prompt="system",
+                    prompt="prompt",
+                    tools=("Read", "Write"),
+                    read_roots=(root,),
+                    write_paths=(draft,),
+                    input_paths=(draft,),
+                    immutable_input_paths=(),
+                    allowed_commands=frozenset(
+                        {f"{sys.executable} -m py_compile {draft}"}
+                    ),
+                )
+            with self.assertRaisesRegex(ValueError, "non-empty"):
+                AgentEditSpec(
+                    purpose="guarded",
+                    schema_version=1,
+                    cwd=root,
+                    system_prompt="system",
+                    prompt="prompt",
+                    tools=("Bash",),
+                    read_roots=(root,),
+                    write_paths=(draft,),
+                    input_paths=(draft,),
+                    immutable_input_paths=(),
+                    allowed_commands=frozenset({"   "}),
+                )
+
+    def test_model_gateway_threads_allowed_commands_into_path_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            authored = root / "draft.py"
+            command = f"{sys.executable} -m py_compile {authored}"
+
+            class PolicyCapturingEditor:
+                def edit(self, *, policy, **kwargs):
+                    del kwargs
+                    self.decisions = (
+                        policy.decision("Bash", {"command": command})[0],
+                        policy.decision("Bash", {"command": f"{command} && ls"})[0],
+                    )
+                    authored.write_text("x = 1\n", encoding="utf-8")
+                    return "draft written", {"backend": "stub"}
+
+            editor = PolicyCapturingEditor()
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=StructuredStub({}),
+                edit_backend=editor,
+            )
+
+            gateway.edit(
+                AgentEditSpec(
+                    purpose="candidate_writer:001",
+                    schema_version=1,
+                    cwd=root,
+                    system_prompt="system",
+                    prompt="prompt",
+                    tools=("Write", "Bash"),
+                    read_roots=(root,),
+                    write_paths=(authored,),
+                    allowed_commands=frozenset({command}),
+                    input_paths=(authored,),
+                    immutable_input_paths=(),
+                ),
+                validate=lambda: authored,
+            )
+
+            self.assertEqual(editor.decisions, (True, False))
+            request_path = next(
+                (root / ".orchestrator" / "invocations").glob(
+                    "candidate_writer-001-*"
+                )
+            ) / "request.json"
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            self.assertEqual(request["allowed_commands"], [command])
+
     def test_timeout_kills_descendant_process_and_bounds_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -555,7 +769,7 @@ class FoundationTests(unittest.TestCase):
                 identity.run_dir / "framework_cfg.json",
                 {"space_initialization": {"dimension_strategy": "catalog_subset"}},
             )
-            toolchain = BackgroundToolchainStub()
+            toolchain = BackgroundToolchainStub(identity.repo_root)
             models = BackgroundModelStub()
             builder = BackgroundBuilder(identity, toolchain, models, task_config={})
 
@@ -573,6 +787,17 @@ class FoundationTests(unittest.TestCase):
                 {path.name for path in spec.derived_output_paths},
                 {"background_retrieval.json"},
             )
+            self.assertIn("Bash", spec.tools)
+            self.assertEqual(
+                spec.allowed_commands,
+                background_validator_commands(
+                    repo_root,
+                    identity.run_dir,
+                    induced=False,
+                    provided_baseline=False,
+                    with_import=True,
+                ),
+            )
             self.assertEqual(len(toolchain.validation_calls), 2)
             self.assertEqual(len(toolchain.retrieval_imports), 1)
             self.assertIn(
@@ -582,6 +807,52 @@ class FoundationTests(unittest.TestCase):
             self.assertTrue(all(not induced for _, induced, _ in toolchain.validation_calls))
             self.assertTrue(
                 all(not provided for _, _, provided in toolchain.validation_calls)
+            )
+
+    def test_background_research_spec_allowlists_exact_validator_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "induced-provided")
+            task_dir = repo_root / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "train.py").write_text("SEED = True\n", encoding="utf-8")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "llm_induced"}},
+            )
+            toolchain = BackgroundToolchainStub(identity.repo_root)
+            models = BackgroundModelStub()
+            builder = BackgroundBuilder(
+                identity,
+                toolchain,
+                models,
+                task_config={
+                    "seed": {"provided": ["train.py"], "entrypoint": "train.py"}
+                },
+            )
+
+            builder.ensure()
+
+            self.assertEqual(len(models.specs), 1)
+            spec = models.specs[0]
+            self.assertEqual(spec.purpose, "background_research")
+            self.assertIn("Bash", spec.tools)
+            self.assertEqual(
+                spec.allowed_commands,
+                background_validator_commands(
+                    repo_root,
+                    identity.run_dir,
+                    induced=True,
+                    provided_baseline=True,
+                    with_import=True,
+                ),
+            )
+            for command in sorted(spec.allowed_commands):
+                self.assertIn(command, spec.prompt)
+            self.assertIn("import-external", spec.prompt)
+            self.assertEqual(
+                toolchain.validation_calls, [(identity.run_dir, True, True)]
             )
 
     def test_background_builder_does_not_research_on_retrieval_infrastructure_failure(
@@ -615,7 +886,7 @@ class FoundationTests(unittest.TestCase):
             models = BackgroundModelStub()
             builder = BackgroundBuilder(
                 identity,
-                UnavailableRetrievalValidator(),
+                UnavailableRetrievalValidator(identity.repo_root),
                 models,
                 task_config={},
             )
@@ -657,7 +928,7 @@ class FoundationTests(unittest.TestCase):
             models = BackgroundModelStub()
             builder = BackgroundBuilder(
                 identity,
-                UnavailableBackgroundValidator(),
+                UnavailableBackgroundValidator(identity.repo_root),
                 models,
                 task_config={},
             )
@@ -701,7 +972,7 @@ class FoundationTests(unittest.TestCase):
             models = BackgroundModelStub()
             builder = BackgroundBuilder(
                 identity,
-                UnavailableBackgroundValidator(),
+                UnavailableBackgroundValidator(identity.repo_root),
                 models,
                 task_config={},
             )
@@ -744,7 +1015,7 @@ class FoundationTests(unittest.TestCase):
                     if len(self.validation_calls) == 1:
                         raise BackgroundArtifactError("registry contract rejected")
 
-            toolchain = LayeredToolchain()
+            toolchain = LayeredToolchain(identity.repo_root)
             models = BackgroundModelStub()
             BackgroundBuilder(identity, toolchain, models, task_config={}).ensure()
 
@@ -792,7 +1063,7 @@ class FoundationTests(unittest.TestCase):
                     if len(self.validation_calls) == 1:
                         raise BackgroundArtifactError("registry rejected")
 
-            toolchain = RegistryRepairToolchain()
+            toolchain = RegistryRepairToolchain(identity.repo_root)
             models = BackgroundModelStub()
             BackgroundBuilder(identity, toolchain, models, task_config={}).ensure()
 
@@ -805,6 +1076,17 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(spec.derived_output_paths, ())
             self.assertNotIn("WebSearch", spec.tools)
             self.assertNotIn("WebFetch", spec.tools)
+            self.assertIn("Bash", spec.tools)
+            self.assertEqual(
+                spec.allowed_commands,
+                background_validator_commands(
+                    repo_root,
+                    identity.run_dir,
+                    induced=False,
+                    provided_baseline=False,
+                    with_import=False,
+                ),
+            )
             self.assertEqual(toolchain.retrieval_imports, [])
             diagnostic_path = (
                 identity.run_dir / ".orchestrator" / "background_repair_diagnostic.json"
@@ -848,7 +1130,7 @@ class FoundationTests(unittest.TestCase):
 
             models = BackgroundModelStub()
             BackgroundBuilder(
-                identity, ReportingToolchain(), models, task_config={}
+                identity, ReportingToolchain(identity.repo_root), models, task_config={}
             ).ensure()
 
             diagnostic_path = (
@@ -903,7 +1185,7 @@ class FoundationTests(unittest.TestCase):
 
             models = InterruptedModels()
             builder = BackgroundBuilder(
-                identity, RejectOnceToolchain(), models, task_config={}
+                identity, RejectOnceToolchain(identity.repo_root), models, task_config={}
             )
             with self.assertRaisesRegex(RuntimeError, "worker killed"):
                 builder.ensure()
@@ -923,7 +1205,7 @@ class FoundationTests(unittest.TestCase):
             resumed_models = BackgroundModelStub()
             BackgroundBuilder(
                 identity,
-                BackgroundToolchainStub(),
+                BackgroundToolchainStub(identity.repo_root),
                 resumed_models,
                 task_config={},
             ).ensure()
@@ -964,7 +1246,7 @@ class FoundationTests(unittest.TestCase):
                     )
                     raise BackgroundArtifactError("registry remains invalid")
 
-            toolchain = RejectingToolchain()
+            toolchain = RejectingToolchain(identity.repo_root)
             models = BackgroundModelStub()
             builder = BackgroundBuilder(identity, toolchain, models, task_config={})
 
@@ -1002,6 +1284,120 @@ class FoundationTests(unittest.TestCase):
                 MAX_BACKGROUND_REPAIR_ATTEMPTS + 1,
             )
 
+    def test_background_builder_absorbs_non_upstream_inference_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "inference-repair")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+            max_turns = InferenceError(
+                "Claude Agent SDK edit ended with error_max_turns: "
+                "max turns reached before a final result"
+            )
+
+            class FailOnceModels(BackgroundModelStub):
+                def edit(self, spec, *, validate):
+                    if not self.specs:
+                        self.specs.append(spec)
+                        raise max_turns
+                    return super().edit(spec, validate=validate)
+
+            models = FailOnceModels()
+            builder = BackgroundBuilder(
+                identity, BackgroundToolchainStub(identity.repo_root), models, task_config={}
+            )
+            builder.ensure()
+
+            self.assertEqual(
+                [spec.purpose for spec in models.specs],
+                ["background_research", "background_research:repair:1"],
+            )
+            # An inference failure is not a validator rejection: the repair
+            # prompt carries the error text but no stale diagnostic reference.
+            self.assertIn("max turns reached", models.specs[1].prompt)
+            self.assertNotIn("background_repair_diagnostic", models.specs[1].prompt)
+            state = json.loads(
+                (
+                    identity.run_dir / ".orchestrator" / "background_authoring.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["attempts_admitted"], 2)
+
+    def test_background_builder_reraises_upstream_inference_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "upstream-background")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+
+            class UpstreamModels(BackgroundModelStub):
+                def edit(self, spec, *, validate):
+                    del validate
+                    self.specs.append(spec)
+                    raise InferenceError(
+                        "Claude Agent SDK edit failed: Error code: 502 - "
+                        "{'error': {'message': 'Upstream service temporarily "
+                        "unavailable', 'type': 'upstream_error'}, 'type': 'error'}"
+                    )
+
+            models = UpstreamModels()
+            builder = BackgroundBuilder(
+                identity, BackgroundToolchainStub(identity.repo_root), models, task_config={}
+            )
+            with self.assertRaisesRegex(InferenceError, "Error code: 502"):
+                builder.ensure()
+
+            # The coordinator's upstream backoff owns this retry: exactly one
+            # admitted attempt was consumed and no repair slot was burned.
+            self.assertEqual(len(models.specs), 1)
+            state = json.loads(
+                (
+                    identity.run_dir / ".orchestrator" / "background_authoring.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["status"], "started")
+            self.assertEqual(state["attempts_admitted"], 1)
+
+    def test_background_builder_bounds_non_upstream_inference_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "bounded-inference")
+            identity.run_dir.mkdir(parents=True)
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"space_initialization": {"dimension_strategy": "catalog_subset"}},
+            )
+
+            class AlwaysFailingModels(BackgroundModelStub):
+                def edit(self, spec, *, validate):
+                    del validate
+                    self.specs.append(spec)
+                    raise InferenceError("Claude Agent SDK returned no final result")
+
+            models = AlwaysFailingModels()
+            builder = BackgroundBuilder(
+                identity, BackgroundToolchainStub(identity.repo_root), models, task_config={}
+            )
+            with self.assertRaisesRegex(ValueError, "no final result"):
+                builder.ensure()
+
+            self.assertEqual(len(models.specs), MAX_BACKGROUND_REPAIR_ATTEMPTS + 1)
+            state = json.loads(
+                (
+                    identity.run_dir / ".orchestrator" / "background_authoring.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["attempts_admitted"], MAX_BACKGROUND_REPAIR_ATTEMPTS + 1)
+            self.assertEqual(state["last_error_kind"], "inference")
+            self.assertEqual(state["status"], "rejected")
+
     def test_frozen_background_rejects_stale_provided_baseline_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -1032,7 +1428,7 @@ class FoundationTests(unittest.TestCase):
                 },
             )
             atomic_write_json(identity.ledger_path, {"records": []})
-            toolchain = BackgroundToolchainStub()
+            toolchain = BackgroundToolchainStub(identity.repo_root)
             models = BackgroundModelStub()
             builder = BackgroundBuilder(
                 identity,

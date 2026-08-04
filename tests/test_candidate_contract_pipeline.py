@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from hieraresearch.artifacts import (  # noqa: E402
 from hieraresearch.candidate import (  # noqa: E402
     CandidateBuildError,
     CandidatePipeline,
+    SourceValidationRejected,
     TuningValues,
 )
 from hieraresearch.llm import (  # noqa: E402
@@ -38,6 +40,7 @@ from hieraresearch.toolchain import (  # noqa: E402
     ToolFailure,
     Toolchain,
     ValidationRejected,
+    exact_command_string,
 )
 
 
@@ -345,6 +348,24 @@ class CandidateContractPipelineTests(unittest.TestCase):
             self.assertTrue(
                 all(spec.write_paths == (draft_path,) for spec in models.edit_specs)
             )
+            expected_lint_command = exact_command_string(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "tuners" / "tune_tools.py"),
+                    "lint-schema",
+                    "--candidate-path",
+                    str(draft_path),
+                ]
+            )
+            self.assertTrue(
+                all("Bash" in spec.tools for spec in models.edit_specs)
+            )
+            self.assertTrue(
+                all(
+                    spec.allowed_commands == frozenset({expected_lint_command})
+                    for spec in models.edit_specs
+                )
+            )
             self.assertEqual(models.canonical_snapshots, [COMPUTED_SCHEMA] * 2)
             self.assertIn("SEARCH_SPACE", candidate_path.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -378,16 +399,82 @@ class CandidateContractPipelineTests(unittest.TestCase):
             self.assertTrue(
                 all(spec.write_paths == (draft_path,) for spec in models.edit_specs)
             )
+            expected_validate_command = exact_command_string(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "validate_candidate_source.py"),
+                    "--path",
+                    str(draft_path),
+                ]
+            )
+            self.assertTrue(
+                all("Bash" in spec.tools for spec in models.edit_specs)
+            )
+            self.assertTrue(
+                all(
+                    spec.allowed_commands == frozenset({expected_validate_command})
+                    for spec in models.edit_specs
+                )
+            )
             self.assertEqual(candidate_path.read_text(), "VALUE = 1\n")
             self.assertTrue(pipeline.implementation_is_ready(action))
+
+    def test_agent_source_validator_command_matches_post_call_gate(self) -> None:
+        cases = [
+            # py_compile accepts a BOM; the strict gate must reject it.
+            ("bom", b"\xef\xbb\xbfVALUE = 1\n", False),
+            # py_compile honors the PEP 263 cookie and rejects UTF-8 bytes;
+            # the strict gate decodes UTF-8 first and must accept.
+            (
+                "ascii_cookie_utf8",
+                "# coding: ascii\nVALUE = 'café'\n".encode("utf-8"),
+                True,
+            ),
+            ("non_ascii_utf8", "VALUE = 'café'  # naïve\n".encode("utf-8"), True),
+            ("syntax_error", b"def broken(:\n", False),
+            ("empty", b"\n", False),
+            ("latin1_bytes", "VALUE = 'café'\n".encode("latin-1"), False),
+            ("missing", None, False),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity = RunIdentity(root, "toy", "source-equivalence")
+            toolchain = self._toolchain()
+            pipeline = CandidatePipeline(identity, toolchain, ScriptedModels(), {})
+            for name, payload, accepted in cases:
+                with self.subTest(case=name):
+                    path = root / f"{name}.py"
+                    if payload is not None:
+                        path.write_bytes(payload)
+                    command = toolchain.candidate_source_validate_command(path)
+                    completed = subprocess.run(
+                        command, shell=True, capture_output=True, text=True
+                    )
+                    gate_error = None
+                    try:
+                        pipeline._validate_authored_python(path)
+                    except SourceValidationRejected as exc:
+                        gate_error = exc
+                    self.assertEqual(completed.returncode == 0, accepted)
+                    self.assertEqual(gate_error is None, accepted)
+                    if not accepted:
+                        verdict = json.loads(completed.stdout)
+                        self.assertFalse(verdict["ok"])
+                        self.assertEqual(
+                            verdict["failure_kind"], "candidate_source_validation"
+                        )
 
     def test_operational_ledger_phase_changes_do_not_reset_writer_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             identity, action, candidate_dir = self._case(
                 Path(tmp), train_source="SEED = True\n"
             )
+            non_upstream = InferenceError(
+                "Claude Agent SDK edit ended with error_max_turns: "
+                "max turns reached before a final result"
+            )
             first_models = ScriptedModels(
-                edit_sources=[InferenceError("agent transport unavailable")]
+                edit_sources=[non_upstream, non_upstream]
             )
             first = CandidatePipeline(
                 identity,
@@ -396,28 +483,22 @@ class CandidateContractPipelineTests(unittest.TestCase):
                 {},
             )
 
-            with self.assertRaisesRegex(InferenceError, "transport unavailable"):
+            with self.assertRaisesRegex(CandidateBuildError, "max turns reached"):
                 first.implement(action)
+
+            self.assertEqual(
+                [spec.purpose for spec in first_models.edit_specs],
+                ["candidate_writer:001", "candidate_writer:001:repair"],
+            )
+            state = json.loads(
+                (candidate_dir / first.IMPLEMENTATION_STATE).read_text()
+            )
+            self.assertEqual(state["attempts_admitted"], 2)
+            self.assertEqual(state["status"], "rejected")
 
             atomic_write_json(
                 identity.run_dir / "ledger.json",
                 {"phase": "blocked", "records": []},
-            )
-            second_models = ScriptedModels(
-                edit_sources=[InferenceError("agent transport unavailable")]
-            )
-            second = CandidatePipeline(
-                identity,
-                self._toolchain(),
-                second_models,
-                {},
-            )
-            with self.assertRaisesRegex(InferenceError, "transport unavailable"):
-                second.implement(action)
-
-            atomic_write_json(
-                identity.run_dir / "ledger.json",
-                {"phase": "running", "records": []},
             )
             no_third_edit = ScriptedModels(edit_sources=["VALUE = 1\n"])
             exhausted = CandidatePipeline(
@@ -426,7 +507,7 @@ class CandidateContractPipelineTests(unittest.TestCase):
                 no_third_edit,
                 {},
             )
-            with self.assertRaisesRegex(InferenceError, "retry limit"):
+            with self.assertRaisesRegex(CandidateBuildError, "max turns reached"):
                 exhausted.implement(action)
 
             state = json.loads(
@@ -434,14 +515,6 @@ class CandidateContractPipelineTests(unittest.TestCase):
             )
             self.assertEqual(state["attempts_admitted"], 2)
             self.assertEqual(no_third_edit.edit_specs, [])
-            self.assertEqual(
-                [first_models.edit_specs[0].purpose, second_models.edit_specs[0].purpose],
-                ["candidate_writer:001", "candidate_writer:001"],
-            )
-            self.assertNotIn(
-                "prior output failed",
-                second_models.edit_specs[0].prompt,
-            )
 
     def test_upstream_transport_exhaustion_reopens_after_outer_recovery(
         self,
@@ -504,7 +577,11 @@ class CandidateContractPipelineTests(unittest.TestCase):
                         "PARTIAL_INFRASTRUCTURE_EDIT = True\n",
                         encoding="utf-8",
                     )
-                    raise InferenceError("agent transport unavailable")
+                    raise InferenceError(
+                        "Claude Agent SDK edit failed: Error code: 502 - "
+                        "{'error': {'message': 'Upstream service temporarily "
+                        "unavailable', 'type': 'upstream_error'}, 'type': 'error'}"
+                    )
 
             first_models = PartialFailureModels()
             first = CandidatePipeline(
@@ -513,7 +590,7 @@ class CandidateContractPipelineTests(unittest.TestCase):
                 first_models,
                 {},
             )
-            with self.assertRaisesRegex(InferenceError, "transport unavailable"):
+            with self.assertRaisesRegex(InferenceError, "Error code: 502"):
                 first.build_contract(action)
 
             class InspectingModels(ScriptedModels):
@@ -564,7 +641,7 @@ class CandidateContractPipelineTests(unittest.TestCase):
                 {},
             )
 
-            with self.assertRaisesRegex(InferenceError, "unavailable"):
+            with self.assertRaisesRegex(CandidateBuildError, "unavailable"):
                 first.build_contract(action)
 
             self.assertTrue(first.tuning_schema_is_ready(action))
@@ -603,44 +680,160 @@ class CandidateContractPipelineTests(unittest.TestCase):
             self.assertTrue(resumed.contract_is_ready(action))
 
     def test_stage_b_transport_retries_are_bounded_without_using_correction(self) -> None:
+        upstream = InferenceError(
+            "Claude Messages request failed: Error code: 502 - "
+            "{'error': {'message': 'Upstream service temporarily unavailable', "
+            "'type': 'upstream_error'}, 'type': 'error'}"
+        )
         with tempfile.TemporaryDirectory() as tmp:
             identity, action, candidate_dir = self._case(
                 Path(tmp), train_source=VALID_SCHEMA
             )
             purposes: list[str] = []
             for _ in range(2):
-                models = ScriptedModels(
-                    infer_responses=[InferenceError("messages API unavailable")]
-                )
+                models = ScriptedModels(infer_responses=[upstream])
                 pipeline = CandidatePipeline(
                     identity,
                     self._toolchain(),
                     models,
                     {},
                 )
-                with self.assertRaisesRegex(InferenceError, "unavailable"):
+                with self.assertRaisesRegex(InferenceError, "Error code: 502"):
                     pipeline.build_contract(action)
                 purposes.append(models.infer_calls[0]["purpose"])
 
-            no_third_call = ScriptedModels(
-                infer_responses=[tuning_response(3)]
-            )
-            exhausted = CandidatePipeline(
-                identity,
-                self._toolchain(),
-                no_third_call,
-                {},
-            )
-            with self.assertRaisesRegex(InferenceError, "retry limit"):
-                exhausted.build_contract(action)
-
             state = json.loads(
-                (candidate_dir / exhausted.TUNING_VALUES_STATE).read_text()
+                (candidate_dir / CandidatePipeline.TUNING_VALUES_STATE).read_text()
             )
             self.assertEqual(purposes, ["tuning_values:001"] * 2)
             self.assertEqual(state["attempts_admitted"], 1)
             self.assertEqual(state["transport_failures"], 2)
-            self.assertEqual(no_third_call.infer_calls, [])
+
+            # The coordinator's outer backoff owns upstream recovery; re-entry
+            # reopens the local window and replays the admitted attempt without
+            # consuming the correction slot.
+            recovered_models = ScriptedModels(
+                infer_responses=[tuning_response(3)]
+            )
+            recovered = CandidatePipeline(
+                identity,
+                self._toolchain(),
+                recovered_models,
+                {},
+            )
+            recovered.build_contract(action)
+
+            self.assertEqual(len(recovered_models.infer_calls), 1)
+            self.assertEqual(
+                recovered_models.infer_calls[0]["purpose"], "tuning_values:001"
+            )
+            state = json.loads(
+                (candidate_dir / recovered.TUNING_VALUES_STATE).read_text()
+            )
+            self.assertEqual(state["attempts_admitted"], 1)
+            self.assertTrue(recovered.contract_is_ready(action))
+
+    def test_stage_b_non_upstream_inference_error_crashes_candidate_not_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, action, candidate_dir = self._case(
+                Path(tmp), train_source=VALID_SCHEMA
+            )
+            models = ScriptedModels(
+                infer_responses=[InferenceError("messages API unavailable")]
+            )
+            pipeline = CandidatePipeline(identity, self._toolchain(), models, {})
+
+            with self.assertRaisesRegex(CandidateBuildError, "unavailable"):
+                pipeline.build_contract(action)
+
+            state = json.loads(
+                (candidate_dir / pipeline.TUNING_VALUES_STATE).read_text()
+            )
+            # A non-transport inference failure is not billed to the upstream
+            # transport window, and the admitted attempt stays replayable.
+            self.assertEqual(state["transport_failures"], 0)
+            self.assertEqual(state["status"], "infrastructure_failed")
+            self.assertEqual(state["attempts_admitted"], 1)
+
+            recovered_models = ScriptedModels(infer_responses=[tuning_response(3)])
+            recovered = CandidatePipeline(
+                identity, self._toolchain(), recovered_models, {}
+            )
+            recovered.build_contract(action)
+            self.assertEqual(
+                [call["purpose"] for call in recovered_models.infer_calls],
+                ["tuning_values:001"],
+            )
+            self.assertTrue(recovered.contract_is_ready(action))
+
+    def test_schema_non_upstream_inference_error_consumes_repairs_then_crashes_candidate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, action, candidate_dir = self._case(
+                Path(tmp), train_source=COMPUTED_SCHEMA
+            )
+            max_turns = InferenceError(
+                "Claude Agent SDK edit ended with error_max_turns: "
+                "max turns reached before a final result"
+            )
+            models = ScriptedModels(edit_sources=[max_turns] * 3)
+            pipeline = CandidatePipeline(identity, self._toolchain(), models, {})
+
+            with self.assertRaisesRegex(CandidateBuildError, "max turns reached"):
+                pipeline.build_contract(action)
+
+            self.assertEqual(
+                [spec.purpose for spec in models.edit_specs],
+                [
+                    "tuning_schema:001",
+                    "tuning_schema:001:repair:1",
+                    "tuning_schema:001:repair:2",
+                ],
+            )
+            state = json.loads(
+                (candidate_dir / pipeline.TUNING_SCHEMA_STATE).read_text()
+            )
+            self.assertEqual(state["attempts_admitted"], 3)
+            self.assertEqual(state["status"], "rejected")
+
+            no_more_edits = ScriptedModels(edit_sources=[VALID_SCHEMA])
+            exhausted = CandidatePipeline(
+                identity, self._toolchain(), no_more_edits, {}
+            )
+            with self.assertRaisesRegex(CandidateBuildError, "max turns reached"):
+                exhausted.build_contract(action)
+            self.assertEqual(no_more_edits.edit_specs, [])
+
+    def test_values_correction_prompt_inlines_the_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, action, _ = self._case(Path(tmp), train_source=VALID_SCHEMA)
+            rejection = ValidationRejected(
+                "search-space validation",
+                process_result(returncode=1, output="distinctive-contract-violation"),
+            )
+            toolchain = RejectFirstSpaceToolchain(rejection)
+            models = ScriptedModels(
+                infer_responses=[tuning_response(3), tuning_response(3)]
+            )
+            pipeline = CandidatePipeline(identity, toolchain, models, {})
+
+            pipeline.build_contract(action)
+
+            self.assertEqual(len(models.infer_calls), 2)
+            correction = models.infer_calls[1]
+            self.assertEqual(correction["purpose"], "tuning_values:001:correction:1")
+            # The tool-less correction call cannot read files: the durable
+            # diagnostic travels inside the prompt, not as a path reference.
+            self.assertIn("distinctive-contract-violation", correction["prompt"])
+            diagnostic_path = (
+                identity.run_dir
+                / ".orchestrator"
+                / "candidate_contract_diagnostics"
+                / "001-values.json"
+            )
+            self.assertTrue(diagnostic_path.is_file())
+            self.assertNotIn(str(diagnostic_path), correction["prompt"])
 
     def test_stage_b_request_rejection_replays_only_after_schema_changes(self) -> None:
         class RequestBackend:
@@ -740,7 +933,7 @@ class CandidateContractPipelineTests(unittest.TestCase):
             )
             first = CandidatePipeline(identity, toolchain, failed_models, {})
 
-            with self.assertRaisesRegex(InferenceError, "unavailable"):
+            with self.assertRaisesRegex(CandidateBuildError, "unavailable"):
                 first.build_contract(action)
 
             first_prompt = failed_models.infer_calls[0]["prompt"]

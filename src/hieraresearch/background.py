@@ -13,11 +13,12 @@ from .artifacts import (
     file_revision,
     paths_revision,
 )
-from .llm import AgentEditSpec, ModelGateway
+from .llm import AgentEditSpec, InferenceError, ModelGateway
 from .models import RunIdentity
 from .process import ProcessResult
 from .prompts import BACKGROUND_SYSTEM
 from .toolchain import ToolFailure, Toolchain, ValidationRejected
+from .upstream import is_retryable_upstream_failure
 
 
 MAX_BACKGROUND_REPAIR_ATTEMPTS = 5
@@ -140,7 +141,7 @@ class BackgroundBuilder:
                 state = {**state, "repairs_admitted": next_repair}
             diagnostic_path = (
                 self._write_repair_diagnostic(last_error)
-                if last_error is not None
+                if last_error is not None and not isinstance(last_error, InferenceError)
                 else None
             )
             reuse_retrieval = self._has_valid_retrieval(retrieval_manifest_path)
@@ -164,6 +165,10 @@ class BackgroundBuilder:
                 retrieval_manifest_path,
                 *(() if diagnostic_path is None else (diagnostic_path,)),
             ]
+            allowed_commands = self._agent_validation_commands(
+                induced=induced,
+                retrieval_draft_path=retrieval_draft_path,
+            )
             prompt = (
                 f"Task: {self.identity.task_name}\nRun directory: {run_dir}\n"
                 f"Dimension strategy: {'llm_induced' if induced else 'catalog_subset'}\n"
@@ -197,9 +202,32 @@ class BackgroundBuilder:
                     if diagnostic_path is not None
                     else ""
                 )
+                + (
+                    "\nBefore finishing, run each of these exact validation commands "
+                    "with the Bash tool and iterate on the authored files until every "
+                    "command exits 0; no other shell command is permitted:\n"
+                    + "\n".join(f"- {command}" for command in sorted(allowed_commands))
+                    + (
+                        "\nThe canonical retrieval manifest may be produced only by "
+                        "running the import-external command on your draft; never "
+                        "write or edit the manifest file directly."
+                        if retrieval_draft_path is not None
+                        else ""
+                    )
+                )
             )
             attempt_prompt = prompt
-            if last_error is not None:
+            if isinstance(last_error, InferenceError):
+                # The prior attempt died inside the model call itself; no
+                # validator diagnostic exists for it, so do not point at one.
+                attempt_prompt += (
+                    "\n\nThe prior bounded authoring attempt failed before "
+                    "validation with an inference error; the deterministic "
+                    "boundary did not reject the artifacts. Re-drive the same "
+                    "authoring task and finish within the turn budget.\n"
+                    + str(last_error)
+                )
+            elif last_error is not None:
                 attempt_prompt += (
                     "\n\nThe deterministic background boundary rejected the prior output. "
                     "Repair every reported contract error. Preserve successful searches "
@@ -234,6 +262,7 @@ class BackgroundBuilder:
                             "Grep",
                             "Write",
                             "Edit",
+                            "Bash",
                             *(
                                 ()
                                 if reuse_retrieval
@@ -242,6 +271,7 @@ class BackgroundBuilder:
                         ),
                         read_roots=(task_dir, docs_dir, contracts_dir, run_dir),
                         write_paths=tuple(authored_paths),
+                        allowed_commands=allowed_commands,
                         input_paths=tuple(input_paths),
                         immutable_input_paths=tuple(
                             path
@@ -274,6 +304,18 @@ class BackgroundBuilder:
                     **self._last_error_fields(exc),
                 }
                 atomic_write_json(authoring_state_path, state)
+            except InferenceError as exc:
+                if is_retryable_upstream_failure(exc):
+                    # Transient provider fault: the coordinator's upstream
+                    # backoff owns the retry; do not consume the repair budget.
+                    raise
+                last_error = exc
+                state = {
+                    **state,
+                    "status": "rejected",
+                    **self._last_error_fields(exc),
+                }
+                atomic_write_json(authoring_state_path, state)
         raise ValueError(f"background artifacts remain invalid: {last_error}")
 
     def _has_valid_retrieval(self, manifest_path: Path) -> bool:
@@ -284,6 +326,36 @@ class BackgroundBuilder:
         except ValidationRejected:
             return False
         return True
+
+    def _agent_validation_commands(
+        self,
+        *,
+        induced: bool,
+        retrieval_draft_path: Path | None,
+    ) -> frozenset[str]:
+        """Exact validator commands the bounded editor may run through Bash.
+
+        Each string is byte-identical to the deterministic check Python re-runs
+        after the call; the edit boundary matches Bash input by string
+        equality. A reused (frozen) retrieval manifest admits no import command.
+        """
+        run_dir = self.identity.run_dir
+        commands = [
+            self.toolchain.background_retrieval_validate_command(run_dir),
+            self.toolchain.background_validate_command(
+                run_dir,
+                provided_baseline=self._has_provided_baseline(),
+            ),
+        ]
+        if retrieval_draft_path is not None:
+            commands.append(
+                self.toolchain.background_retrieval_import_command(
+                    run_dir, retrieval_draft_path
+                )
+            )
+        if induced:
+            commands.append(self.toolchain.dimension_catalog_validate_command(run_dir))
+        return frozenset(commands)
 
     @staticmethod
     def _last_error_fields(error: BaseException | None) -> dict[str, Any]:
@@ -300,6 +372,14 @@ class BackgroundBuilder:
                 "last_error_label": error.label,
                 "last_error_returncode": error.result.returncode,
                 "last_error_output": error.result.output,
+            }
+        if isinstance(error, InferenceError):
+            return {
+                "last_error": str(error),
+                "last_error_kind": "inference",
+                "last_error_label": "",
+                "last_error_returncode": 0,
+                "last_error_output": "",
             }
         return {
             "last_error": str(error or ""),
@@ -329,6 +409,8 @@ class BackgroundBuilder:
                     elapsed_seconds=0.0,
                 ),
             )
+        if state.get("last_error_kind") == "inference":
+            return InferenceError(message)
         return BackgroundArtifactError(message)
 
     @staticmethod
@@ -365,7 +447,7 @@ class BackgroundBuilder:
             and (purpose is None or isinstance(purpose, str))
             and isinstance(state.get("last_error"), str)
             and state.get("last_error_kind", "")
-            in {"", "artifact_error", "validation_rejected"}
+            in {"", "artifact_error", "validation_rejected", "inference"}
             and isinstance(state.get("last_error_label", ""), str)
             and isinstance(state.get("last_error_output", ""), str)
             and isinstance(state.get("last_error_returncode", 0), int)
