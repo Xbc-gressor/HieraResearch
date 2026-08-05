@@ -30,6 +30,7 @@ from _common import (  # noqa: E402
 from grid_search import main as grid_main  # noqa: E402
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
+    _last_bout_was_first,
     close_exhausted_stage,
     finalizable_tuning_result,
     phase_c_action,
@@ -1373,6 +1374,118 @@ class ProgressiveSelectCandidateTest(unittest.TestCase):
         )
         self.assertEqual(result["run_id"], "001")
         self.assertEqual(result["budget_allocation"]["trial_cap"], 8)
+
+    def test_alternation_responder_follows_first_bout(self):
+        # After a first bout, the waiting responder wins even though the best
+        # fresh candidate passes the percentile gate.
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.30),
+            _candidate_record("006", 0.95, tune=True, bouts=1,
+                              improved=True, final=0.94),
+        ])
+        result = select_candidate(
+            ledger, n_min=5, top_percentile=80.0, last_bout_was_first=True
+        )
+        self.assertEqual(result["run_id"], "006")
+        self.assertIs(result["is_continuation"], True)
+        self.assertIn("alternation", result["reason"])
+
+    def test_alternation_fresh_follows_continuation(self):
+        # Same population, but the last bout was a continuation: the
+        # gate-passing fresh candidate wins.
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.30),
+            _candidate_record("006", 0.95, tune=True, bouts=2,
+                              improved=True, final=0.94),
+        ])
+        result = select_candidate(
+            ledger, n_min=5, top_percentile=80.0, last_bout_was_first=False
+        )
+        self.assertEqual(result["run_id"], "001")
+        self.assertIs(result["is_continuation"], False)
+
+    def test_alternation_none_preserves_legacy_order(self):
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.30),
+            _candidate_record("006", 0.95, tune=True, bouts=1,
+                              improved=True, final=0.94),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertEqual(result["run_id"], "001")
+        self.assertIs(result["is_continuation"], False)
+
+    def test_alternation_without_responder_falls_back_to_fresh(self):
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.30),
+            _candidate_record("006", 0.95, tune=True, bouts=1,
+                              improved=False, final=0.95),
+        ])
+        result = select_candidate(
+            ledger, n_min=5, top_percentile=80.0, last_bout_was_first=True
+        )
+        self.assertEqual(result["run_id"], "001")
+        self.assertIs(result["is_continuation"], False)
+
+
+class LastBoutWasFirstTest(unittest.TestCase):
+    def _attempts(self, root: Path, rows: list[dict]) -> Path:
+        path = root / "evaluation_attempts.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return path
+
+    def test_last_finalized_first_bout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._attempts(root, [
+                {"kind": "score_attempt", "phase": "phase_a", "run_id": "001"},
+                {"kind": "score_attempt", "phase": "phase_c", "run_id": "001"},
+            ])
+            ledger = {"records": [
+                {"run_id": "001", "status": "keep", "tune": True, "tuning_bouts": 1},
+            ]}
+            self.assertIs(_last_bout_was_first(root, ledger), True)
+
+    def test_last_finalized_continuation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._attempts(root, [
+                {"kind": "score_attempt", "phase": "phase_c", "run_id": "001"},
+            ])
+            ledger = {"records": [
+                {"run_id": "001", "status": "keep", "tune": True, "tuning_bouts": 2},
+            ]}
+            self.assertIs(_last_bout_was_first(root, ledger), False)
+
+    def test_in_flight_bout_yields_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._attempts(root, [
+                {"kind": "score_attempt", "phase": "phase_c", "run_id": "001"},
+            ])
+            ledger = {"records": [
+                {"run_id": "001", "status": "keep"},  # no tune flag yet
+            ]}
+            self.assertIsNone(_last_bout_was_first(root, ledger))
+
+    def test_missing_attempts_file_yields_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(_last_bout_was_first(Path(tmp), {"records": []}))
 
 
 if __name__ == "__main__":

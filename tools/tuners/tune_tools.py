@@ -3226,6 +3226,47 @@ def _has_unresolved_primary_descendant(ledger: dict, parent_run_id: str) -> bool
     return bool(unbound_primary_descendants(ledger, parent_run_id))
 
 
+def _last_bout_was_first(run_dir: Path, ledger: dict) -> bool | None:
+    """Whether the run's last finalized bout was a first bout, if knowable.
+
+    Derived from the last phase_c score attempt in evaluation_attempts.jsonl
+    plus the ledger's tuning_bouts.  None when no bout has run, the attempts
+    file is missing, or the last bout has not finalized (in flight).
+    """
+    path = Path(run_dir) / "evaluation_attempts.jsonl"
+    if not path.is_file():
+        return None
+    last_run_id = None
+    try:
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(row, dict)
+                and row.get("kind") == "score_attempt"
+                and row.get("phase") == "phase_c"
+                and isinstance(row.get("run_id"), str)
+            ):
+                last_run_id = row["run_id"]
+    except OSError:
+        return None
+    if last_run_id is None:
+        return None
+    record = next(
+        (
+            item
+            for item in ledger.get("records", [])
+            if isinstance(item, dict) and str(item.get("run_id")) == last_run_id
+        ),
+        None,
+    )
+    if not isinstance(record, dict) or not record.get("tune"):
+        return None  # bout still in flight, or pre-progressive record
+    return int(record.get("tuning_bouts") or 1) <= 1
+
+
 def select_candidate(
     ledger: dict,
     *,
@@ -3233,6 +3274,7 @@ def select_candidate(
     top_percentile: float = DEFAULT_TOP_PERCENTILE,
     bout_trials: int | None = None,
     budget_allocation: dict | None = None,
+    last_bout_was_first: bool | None = None,
 ) -> dict:
     """Which candidate receives the next tuning bout (progressive §15), or none.
 
@@ -3243,11 +3285,13 @@ def select_candidate(
     Continuations (tuning_bouts >= 1) skip the percentile gate but require
     `last_bout_improved` not False — a non-responder is never re-tuned.
 
-    Ranking is like-for-like: fresh candidates (0 bouts, warm scores) always
-    precede continuations; continuations order by (tuning_bouts,
-    final_best_score) — fewest bouts first (evidence coverage), then best
-    tuned score. Warm and tuned scores are never compared against each
-    other. Returns {run_id|None, reason, bout_index, is_continuation, ...}.
+    Ranking is like-for-like and alternates: when the run's last finalized
+    bout was a first bout (last_bout_was_first=True), a waiting responder is
+    selected before the fresh gate runs; otherwise fresh candidates (0 bouts,
+    warm scores) precede continuations. Continuations order by
+    (tuning_bouts, final_best_score) — fewest bouts first, then best tuned
+    score. Warm and tuned scores are never compared against each other.
+    Returns {run_id|None, reason, bout_index, is_continuation, ...}.
     """
     if (
         not isinstance(n_min, int)
@@ -3350,7 +3394,20 @@ def select_candidate(
     selected = None
     is_continuation = False
     pct = None
-    if fresh:
+    alternation = False
+    if last_bout_was_first and continuations:
+        # Alternation: a completed first bout guarantees a waiting responder
+        # the next bout before any new first bout starts.
+        selected = min(
+            continuations,
+            key=lambda r: (
+                int(r.get("tuning_bouts") or 1),
+                float(r["final_best_score"]),
+            ),
+        )
+        is_continuation = True
+        alternation = True
+    if selected is None and fresh:
         best_fresh = min(fresh, key=lambda r: r["best_warm_score"])
         value = best_fresh["best_warm_score"]
         # percentile = fraction of OTHER candidates strictly worse (higher
@@ -3410,6 +3467,11 @@ def select_candidate(
             f"continuation: responder with fewest bouts ({tuning_bouts}) and "
             "best tuned score"
         )
+        if alternation:
+            reason = (
+                "alternation: responder follows last round's first bout; "
+                + reason
+            )
     else:
         reason = (
             f"best untuned in top {100 - top_percentile:.0f}% "
@@ -3645,6 +3707,7 @@ def cmd_select_candidate(args) -> int:
             top_percentile=top_p,
             bout_trials=bout,
             budget_allocation=budget_status(led.parent),
+            last_bout_was_first=_last_bout_was_first(led.parent, ledger),
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
