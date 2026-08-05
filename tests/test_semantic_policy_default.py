@@ -18,6 +18,8 @@ from semantic_evidence import (  # noqa: E402
     validate_conditioned_adjustment,
 )
 from semantic_search import (  # noqa: E402
+    DEFAULT_POLICY_CONFIG,
+    _carrier_priors,
     build_baseline_proposal_set,
     build_gain_context,
     build_proposal_set,
@@ -866,3 +868,54 @@ class CoverageExperiencePolicyTests(unittest.TestCase):
             experience=ledger["experience"],
         )
         self.assertEqual(receipt["experience"]["generation"], 1)
+
+
+
+class CarrierPriorBaselineTests(unittest.TestCase):
+    def test_baseline_hypotheses_earn_no_prior(self) -> None:
+        # Two successful reversions from the treatment back to baseline give
+        # the baseline hypothesis two positive carrier contexts — but that
+        # evidence already counts as negative carriers of the treatment, so
+        # the all-baselines point must get no bonus for it.
+        registry = fixture_registry()
+        baseline_hypothesis = next(
+            dimension["baseline_hypothesis_id"]
+            for dimension in registry["dimensions"]
+            if dimension["id"] == "dim-data-curation"
+        )
+        baseline = complete_point(registry)
+        filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+        records = []
+        for revision, (run_id, parents, point, status, score) in enumerate([
+            ("000", [], baseline, "keep", 0.40),
+            ("001", ["000"], filtered, "discard", 0.50),
+            ("002", ["001"], baseline, "keep", 0.42),
+            ("003", [], baseline, "keep", 0.41),
+            ("004", ["003"], filtered, "discard", 0.52),
+            ("005", ["004"], baseline, "keep", 0.43),
+        ], 1):
+            record = {
+                "run_id": run_id, "source_run_ids": parents,
+                "semantic_point": point, "status": status,
+                "final_best_score": score, "evaluation_depth": "screening",
+                "dag_revision": revision,
+            }
+            record["semantic_edges"] = build_semantic_edges(records, record)
+            records.append(record)
+        ledger = {"records": records, "dag_revision": 6}
+        proposals = build_proposal_set(registry, ledger, op="fresh", parents=[])
+        self.assertEqual(proposals["schema_version"], 4)
+        priors = _carrier_priors(proposals, ledger, dict(DEFAULT_POLICY_CONFIG))
+
+        baseline_prior, baseline_detail = priors[baseline["point_id"]]
+        self.assertEqual(baseline_prior, 0.0)
+        self.assertEqual(baseline_detail, {})
+
+        filtered_prior, filtered_detail = priors[filtered["point_id"]]
+        self.assertEqual(filtered_prior, -0.4)
+        self.assertEqual(
+            filtered_detail,
+            {"hyp-data-filtered": {"negative": 2, "positive": 0}},
+        )
+        # The raw baseline count exists; the prior deliberately ignores it.
+        self.assertIn(baseline_hypothesis, proposals["baseline_hypothesis_ids"])

@@ -337,7 +337,7 @@ run_id: <id>
 op: <op>
 parents: <ids-or-none>
 point_id: <point-id>
-policy: <coverage|gain|gain_uncertainty|gain_uncertainty_nocost>
+policy: <coverage_experience|coverage|gain|gain_uncertainty|gain_uncertainty_nocost>
 candidate: <name>
 ledger: <run_dir>/ledger.json
 ```

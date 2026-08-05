@@ -75,7 +75,7 @@ from semantic_space import (
 )
 
 
-PROPOSAL_SCHEMA_VERSION = 3
+PROPOSAL_SCHEMA_VERSION = 4
 GAIN_CONTEXT_SCHEMA_VERSION = 3
 PREDICTION_SCHEMA_VERSION = 3
 CONDITIONED_PREDICTION_SCHEMA_VERSION = 2
@@ -580,6 +580,12 @@ def build_proposal_set(
         "schema_version": PROPOSAL_SCHEMA_VERSION,
         "space": space_receipt(registry),
         "search_space_state_revision": state_revision,
+        "baseline_hypothesis_ids": sorted(
+            str(dimension["baseline_hypothesis_id"])
+            for dimension in registry.get("dimensions", [])
+            if isinstance(dimension, dict)
+            and dimension.get("baseline_hypothesis_id") is not None
+        ),
         "action": {"op": op, "parents": parents},
         "coverage_snapshot": {
             "n_valid_records": coverage["n_valid_records"],
@@ -636,6 +642,7 @@ def validate_proposal_set(value: Any) -> list[str]:
         "schema_version",
         "space",
         "search_space_state_revision",
+        "baseline_hypothesis_ids",
         "action",
         "coverage_snapshot",
         "proposals",
@@ -644,8 +651,17 @@ def validate_proposal_set(value: Any) -> list[str]:
     unknown_top = sorted(set(value) - allowed_top)
     if unknown_top:
         errors.append(f"proposal set has unknown fields {unknown_top}")
-    if value.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
-        errors.append(f"proposal set schema_version must be {PROPOSAL_SCHEMA_VERSION}")
+    if value.get("schema_version") not in {3, 4}:
+        errors.append("proposal set schema_version must be 3 or 4")
+    if value.get("schema_version") == 4:
+        baseline_ids = value.get("baseline_hypothesis_ids")
+        if (
+            not isinstance(baseline_ids, list)
+            or any(not isinstance(item, str) or not item for item in baseline_ids)
+        ):
+            errors.append(
+                "proposal set baseline_hypothesis_ids must be a list of hypothesis ids"
+            )
     state_revision = value.get("search_space_state_revision")
     if (
         not isinstance(state_revision, int)
@@ -1163,27 +1179,40 @@ def _carrier_priors(
     ledger: dict[str, Any],
     cfg: dict[str, Any],
 ) -> dict[str, tuple[float, dict[str, dict[str, int]]]]:
-    """Deterministic per-point experience prior from hypothesis carriers."""
+    """Deterministic per-point experience prior from hypothesis carriers.
+
+    Only non-baseline hypotheses contribute: a reversion to baseline is the
+    failing treatment's evidence, and counting it again as a baseline bonus
+    would double-count the edge and bias selection toward baseline points.
+    """
+    baselines = set(proposal_set.get("baseline_hypothesis_ids") or [])
     cache: dict[str, dict[str, Any]] = {}
     priors: dict[str, tuple[float, dict[str, dict[str, int]]]] = {}
     for proposal in proposal_set["proposals"]:
         prior = 0.0
         detail: dict[str, dict[str, int]] = {}
+        deprioritized = set(proposal.get("deprioritized_hypotheses") or [])
         for hypothesis_id in sorted(
-            set(selected_assignments(proposal["point"]).values())
+            set(selected_assignments(proposal["point"]).values()) - baselines
         ):
             if hypothesis_id not in cache:
                 cache[hypothesis_id] = hypothesis_carriers(
                     ledger, target_id=hypothesis_id
                 )
             carriers = cache[hypothesis_id]
+            # A deprioritized hypothesis (runtime overlay or external
+            # guidance) counts as at least one negative context even without
+            # carrier history — demotion must not be selection-inert.
+            negative = carriers["negative"]
+            if hypothesis_id in deprioritized:
+                negative = max(negative, 1)
             prior += min(carriers["positive"], int(cfg["carrier_pos_cap"])) * float(
                 cfg["carrier_pos_weight"]
-            ) - min(carriers["negative"], int(cfg["carrier_neg_cap"])) * float(
+            ) - min(negative, int(cfg["carrier_neg_cap"])) * float(
                 cfg["carrier_neg_weight"]
             )
             detail[hypothesis_id] = {
-                "negative": carriers["negative"],
+                "negative": negative,
                 "positive": carriers["positive"],
             }
         priors[proposal["point_id"]] = (round(prior, 10), detail)

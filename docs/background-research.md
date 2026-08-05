@@ -249,16 +249,22 @@ Proposal neighborhoods are deterministic:
 Hypotheses are reusable and may participate in many points. There is no
 “consumed direction” state.
 
-Four replaceable policies are implemented:
+Five replaceable policies are implemented:
 
-1. `coverage` — deterministic exploration by inverse hypothesis coverage and
+1. `coverage_experience` — the default: deterministic coverage plus the
+   carrier prior, a per-hypothesis count of independent ledger contexts where
+   adding the hypothesis made its parent strictly worse (penalty) or better
+   (smaller bonus). No LLM score is required.
+2. `coverage` — deterministic exploration by inverse hypothesis coverage and
    exact-point novelty; no LLM score is required.
-2. `gain` — predicted gain plus a small coverage term minus predicted cost.
-3. `gain_uncertainty` — predicted gain plus an explicit uncertainty bonus and
+3. `gain` — predicted gain plus a small coverage term minus predicted cost.
+4. `gain_uncertainty` — predicted gain plus an explicit uncertainty bonus and
    coverage, minus predicted cost.
-4. `gain_uncertainty_nocost` — like `gain_uncertainty` but with no cost
+5. `gain_uncertainty_nocost` — like `gain_uncertainty` but with no cost
    prediction at all, for settings where pre-implementation cost estimates
    are noise and only waste tokens.
+
+The last three are currently dormant.
 
 For model-scored policies, each proposal receives separate `[0,1]` background
 priors for gain and uncertainty, signed experience adjustments, final
@@ -285,29 +291,31 @@ unscaled. Raw forecasts remain unchanged. A score of `100` preserves legacy
 selection exactly; `0` leaves only the configured coverage term even though
 forecasts are still collected. It is not normalized against a changing
 leaderboard and must not be described as a calibrated probability. The first
-schema-6 admission freezes it for the run; selection and ledger validation
+schema-6/7 admission freezes it for the run; selection and ledger validation
 reject later changes.
 
-Policy receipt schema 6 preserves the prior, adjustment, final score,
+Policy receipt schema 7 preserves the prior, adjustment, final score,
 experience revision, exact target/proposal relation, comparator coverage,
 evidence ids, acquisition role/direction, `coverage`, configured intelligence
 score, applied judgment weight, other weights, proposal-set digest, action,
-ranking, and evidence. These values stay in `policy_receipt`; they do not
-become observations or beliefs. Historical schema-2/3/4/5 receipts remain
+ranking, and evidence. Under `coverage_experience` it instead records the
+deterministic `experience_prior` and per-hypothesis carrier context counts.
+These values stay in `policy_receipt`; they do not
+become observations or beliefs. Historical schema-2/3/4/5/6 receipts remain
 readable.
 
-Runtime-deprioritized proposals occupy a separate, deterministic
-semantic-admission budget lane. `deprioritized_budget_interval: N` reserves
-every Nth one-based outer admission for that lane (default `N=5`, or 20%);
-ordinary slots select only active proposals. Acquisition scores rank within
-the scheduled lane and cannot buy a deprioritized point an active slot. When
-the scheduled lane is empty, the other lane fills the slot and policy receipt
-schema 6 records the selection index, interval, scheduled/selected lanes,
-fallback reason, and the selected point's pre-lane acquisition rank.
+Runtime-deprioritized content stays eligible but is penalized in selection:
+the carrier prior subtracts from a point's acquisition score for every
+independent negative carrier context its non-baseline hypotheses carry, so
+repeated disasters push a point down the ranking while a later positive
+context can lift it again. The schema-7 receipt records the prior, the
+per-hypothesis counts, and the selection index; the legacy lane fields are
+null with `fallback: lanes_removed`.
 
 Run-local configuration lives under `framework_cfg.json.semantic_search`.
-`coverage` (fully deterministic, no LLM scores) is the code and copied-template
-default. Model-scored policies remain explicit opt-ins, for example:
+`coverage_experience` (fully deterministic, no LLM scores) is the code and
+copied-template default. Model-scored policies remain explicit opt-ins, for
+example:
 
 ```json
 {
@@ -515,8 +523,9 @@ Sources, hypotheses, and guidance share five exact-tag scope facets:
 
 `background_contract.py` derives claim-to-hypothesis transfer as `direct`,
 `partial`, `mismatch`, or `unknown`. Only `direct` guidance changes eligibility.
-`caution` annotates; external `deprioritize` assigns a directly matched
-hypothesis to the same limited budget lane as runtime deprioritization;
+`caution` annotates; external `deprioritize` marks a directly matched
+hypothesis deprioritized — like runtime deprioritization it stays eligible
+but earns at least a one-context carrier-prior penalty in selection;
 `exclude` removes it from proposal generation while preserving its identity
 and receipt.
 

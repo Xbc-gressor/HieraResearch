@@ -1527,7 +1527,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
 
     Automated pruning is two-stage (``active -> deprioritized -> pruned``), so
     the pruned overlay is revision 2 and reopening lands at revision 3; the
-    deprioritized stage at revision 1 exercises the deterministic budget lane.
+    deprioritized stage at revision 1 exercises the carrier-prior penalty.
     """
 
     def setUp(self) -> None:
@@ -1540,6 +1540,40 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         return build_proposal_set(
             self.registry, ledger, op="fresh", parents=[], max_points=64
         )
+
+    def test_deprioritized_without_carriers_is_penalized(self) -> None:
+        # A deprioritized hypothesis with no carrier history (e.g. external
+        # guidance) still earns one negative-context weight: demotion must
+        # not be selection-inert now that lanes are gone.
+        from semantic_search import DEFAULT_POLICY_CONFIG, _carrier_priors
+
+        state = state_with(
+            decision(1, "hyp-data-filtered", "active", "deprioritized")
+        )
+        ledger = {"records": [], "search_space_state": state}
+        proposals = self._proposals(ledger)
+        priors = _carrier_priors(proposals, ledger, dict(DEFAULT_POLICY_CONFIG))
+        deprioritized = [
+            proposal
+            for proposal in proposals["proposals"]
+            if "hyp-data-filtered" in proposal["deprioritized_hypotheses"]
+        ]
+        self.assertTrue(deprioritized)
+        for proposal in deprioritized:
+            prior, detail = priors[proposal["point_id"]]
+            self.assertEqual(prior, -0.2)
+            self.assertEqual(
+                detail["hyp-data-filtered"], {"negative": 1, "positive": 0}
+            )
+        clean = [
+            proposal
+            for proposal in proposals["proposals"]
+            if not proposal["deprioritized_hypotheses"]
+        ]
+        self.assertTrue(clean)
+        for proposal in clean:
+            prior, _ = priors[proposal["point_id"]]
+            self.assertEqual(prior, 0.0)
 
     @staticmethod
     def _selects_filtered(proposal: dict) -> bool:
@@ -1992,7 +2026,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         # 1. Revision 0 proposes a point containing hyp-data-filtered.
         ledger: dict = {"records": [], "search_space_state": empty_search_space_state()}
         proposals = self._proposals(ledger)
-        self.assertEqual(proposals["schema_version"], 3)
+        self.assertEqual(proposals["schema_version"], 4)
         self.assertEqual(proposals["search_space_state_revision"], 0)
         self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
@@ -2011,7 +2045,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         state = state_with(decision(1, "hyp-data-filtered", "active", "deprioritized"))
         ledger["search_space_state"] = state
         proposals = self._proposals(ledger)
-        self.assertEqual(proposals["schema_version"], 3)
+        self.assertEqual(proposals["schema_version"], 4)
         self.assertEqual(proposals["search_space_state_revision"], 1)
         filtered_proposals = [
             item for item in proposals["proposals"] if self._selects_filtered(item)
@@ -2047,7 +2081,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         )
         state["revision"] = 2
         proposals = self._proposals(ledger)
-        self.assertEqual(proposals["schema_version"], 3)
+        self.assertEqual(proposals["schema_version"], 4)
         self.assertEqual(proposals["search_space_state_revision"], 2)
         self.assertFalse(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")

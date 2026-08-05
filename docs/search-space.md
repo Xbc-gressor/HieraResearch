@@ -103,7 +103,9 @@ ordered against the ledger's current `search_space_state` revision:
 Every enumerated point passes `validate_point` — admissibility under
 `requires`/`excludes` is a deterministic check, not a policy judgment.
 `semantic_search.py select` then applies a replaceable acquisition policy
-(`coverage`, `gain`, `gain_uncertainty`, `gain_uncertainty_nocost`) over
+(`coverage_experience` by default — deterministic coverage plus the carrier
+prior — plus `coverage`, `gain`, `gain_uncertainty`,
+`gain_uncertainty_nocost`) over
 fibers. For model-scored policies, `gain-context` pins the bounded experience
 generation but exposes no generic prose, raw scores, or signed legacy deltas.
 Prediction schema 3 separates the background/mechanism prior from signed
@@ -121,21 +123,21 @@ the complete LLM-authored gain/uncertainty/cost term; deterministic coverage
 is added without scaling, and raw forecasts are preserved. Thus `100` is exact
 legacy behavior and `0` leaves only the configured coverage term even though
 forecasts are still collected. The score is neither a calibrated probability
-nor normalized to a changing leaderboard. The first schema-6 admission freezes
+nor normalized to a changing leaderboard. The first schema-6/7 admission freezes
 it for the run; selection and ledger validation reject later changes.
 
-Policy receipt schema 6 persists the exact
+Policy receipt schema 7 persists the exact
 helper-derived target, proposal relation, comparator coverage, evidence ids,
 acquisition role, gain direction, configured score, and applied weight
-separately from `coverage` and `cost`;
+separately from `coverage` and `cost` — or, under `coverage_experience`, the
+deterministic `experience_prior` and per-hypothesis carrier context counts;
 the cited run/edge ids must be the complete union of the named target receipts,
-not a model-selected subset. Before
-acquisition, proposals are partitioned into active and deprioritized budget
-lanes. With interval `N` (default 5), every
-Nth one-based semantic admission selects within the deprioritized lane and
-all other admissions select within the active lane; acquisition scores never
-move a point across lanes. If a scheduled lane is empty, the other lane fills
-the slot and the schema-6 receipt records the fallback and both lanes.
+not a model-selected subset. Deprioritized
+content stays eligible but is penalized by the carrier prior rather than
+lane-scheduled: every independent negative carrier context subtracts from a
+point's acquisition score, and the schema-7 receipt records the prior, the
+per-hypothesis counts, and the selection index (legacy lane fields are null,
+`fallback: lanes_removed`).
 Hypotheses are coordinates, not consumable resources: one `hyp-*` may
 participate in many points.
 
@@ -145,7 +147,7 @@ keeps a content receipt, its supplied default configuration is evaluated once,
 and the observation consumes the normal objective budget. It remains an
 ordinary `kind: optimization`, `op: fresh` record—there is no second seed
 species or scoring path. The only special policy action is deterministic:
-`baseline-only` proposal generation plus a one-point coverage receipt prevents
+`baseline-only` proposal generation plus a one-point deterministic receipt prevents
 an acquisition prior from replacing the control. Tasks without a provided
 entrypoint retain the normal `fresh` bootstrap.
 

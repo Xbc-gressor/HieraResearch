@@ -1538,3 +1538,32 @@ class TestHypothesisCarriers(unittest.TestCase):
         result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
         self.assertEqual(result["negative"], 0)
         self.assertEqual(result["positive"], 0)
+
+
+
+class TestSchema7TransferRequirement(unittest.TestCase):
+    def test_schema7_nonfresh_terminal_requires_parameter_transfer(self):
+        record = {
+            "run_id": "001",
+            "source_run_ids": ["000"],
+            "op": "improve",
+            "status": "keep",
+            "final_best_score": 0.5,
+            "policy_receipt": {"schema_version": 7},
+        }
+        errors = validate_parameter_transfer_evidence(record)
+        self.assertTrue(
+            any("parameter_transfer is required" in error for error in errors),
+            errors,
+        )
+
+    def test_schema7_fresh_still_forbids_parameter_transfer(self):
+        record = {
+            "run_id": "000",
+            "source_run_ids": [],
+            "op": "fresh",
+            "status": "keep",
+            "final_best_score": 0.5,
+            "policy_receipt": {"schema_version": 7},
+        }
+        self.assertEqual(validate_parameter_transfer_evidence(record), [])

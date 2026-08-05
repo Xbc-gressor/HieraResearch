@@ -928,7 +928,7 @@ def hypothesis_carriers(
 def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     """Validate the durable inherited-control evidence on one ledger record.
 
-    New (policy-receipt schema 6) non-fresh terminal records must carry the
+    New (policy-receipt schema 5+) non-fresh terminal records must carry the
     tuner-produced transfer receipt.  Its inherited row proves parameter
     continuity, not semantic isolation; only an additional paired semantic
     control can qualify. Historical records remain readable but never acquire
@@ -939,7 +939,7 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     transfer = record.get("parameter_transfer")
     policy = record.get("policy_receipt")
     is_new_contract = (
-        isinstance(policy, dict) and policy.get("schema_version") in {5, 6}
+        isinstance(policy, dict) and policy.get("schema_version") in {5, 6, 7}
     )
     nonfresh = record.get("op") in {"improve", "crossover"}
     terminal_noncrash = record.get("status") in NONCRASH_TERMINAL_STATUSES
