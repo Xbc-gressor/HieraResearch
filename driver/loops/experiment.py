@@ -19,6 +19,13 @@ from ..status import budget_status, compact_status
 from . import common
 from .common import RunBlocked
 
+_RECONCILE_GUIDANCE = (
+    " Reconcile from the AUTHORITATIVE artifacts (ledger, "
+    "tune_report.json, attempt log, finalization artifacts) — never "
+    "the receipt. Complete any valid pending finalization ONLY via "
+    "tools/finalize_tuning.py, or submit a corrected truthful no-op "
+    "receipt.")
+
 
 def _brief(run_dir: Path, repo_root: Path, cmd) -> dict:
     out = cmd(["python", "tools/ledger.py", "brief",
@@ -196,20 +203,15 @@ def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str):
     receipt, _ = _invoke(
         runner, store, "tuner-orchestrator", task, tag, run_dir,
         round_no=round_no,
-        extra={"reconcile_note": reason + (
-            " Reconcile from the AUTHORITATIVE artifacts (ledger, "
-            "tune_report.json, attempt log, finalization artifacts) — never "
-            "the receipt. Complete any valid pending finalization ONLY via "
-            "tools/finalize_tuning.py, or submit a corrected truthful no-op "
-            "receipt.")})
+        extra={"reconcile_note": reason + _RECONCILE_GUIDANCE})
     return receipt
 
 
 def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
           events) -> None:
     try:
-        receipt, _ = _invoke(runner, store, "tuner-orchestrator", task, tag,
-                             run_dir, round_no=round_no)
+        receipt, tuner_inv = _invoke(runner, store, "tuner-orchestrator",
+                                     task, tag, run_dir, round_no=round_no)
     except InvocationFailed:
         try:
             receipt = _tuner_reconcile(runner, store, task, tag, run_dir,
@@ -221,14 +223,25 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
     tuned_id = receipt.get("tuned_run_id", "none")
     if receipt.get("tuned") and tuned_id != "none" and \
             not _tune_flag(run_dir, tuned_id):
+        note = (f"receipt claims tuned {tuned_id} but ledger has tune: false.")
+        # spec: corrective follow-up in the SAME tuner session first
+        corrected = None
         try:
-            corrected = _tuner_reconcile(
-                runner, store, task, tag, run_dir, round_no,
-                f"receipt claims tuned {tuned_id} but ledger has tune: false.")
-        except InvocationFailed as exc:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"tuner receipt/ledger contradiction unresolved: "
-                      f"{exc.problems}")
+            corrected, _ = _invoke(
+                runner, store, "tuner-orchestrator", task, tag, run_dir,
+                round_no=round_no, resume_from=tuner_inv,
+                extra={"reconcile_note": note + _RECONCILE_GUIDANCE})
+        except InvocationFailed:
+            corrected = None
+        if corrected is None or (corrected.get("tuned") and not _tune_flag(
+                run_dir, corrected.get("tuned_run_id", "none"))):
+            try:
+                corrected = _tuner_reconcile(
+                    runner, store, task, tag, run_dir, round_no, note)
+            except InvocationFailed as exc:
+                _or_block(run_dir, repo_root, cmd, events,
+                          f"tuner receipt/ledger contradiction unresolved: "
+                          f"{exc.problems}")
         if corrected.get("tuned") and \
                 not _tune_flag(run_dir, corrected.get("tuned_run_id", "none")):
             _or_block(run_dir, repo_root, cmd, events,

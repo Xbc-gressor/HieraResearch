@@ -163,6 +163,42 @@ class ExperimentTests(unittest.TestCase):
                                  "candidate-writer", "tunable-contract-extractor",
                                  "tuner-orchestrator"])
 
+    def test_tuner_contradiction_corrected_in_same_session(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, True]   # ideation check, pre-tuner check, step-0 check
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: (
+                 (ctx.run_dir / "background.md").write_text("# bg\n"),
+                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            # contradiction: claims tuned 000 but the ledger has no tune flag
+            {"receipt": {"tuned_run_id": "000", "tuned": True,
+                         "ledger_updated": True}},
+            # same-session corrective follow-up: truthful no-op
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        tuner_calls = [ctx for name, ctx in runner.calls
+                       if name == "tuner-orchestrator"]
+        # in-session follow-up only; no fresh reconciliation session
+        self.assertEqual(len(tuner_calls), 2)
+        self.assertNotIn("reconcile_note", tuner_calls[0].extra)
+        self.assertIn("reconcile_note", tuner_calls[1].extra)
+
     def test_refresh_runs_before_ideation(self) -> None:
         write_task(self.repo)
         cmd = ExperimentCmd(self.repo)
