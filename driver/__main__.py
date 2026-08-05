@@ -55,8 +55,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(status, indent=2, sort_keys=True))
             return 0
-        print("error: --loop experiment not implemented yet", file=sys.stderr)
-        return 2
+        from driver.loops.experiment import run_experiment
+        runner = SDKSessionRunner(model=model, events=EventsLog(run_dir),
+                                  cli_path=args.cli_path)
+        status = run_experiment(
+            args.task, args.tag, runner=runner, model=model,
+            max_evaluations=args.max_evaluations, timeout=args.timeout,
+            dimension_strategy=args.dimension_strategy,
+            llm_intelligence_score=args.llm_intelligence_score,
+            cli_path=args.cli_path,
+        )
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0
     return 0
 
 

@@ -11,6 +11,10 @@ from ..events import EventsLog
 from ..roles import REPO_ROOT, ROLES, InvocationContext
 
 
+class RunBlocked(Exception):
+    """Raised to unwind the loop after block() persisted the blocked phase."""
+
+
 def run_cmd(args, repo_root, check=True, capture=True, **kw) -> subprocess.CompletedProcess:
     return subprocess.run([str(a) for a in args], cwd=repo_root,
                           capture_output=capture, text=True, check=check, **kw)
