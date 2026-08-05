@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from background_contract import ContractError  # noqa: E402
 from semantic_evidence import (  # noqa: E402
     acquisition_conditioning,
+    build_semantic_edges,
     validate_conditioned_adjustment,
 )
 from semantic_search import (  # noqa: E402
@@ -578,9 +579,9 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
         self.assertEqual(removed["proposal_relation"], "removed")
         self.assertEqual(removed["gain_direction"], "positive")
 
-    def test_default_policy_is_pure_coverage_in_template_and_cli(self) -> None:
+    def test_default_policy_is_coverage_experience_in_template_and_cli(self) -> None:
         template = json.loads((ROOT / "tasks" / "framework_cfg.example.json").read_text())
-        self.assertEqual(template["semantic_search"]["policy"], "coverage")
+        self.assertEqual(template["semantic_search"]["policy"], "coverage_experience")
         self.assertEqual(
             template["semantic_search"]["deprioritized_budget_interval"], 5
         )
@@ -612,14 +613,16 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             receipt = json.loads(receipt_path.read_text())
-            self.assertEqual(receipt["policy"]["name"], "coverage")
-            self.assertEqual(receipt["schema_version"], 6)
+            self.assertEqual(receipt["policy"]["name"], "coverage_experience")
+            self.assertEqual(receipt["schema_version"], 7)
             self.assertIsNone(receipt["components"]["llm_judgment_weight"])
             self.assertIsNone(receipt["components"]["predicted_gain"])
             self.assertIsNone(receipt["components"]["uncertainty"])
+            self.assertEqual(receipt["components"]["experience_prior"], 0.0)
             self.assertEqual(receipt["evidence"], [])
             self.assertEqual(receipt["experience"]["conditioning"], [])
-            self.assertEqual(receipt["budget"]["selected_lane"], "active")
+            self.assertIsNone(receipt["budget"]["selected_lane"])
+            self.assertEqual(receipt["budget"]["fallback"], "lanes_removed")
 
     def test_llm_intelligence_score_weights_only_model_judgments(self) -> None:
         registry = fixture_registry()
@@ -782,3 +785,84 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def _two_negative_ledger(registry: dict) -> dict:
+    """Two independent negative carrier contexts for hyp-data-filtered."""
+    baseline = complete_point(registry)
+    filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+    records = []
+    for revision, (run_id, parents, point, status, score) in enumerate([
+        ("000", [], baseline, "keep", 0.40),
+        ("001", ["000"], filtered, "discard", 0.50),
+        ("002", [], baseline, "keep", 0.41),
+        ("003", ["002"], filtered, "discard", 0.52),
+    ], 1):
+        record = {
+            "run_id": run_id, "source_run_ids": parents,
+            "semantic_point": point, "status": status,
+            "final_best_score": score, "evaluation_depth": "screening",
+            "dag_revision": revision,
+        }
+        record["semantic_edges"] = build_semantic_edges(records, record)
+        records.append(record)
+    return {"records": records, "dag_revision": 4}
+
+
+class CoverageExperiencePolicyTests(unittest.TestCase):
+    def test_repeated_negative_point_loses_to_clean_point(self) -> None:
+        registry = fixture_registry()
+        ledger = _two_negative_ledger(registry)
+        proposals = build_proposal_set(registry, ledger, op="fresh", parents=[])
+        point, receipt = select_proposal(
+            proposals, policy="coverage_experience", ledger=ledger
+        )
+        self.assertNotEqual(
+            selected_assignments(point).get("dim-data-curation"),
+            "hyp-data-filtered",
+        )
+        self.assertEqual(receipt["schema_version"], 7)
+        self.assertEqual(receipt["policy"]["name"], "coverage_experience")
+        self.assertEqual(receipt["budget"]["fallback"], "lanes_removed")
+
+    def test_zero_evidence_matches_coverage_choice(self) -> None:
+        registry = fixture_registry()
+        ledger = {"records": []}
+        proposals = build_proposal_set(registry, ledger, op="fresh", parents=[])
+        point_cov, _ = select_proposal(proposals, policy="coverage", ledger=ledger)
+        point_exp, receipt = select_proposal(
+            proposals, policy="coverage_experience", ledger=ledger
+        )
+        self.assertEqual(point_cov["point_id"], point_exp["point_id"])
+        self.assertEqual(receipt["components"]["experience_prior"], 0.0)
+
+    def test_components_expose_prior_and_carriers(self) -> None:
+        registry = fixture_registry()
+        ledger = _two_negative_ledger(registry)
+        proposals = build_proposal_set(registry, ledger, op="fresh", parents=[])
+        _, receipt = select_proposal(
+            proposals, policy="coverage_experience", ledger=ledger
+        )
+        carriers = receipt["components"]["carriers"]
+        self.assertIsInstance(carriers, dict)
+        for detail in carriers.values():
+            self.assertIn("negative", detail)
+            self.assertIn("positive", detail)
+
+    def test_schema4_experience_accepted(self) -> None:
+        registry = fixture_registry()
+        ledger = _two_negative_ledger(registry)
+        ledger["experience"] = {
+            "schema_version": 4,
+            "updated_at_run": "003",
+            "generation": 1,
+        }
+        proposals = build_proposal_set(registry, ledger, op="fresh", parents=[])
+        _, receipt = select_proposal(
+            proposals,
+            policy="coverage_experience",
+            ledger=ledger,
+            experience=ledger["experience"],
+        )
+        self.assertEqual(receipt["experience"]["generation"], 1)

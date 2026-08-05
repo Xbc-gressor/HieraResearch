@@ -1996,7 +1996,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 0)
         self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 6)
+        self.assertEqual(receipt["schema_version"], 7)
         self.assertEqual(receipt["search_space_state_revision"], 0)
 
         # A revision-0 historical record selects the hypothesis to be pruned.
@@ -2036,9 +2036,10 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         for active, dep in mixed_pairs:
             self.assertLess(positions[active["point_id"]], positions[dep["point_id"]])
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 6)
+        self.assertEqual(receipt["schema_version"], 7)
         self.assertEqual(receipt["search_space_state_revision"], 1)
-        self.assertEqual(receipt["budget"]["selected_lane"], "active")
+        self.assertIsNone(receipt["budget"]["selected_lane"])
+        self.assertEqual(receipt["budget"]["fallback"], "lanes_removed")
 
         # 3. Revision 2 proposals omit the pruned hypothesis.
         state["decisions"].append(
@@ -2050,7 +2051,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 2)
         self.assertFalse(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 6)
+        self.assertEqual(receipt["schema_version"], 7)
         self.assertEqual(receipt["search_space_state_revision"], 2)
 
         # 4. The revision-0 historical record remains ledger-valid.
@@ -2146,7 +2147,9 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             self.assertNotEqual(selected.get("dim-validation-selection"), "hyp-valid-cv")
             self.assertNotEqual(selected.get("dim-ensemble"), "hyp-ensemble-stacking")
 
-    def test_deprioritized_lane_receives_only_its_budget_slot(self) -> None:
+    def test_budget_lane_field_no_longer_schedules(self) -> None:
+        # Lane scheduling was removed: budget_lane stays on proposals for
+        # backward readability but selection ranks by score alone.
         state = state_with(
             decision(1, "hyp-data-filtered", "active", "deprioritized")
         )
@@ -2171,40 +2174,31 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 }
             )
 
-        active_point, active_receipt = select_proposal(
-            proposals,
-            policy="gain",
-            predictions=predictions,
-            selection_index=1,
+        self.assertTrue(
+            any(
+                item["budget_lane"] == "deprioritized"
+                for item in proposals["proposals"]
+            )
         )
-        self.assertEqual(active_receipt["budget"]["scheduled_lane"], "active")
-        self.assertEqual(active_receipt["budget"]["selected_lane"], "active")
-        self.assertEqual(active_receipt["budget"]["fallback"], "none")
-        self.assertNotEqual(
-            selected_assignments(active_point).get("dim-data-curation"),
-            "hyp-data-filtered",
-        )
+        for selection_index in (1, 5):
+            point, receipt = select_proposal(
+                proposals,
+                policy="gain",
+                predictions=predictions,
+                selection_index=selection_index,
+            )
+            self.assertIsNone(receipt["budget"]["scheduled_lane"])
+            self.assertIsNone(receipt["budget"]["selected_lane"])
+            self.assertEqual(receipt["budget"]["fallback"], "lanes_removed")
+            self.assertEqual(receipt["budget"]["base_rank"], 1)
+            # The highest-scoring proposal wins at every selection index:
+            # no lane reservation diverts the fifth slot.
+            self.assertEqual(
+                selected_assignments(point).get("dim-data-curation"),
+                "hyp-data-filtered",
+            )
 
-        deprioritized_point, deprioritized_receipt = select_proposal(
-            proposals,
-            policy="gain",
-            predictions=predictions,
-            selection_index=5,
-        )
-        self.assertEqual(
-            deprioritized_receipt["budget"]["scheduled_lane"], "deprioritized"
-        )
-        self.assertEqual(
-            deprioritized_receipt["budget"]["selected_lane"], "deprioritized"
-        )
-        self.assertEqual(deprioritized_receipt["budget"]["fallback"], "none")
-        self.assertEqual(
-            selected_assignments(deprioritized_point).get("dim-data-curation"),
-            "hyp-data-filtered",
-        )
-        self.assertGreater(deprioritized_receipt["budget"]["base_rank"], 0)
-
-    def test_empty_scheduled_lane_records_deterministic_fallback(self) -> None:
+    def test_empty_proposal_lane_state_records_no_fallback(self) -> None:
         proposals = self._proposals(
             {"records": [], "search_space_state": empty_search_space_state()}
         )
@@ -2214,11 +2208,9 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         _point, receipt = select_proposal(
             proposals, policy="coverage", selection_index=5
         )
-        self.assertEqual(receipt["budget"]["scheduled_lane"], "deprioritized")
-        self.assertEqual(receipt["budget"]["selected_lane"], "active")
-        self.assertEqual(
-            receipt["budget"]["fallback"], "no_deprioritized_proposals"
-        )
+        self.assertIsNone(receipt["budget"]["scheduled_lane"])
+        self.assertIsNone(receipt["budget"]["selected_lane"])
+        self.assertEqual(receipt["budget"]["fallback"], "lanes_removed")
 
     def test_pruned_dimension_proposes_only_its_baseline(self) -> None:
         state = state_with(
@@ -2265,7 +2257,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             proposals_path.write_text(json.dumps(current))
             self.assertEqual(cmd_select(args), 0)
             written = json.loads(receipt_path.read_text())
-        self.assertEqual(written["schema_version"], 6)
+        self.assertEqual(written["schema_version"], 7)
         self.assertEqual(written["search_space_state_revision"], 1)
 
     def test_schema6_llm_weight_is_auditable_and_schema5_remains_readable(
@@ -2363,7 +2355,24 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         legacy_receipt = legacy["records"][0]["policy_receipt"]
         legacy_receipt["schema_version"] = 5
         legacy_receipt["policy"]["config"].pop("llm_intelligence_score")
+        for carrier_key in (
+            "carrier_pos_weight",
+            "carrier_pos_cap",
+            "carrier_neg_weight",
+            "carrier_neg_cap",
+        ):
+            legacy_receipt["policy"]["config"].pop(carrier_key)
         legacy_receipt["components"].pop("llm_judgment_weight")
+        legacy_receipt["components"].pop("experience_prior")
+        legacy_receipt["components"].pop("carriers")
+        legacy_receipt["budget"] = {
+            "selection_index": legacy_receipt["budget"]["selection_index"],
+            "deprioritized_interval": 5,
+            "scheduled_lane": "active",
+            "selected_lane": "active",
+            "fallback": "none",
+            "base_rank": 1,
+        }
         unweighted_model_score = 0.6 + 0.5 * 0.2
         legacy_receipt["acquisition_score"] = round(
             unweighted_model_score

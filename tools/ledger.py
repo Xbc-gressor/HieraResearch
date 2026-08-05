@@ -578,9 +578,9 @@ def cmd_add_record(args) -> int:
             f"current search space state revision {current_revision}; re-propose and "
             "re-select against the current overlay before admission"
         )
-    if policy_receipt.get("schema_version") != 6:
+    if policy_receipt.get("schema_version") not in {6, 7}:
         raise SystemExit(
-            "new candidate admission requires policy receipt schema 6 with "
+            "new candidate admission requires policy receipt schema 6 or 7 with "
             "proposal-relevant gated experience conditioning and an auditable "
             "LLM-judgment reliability prior; historical schema-2/3/4/5 "
             "receipts remain readable"
@@ -1247,7 +1247,7 @@ def cmd_set_tuning(args) -> int:
         if (
             record.get("op") in {"improve", "crossover"}
             and isinstance(receipt, dict)
-            and receipt.get("schema_version") in {5, 6}
+            and receipt.get("schema_version") in {5, 6, 7}
         ):
             raise SystemExit(
                 "new non-fresh candidates require --from-report so the exact "

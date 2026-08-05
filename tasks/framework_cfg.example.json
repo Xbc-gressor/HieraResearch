@@ -25,12 +25,16 @@
     "dimension_strategy": "catalog_subset"
   },
   "semantic_search": {
-    "policy": "coverage",
+    "policy": "coverage_experience",
     "coverage_weight": 0.1,
     "cost_weight": 0.2,
     "uncertainty_weight": 0.5,
     "deprioritized_budget_interval": 5,
-    "llm_intelligence_score": 100
+    "llm_intelligence_score": 100,
+    "carrier_pos_weight": 0.05,
+    "carrier_pos_cap": 2,
+    "carrier_neg_weight": 0.2,
+    "carrier_neg_cap": 3
   },
   "tuner": {
     "K": 5,
@@ -59,12 +63,16 @@
     "got.c_leaf": "outer: select_leaf UCB exploration constant during descent (default 0.4). OFAT {0.2,0.4,0.8}.",
     "got.tau": "outer: op-prior softmax temperature (default 0.3). OFAT {0.1,0.3,0.6}.",
     "space_initialization.dimension_strategy": "search-space setup: catalog_subset selects from contracts/semantic-dimensions-v1.json (default); llm_induced makes background-researcher create and fully use a validated run-local dimension_catalog.json before retrieval. Explicit --catalog overrides the source, not the configured full-vs-subset semantics.",
-    "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage (default; fully deterministic, no LLM scores), gain, gain_uncertainty, or gain_uncertainty_nocost (gain_uncertainty without any cost prediction, for when pre-implementation cost estimates are noise). The last three require per-proposal rubric inputs and preserve background priors, signed experience adjustments, final predicted_gain/uncertainty, cost (absent for gain_uncertainty_nocost), and coverage separately in each record's policy_receipt.",
+    "semantic_search.policy": "outer semantic point policy, independent of got graph action selection: coverage_experience (default; deterministic coverage plus the carrier prior — per-hypothesis independent negative/positive context counts from ledger edges, no LLM scores), coverage (coverage only), gain, gain_uncertainty, or gain_uncertainty_nocost (gain_uncertainty without any cost prediction). The last three require per-proposal rubric inputs and preserve background priors, signed experience adjustments, final predicted_gain/uncertainty, cost (absent for gain_uncertainty_nocost), and coverage separately in each record's policy_receipt; they are currently dormant.",
     "semantic_search.coverage_weight": "semantic acquisition: additive deterministic under-coverage contribution for gain policies (default 0.1).",
     "semantic_search.cost_weight": "semantic acquisition: subtractive predicted implementation/evaluation cost contribution (default 0.2).",
     "semantic_search.uncertainty_weight": "semantic acquisition: exploration bonus used only by gain_uncertainty and gain_uncertainty_nocost (default 0.5); uncertainty is a rubric score, not a calibrated posterior.",
-    "semantic_search.deprioritized_budget_interval": "real outer-search budget allocation: every Nth one-based semantic admission is reserved for the best deprioritized proposal when one exists (default 5 = 20%); other slots select only active proposals unless that lane is empty. Must be an integer in [2,1000].",
+    "semantic_search.deprioritized_budget_interval": "LEGACY: lane scheduling was removed — deprioritized content is penalized via the carrier prior instead of a reserved selection slot. The key is still accepted (and echoed in schema-6 receipts) but no longer affects selection.",
     "semantic_search.llm_intelligence_score": "pre-run heuristic reliability prior for LLM-authored gain, uncertainty, and cost judgments, on a fixed [0,100] scale (default 100 preserves legacy acquisition exactly; e.g. 44 applies weight 0.44). It is not a calibrated probability or a leaderboard-relative percentile. Deterministic coverage is not scaled, raw forecasts remain unchanged, and score 0 leaves only the configured coverage term even though forecasts are still collected. The applied weight is recorded in policy_receipt. Freeze this value before semantic artifacts exist.",
+    "semantic_search.carrier_pos_weight": "experience prior: acquisition bonus per independent positive carrier context for a hypothesis (default 0.05).",
+    "semantic_search.carrier_pos_cap": "experience prior: maximum positive contexts counted per hypothesis (default 2).",
+    "semantic_search.carrier_neg_weight": "experience prior: acquisition penalty per independent negative carrier context for a hypothesis (default 0.2 — deliberately larger than the positive weight: re-probing a deadend wastes budget, a missed exploration costs nothing measurable).",
+    "semantic_search.carrier_neg_cap": "experience prior: maximum negative contexts counted per hypothesis (default 3).",
     "tuner.K": "inner: number of warm-start configs the tunable-contract-extractor PROPOSES per candidate (default 5; read by the AGENT). OFAT {3,5,8} — highest-impact inner knob.",
     "tuner.K_eval": "inner: how many of the K proposed warm configs are uniformly sampled without replacement and EVALUATED at step 0+1 (default 2, minimum 2; best-of-K_eval = screening score). Was 3; lowered because screening is where budget goes to die — run 0802-sonnet-ex125-1 spent 74 of 124 evaluations on it for zero score improvements. 2 is the floor that still gives a non-fresh candidate one inherited fidelity control plus one selectable treatment row. Also raises got_select's admission cap floor(remaining/max(2,K_eval)), so fewer slots end up unspendable at the end of a run. The sampled permutation is persisted in tune_report.phase_a.warm_config_selection for exact resume; list order has no screening priority. The remaining K−K_eval are DEFERRED — stored params-only in tune_report.phase_a.deferred_configs and evaluated by the deep-tuner FIRST (bo enqueue / grid prepend) ONLY if the candidate is promoted. Saves (K−K_eval) evals on every un-promoted candidate; budget-neutral for promoted ones (deferred are extra initial trials). K_eval>=K disables deferral (evaluate all).",
     "tuner.n_min": "inner: min population before deep-tune fires. NOW DERIVED from top_percentile = ceil(100/(100-P)) (P=80→5); this key is only an explicit OVERRIDE.",

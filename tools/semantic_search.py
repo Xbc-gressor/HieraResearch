@@ -54,6 +54,7 @@ from search_space_state import (
 from semantic_evidence import (
     acquisition_conditioning,
     conditioning_cited_ids,
+    hypothesis_carriers,
     mechanical_gain_directions,
     validate_conditioned_adjustment,
 )
@@ -79,14 +80,18 @@ GAIN_CONTEXT_SCHEMA_VERSION = 3
 PREDICTION_SCHEMA_VERSION = 3
 CONDITIONED_PREDICTION_SCHEMA_VERSION = 2
 LEGACY_PREDICTION_SCHEMA_VERSION = 1
-POLICY_RECEIPT_SCHEMA_VERSION = 6
-POLICIES = {"coverage", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
+POLICY_RECEIPT_SCHEMA_VERSION = 7
+POLICIES = {"coverage", "coverage_experience", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
 DEFAULT_POLICY_CONFIG = {
     "coverage_weight": 0.10,
     "cost_weight": 0.20,
     "uncertainty_weight": 0.50,
     "deprioritized_budget_interval": 5,
     "llm_intelligence_score": 100.0,
+    "carrier_pos_weight": 0.05,
+    "carrier_pos_cap": 2,
+    "carrier_neg_weight": 0.20,
+    "carrier_neg_cap": 3,
 }
 MAX_PROPOSALS = 128
 MAX_EXPERIENCE_RUN_IDS = 5
@@ -126,7 +131,7 @@ def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
     generation = experience.get("generation")
     updated_at_run = experience.get("updated_at_run")
     if (
-        experience.get("schema_version") != 3
+        experience.get("schema_version") not in {3, 4}
         or not isinstance(generation, int)
         or isinstance(generation, bool)
         or generation < 0
@@ -134,7 +139,7 @@ def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
         or not updated_at_run.isdigit()
     ):
         raise ContractError(
-            "ledger.experience must be a valid schema-3 snapshot with generation "
+            "ledger.experience must be a valid schema-3/4 snapshot with generation "
             "and numeric updated_at_run before gain prediction"
         )
     return {
@@ -1153,6 +1158,38 @@ def _prediction_map(
     return result, errors
 
 
+def _carrier_priors(
+    proposal_set: dict[str, Any],
+    ledger: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, tuple[float, dict[str, dict[str, int]]]]:
+    """Deterministic per-point experience prior from hypothesis carriers."""
+    cache: dict[str, dict[str, Any]] = {}
+    priors: dict[str, tuple[float, dict[str, dict[str, int]]]] = {}
+    for proposal in proposal_set["proposals"]:
+        prior = 0.0
+        detail: dict[str, dict[str, int]] = {}
+        for hypothesis_id in sorted(
+            set(selected_assignments(proposal["point"]).values())
+        ):
+            if hypothesis_id not in cache:
+                cache[hypothesis_id] = hypothesis_carriers(
+                    ledger, target_id=hypothesis_id
+                )
+            carriers = cache[hypothesis_id]
+            prior += min(carriers["positive"], int(cfg["carrier_pos_cap"])) * float(
+                cfg["carrier_pos_weight"]
+            ) - min(carriers["negative"], int(cfg["carrier_neg_cap"])) * float(
+                cfg["carrier_neg_weight"]
+            )
+            detail[hypothesis_id] = {
+                "negative": carriers["negative"],
+                "positive": carriers["positive"],
+            }
+        priors[proposal["point_id"]] = (round(prior, 10), detail)
+    return priors
+
+
 def select_proposal(
     proposal_set: dict[str, Any],
     *,
@@ -1192,6 +1229,17 @@ def select_proposal(
                     )
                 cfg[key] = value
                 continue
+            if key in {"carrier_pos_cap", "carrier_neg_cap"}:
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 1 <= value <= 100
+                ):
+                    raise ContractError(
+                        f"semantic policy config {key} must be an integer in [1, 100]"
+                    )
+                cfg[key] = value
+                continue
             if key == "llm_intelligence_score":
                 if (
                     not isinstance(value, (int, float))
@@ -1215,7 +1263,7 @@ def select_proposal(
             cfg[key] = float(value)
 
     prediction_by_id: dict[str, dict[str, Any]] = {}
-    if policy != "coverage":
+    if policy not in {"coverage", "coverage_experience"}:
         prediction_by_id, prediction_errors = _prediction_map(
             predictions,
             proposal_set,
@@ -1225,6 +1273,12 @@ def select_proposal(
         )
         if prediction_errors:
             raise ContractError("invalid policy predictions: " + "; ".join(prediction_errors))
+
+    carrier_priors: dict[str, tuple[float, dict[str, dict[str, int]]]] = {}
+    if policy == "coverage_experience":
+        if not isinstance(ledger, dict):
+            raise ContractError("coverage_experience selection requires the ledger")
+        carrier_priors = _carrier_priors(proposal_set, ledger, cfg)
 
     ranked: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
     llm_judgment_weight = float(cfg["llm_intelligence_score"]) / 100.0
@@ -1241,6 +1295,8 @@ def select_proposal(
         )
         if policy == "coverage":
             score = coverage
+        elif policy == "coverage_experience":
+            score = coverage + carrier_priors[point_id_value][0]
         elif policy == "gain":
             score = (
                 llm_judgment_weight
@@ -1290,39 +1346,39 @@ def select_proposal(
             ),
             "uncertainty": uncertainty,
             "cost": cost,
+            "experience_prior": (
+                None
+                if policy != "coverage_experience"
+                else carrier_priors[point_id_value][0]
+            ),
+            "carriers": (
+                None
+                if policy != "coverage_experience"
+                else carrier_priors[point_id_value][1]
+            ),
         }
         ranked.append((round(score, 10), point_id_value, proposal, components))
     ranked.sort(key=lambda item: (-item[0], item[1]))
 
-    interval = cfg["deprioritized_budget_interval"]
-    scheduled_lane = (
-        "deprioritized" if selection_index % interval == 0 else "active"
-    )
-    by_lane = {
-        lane: [item for item in ranked if item[2]["budget_lane"] == lane]
-        for lane in ("active", "deprioritized")
-    }
-    if by_lane[scheduled_lane]:
-        selected_lane = scheduled_lane
-        fallback = "none"
-    else:
-        selected_lane = "active" if scheduled_lane == "deprioritized" else "deprioritized"
-        fallback = (
-            "no_deprioritized_proposals"
-            if scheduled_lane == "deprioritized"
-            else "no_active_proposals"
-        )
-    lane_ranked = by_lane[selected_lane]
-    if not lane_ranked:
-        raise ContractError("proposal set has no selectable budget lane")
-    selected_item = lane_ranked[0]
-    base_rank = ranked.index(selected_item) + 1
-    final_ranked = lane_ranked + by_lane[
-        "active" if selected_lane == "deprioritized" else "deprioritized"
-    ]
+    # Lane scheduling was removed: deprioritized content stays eligible and is
+    # penalized through the carrier prior instead of a forced budget lane.
+    # `budget_lane` is still computed in build_proposal_set for backward
+    # readability but no longer affects selection.
+    selected_item = ranked[0]
+    base_rank = 1
+    final_ranked = ranked
     score, selected_id, selected, components = selected_item
     prediction = prediction_by_id.get(selected_id)
     snapshot = _experience_snapshot_receipt(experience)
+    if prediction is not None:
+        rationale = prediction["experience_rationale"]
+    elif policy == "coverage_experience":
+        rationale = (
+            "deterministic carrier prior over recorded edges; "
+            "no model-scored experience"
+        )
+    else:
+        rationale = "coverage policy does not use model-scored experience"
     experience_receipt = {
         **snapshot,
         "conditioning": (
@@ -1334,11 +1390,7 @@ def select_proposal(
         "evidence_edge_ids": (
             [] if prediction is None else prediction["experience_edge_ids"]
         ),
-        "rationale": (
-            "coverage policy does not use model-scored experience"
-            if prediction is None
-            else prediction["experience_rationale"]
-        ),
+        "rationale": rationale,
     }
     receipt = {
         "schema_version": POLICY_RECEIPT_SCHEMA_VERSION,
@@ -1354,10 +1406,10 @@ def select_proposal(
         "experience": experience_receipt,
         "budget": {
             "selection_index": selection_index,
-            "deprioritized_interval": interval,
-            "scheduled_lane": scheduled_lane,
-            "selected_lane": selected_lane,
-            "fallback": fallback,
+            "deprioritized_interval": None,
+            "scheduled_lane": None,
+            "selected_lane": None,
+            "fallback": "lanes_removed",
             "base_rank": base_rank,
         },
         "ranked_point_ids": [item[1] for item in final_ranked],
@@ -1479,7 +1531,7 @@ def cmd_select(args: argparse.Namespace) -> int:
     proposals = _load_object(args.proposals)
     predictions = _load_object(args.predictions) if args.predictions else None
     configured_policy, configured_weights = _framework_policy_config(args.ledger)
-    policy = args.policy or configured_policy or "coverage"
+    policy = args.policy or configured_policy or "coverage_experience"
     config = dict(configured_weights)
     if args.cfg:
         override = json.loads(args.cfg)
@@ -1506,7 +1558,7 @@ def cmd_select(args: argparse.Namespace) -> int:
             prior_policy = (
                 prior_receipt.get("policy")
                 if isinstance(prior_receipt, dict)
-                and prior_receipt.get("schema_version") == 6
+                and prior_receipt.get("schema_version") in {6, 7}
                 else None
             )
             prior_config = (

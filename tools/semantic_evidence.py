@@ -1623,7 +1623,7 @@ def matched_inherited_control(
         or parent.get("status") not in NONCRASH_TERMINAL_STATUSES
         or child.get("status") not in NONCRASH_TERMINAL_STATUSES
         or not isinstance(child.get("policy_receipt"), dict)
-        or child["policy_receipt"].get("schema_version") != 6
+        or child["policy_receipt"].get("schema_version") not in {6, 7}
         or validate_parameter_transfer_binding(ledger, child)
     ):
         return None
