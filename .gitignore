@@ -30,3 +30,7 @@ run.log
 runs/
 tasks/*/run.log
 tasks/*/results.tsv
+
+# Superpowers skill artifacts (local-only design docs/plans)
+docs/superpowers/
+.superpowers/

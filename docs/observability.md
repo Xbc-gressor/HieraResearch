@@ -1,8 +1,7 @@
 # Live harness observability
 
-`tools/harness_watch.py` attributes token use and exposes hidden delegation and
-run-lifecycle drift without changing a run. It has no external service
-dependency.
+`tools/harness_watch.py` attributes token use and exposes run-lifecycle drift
+without changing a run. It has no external service dependency.
 
 ## Claude Code
 
@@ -12,7 +11,7 @@ model. For historical or full-session attribution, point the monitor at a main
 JSONL transcript:
 
 ```bash
-python tools/harness_watch.py --source claude \
+python tools/harness_watch.py \
   --transcript ~/.claude/projects/<project>/<session>.jsonl \
   --run-dir runs/<task>/<tag>
 ```
@@ -28,29 +27,12 @@ post-tool results. Compact child receipts therefore remain prompt-plus-schema
 discipline, while the independent monitor exposes violations after the fact.
 
 The display separates fresh input, cache reads/writes, output, reasoning,
-processed input, and recorded cost. It also shows per-agent totals, current
-tools, latest context size, run evaluations, pending candidates, and alerts.
-Exit status is 2 when a one-shot report contains alerts; this is intentional for
-CI or shell checks.
+processed input, and recorded cost per transcript, plus the run's evaluations
+and pending candidates. Exit status is 2 when a one-shot report contains an
+alert; this is intentional for CI or shell checks.
 
-Default alerts cover:
-
-- candidate-writer assignments that include contract/evaluation work;
-- recursive or unexpected delegation;
-- root context at or above 150k tokens;
-- child fresh input at or above 50k tokens;
-- an idle root while the run remains active;
-- pending candidates without an active worker.
-
-Tune thresholds with `--max-root-context` and `--max-session-input`.
-
-## Deprecated: OpenCode
-
-The `--source opencode` path still exists in `tools/harness_watch.py` but is
-unmaintained, as are the `.opencode/` and `.kimi/` runtime mirrors. It reads
-OpenCode's local SQLite store read-only, selects the latest root session for the
-run, and traverses all descendants; `--session <root-or-child-session-id>` pins
-one when several runs share a project. Keep it only for reading old sessions.
+The only alert today is a subagent transcript at or above 50k fresh input
+tokens. Tune the threshold with `--max-session-input`.
 
 ## Artifact-only fallback
 

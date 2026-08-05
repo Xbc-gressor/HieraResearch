@@ -62,9 +62,7 @@ runs/<task-name>/<tag>/          local run artifacts (gitignored)
 ```
 
 Each task is its own uv project. Do not treat `tasks/*` as a uv workspace.
-`.opencode/` and `.kimi/` are deprecated runtime mirrors: unmaintained, free to
-drift, and not to be read as contracts. `.claude/` is canonical — do not sync
-changes into them.
+`.claude/` is the sole runtime.
 
 ## Reference Docs
 
