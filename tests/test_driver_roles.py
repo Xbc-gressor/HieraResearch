@@ -61,6 +61,29 @@ class RegistryTests(unittest.TestCase):
                 self.assertNotIn(write_tool, role.tools, name)
                 self.assertIn(write_tool, role.disallowed, name)
 
+    def test_tools_tuples_match_retired_agent_frontmatter(self) -> None:
+        """Pin each role's positive capability set to exactly the retired
+        agent's frontmatter ``tools:`` list minus Agent/Task/Skill.
+
+        The fail-closed PreToolUse hook enforces exactly these sets, so any
+        drift here is a real permission grant or denial and must fail loudly.
+        """
+        expected = {
+            "background-researcher":
+                ("Read", "Write", "Bash", "Glob", "WebSearch", "WebFetch"),
+            "idea-generator": ("Read", "Write", "Bash", "Glob"),
+            "candidate-writer": ("Read", "Write", "Edit", "Glob"),
+            "tunable-contract-extractor":
+                ("Read", "Edit", "Write", "Bash", "Glob"),
+            "tuner-orchestrator": ("Read", "Write", "Edit", "Bash", "Glob"),
+            "experience-extractor": ("Read", "Write", "Bash"),
+            "crash-diagnosis": ("Read", "Bash", "Glob", "Grep"),
+            "hillclimb-editor": ("Read", "Write", "Edit", "Bash", "Glob"),
+        }
+        self.assertEqual(set(ROLES), set(expected))
+        for name, tools in expected.items():
+            self.assertEqual(ROLES[name].tools, tools, name)
+
 
 class PostconditionTests(unittest.TestCase):
     def _write_ledger(self, run_dir: Path, records: list[dict]) -> None:

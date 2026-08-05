@@ -155,7 +155,7 @@ ROLES: dict[str, RoleDefinition] = {
     "background-researcher": RoleDefinition(
         name="background-researcher",
         prompt_file="background-researcher.md",
-        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"),
+        tools=("Read", "Write", "Bash", "Glob", "WebSearch", "WebFetch"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "status": ("enum", "ok"),
@@ -167,7 +167,7 @@ ROLES: dict[str, RoleDefinition] = {
     "idea-generator": RoleDefinition(
         name="idea-generator",
         prompt_file="idea-generator.md",
-        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        tools=("Read", "Write", "Bash", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"actions": "list"},
         postconditions=(actions_admitted,),
@@ -175,7 +175,7 @@ ROLES: dict[str, RoleDefinition] = {
     "candidate-writer": RoleDefinition(
         name="candidate-writer",
         prompt_file="candidate-writer.md",
-        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        tools=("Read", "Write", "Edit", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "status": ("enum", "written", "existing"),
@@ -187,7 +187,7 @@ ROLES: dict[str, RoleDefinition] = {
     "tunable-contract-extractor": RoleDefinition(
         name="tunable-contract-extractor",
         prompt_file="tunable-contract-extractor.md",
-        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        tools=("Read", "Edit", "Write", "Bash", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "run_id": "str",
@@ -199,7 +199,7 @@ ROLES: dict[str, RoleDefinition] = {
     "tuner-orchestrator": RoleDefinition(
         name="tuner-orchestrator",
         prompt_file="tuner-orchestrator.md",
-        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        tools=("Read", "Write", "Edit", "Bash", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "tuned_run_id": "str",
@@ -210,7 +210,7 @@ ROLES: dict[str, RoleDefinition] = {
     "experience-extractor": RoleDefinition(
         name="experience-extractor",
         prompt_file="experience-extractor.md",
-        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        tools=("Read", "Write", "Bash"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "search_space_state_revision": "int",
@@ -232,7 +232,7 @@ ROLES: dict[str, RoleDefinition] = {
     "hillclimb-editor": RoleDefinition(
         name="hillclimb-editor",
         prompt_file="hillclimb-editor.md",
-        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        tools=("Read", "Write", "Edit", "Bash", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"edited": "bool", "summary": "str"},
         postconditions=(editor_train_py_exists,),
