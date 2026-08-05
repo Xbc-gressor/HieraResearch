@@ -192,10 +192,16 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
 
     # Bootstrap the working copy if the task ships no entrypoint.
     if not (run_dir / "train.py").exists():
-        last_editor = _editor_session(
-            runner, store, task, tag, run_dir,
-            extra={"bootstrap": "create the initial working copy per the "
-                                 "task contract's tiny-driver fallback"})
+        try:
+            last_editor = _editor_session(
+                runner, store, task, tag, run_dir,
+                extra={"bootstrap": "create the initial working copy per the "
+                                     "task contract's tiny-driver fallback"})
+        except InvocationFailed as exc:
+            stop_condition = f"editor bootstrap failed: {exc.problems}"
+            events.emit("blocked", reason=stop_condition)
+            return _status(task, tag, run_dir, metric, stop_condition,
+                           repo_root, cmd)
 
     # Baseline: exactly one evaluation of the unmodified copy.
     if not _tsv_rows(run_dir):

@@ -105,7 +105,12 @@ class HillclimbTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name)
-        write_task(self.repo)
+        write_task(self.repo, with_entrypoint=False)
+        self.add_entrypoint()
+
+    def add_entrypoint(self) -> None:
+        (self.repo / "tasks" / "fake-task" / "train.py").write_text(
+            "# baseline implementation\n")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -192,6 +197,18 @@ class HillclimbTests(unittest.TestCase):
                                repo_root=self.repo, cmd=cmd, max_evaluations=1)
         self.assertEqual(status["active_stop_condition"], "none")
         self.assertEqual(status["steps_done"], 1)
+
+    def test_bootstrap_editor_failure_blocked(self) -> None:
+        # task ships no entrypoint: the bootstrap editor session is required
+        (self.repo / "tasks" / "fake-task" / "train.py").unlink()
+        cmd = FakeCmd(self.repo, scores=[])
+        runner = FakeSessionRunner([
+            {"fail": ["postcondition: train.py missing"]},
+        ])
+        status = run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                               repo_root=self.repo, cmd=cmd, max_evaluations=3)
+        self.assertIn("bootstrap", status["active_stop_condition"])
+        self.assertFalse((self.run_dir() / "best.py").exists())
 
     def test_reconcile_appends_recovery_rows(self) -> None:
         # pre-create a run whose attempt log is ahead of results.tsv
