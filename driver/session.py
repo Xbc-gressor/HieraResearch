@@ -235,6 +235,11 @@ class FakeSessionRunner:
 
     def run(self, role: RoleDefinition, ctx: InvocationContext) -> dict:
         self.calls.append((role.name, ctx))
+        # Mirror the real runner's init-time persistence so loop tests can
+        # exercise same-session resume (resume=<session_id>).
+        ReceiptStore(ctx.run_dir).persist_session_id(
+            role.name, ctx.invocation_id, f"fake-sess-{ctx.invocation_id:04d}"
+        )
         if not self.script:
             raise InvocationFailed(role.name, ["fake runner: script exhausted"])
         entry = self.script.pop(0)

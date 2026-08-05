@@ -198,6 +198,10 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(len(tuner_calls), 2)
         self.assertNotIn("reconcile_note", tuner_calls[0].extra)
         self.assertIn("reconcile_note", tuner_calls[1].extra)
+        # corrective follow-up RESUMES the first tuner session, not a fresh one
+        self.assertEqual(
+            tuner_calls[1].resume_session_id,
+            f"fake-sess-{tuner_calls[0].invocation_id:04d}")
 
     def test_refresh_runs_before_ideation(self) -> None:
         write_task(self.repo)
