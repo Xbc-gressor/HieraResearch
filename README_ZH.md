@@ -18,7 +18,6 @@
 - **`CLAUDE.md`**：Claude Code 打开项目时首先读取的入口文档。
 - **`.claude/agents/`**：用于复杂多步骤任务的专用子智能体（想法生成、代码编写、合约提取、调优编排）。
 - **`.claude/skills/`**：可复用的内联方法论（当前：崩溃诊断）。
-- **`AGENTS.md`** 与 **`.opencode/` / `.kimi/`**：已弃用的非 Claude runtime 入口与镜像，不再维护，允许漂移，不作为合约阅读。
 - **`tools/`**：候选方案创建、账本管理、图搜索和调优的确定性脚本。
 - **`tasks/`**：独立任务包。每个都是独立的 uv 项目。
 - **`runs/`**：本地实验状态（候选方案、日志、账本、循环状态）。被 git 忽略；永不提交。
@@ -142,7 +141,7 @@ step 0+1: tunable-contract-extractor
 
 - **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
   - 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——首个 bout 门控：种群 ≥ `N_min`（P=80 时推导为 5）且按 `best_warm_score` 的最佳未调优候选在前 20%；继续 bout 跳过百分位门控但要求上一 bout 有改进 —— 选择**一个** bout；无合格者 → 返回 `none`（有效的无操作）
-  - Phase C：基于维度的方法选择（grid n_dims≤2 / bo=多元 TPE ≥3；cmaes 仅作后备；见 HPO 基准 `dev_plan/hpo-benchmark-report.md`）；以全部历史 trial 为先验，每 bout 至多 `tuner.bout_trials`（默认 8）次客观评估
+  - Phase C：基于维度的方法选择（grid n_dims≤2 / bo=多元 TPE ≥3；cmaes 仅作后备；见 HPO 基准 `dev_plan/hpo-benchmark-report.md`）；以全部历史 trial 为先验，每 bout 至多 `tuner.bout_trials`（默认 10）次客观评估
   - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后在 warm incumbent 与**所有 bout 的全部 trial** 上取全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与分级 `evaluation_depth`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
   详见 §5.7。
 
@@ -246,7 +245,7 @@ Step 0+1：在候选 `train.py` 准备好后运行，在一个子智能体中完
 
 ### 5.7 tuner-orchestrator
 
-Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运行一次**，每次至多运行**一个调优 bout**（`tuner.bout_trials` 次客观评估，默认 8）。**无热启动**——`phase_a` 是 step 0+1（extractor）输出用作输入。
+Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运行一次**，每次至多运行**一个调优 bout**（`tuner.bout_trials` 次客观评估，默认 10）。**无热启动**——`phase_a` 是 step 0+1（extractor）输出用作输入。
 
 流程：
 

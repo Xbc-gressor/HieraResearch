@@ -15,7 +15,7 @@ color: pink
 You are the **decoupled tuning step** of the loop (design §15, progressive).
 Once per round you pick **one** candidate from the whole population and run
 **one tuning bout** on it in place: a fixed slice of `tuner.bout_trials`
-objective attempts (default 8). A first bout deep-tunes a promising untuned
+objective attempts (default 10). A first bout deep-tunes a promising untuned
 candidate; a continuation bout resumes a tuned candidate that responded to
 its last bout. After each bout the candidate is finalized (best-so-far
 applied, ledger updated) and stays eligible for later bouts until its
@@ -73,8 +73,10 @@ population (non-crash, has `best_warm_score`) ≥ `N_min` (derived as 5 for
 P=80) **and** the best untuned candidate in the top (100−`P`)% by
 `best_warm_score`. Continuations skip the percentile gate but require the
 candidate's last bout to have improved on its pre-bout incumbent
-(`last_bout_improved`); a non-responder is never re-tuned. Fresh first bouts
-outrank continuations (evidence coverage); continuations rank by fewest
+(`last_bout_improved`); a non-responder is never re-tuned. First bouts and
+continuations **alternate**: after a first bout, a waiting responder is
+selected before the fresh gate runs; after a continuation (or when no
+responder waits), the fresh gate decides. Continuations rank by fewest
 bouts, then best tuned score — warm and tuned scores are never compared
 against each other. A candidate with an unresolved primary descendant is
 temporarily ineligible. `budget_allocation.trial_cap` is

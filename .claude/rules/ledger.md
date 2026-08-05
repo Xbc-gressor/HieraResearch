@@ -190,8 +190,8 @@ comparison: it requires a validated same-child-code control/treatment pair
 whose configs differ only in the declared semantic switch, the pinned parent
 snapshot, and no shared-key reset.
 `evaluation_depth` is graded by cumulative Phase-C objective attempts:
-`screening` (0), `tuned_lightly` (1 to `tuner.tuned_threshold`−1, default 15),
-or `tuned` (≥ threshold, default 16). A direct edge is **tuned** when the
+`screening` (0), `tuned_lightly` (1 to `tuner.tuned_threshold`−1, default 19),
+or `tuned` (≥ threshold, default 20). A direct edge is **tuned** when the
 child record's `evaluation_depth` is `tuned` and **lightly tuned** at
 `tuned_lightly`; screening-depth and legacy direct edges remain evidence but
 cannot drive contradiction gates. Contradiction-grade transitions require at
