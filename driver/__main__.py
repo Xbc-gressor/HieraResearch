@@ -29,12 +29,33 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "run":
-        if not args.model:
-            # New runs must pin a concrete model. Resumed runs reuse
-            # run_metadata.json; the loops resolve this in Tasks 6-7.
+        import json
+        from pathlib import Path
+
+        from driver.loops.hillclimb import run_hillclimb
+        from driver.roles import REPO_ROOT
+        from driver.session import SDKSessionRunner
+        from driver.events import EventsLog
+
+        run_dir = REPO_ROOT / "runs" / args.task / args.tag
+        model = args.model
+        metadata_path = run_dir / "run_metadata.json"
+        if model is None and metadata_path.exists():
+            model = json.loads(metadata_path.read_text(encoding="utf-8"))["model"]
+        if model is None:
             print("error: --model is required for a new run", file=sys.stderr)
             return 2
-        print("error: loops not implemented yet", file=sys.stderr)
+        if args.loop == "hillclimb":
+            runner = SDKSessionRunner(model=model, events=EventsLog(run_dir),
+                                      cli_path=args.cli_path)
+            status = run_hillclimb(
+                args.task, args.tag, runner=runner, model=model,
+                max_evaluations=args.max_evaluations, timeout=args.timeout,
+                cli_path=args.cli_path,
+            )
+            print(json.dumps(status, indent=2, sort_keys=True))
+            return 0
+        print("error: --loop experiment not implemented yet", file=sys.stderr)
         return 2
     return 0
 
