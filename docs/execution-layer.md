@@ -66,6 +66,18 @@ under `runs/<task>/<tag>/.orchestrator/`:
 9. refresh bounded experience at the quiescent round boundary and stop when
    the ledger says the budget is reached or progress is impossible.
 
+Progress impossibility is judged at the round boundary with its cause kept
+distinct: a SELECT that admitted no actions and a deep tune that spent no
+objective call blocks immediately, while a round emptied only by dropped
+ideation contract failures is a model-side event that earns one bounded
+retry (`NO_PROGRESS_ROUND_LIMIT` consecutive such rounds) before the same
+block. The cause is recovered from the durable receipts under
+`.orchestrator/admission_failures/`, so a restarted process classifies the
+round the same way. Receipts are validated before use (schema version,
+`kind: ideation_failure`, `outcome: action_dropped`, typed payload fields);
+a corrupt or contradictory receipt is artifact corruption and blocks the
+run rather than reclassifying the round.
+
 `state.json` is restart bookkeeping, not the source of truth for experiment
 results. `ledger.json`, `evaluation_attempts.jsonl`, candidate reports, and the
 existing `tools/` helpers remain authoritative for their respective contracts.

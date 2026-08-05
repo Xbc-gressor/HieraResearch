@@ -52,6 +52,14 @@ class RunControls:
     upstream_max_single_backoff_seconds: float | None = None
 
 
+# Consecutive model-side empty rounds (every action dropped after ideation
+# contract failures, no objective progress) the run tolerates before blocking.
+# One retry separates a stochastic ideation blip from a provider that cannot
+# currently produce a usable idea; a genuinely action-free SELECT is not
+# counted here and still blocks immediately.
+NO_PROGRESS_ROUND_LIMIT = 2
+
+
 class ExperimentCoordinator:
     def __init__(
         self,
@@ -422,6 +430,66 @@ class ExperimentCoordinator:
         )
         return True
 
+    def _ideation_drops(self, round_id: int) -> int:
+        """Count one round's validated ideation-failure drop receipts.
+
+        The receipts written by ``_drop_failed_admission`` are the authority;
+        deriving the count at the decision point keeps restarts and upgrades
+        consistent without a second, driftable record in ``state.json``.
+        Authority comes from the validated content, not the filename: a
+        corrupt or contradictory receipt is artifact corruption and raises,
+        which the run loop blocks on, rather than reclassifying the round.
+        """
+        directory = self.identity.run_dir / ".orchestrator" / "admission_failures"
+        if not directory.is_dir():
+            return 0
+        drops = 0
+        for path in sorted(directory.glob(f"round-{round_id}-*.json")):
+            self._verify_drop_receipt(path)
+            drops += 1
+        return drops
+
+    @staticmethod
+    def _verify_drop_receipt(path: Path) -> None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ArtifactError(
+                f"invalid admission-failure receipt {path}: {exc}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise ArtifactError(
+                f"admission-failure receipt must be an object: {path}"
+            )
+        if (
+            value.get("schema_version") != 1
+            or value.get("kind") != "ideation_failure"
+            or value.get("outcome") != "action_dropped"
+        ):
+            raise ArtifactError(
+                f"admission-failure receipt contradicts its contract: {path}"
+            )
+        run_id = value.get("run_id")
+        if not isinstance(run_id, str) or not run_id.isdigit():
+            raise ArtifactError(
+                f"admission-failure receipt has an invalid run_id: {path}"
+            )
+        if value.get("op") not in {"fresh", "improve", "crossover"}:
+            raise ArtifactError(
+                f"admission-failure receipt has an invalid op: {path}"
+            )
+        parents = value.get("parents")
+        if not isinstance(parents, list) or not all(
+            isinstance(parent, str) for parent in parents
+        ):
+            raise ArtifactError(
+                f"admission-failure receipt has invalid parents: {path}"
+            )
+        if not isinstance(value.get("error"), str) or not value["error"]:
+            raise ArtifactError(
+                f"admission-failure receipt lacks its error: {path}"
+            )
+
     def _materialize_and_implement(self) -> None:
         action = self._next_unresolved_action()
         assert self.candidates is not None
@@ -518,15 +586,36 @@ class ExperimentCoordinator:
         no_objective_progress = (
             int(after.get("evaluations_attempted", 0)) == active.evaluations_before
         )
-        if no_admissions and no_objective_progress:
+        stalled = no_admissions and no_objective_progress
+        # An empty round has two distinct causes. A SELECT that returned no
+        # actions (admission cap exhausted) means progress is genuinely
+        # impossible; blocking immediately is correct. A round emptied by
+        # dropped ideation failures is a model-side event — the objective
+        # budget is untouched and the next round re-derives fresh actions —
+        # so it earns a bounded tolerance before the run is parked. The cause
+        # is recovered from the durable admission-failure receipts rather than
+        # coordinator state, so a restarted (or upgraded) process classifies
+        # the round the same way.
+        if stalled and not self._ideation_drops(active.round_id):
+            self.state.no_progress_cycles = 0
+            self.store.save(self.state)
+            self._block(
+                "no_progress_possible: semantic admission cap returned no actions "
+                "and deep tuning admitted no objective call"
+            )
+            return
+        if stalled:
             self.state.no_progress_cycles += 1
         else:
             self.state.no_progress_cycles = 0
         self.store.save(self.state)
-        if self.state.no_progress_cycles:
+        if self.state.no_progress_cycles >= NO_PROGRESS_ROUND_LIMIT:
             self._block(
-                "no_progress_possible: semantic admission cap returned no actions "
-                "and deep tuning admitted no objective call"
+                "no_progress_possible: "
+                f"{self.state.no_progress_cycles} consecutive rounds had every "
+                "action dropped after ideation contract failures (see "
+                ".orchestrator/admission_failures) and deep tuning admitted no "
+                "objective call"
             )
 
     def _close_finished_round(self) -> None:
