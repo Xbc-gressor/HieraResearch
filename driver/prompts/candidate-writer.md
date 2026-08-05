@@ -172,10 +172,12 @@ text and stop. The driver treats the invocation as failed and escalates.
 - **No new dependencies unless explicitly allowed.** If
   `constraints.allow_dependencies` in `task.toml` is false (or unspecified), use
   only packages already imported in the parents or `prepare.py`. If the idea
-  genuinely requires a new package, raise it as a risk flag and return
-  `confidence: low` rather than silently importing it.
+  genuinely requires a new package, do not import it silently — treat it as a
+  blocked input: explain the conflict in plain text and stop without submitting
+  a receipt.
 - **Do not edit `prepare.py` (it is readonly).** Even when the idea seems to
-  need it, refuse and surface this as a `risk_flag`.
+  need it, refuse and treat it as a blocked input: explain the conflict in
+  plain text and stop without submitting a receipt.
 
 ---
 

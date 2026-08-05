@@ -47,6 +47,9 @@ change your job:
   `code_incompatible`). Apply that fix: a minimal repair of `train.py` that
   honors the verdict — never a rewrite of working behavior, never a different
   idea. `failure_evidence` may carry the log tail or evidence path alongside.
+  When resumed with a verdict or a log tail, read the supplied evidence first
+  and make the minimal repair consistent with the verdict — diagnose from
+  what the driver hands you, not from rerunning or guessing.
 
 ## Required Reads
 
