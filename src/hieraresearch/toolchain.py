@@ -35,6 +35,15 @@ class ValidationRejected(ToolFailure):
     """A deterministic validator ran successfully and rejected authored data."""
 
 
+class PreflightTimeout(ToolFailure):
+    """The no-score preflight exceeded its wall-clock limit.
+
+    Distinct from a generic tool failure because the attempt is
+    side-effect-free and consumes no objective slot, so the caller may apply
+    a bounded retry before treating the candidate as failed.
+    """
+
+
 def _validation_error(label: str, result: ProcessResult) -> ToolFailure:
     if result.returncode == 1 and not result.timed_out and not result.interrupted:
         return ValidationRejected(label, result)
@@ -800,6 +809,16 @@ class Toolchain:
             label="candidate preflight",
             check=False,
         )
+        if not result.ok:
+            try:
+                failure_payload = parse_json_output(result.output)
+            except ValueError:
+                failure_payload = None
+            if (
+                isinstance(failure_payload, dict)
+                and failure_payload.get("failure_kind") == "preflight_timeout"
+            ):
+                raise PreflightTimeout("candidate preflight", result)
         payload = _validation_payload(
             "candidate preflight",
             result,

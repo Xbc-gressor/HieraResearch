@@ -54,6 +54,7 @@ from hieraresearch.process import (  # noqa: E402
 )
 from hieraresearch.state_machine import next_transition  # noqa: E402
 from hieraresearch.toolchain import (  # noqa: E402
+    PreflightTimeout,
     ToolFailure,
     Toolchain,
     parse_json_output,
@@ -412,6 +413,49 @@ class CandidatePreflightToolchainStub:
             "configs_checked": 1,
             "attempts": [{"index": 0, "result": {"status": "ok"}}],
         }
+
+
+class TimeoutPreflightToolchainStub(CandidatePreflightToolchainStub):
+    """Preflight that times out ``timeouts`` times before succeeding."""
+
+    def __init__(self, timeouts: int):
+        super().__init__()
+        self.timeouts = timeouts
+
+    def candidate_preflight(
+        self,
+        candidate_path: Path,
+        configs_path: Path,
+        *,
+        k_eval: int,
+        task_config: dict,
+    ) -> dict:
+        if len(self.calls) < self.timeouts:
+            self.calls.append((candidate_path, configs_path, k_eval))
+            raise PreflightTimeout(
+                "candidate preflight",
+                ProcessResult(
+                    args=("preflight",),
+                    returncode=2,
+                    output='{"failure_kind": "preflight_timeout"}',
+                    elapsed_seconds=300.0,
+                ),
+            )
+        return super().candidate_preflight(
+            candidate_path, configs_path, k_eval=k_eval, task_config=task_config
+        )
+
+
+class StaticResultToolchain(Toolchain):
+    """Toolchain whose subprocess boundary returns one recorded result."""
+
+    def __init__(self, result: ProcessResult):
+        super().__init__(ROOT, ProcessRunner(), helper_timeout=30.0)
+        self._static_result = result
+
+    def _run(self, args, **kwargs) -> ProcessResult:
+        del args, kwargs
+        return self._static_result
 
 
 class CrashClosureToolchainStub:
@@ -3813,6 +3857,128 @@ class OrchestratorBoundaryTests(unittest.TestCase):
             pipeline.toolchain = CandidatePreflightToolchainStub(attempts_path)
             with self.assertRaisesRegex(ArtifactError, "objective attempt accounting"):
                 pipeline.preflight(action)
+
+    def test_candidate_preflight_timeout_is_retried_once_before_closing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            identity = RunIdentity(repo_root, "toy", "run")
+            task_dir = repo_root / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.toml").write_text("", encoding="utf-8")
+            candidate_dir = identity.run_dir / "candidates" / "001"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "train.py").write_text(
+                "def make_model(env, params):\n    return params\n",
+                encoding="utf-8",
+            )
+            (candidate_dir / "prepare.py").write_text("", encoding="utf-8")
+            atomic_write_json(candidate_dir / "_warm_configs.json", [{"x": 1}])
+            atomic_write_json(candidate_dir / "_search_space.json", {"x": ["int", 1, 2]})
+            atomic_write_json(
+                candidate_dir / CandidatePipeline.CONTRACT_RECEIPT,
+                {"schema_version": 1},
+            )
+            atomic_write_json(
+                candidate_dir / "_candidate_brief.json",
+                {
+                    "schema_version": 4,
+                    "run_id": "001",
+                    "op": "fresh",
+                    "source_run_ids": [],
+                    "implementation_source": {"kind": "generated"},
+                },
+            )
+            atomic_write_json(
+                identity.run_dir / "framework_cfg.json",
+                {"tuner": {"K_eval": 3}},
+            )
+            action = RoundAction(
+                op="fresh",
+                run_id="001",
+                admitted=True,
+                materialized=True,
+                implemented=True,
+                contract_ready=True,
+            )
+
+            toolchain = TimeoutPreflightToolchainStub(timeouts=1)
+            pipeline = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=object(),
+                task_config={},
+            )
+
+            receipt = pipeline.preflight(action)
+
+            self.assertEqual(receipt["status"], "ok")
+            self.assertEqual(receipt["attempts"], 2)
+            self.assertEqual(len(toolchain.calls), 2)
+            self.assertTrue(pipeline.preflight_is_ready(action))
+
+            (candidate_dir / pipeline.PREFLIGHT_RECEIPT).unlink()
+            persistent = TimeoutPreflightToolchainStub(timeouts=2)
+            failing = CandidatePipeline(
+                identity,
+                toolchain=persistent,
+                models=object(),
+                task_config={},
+            )
+            with self.assertRaisesRegex(CandidateBuildError, "timed out 2 times"):
+                failing.preflight(action)
+            self.assertEqual(len(persistent.calls), 2)
+            self.assertFalse((candidate_dir / pipeline.PREFLIGHT_RECEIPT).exists())
+            self.assertFalse(
+                (identity.run_dir / "evaluation_attempts.jsonl").exists()
+            )
+
+    def test_candidate_preflight_maps_typed_timeout_payload(self) -> None:
+        timeout_result = ProcessResult(
+            args=("uv", "run"),
+            returncode=2,
+            output=json.dumps(
+                {
+                    "status": "operational_failure",
+                    "ok": False,
+                    "failure_kind": "preflight_timeout",
+                    "errors": ["preflight exceeded preflight_runtime_limit=300s"],
+                    "objective_calls": 0,
+                    "error_type": "TimeoutError",
+                }
+            ),
+            elapsed_seconds=300.0,
+        )
+        toolchain = StaticResultToolchain(timeout_result)
+
+        with self.assertRaises(PreflightTimeout):
+            toolchain.candidate_preflight(
+                Path("candidate/train.py"),
+                Path("candidate/_warm_configs.json"),
+                k_eval=1,
+                task_config={"env": {"project": "tasks/toy"}},
+            )
+
+        generic_result = ProcessResult(
+            args=("uv", "run"),
+            returncode=2,
+            output=json.dumps(
+                {
+                    "status": "operational_failure",
+                    "ok": False,
+                    "errors": ["preflight worker exploded"],
+                    "objective_calls": 0,
+                }
+            ),
+            elapsed_seconds=1.0,
+        )
+        with self.assertRaises(ToolFailure) as caught:
+            StaticResultToolchain(generic_result).candidate_preflight(
+                Path("candidate/train.py"),
+                Path("candidate/_warm_configs.json"),
+                k_eval=1,
+                task_config={"env": {"project": "tasks/toy"}},
+            )
+        self.assertNotIsInstance(caught.exception, PreflightTimeout)
 
 
 if __name__ == "__main__":

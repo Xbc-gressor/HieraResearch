@@ -66,7 +66,7 @@ from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 
 REQUIRED_SYMBOLS = ("BASE_PARAMS", "SEARCH_SPACE", "make_model")
 DEFAULT_SCORE_FN = "evaluate_config"
-DEFAULT_PREFLIGHT_LIMIT = 180.0
+DEFAULT_PREFLIGHT_LIMIT = 450.0
 DEEP_TUNE_INVOCATION_STARTED_AT = "invocation_started_at_epoch_seconds"
 PHASE_C_LOCK_FILENAME = ".phase_c.lock"
 PHASE_C_ACTIVE_OBJECTIVE_ATTEMPT = "active_objective_attempt"

@@ -44,6 +44,7 @@ from .schemas import (
     tuning_values_schema,
 )
 from .toolchain import (
+    PreflightTimeout,
     ToolFailure,
     Toolchain,
     ValidationRejected,
@@ -323,6 +324,9 @@ class CandidatePipeline:
     TUNING_VALUES_RECEIPT = "_tuning_values_ready.json"
     CONTRACT_RECEIPT = "_contract_ready.json"
     PREFLIGHT_RECEIPT = "_preflight_ready.json"
+    # Bounded retry allowance for side-effect-free preflight timeouts (the
+    # initial attempt plus this many retries).
+    PREFLIGHT_TIMEOUT_RETRIES = 1
     PHASE_A_RETRY_RECEIPT = "_phase_a_retry.json"
     PHASE_A_REPAIR_RECEIPT = "_phase_a_repair.json"
     DEBUG_CORRECTED_BASE = "_debug_corrected_base.json"
@@ -2431,12 +2435,30 @@ class CandidatePipeline:
         input_revision = paths_revision(self._preflight_input_paths(action.run_id))
         attempts_path = self.identity.run_dir / "evaluation_attempts.jsonl"
         attempts_before = paths_revision((attempts_path,))
-        payload = self.toolchain.candidate_preflight(
-            candidate_path,
-            configs_path,
-            k_eval=k_eval,
-            task_config=self.task_config,
-        )
+        payload = None
+        last_timeout: PreflightTimeout | None = None
+        attempts = 0
+        # A preflight timeout is side-effect-free and consumes no objective
+        # slot, so it earns one bounded retry before the candidate is closed.
+        for _attempt in range(self.PREFLIGHT_TIMEOUT_RETRIES + 1):
+            attempts += 1
+            try:
+                payload = self.toolchain.candidate_preflight(
+                    candidate_path,
+                    configs_path,
+                    k_eval=k_eval,
+                    task_config=self.task_config,
+                )
+                last_timeout = None
+                break
+            except PreflightTimeout as exc:
+                last_timeout = exc
+        if last_timeout is not None:
+            raise CandidateBuildError(
+                f"candidate preflight timed out "
+                f"{self.PREFLIGHT_TIMEOUT_RETRIES + 1} times: {last_timeout}"
+            ) from last_timeout
+        assert payload is not None
         if paths_revision(self._preflight_input_paths(action.run_id)) != input_revision:
             raise ArtifactError("candidate inputs changed during no-score preflight")
         if paths_revision((attempts_path,)) != attempts_before:
@@ -2454,6 +2476,7 @@ class CandidatePipeline:
             "k_eval": k_eval,
             "status": payload["status"],
             "objective_calls": 0,
+            "attempts": attempts,
             "result": payload,
         }
         atomic_write_json(candidate_dir / self.PREFLIGHT_RECEIPT, receipt)

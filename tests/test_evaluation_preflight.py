@@ -962,6 +962,56 @@ def make_model(env, params):
             self.assertEqual(payload["result"]["seen"], 7)
             self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
 
+    def test_standalone_preflight_timeout_is_typed_for_bounded_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = (
+                Path(tmp)
+                / "runs"
+                / "autoresearch-baseline"
+                / "hillclimb"
+            )
+            run_dir.mkdir(parents=True)
+            candidate = run_dir / "train.py"
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 1, "preflight_runtime_limit": 2})
+            )
+            (run_dir / "prepare.py").write_text(
+                """
+import time
+
+def preflight_config(make_model, params):
+    time.sleep(30)
+    return {"status": "ok"}
+""".lstrip()
+            )
+            candidate.write_text(
+                """
+DEFAULT_PARAMS = {"x": 7}
+
+def make_model(env, params):
+    return params["x"]
+""".lstrip()
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "preflight_candidate.py"),
+                    "--candidate-path",
+                    str(candidate),
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 2)
+            payload = json.loads(completed.stderr)
+            self.assertEqual(payload["failure_kind"], "preflight_timeout")
+            self.assertEqual(payload["status"], "operational_failure")
+            self.assertEqual(payload["objective_calls"], 0)
+            self.assertEqual(payload["error_type"], "TimeoutError")
+            self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
+
     def test_authored_preflight_uses_exact_provided_warm_control_without_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = (

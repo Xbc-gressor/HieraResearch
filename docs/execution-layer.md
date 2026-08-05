@@ -57,7 +57,9 @@ under `runs/<task>/<tag>/.orchestrator/`:
 2. create or validate the frozen background artifacts;
 3. admit the provided baseline or a deterministic graph action;
 4. materialize the admitted candidate and obtain a bounded implementation edit;
-5. obtain the tuning contract, validate it, and run a no-score preflight;
+5. obtain the tuning contract, validate it, and run a no-score preflight (a
+   wall-clock timeout is side-effect-free and earns one bounded retry before
+   the candidate is closed);
 6. run sequential Phase-A warm evaluations through the existing budget helper;
 7. deterministically select at most one candidate for Phase-C deep tuning;
 8. finalize tuning through the existing idempotent helper;

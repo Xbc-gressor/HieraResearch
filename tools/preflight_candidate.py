@@ -197,6 +197,27 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    except TimeoutError as exc:
+        # A no-score preflight timeout is side-effect-free and consumes no
+        # objective slot.  Type it explicitly so the caller may apply its
+        # bounded-retry policy instead of treating it as an opaque tool
+        # failure.
+        print(
+            json.dumps(
+                {
+                    "status": "operational_failure",
+                    "ok": False,
+                    "failure_kind": "preflight_timeout",
+                    "errors": [str(exc)],
+                    "objective_calls": 0,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                default=str,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     except Exception as exc:
         print(
             json.dumps(
