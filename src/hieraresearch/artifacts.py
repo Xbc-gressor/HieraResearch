@@ -460,4 +460,23 @@ class InvocationJournal:
         receipt["error_type"] = type(error).__name__
         receipt["replay_permitted"] = replay_permitted
         receipt["disposition"] = disposition
+        # A parser rejection carries the raw payload (duck-typed to keep this
+        # module below llm.py). It is the primary evidence for diagnosing why
+        # the model's response failed the contract; persist it beside the
+        # receipt rather than losing it with the in-memory correction loop.
+        # Persistence is best-effort: an unencodable or unhashable payload
+        # (NaN under the strict writer, mixed-type keys under the canonical
+        # hasher) must never mask the original failure or leave the receipt
+        # stuck at `running`.
+        rejected_response = getattr(error, "rejected_response", None)
+        if rejected_response is not None:
+            try:
+                atomic_write_json(path / "rejected_response.json", rejected_response)
+                revision = json_revision(rejected_response)
+            except (OSError, TypeError, ValueError) as persistence_error:
+                receipt["rejected_response_error"] = (
+                    f"{type(persistence_error).__name__}: {persistence_error}"
+                )
+            else:
+                receipt["rejected_response_revision"] = revision
         atomic_write_json(receipt_path, receipt)

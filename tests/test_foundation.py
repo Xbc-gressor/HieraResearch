@@ -480,6 +480,152 @@ class FoundationTests(unittest.TestCase):
                     self.assertEqual(receipt["disposition"], expected_disposition)
                     self.assertEqual(receipt["replay_permitted"], expected_replay)
 
+    def test_failed_invocation_persists_the_rejected_response(self) -> None:
+        """The raw payload behind a parser rejection is durable evidence.
+
+        The journal used to hold it only in memory for the correction
+        re-prompt, so a run whose correction also failed retained nothing to
+        diagnose — the exact position the live DeepSeek schema investigation
+        was in. The rejected payload belongs to the failed invocation, not to
+        a later completed one, so it is persisted beside the failed receipt.
+        """
+        malformed = {"idea": "x", "unexpected": "field the endpoint invented"}
+
+        def reject(value: object) -> object:
+            raise ValueError("idea response fields must be exactly [...]")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.txt"
+            source.write_text("stable", encoding="utf-8")
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=StructuredStub(malformed),
+                edit_backend=UnusedEditor(),
+            )
+
+            with self.assertRaises(InferenceContractError):
+                gateway.infer(
+                    purpose="candidate_idea:001",
+                    schema_version=1,
+                    system_prompt="s",
+                    prompt="p",
+                    schema={"type": "object"},
+                    input_paths=[source],
+                    parser=reject,
+                    max_corrections=0,
+                )
+
+            invocations = list((root / ".orchestrator" / "invocations").iterdir())
+            self.assertEqual(len(invocations), 1)
+            persisted = json.loads(
+                (invocations[0] / "rejected_response.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(persisted, malformed)
+            receipt = json.loads(
+                (invocations[0] / "receipt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["disposition"], "contract_correction_eligible")
+            self.assertEqual(
+                receipt["rejected_response_revision"], json_revision(malformed)
+            )
+
+    def test_unpersistable_rejected_response_does_not_mask_the_failure(self) -> None:
+        """Evidence persistence is best-effort and never hides the failure.
+
+        A rejected payload containing NaN cannot be encoded by the journal's
+        strict JSON writer. Persisting it must not raise over the original
+        InferenceContractError, and the receipt must still reach `failed` —
+        otherwise the run keeps a false `running` invocation and the caller's
+        drop/retry policy never sees the real failure.
+        """
+        malformed = {"idea": float("nan")}
+
+        def reject(value: object) -> object:
+            raise ValueError("idea response fields must be exactly [...]")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.txt"
+            source.write_text("stable", encoding="utf-8")
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=StructuredStub(malformed),
+                edit_backend=UnusedEditor(),
+            )
+
+            with self.assertRaises(InferenceContractError):
+                gateway.infer(
+                    purpose="candidate_idea:001",
+                    schema_version=1,
+                    system_prompt="s",
+                    prompt="p",
+                    schema={"type": "object"},
+                    input_paths=[source],
+                    parser=reject,
+                    max_corrections=0,
+                )
+
+            invocations = list((root / ".orchestrator" / "invocations").iterdir())
+            self.assertEqual(len(invocations), 1)
+            self.assertFalse((invocations[0] / "rejected_response.json").exists())
+            receipt = json.loads(
+                (invocations[0] / "receipt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["disposition"], "contract_correction_eligible")
+            self.assertIn("rejected_response_error", receipt)
+
+    def test_unhashable_rejected_response_does_not_mask_the_failure(self) -> None:
+        """The revision hash is inside the same best-effort boundary.
+
+        Mixed-type mapping keys serialize fine without sorting but break the
+        canonical hasher's `sort_keys`. The receipt must still reach `failed`
+        and the original InferenceContractError must propagate, with the gap
+        noted as `rejected_response_error`.
+        """
+        malformed = {"idea": "x", 1: "mixed-type key"}
+
+        def reject(value: object) -> object:
+            raise ValueError("idea response fields must be exactly [...]")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.txt"
+            source.write_text("stable", encoding="utf-8")
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=StructuredStub(malformed),
+                edit_backend=UnusedEditor(),
+            )
+
+            with self.assertRaises(InferenceContractError):
+                gateway.infer(
+                    purpose="candidate_idea:001",
+                    schema_version=1,
+                    system_prompt="s",
+                    prompt="p",
+                    schema={"type": "object"},
+                    input_paths=[source],
+                    parser=reject,
+                    max_corrections=0,
+                )
+
+            invocations = list((root / ".orchestrator" / "invocations").iterdir())
+            self.assertEqual(len(invocations), 1)
+            receipt = json.loads(
+                (invocations[0] / "receipt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["disposition"], "contract_correction_eligible")
+            self.assertIn("rejected_response_error", receipt)
+
     def test_legacy_retryable_receipts_still_forbid_replay(self) -> None:
         """Receipts written before the rename are durable and must still parse.
 

@@ -114,6 +114,15 @@ questions and must not be conflated:
   `request_rejected`, `stale_inputs`, `validation_rejected`, `interrupted`,
   `failed`. Classification lives in one place (`llm.py:_failure_disposition`).
 
+A parser rejection also persists the raw model payload as
+`rejected_response.json` beside the failed receipt (with
+`rejected_response_revision` recorded in it). The payload previously existed
+only in memory for the correction re-prompt, so a run whose correction also
+failed retained nothing to diagnose. Persistence is best-effort: a payload
+the strict JSON writer cannot encode or the canonical hasher cannot order is
+noted as `rejected_response_error` on the receipt instead, and never masks
+the original failure.
+
 Only `upstream_transient` drives coordinator backoff. `replay_permitted: true`
 therefore does **not** mean the run will retry — it means the journal does not
 forbid a future attempt. These were previously one boolean named `retryable`,
