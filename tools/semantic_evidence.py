@@ -816,6 +816,86 @@ def _finite_score(value: Any) -> float | None:
     return float(value)
 
 
+def _like_for_like_delta(
+    parent: dict[str, Any], child: dict[str, Any]
+) -> float | None:
+    """child − parent at matched evaluation depth, else ``None``.
+
+    Warm scores pair with warm scores; terminal finals pair with finals.  A
+    warm score is never compared against a tuning-lowered final.
+    """
+    parent_warm = _finite_score(parent.get("best_warm_score"))
+    child_warm = _finite_score(child.get("best_warm_score"))
+    if parent_warm is not None and child_warm is not None:
+        return child_warm - parent_warm
+    parent_final = _terminal_score(parent)
+    child_final = _terminal_score(child)
+    if parent_final is not None and child_final is not None:
+        return child_final - parent_final
+    return None
+
+
+def hypothesis_carriers(ledger: dict[str, Any], *, target_id: str) -> dict[str, Any]:
+    """Count independent contexts where adding ``target_id`` hurt or helped.
+
+    A carrier edge's child point adds the hypothesis relative to the edge's
+    parent.  Contexts group by parent run id: a context is negative when
+    every carrier delta in it is strictly worse (positive — scores are
+    lower-is-better) and positive when every delta is strictly better.
+    Mixed, zero-delta, crash, and depth-unpaired edges never count.
+    """
+    records = _records_by_id(ledger)
+    contexts: dict[str, list[float]] = {}
+    for record in ledger.get("records", []):
+        if not isinstance(record, dict):
+            continue
+        if record.get("status") not in NONCRASH_TERMINAL_STATUSES:
+            continue
+        receipts = record.get("semantic_edges")
+        if not isinstance(receipts, list):
+            continue
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                continue
+            changes = receipt.get("changes")
+            if not isinstance(changes, list):
+                continue
+            adds = any(
+                isinstance(change, dict)
+                and change.get("to_hypothesis_id") == target_id
+                and change.get("from_hypothesis_id") != target_id
+                for change in changes
+            )
+            if not adds:
+                continue
+            parent = records.get(str(receipt.get("parent_run_id")))
+            if (
+                parent is None
+                or parent.get("status") not in NONCRASH_TERMINAL_STATUSES
+            ):
+                continue
+            delta = _like_for_like_delta(parent, record)
+            if delta is None or abs(delta) <= 1e-12:
+                continue
+            contexts.setdefault(str(receipt.get("parent_run_id")), []).append(delta)
+    negative = sorted(
+        parent_id
+        for parent_id, deltas in contexts.items()
+        if all(delta > 0 for delta in deltas)
+    )
+    positive = sorted(
+        parent_id
+        for parent_id, deltas in contexts.items()
+        if all(delta < 0 for delta in deltas)
+    )
+    return {
+        "negative": len(negative),
+        "positive": len(positive),
+        "negative_contexts": negative,
+        "positive_contexts": positive,
+    }
+
+
 def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     """Validate the durable inherited-control evidence on one ledger record.
 

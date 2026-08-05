@@ -20,6 +20,7 @@ from semantic_evidence import (  # noqa: E402
     edge_index,
     edge_observation,
     experience_cited_ids,
+    hypothesis_carriers,
     mechanical_gain_direction,
     normalize_coverage,
     render_target_evidence,
@@ -1433,3 +1434,107 @@ class TargetEvidenceViewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _append_plain(
+    records: list[dict],
+    run_id: str,
+    parents: list[str],
+    point: dict,
+    *,
+    status: str,
+    score: float | None,
+    dag_revision: int,
+    warm: float | None = None,
+) -> dict:
+    record = {
+        "run_id": run_id,
+        "source_run_ids": parents,
+        "semantic_point": point,
+        "status": status,
+        "final_best_score": score,
+        "evaluation_depth": "screening",
+        "dag_revision": dag_revision,
+    }
+    if warm is not None:
+        record["best_warm_score"] = warm
+    record["semantic_edges"] = build_semantic_edges(records, record)
+    records.append(record)
+    return record
+
+
+class TestHypothesisCarriers(unittest.TestCase):
+    def _registry_points(self):
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+        return registry, baseline, filtered
+
+    def test_two_independent_negative_contexts(self):
+        registry, baseline, filtered = self._registry_points()
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append_plain(records, "001", ["000"], filtered, status="discard", score=0.50, dag_revision=2)
+        _append_plain(records, "002", [], baseline, status="keep", score=0.41, dag_revision=3)
+        _append_plain(records, "003", ["002"], filtered, status="discard", score=0.52, dag_revision=4)
+        result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
+        self.assertEqual(result["negative"], 2)
+        self.assertEqual(result["positive"], 0)
+        self.assertEqual(result["negative_contexts"], ["000", "002"])
+        self.assertEqual(result["positive_contexts"], [])
+
+    def test_crash_child_never_counts(self):
+        registry, baseline, filtered = self._registry_points()
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append_plain(records, "001", ["000"], filtered, status="crash", score=None, dag_revision=2)
+        result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
+        self.assertEqual(result["negative"], 0)
+        self.assertEqual(result["positive"], 0)
+
+    def test_positive_context_reported(self):
+        registry, baseline, filtered = self._registry_points()
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append_plain(records, "001", ["000"], filtered, status="keep", score=0.38, dag_revision=2)
+        result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
+        self.assertEqual(result["negative"], 0)
+        self.assertEqual(result["positive"], 1)
+
+    def test_mixed_context_counts_neither(self):
+        registry, baseline, filtered = self._registry_points()
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append_plain(records, "001", ["000"], filtered, status="discard", score=0.50, dag_revision=2)
+        _append_plain(records, "002", ["000"], filtered, status="keep", score=0.38, dag_revision=3)
+        result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
+        self.assertEqual(result["negative"], 0)
+        self.assertEqual(result["positive"], 0)
+
+    def test_equal_scores_do_not_count(self):
+        registry, baseline, filtered = self._registry_points()
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append_plain(records, "001", ["000"], filtered, status="keep", score=0.40, dag_revision=2)
+        result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
+        self.assertEqual(result["negative"], 0)
+        self.assertEqual(result["positive"], 0)
+
+    def test_warm_scores_pair_with_warm_not_final(self):
+        registry, baseline, filtered = self._registry_points()
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1, warm=0.45)
+        _append_plain(records, "001", ["000"], filtered, status="keep", score=0.50, dag_revision=2, warm=0.44)
+        result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
+        self.assertEqual(result["negative"], 0)
+        self.assertEqual(result["positive"], 1)
+
+    def test_missing_pair_does_not_count(self):
+        registry, baseline, filtered = self._registry_points()
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        child = _append_plain(records, "001", ["000"], filtered, status="keep", score=None, dag_revision=2, warm=0.60)
+        del child["final_best_score"]
+        result = hypothesis_carriers({"records": records}, target_id="hyp-data-filtered")
+        self.assertEqual(result["negative"], 0)
+        self.assertEqual(result["positive"], 0)
