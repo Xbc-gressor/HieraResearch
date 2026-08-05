@@ -1,7 +1,10 @@
 [project]
 name = "autoresearch-automl"
 version = "0.1.0"
-description = "Claude Code-driven multi-task autoresearch harness"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+description = "Claude Agent SDK-driven multi-task autoresearch harness"
+readme = "README_ZH.md"
+requires-python = ">=3.11"
+dependencies = ["claude-agent-sdk"]
+
+[dependency-groups]
+dev = ["pytest", "numpy"]
