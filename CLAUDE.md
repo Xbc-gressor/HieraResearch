@@ -1,33 +1,31 @@
 # autoresearch-automl
 
 Multi-task autoresearch harness. Autonomous loops edit run-local candidate
-`train.py` files and minimize the task's configured metric. Claude Code
-(`.claude/`) is the supported interactive runtime; deterministic state, graph
-search, evaluation, and tuning live in `tools/` and are shared.
-
-The loop's current bar is beating `autoresearch-hillclimb` — the deliberately
-simple edit→run→keep/revert baseline — at matched evaluation budget. It does not
-yet. Until it does, prefer diagnosing current run artifacts and simplifying the
-loop over extending it.
+`train.py` files and minimize the task's configured metric. The `driver/`
+Python package is the sole runtime: a deterministic driver sequencing Claude
+Agent SDK role sessions. Deterministic state, graph search, evaluation, and
+tuning live in `tools/` and are shared. The `.claude/` Claude Code runtime
+is retired (deleted in `816690f`).
 
 ## Start an experiment
 
 ```bash
-claude --agent autoresearch-experiment     # from this repo root
+uv run python -m driver run <task> <tag> --loop experiment \
+  --model <model-id> [--max-evaluations N] [--timeout SECONDS]
 ```
 
-Then provide `task_name`, `tag`, and optionally `max_evaluations` and `timeout`
-(the hard per-evaluation limit in seconds). The same controls can be set
-deterministically beforehand:
+`--loop hillclimb` is the comparison baseline and starts the same way.
+`--model` is required for a new run and ignored on resume — the run's
+`run_metadata.json` wins. `--max-evaluations` and `--timeout` persist as
+`max_evaluations` and `per_runtime_limit` in the run's `framework_cfg.json`
+via `tools/init_run.py`; `--timeout` is a pass-through alias for
+`init_run.py --per-runtime-limit` — the task-layer per-evaluation limit,
+NOT a session watchdog. The same controls can also be set deterministically
+beforehand:
 
 ```bash
 python tools/init_run.py <task> <tag> --max-evaluations <n> --timeout <seconds>
 ```
-
-They persist as `max_evaluations` and `per_runtime_limit` in the run's
-`framework_cfg.json`; explicit initialization values override the copied
-template. `autoresearch-hillclimb` is the comparison baseline and starts the
-same way with `--agent autoresearch-hillclimb`.
 
 ## Authoritative Documents
 
@@ -37,32 +35,41 @@ Always read these in this order before doing experiment work:
    and machine-readable contract for whichever task is in scope. The task
    contract is authoritative for environment, preparation, editable files,
    dependency permission, timeout, and metric details.
-2. `.claude/agents/autoresearch-experiment.md` — the canonical experiment
-   protocol (setup, loop, candidate directories, ledger.json, loop_state.md,
-   NEVER STOP rules). The agent prompt carries the protocol; there is no
-   separate protocol document — the repo-root `program.md` was removed in
-   `0ba735f`, so ignore any remaining mention of it.
-3. `.claude/rules/ledger.md` — only when ledger schema detail is needed.
+2. `driver/loops/experiment.py` and `driver/loops/hillclimb.py` — the
+   canonical loop protocols, now deterministic Python. Role behavior lives in
+   `driver/prompts/*.md`; each role's own prompt is authoritative for its
+   contract. There is no separate protocol document — the repo-root
+   `program.md` was removed in `0ba735f`, so ignore any remaining mention of
+   it.
+3. `driver/prompts/rules/ledger.md` — only when ledger schema detail is
+   needed.
 
 ## Project Layout
 
 ```text
-.claude/agents/                  project-local agents; the experiment agent
-                                 carries the canonical run protocol
-.claude/skills/                  project-local Claude Code skills
-.claude/rules/                   path-scoped Claude Code rules and schemas
-.claude/settings.json            Agent delegation guard + status lines
+driver/                          the sole runtime: deterministic loops
+                                 sequencing Claude Agent SDK role sessions
+driver/loops/                    experiment.py and hillclimb.py protocols
+driver/prompts/                  role prompts (+ rules/ledger.md)
+driver/session.py                one role invocation = one SDK session +
+                                 verify-repair loop
+driver/roles.py                  role registry: prompt, capability set,
+                                 receipt schema, postconditions
+driver/receipts.py               receipt protocol + in-process MCP server
+driver/events.py                 stdout progress lines + driver_events.jsonl
+driver/metadata.py               run_metadata.json provenance + drift warnings
 contracts/                       versioned shared contracts (dimension catalog)
 docs/                            search-space, background, observability notes
 tasks/<task-name>/               independent uv task projects
-tests/                           pytest suite over tools/; tests/fixtures.py
-                                 holds the shared toy search space
+tests/                           pytest suite over tools/ and driver/;
+                                 tests/fixtures.py holds the shared toy
+                                 search space
 tools/                           shared deterministic machinery
 runs/<task-name>/<tag>/          local run artifacts (gitignored)
 ```
 
 Each task is its own uv project. Do not treat `tasks/*` as a uv workspace.
-`.claude/` is the sole runtime.
+`driver/` is the sole runtime.
 
 ## Reference Docs
 
@@ -74,62 +81,56 @@ Read on demand, not by default:
   evidence and scope semantics, retrieval fallback, validation commands.
 - `docs/dimension-induction.md` — only when using the `llm_induced` dimension
   strategy.
-- `docs/observability.md` — `tools/harness_watch.py` token and drift attribution.
+- `docs/observability.md` — driver stdout progress lines and
+  `driver_events.jsonl` event kinds; receipt↔session↔event correlation.
 
-## Skills
+## Driver
 
-Project-local skills under `.claude/skills/` are auto-discovered. Match the
-user's request to each skill's `description`; do not pick by a name recalled
-from training data. Skills here are **capability skills**: pure methodology
-followed **inline** in the caller's own context, no spawning, reusable at many
-sites. A skill **owns** its protocol — callers invoke it and verify its output;
-they do not restate its steps.
+The driver is deterministic Python; LLM judgment enters only through bounded
+role sessions. The division of responsibility: **deterministic helpers own
+deterministic decisions** (candidate promotion is `tune_tools.py
+select-candidate`, tuner method choice is `select-method`, search-space state
+transitions are `ledger.py apply-space-state`), **the driver owns sequencing**
+(budget checks, escalation chains, crash recovery, keep/revert), and **LLM
+sessions own generation** (ideas, code, diagnoses).
 
-- `crash-diagnosis` — diagnose one candidate preflight or objective crash and
-  decide recovery: `config_invalid` (fix the config) / `code_incompatible`
-  (minimally fix the code, preferred) / `abandon`.
+Role/receipt model:
 
-## Agents
+- Each role in `driver/roles.py` pins a prompt file under `driver/prompts/`,
+  a positive tool capability set (enforced fail-closed by a PreToolUse hook;
+  `Agent`/`Task`/`Skill` are always denied), a receipt schema, and
+  driver-side postconditions.
+- One role invocation = one SDK session (`driver/session.py`). Roles never
+  return free text: each session gets an in-process MCP server exposing
+  `mcp__receipts__submit_receipt`; the accepted receipt is persisted under
+  `<run_dir>/receipts/` linked by `invocation_id`. Failed postconditions
+  trigger corrective follow-ups in the SAME session with concrete
+  diagnostics, up to `role.corrective_attempts`, then `InvocationFailed`;
+  escalation beyond that is the loop's job.
+- Children return receipts, not payloads. Pass paths and compact ids; the
+  durable run artifact is the payload. Do not collapse role boundaries to
+  save time or budget.
+- Session ids are persisted at session init, so a killed session can be
+  resumed via `resume=<session_id>`; every recovery path also works without
+  it.
 
-Agents under `.claude/agents/` run in their own fresh context. Claude Code
-surfaces each one's `description` automatically, and **each agent's own prompt
-is authoritative for its contract** — read the prompt, not a summary, before
-changing what an agent does.
-
-| agent | role | cadence |
-|---|---|---|
-| `autoresearch-experiment` | run-level orchestrator for one `task_name + tag + run_dir`; its prompt carries the full run protocol | main thread, one per concurrent run |
-| `background-researcher` | freezes `background.md` + `background_retrieval.json`: the run's hierarchical semantic search space | once, before the loop (required) |
-| `idea-generator` | graph `SELECT` via `got_select`, then semantic point choice and record/receipt persistence | per round |
-| `candidate-writer` | implements one candidate's `train.py` from its own ledger record | per candidate |
-| `tunable-contract-extractor` | step 0+1: `PARAM_SCHEMA` refactor, warm configs, `SEARCH_SPACE`, screening evaluation | per candidate |
-| `tuner-orchestrator` | step 2: promotion gate, then one progressive-tuning bout for at most one selected candidate in place | once per round |
-| `experience-extractor` | regenerates the bounded belief snapshot and requests state transitions | per completed non-empty round |
+Provenance: each new run writes `<run_dir>/run_metadata.json` (model,
+SDK/CLI version and source, permission policy, prompt hashes). Resuming
+with a drifted toolchain or edited prompts emits `metadata_mismatch`
+warnings — record and warn, never refuse; a toolchain upgrade must not
+orphan an in-flight run.
 
 Orchestration rules that live in no single prompt:
 
-- **Two execution modes.** A default main session follows the protocol in
-  `.claude/agents/autoresearch-experiment.md` and spawns the bounded children
-  itself; a dedicated session starts with
-  `claude --agent autoresearch-experiment`, making that agent the main thread.
-- **Never spawn `autoresearch-experiment` as a child agent.** Claude Code
-  subagents cannot spawn subagents, so that mode removes the independent
-  contexts the design depends on. `.claude/settings.json` enforces this with an
-  `Agent` PreToolUse guard (`tools/harness_guard.py`).
 - **Step 2 is decoupled from step 0+1** (design §15). Every candidate stops at
   step 0+1; `tuner-orchestrator` then runs once for the whole round and picks at
   most one candidate. A `none` selection is a valid no-op.
-- **Deterministic helpers own deterministic decisions.** Candidate promotion is
-  `tune_tools.py select-candidate`, tuner method choice is `select-method`,
-  search-space state transitions are `ledger.py apply-space-state`. An agent
-  proposes; the helper decides. Never hand-edit `ledger.json`.
+- **Deterministic helpers own deterministic decisions.** An agent proposes;
+  the helper decides. Never hand-edit `ledger.json`.
 - **Preflight failures are not objective evaluations.** They are no-score
-  engineering checks, diagnosed inline via `crash-diagnosis`, and consume no
+  engineering checks, diagnosed via the `crash-diagnosis` role, and consume no
   budget slot. Objective calls reserve against the run cap in
   `evaluation_attempts.jsonl` immediately before `score_fn`.
-- **Children return receipts, not payloads.** Pass paths and compact ids; the
-  durable run artifact is the payload. Do not collapse role boundaries to save
-  time or budget.
 
 ## Running A Task
 
@@ -147,7 +148,7 @@ environment.
 ## Validation
 
 ```bash
-python -m pytest tests -q             # the suite; fast, no GPU, no network
+uv run python -m pytest tests -q      # the suite; fast, no GPU, no network
 python tools/validate_tasks.py        # task contracts
 python tools/validate_background.py   # background round trip, shape
                                       # neutrality, retrieval, lifecycle
@@ -156,7 +157,7 @@ python tools/validate_search_backends.py
 ```
 
 Keep checks minimal and implied by the touched contract. Do not add
-required-wording or forbidden-wording checks over agent prompts, rules, or
+required-wording or forbidden-wording checks over role prompts, rules, or
 docs.
 
 ## Adding A Task
@@ -182,15 +183,14 @@ docs.
    `neg_mean_test_accuracy`). A crash scores `+inf`, the worst.
 4. Run `python tools/validate_tasks.py`.
 
-## Adding A Skill
+## Adding A Role
 
-1. Create `.claude/skills/<skill-name>/SKILL.md`. Mirror an existing skill
-   such as `crash-diagnosis` for shape.
-2. Use lowercase hyphen-case for `<skill-name>`.
-3. Frontmatter must declare `name` (matching the folder) and `description`
-   (the trigger Claude Code matches against user requests).
-4. Keep the body concise. Put long details in `references/` and deterministic
-   helpers in `scripts/`.
+1. Add `driver/prompts/<role-name>.md` and register the role in
+   `driver/roles.py`: prompt file, positive tool capability set, receipt
+   schema, postconditions.
+2. Use lowercase hyphen-case for `<role-name>`.
+3. Keep the prompt scoped to generation and judgment; put deterministic
+   logic in `tools/` and sequencing in `driver/loops/`.
 
 ## Shell Command Conventions
 

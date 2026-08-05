@@ -187,4 +187,4 @@ records `final_best_score` = `best_warm_score` straight into the candidate's
 `ledger.json` record via `tools/ledger.py` (`record-run` + `set-tuning`); the
 decoupled `tuner-orchestrator`, if it selects the candidate, lowers
 `final_best_score` with the tuned best. One JSON record per run; see
-`.claude/rules/ledger.md`.
+`driver/prompts/rules/ledger.md`.

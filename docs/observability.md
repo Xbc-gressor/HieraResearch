@@ -1,47 +1,55 @@
-# Live harness observability
+# Driver observability
 
-`tools/harness_watch.py` attributes token use and exposes run-lifecycle drift
-without changing a run. It has no external service dependency.
+`tools/harness_watch.py` and the Claude Code status lines are retired along
+with the `.claude/` runtime. Observability now comes from the driver itself:
+human-readable progress lines on stdout plus a structured event log at
+`<run_dir>/driver_events.jsonl`. Every event is emitted as one stdout line
+(`[driver] <kind>: {...}`) and one JSONL row, so a run can be watched live
+from the terminal or after the fact from the log. There is no external
+service dependency.
 
-## Claude Code
+## Event kinds
 
-`.claude/settings.json` installs a main status line, subagent status lines, and a
-PreToolUse delegation guard. The status line is local and does not invoke a
-model. For historical or full-session attribution, point the monitor at a main
-JSONL transcript:
+- `setup` — run directory initialized (`task`, `tag`); emitted by the
+  hillclimb loop on fresh runs.
+- `session_start` — a role SDK session opened (`role`, `invocation_id`,
+  `resume`).
+- `session_end` — the session returned (`role`, `invocation_id`,
+  `session_id`, `is_error`, `num_turns`, `total_cost_usd`, `usage`).
+  `session_start`/`session_end` pairs carry per-session cost and token usage.
+- `corrective_followup` — a postcondition or receipt check failed and the
+  driver sent a corrective message in the SAME session (`role`,
+  `invocation_id`, `attempt`, `problems`).
+- `reconcile_recovery_row` — hillclimb crash recovery appended a TSV
+  recovery row for a reserved attempt that was interrupted before its
+  outcome row (`index`).
+- `metadata_mismatch` — resume-time provenance drift (model, SDK/CLI
+  version, or prompt hashes differ from `run_metadata.json`); record and
+  warn, never refuse (`warning`).
+- `blocked` — the loop hit a hard stop condition (`reason`).
 
-```bash
-python tools/harness_watch.py \
-  --transcript ~/.claude/projects/<project>/<session>.jsonl \
-  --run-dir runs/<task>/<tag>
-```
+## Correlation
 
-The monitor deduplicates streamed assistant updates by message id and includes
-discoverable subagent transcript directories. Claude's main status-line payload
-provides current context and cost; subagent status lines expose each task's
-reported token count and flag 50k or more. Historical attribution is incomplete
-when transcripts have been removed or moved.
+Receipts, sessions, and events join on `invocation_id`: the accepted receipt
+for an invocation lives under `<run_dir>/receipts/`, the session id is
+persisted at session init (a killed session can be resumed via
+`resume=<session_id>`), and every `session_*` / `corrective_followup` event
+carries the same `invocation_id`. `run_metadata.json` pins the run's model,
+SDK/CLI version, permission policy, and prompt hashes for A/B provenance.
 
-Claude hooks can deny a bad delegation before it starts, but do not rewrite
-post-tool results. Compact child receipts therefore remain prompt-plus-schema
-discipline, while the independent monitor exposes violations after the fact.
-
-The display separates fresh input, cache reads/writes, output, reasoning,
-processed input, and recorded cost per transcript, plus the run's evaluations
-and pending candidates. Exit status is 2 when a one-shot report contains an
-alert; this is intentional for CI or shell checks.
-
-The only alert today is a subagent transcript at or above 50k fresh input
-tokens. Tune the threshold with `--max-session-input`.
+Token/cost attribution is per session via `session_end`
+(`total_cost_usd`/`usage`). Drift attribution across a whole run — the old
+harness_watch roll-up — is a non-goal of the driver; it can be rebuilt on
+top of the events log if needed.
 
 ## Artifact-only fallback
 
-When a session database or transcript is unavailable, lifecycle checks still
-derive from `ledger.json`, `framework_cfg.json`, and `loop_state.md`:
+Lifecycle checks still derive from `ledger.json`, `framework_cfg.json`, and
+`loop_state.md` (`driver/status.py` derives the same phases the retired
+harness_watch snapshot did):
 
 ```bash
 python tools/ledger.py brief --ledger runs/<task>/<tag>/ledger.json
-python tools/harness_watch.py --check-run-idle --run-dir runs/<task>/<tag>
 ```
 
 `ledger.py set-phase` is the only supported lifecycle transition. It refuses

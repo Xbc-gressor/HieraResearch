@@ -58,7 +58,7 @@ Rules:
 ## Program Mapping
 
 This task follows the repository-level experiment protocol (see
-`.claude/agents/autoresearch-experiment.md`) with these task-specific file
+`driver/loops/experiment.py`) with these task-specific file
 roles:
 
 - Editable experiment surface: `runs/tabular-model-search/<tag>/candidates/<run_id>/train.py`
@@ -170,7 +170,7 @@ Phase C) and the score is written straight to `ledger.json` via `tools/ledger.py
   those downstream fields unchanged.
 
 The candidate's result lives in `runs/tabular-model-search/<tag>/ledger.json`
-(one record per run; see `.claude/rules/ledger.md`). `ledger.py record-run`
+(one record per run; see `driver/prompts/rules/ledger.md`). `ledger.py record-run`
 computes the keep/discard status: a completed run is `keep` only if its
 `final_best_score` strictly improves over the best previous kept value in the
 ledger, otherwise `discard`; a candidate that cannot be evaluated is `crash`

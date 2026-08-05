@@ -1,6 +1,6 @@
 # autoresearch-automl
 
-由 Claude Code 驱动的自主 AutoML 实验框架。LLM runtime 负责角色隔离与判断，确定性的状态、图搜索、评估和调优由共享的 `tools/` 实现。
+由确定性 Python driver 驱动的自主 AutoML 实验框架。`driver/` 包编排 Claude Agent SDK 角色会话——driver 拥有排序、预算与升级链，LLM 会话负责生成与判断；确定性的状态、图搜索、评估和调优由共享的 `tools/` 实现。原 `.claude/` Claude Code runtime 已退役并删除。
 
 ## 1. 框架功能
 
@@ -15,9 +15,8 @@
 
 框架包含：
 
-- **`CLAUDE.md`**：Claude Code 打开项目时首先读取的入口文档。
-- **`.claude/agents/`**：用于复杂多步骤任务的专用子智能体（想法生成、代码编写、合约提取、调优编排）。
-- **`.claude/skills/`**：可复用的内联方法论（当前：崩溃诊断）。
+- **`CLAUDE.md`**：开发 agent 打开项目时首先读取的入口文档。
+- **`driver/`**：唯一 runtime。确定性 Python 循环（`driver/loops/experiment.py`、`driver/loops/hillclimb.py`）编排 Claude Agent SDK 角色会话；角色 prompt 位于 `driver/prompts/`；每次角色调用 = 一个 SDK 会话 + 一份持久化 receipt。
 - **`tools/`**：候选方案创建、账本管理、图搜索和调优的确定性脚本。
 - **`tasks/`**：独立任务包。每个都是独立的 uv 项目。
 - **`runs/`**：本地实验状态（候选方案、日志、账本、循环状态）。被 git 忽略；永不提交。
@@ -38,26 +37,22 @@
 
 ### 3.2 运行实验
 
-用 Claude Code 启动完整实验：
+用 driver 启动完整实验（真实 SDK 会话，消耗 API 额度）：
 
 ```bash
-claude --agent autoresearch-experiment
+uv run python -m driver run tabular-model-search <tag> \
+  --loop experiment --model <model-id> [--max-evaluations N] [--timeout SECONDS]
 ```
 
-然后提供：
+`--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations` 与 `--timeout` 经 `tools/init_run.py` 持久化为 `framework_cfg.json` 中的 `max_evaluations` 与 `per_runtime_limit`；`--timeout` 是单次评估时限的别名，不是会话看门狗。
 
-```text
-task_name: tabular-model-search
-tag: <你的运行标签>
-```
-
-对于并行实验，使用不同的 `tag` 值启动多个终端会话。
+对于并行实验，使用不同的 `tag` 值启动多个进程。
 
 ## 4. 框架工作原理
 
 ### 4.1 核心文档
 
-**`CLAUDE.md`**：Claude Code 的项目入口。完整实验协议编码在 `.claude/agents/autoresearch-experiment.md` 主代理中；任务语义来自 `TASK.md` 和 `task.toml`。
+**`CLAUDE.md`**：项目入口。完整实验协议以确定性 Python 编码在 `driver/loops/experiment.py` 中，各角色行为由 `driver/prompts/*.md` 承载；任务语义来自 `TASK.md` 和 `task.toml`。
 
 **`tasks/<task-name>/TASK.md`**：供人和 LLM 阅读的任务描述。包含 `## Evaluation Contract` 部分，描述：
 - 训练表面：候选方案在训练期间做什么
@@ -66,7 +61,7 @@ tag: <你的运行标签>
 - 调优器评估表面：单一 `config → score` 函数（如果支持调优）
 - 行为规则
 
-每个子智能体在工作前读取此合约。主循环在每轮开始时重新读取以避免长时间运行中的漂移。
+每个角色会话在工作前读取此合约。主循环在每轮开始时重新读取以避免长时间运行中的漂移。
 
 **`tasks/<task-name>/task.toml`**：机器可读配置。包含：
 - uv 环境和超时
@@ -84,10 +79,10 @@ tag: <你的运行标签>
 
 ### 4.2 实验流程
 
-手动通过主会话运行实验时，**一轮 = ① 一代（≤B 个想法，每个经过 step 0+1）+ ② 一次解耦深度调优步骤**：
+driver 的实验循环（`driver/loops/experiment.py`）以确定性 Python 拥有排序、预算与升级链；LLM 只通过有界角色会话进入。**一轮 = ① 一代（≤B 个想法，每个经过 step 0+1）+ ② 一次解耦深度调优步骤**：
 
 ```text
-读取主代理 prompt / task.toml / TASK.md
+driver 读取 task.toml / TASK.md（角色 prompt 位于 driver/prompts/）
         ↓
 background-researcher: 解析维度策略 → 多后端知识侦察 → background.md + background_retrieval.json
     (llm_induced 额外先生成 dimension_catalog.json；随后冻结显式基线、hyp-* 与关系)
@@ -110,7 +105,7 @@ step 0+1: tunable-contract-extractor
     ① 制作 PARAM_SCHEMA + 重构 make_model
     ② 提出 K 个热启动配置 + SEARCH_SPACE
     ③ 评估 K 个配置(一个 config→score 函数; 没有单独的官方运行)
-       → 对每次崩溃内联 crash-diagnosis skill(修复配置或修复代码)
+       → 对每次崩溃调用 crash-diagnosis 角色(修复配置或修复代码)
        → 构建 BASE_PARAMS, 记录 best_warm_score
        → extractor 调用 record-run (final_best_score=best_warm_score + keep/discard status)
          + set-tuning (元数据, 无 --mark-tuned) 到 ledger.json
@@ -121,7 +116,7 @@ step 0+1: tunable-contract-extractor
     → finalize_tuning.py 验证终态后统一应用参数并原地关闭 report + ledger (无重新运行)
 ```
 
-使用 `claude --agent autoresearch-experiment` 时，主代理内部编码此协议。`.claude/settings.json` 的 `Agent` PreToolUse guard 将调用闭包限制为六个角色；崩溃诊断使用 `crash-diagnosis` skill 内联。
+上述协议原先是单一主会话内的约定，现已全部落入 driver 代码：循环按顺序为每个角色调用一个 SDK 会话，会话只持路径与紧凑 id，通过 `mcp__receipts__submit_receipt` 返回 receipt；driver 校验 receipt 与后置条件，不满足则在同一会话内纠正跟进，直至升级。角色工具能力由 fail-closed 的 PreToolUse hook 强制（`Agent`/`Task`/`Skill` 一律拒绝），崩溃诊断由 `crash-diagnosis` 角色完成。
 
 ### 4.3 两层搜索架构
 
@@ -133,10 +128,10 @@ step 0+1: tunable-contract-extractor
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
-- **Step 0+1**（tunable-contract-extractor；一个子智能体完成；对每个候选方案运行）：
+- **Step 0+1**（tunable-contract-extractor；一个角色会话完成；对每个候选方案运行）：
   ① 行为保持地重构构造逻辑为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）+ 声明 `PARAM_SCHEMA`
   ② provided entrypoint 仅使用一个原始默认配置；其他候选结合**血统证据**与数据提出 K=5 个热启动配置 + 数据驱动的 `SEARCH_SPACE`；一致性预检 + `check-search-space` + `apply_search_space`
-  ③ **评估 K 个配置**（warmstart_eval；顺序/可恢复）；**对每次崩溃内联 crash-diagnosis skill**（config-invalid → 修复配置；code-incompatible → 最小化修复代码 ≤10 次）；全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
+  ③ **评估 K 个配置**（warmstart_eval；顺序/可恢复）；**对每次崩溃调用 crash-diagnosis 角色**（config-invalid → 修复配置；code-incompatible → 最小化修复代码 ≤10 次）；全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
   深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
 
 - **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
@@ -147,36 +142,25 @@ step 0+1: tunable-contract-extractor
 
 **关键洞察**：没有单独的官方运行。有**一个全局 `config → score` 函数**（task.toml `[evaluation].score_fn`）。热启动评估和 Phase C 调优都调用它。调优后的最佳值就是候选方案的新分数。
 
-## 5. 智能体
+## 5. 角色
 
-智能体位于 `.claude/agents/`：
+原 `.claude/agents/` 子智能体已随 Claude Code runtime 一起退役，迁移为 driver 角色：prompt 位于 `driver/prompts/`，由 `driver/roles.py` 注册（prompt 文件、正向工具能力集、receipt schema、driver 侧后置条件），每次调用是一个独立的 Claude Agent SDK 会话。会话不返回自由文本——通过进程内 MCP 工具 `mcp__receipts__submit_receipt` 提交 schema 校验的 receipt，持久化在 `<run_dir>/receipts/` 下并按 `invocation_id` 关联；后置条件不满足时 driver 在同一会话内发起纠正跟进（至多 `role.corrective_attempts` 次），再失败则抛 `InvocationFailed`，由循环按角色升级。会话 id 在 init 时即持久化，被杀的会话可用 `resume=<session_id>` 恢复。
 
-当前智能体：`autoresearch-experiment`、`background-researcher`、`idea-generator`、`experience-extractor`、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator`。
+当前角色：`background-researcher`、`idea-generator`、`experience-extractor`、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator`、`crash-diagnosis`、`hillclimb-editor`。原 `autoresearch-experiment` 主代理的编排职责已确定性化为 `driver/loops/experiment.py`（hillclimb 基线为 `driver/loops/hillclimb.py` + `hillclimb-editor` 角色）。
 
-**重要约束**：`autoresearch-experiment` 必须作为 primary 启动，不能作为子代理嵌套（Claude Code 子代理无法再派生子代理）。`.claude/settings.json` 通过 `tools/harness_guard.py` 的 `Agent` PreToolUse guard 强制这一点，并把主代理的调用闭包限制为六个项目角色。
+### 5.1 driver 实验循环
 
-### 5.1 autoresearch-experiment
-
-管理一个完整的实验运行（一个 `task_name + tag + run_dir`）。
+`driver/loops/experiment.py` 管理一个完整的实验运行（一个 `task_name + tag + run_dir`）。
 
 职责：
-- 完全自包含地执行完整实验协议，协议本身写在该 agent 的 prompt 中，无需额外的协议文档
-- 初始化新的 `runs/<task>/<tag>/`（先运行 `background-researcher`；若任务声明 provided entrypoint，则先登记并评估该基线，否则循环通过 `fresh` 自举）
+- 初始化新的 `runs/<task>/<tag>/`（先调用 `background-researcher`；若任务声明 provided entrypoint，则先登记并评估该基线，否则循环通过 `fresh` 自举）
+- 写入 `run_metadata.json`（模型、SDK/CLI 版本、权限策略、prompt 哈希）；恢复运行时对漂移发出 `metadata_mismatch` 警告——记录并警告，绝不拒绝
 - 按**轮次**推进循环：一代 ≤B 个想法经过 step 0+1，然后一次解耦深度调优步骤
-- 调用 `idea-generator` 用于 SELECT + IDEATE
-- 调用 `candidate-writer` 编写候选代码
-- 调用 `tunable-contract-extractor` 提取调优器合约并执行 step 0+1
-- 调用 `tuner-orchestrator` 用于每轮一次的解耦深度调优
-- 内联使用 `crash-diagnosis` skill 进行崩溃分析
+- 依次调用 `idea-generator`（SELECT + IDEATE）、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator` 角色会话
+- 用 `crash-diagnosis` 角色进行崩溃分析
 - 无单独的候选运行；extractor/tuner 各自使用 `record-run` + `set-tuning` 记录分数（无 `parse_result`）
 - 通过 `tools/ledger.py` 维护 `ledger.json` 和派生的 `loop_state.md`
-- 持续直到硬停止条件
-
-不做：
-- 同时管理多个实验
-- 作为无法继续调度角色子代理的嵌套子智能体运行
-- 内联执行 `idea-generator` / `candidate-writer` / `tunable-contract-extractor` / `tuner-orchestrator` 工作（`crash-diagnosis` skill 是例外——它是内联的）
-- 修改其他运行目录
+- 拥有预算检查、升级链与崩溃恢复；持续直到硬停止条件（`blocked` 事件带具体原因）
 
 ### 5.2 background-researcher
 
@@ -196,7 +180,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 - `source_run_ids` 只保存数字父代，假设归因、策略预测与分数观测分别存放
 - 证据为基础（每个声明可追溯；无虚构论文）；对任务/账本只读；不运行实验
 - schema-3 空间在 setup 后冻结；运行时剪枝只发生在账本 `search_space_state` 覆盖层，不修改冻结 registry；空间扩展留到 P4
-- `model: inherit`（继承调用会话的模型配置）
+- 模型由运行的 `run_metadata.json` 固定（新运行时 `--model` 指定）
 
 ### 5.3 idea-generator
 
@@ -235,11 +219,11 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 
 ### 5.6 tunable-contract-extractor
 
-Step 0+1：在候选 `train.py` 准备好后运行，在一个子智能体中完成所有事情：
+Step 0+1：在候选 `train.py` 准备好后运行，在一个角色会话中完成所有事情：
 
 ① 行为保持地将构造逻辑重构为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）并声明 `PARAM_SCHEMA`（仅列出可调参数 + 类型，无范围/默认值）
 ② provided entrypoint 仅使用一个原始默认配置；非 fresh 候选从 primary parent 的完整代码快照开始，并把其已应用 incumbent 精确投影为强制 warm config 0（记录 copied/reset/new/dropped、父代 durable applied snapshot 与 hash）；该控制保证 tuning win 可继承，但 receipt 明确标为 semantic `unverified`，不冒充语义因果比较；其余候选结合**血统证据**（`lineage-evidence`）与数据提出热启动配置及 `SEARCH_SPACE`
-③ 评估所选配置（`warmstart_eval`；强制先保留 inherited control、顺序/可恢复/崩溃时停止）；**对每次崩溃内联调用 `crash-diagnosis` skill**（config-invalid → 修复配置 / code-incompatible → 最小化修复代码 ≤10 次）直到通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，并把完整 transfer/control/score receipt 写入 ledger；无法修复 → 记录 `status:crash`
+③ 评估所选配置（`warmstart_eval`；强制先保留 inherited control、顺序/可恢复/崩溃时停止）；**对每次崩溃调用 `crash-diagnosis` 角色**（config-invalid → 修复配置 / code-incompatible → 最小化修复代码 ≤10 次）直到通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，并把完整 transfer/control/score receipt 写入 ledger；无法修复 → 记录 `status:crash`
 
 主循环在 `candidate-writer` 返回后对每个新候选方案运行一次此操作。深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
 
@@ -256,25 +240,13 @@ Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运�
 
 资格不足（种群太小、顶层已调优且无响应继续、或预算/上限耗尽）返回 `none`——有效的无操作。
 
-## 6. Skills
+## 6. 崩溃诊断
 
-Skills 是可复用的方法论描述，位于：
-
-```text
-.claude/skills/
-```
-
-当前：1 个 skill（`idea-proposer`、`hyperparam-tuner-llm`、`task-initializer` 全部退役——前两个合并到智能体；种子阶段溶解到 `fresh` 自举）：
-
-### 6.1 crash-diagnosis
-
-诊断一个候选崩溃并决定恢复方法的方法论，**由运行候选的上下文内联遵循**（非单独智能体）——主要是 `tunable-contract-extractor` 在 eval-K 崩溃期间（无单独的官方运行，因此主线程不再有官方运行崩溃路径），因为子智能体无法生成诊断子智能体。三向判决：
+原 `.claude/skills/` 已随 runtime 退役；`crash-diagnosis` 从 skill 迁移为 driver 角色（`driver/prompts/crash-diagnosis.md`，只读工具集：Read/Bash/Glob/Grep），由循环在候选 preflight 或客观评估崩溃时调用。三向判决：
 
 - `config_invalid`：配置值本身无法挽救 → 修复配置
 - `code_incompatible`：配置合理，代码不兼容 → **最小化修复代码**以适应（首选）
 - `abandon`：需要编辑只读 / 添加禁止的依赖 / 根本不兼容 → 放弃
-
-> 注：外层想法生成从 `idea-proposer` skill 改为两个**智能体**（见上面的智能体部分）：`idea-generator`（S-GoT：每代首先调用 `got_select.py decide` 进行 SELECT，然后 IDEATE 每个行动）和 `experience-extractor`（每个已完成的非空轮次后将全局经验提炼到 ledger.json experience）。智能体转换通过用持久账本/经验替换对话上下文依赖实现。原始 `task-initializer` skill 也退役——无单独的种子阶段；循环通过 `fresh` 候选方案自举。
 
 ## 7. 工具
 
@@ -306,7 +278,7 @@ python tools/new_candidate.py <task-name> <tag> <run_id> --from-candidate <best_
 
 ### 7.2 ledger.py
 
-`ledger.json` 的唯一写入者，以及实验状态的结构化真相源（每个候选一个 JSON 记录，合并原始 `idea_log.md` 想法字段与 `results.tsv` 分数/状态）。**永不手动编辑**；仅通过子命令变更，确保长时间运行中的模式稳定性（见 `.claude/rules/ledger.md`）：
+`ledger.json` 的唯一写入者，以及实验状态的结构化真相源（每个候选一个 JSON 记录，合并原始 `idea_log.md` 想法字段与 `results.tsv` 分数/状态）。**永不手动编辑**；仅通过子命令变更，确保长时间运行中的模式稳定性（见 `driver/prompts/rules/ledger.md`）：
 
 ```bash
 python tools/ledger.py add-record      ...   # idea-generator 创建记录 (带 --op)
@@ -471,10 +443,9 @@ model = make_model(dataset, BASE_PARAMS)
 
 1. **`README.md`**：理解整体结构
 2. **`CLAUDE.md`**：理解 runtime 如何进入项目
-3. **`.claude/agents/*.md`**：理解主代理与子代理的责任边界
-4. **`.claude/skills/*/SKILL.md`**：理解可复用的方法论
-5. **`tools/*.py` 和 `tools/tuners/*.py`**：理解确定性执行层
-6. **`tasks/tabular-model-search/`**：理解当前主要验证任务
+3. **`driver/loops/*.py` 和 `driver/prompts/*.md`**：理解循环编排与角色责任边界
+4. **`tools/*.py` 和 `tools/tuners/*.py`**：理解确定性执行层
+5. **`tasks/tabular-model-search/`**：理解当前主要验证任务
 
 ## 11. 继续开发
 
@@ -498,22 +469,14 @@ uv --directory tasks/<task-name> sync
 python tools/validate_tasks.py
 ```
 
-### 11.2 添加 Skill
+### 11.2 添加角色
 
-1. 创建 `.claude/skills/<skill-name>/SKILL.md`
+1. 创建 `driver/prompts/<role-name>.md` 并在 `driver/roles.py` 注册：prompt 文件、正向工具能力集、receipt schema、后置条件
 2. 使用小写连字符命名
-3. 前置必须有 `name` 和 `description`
-4. 将长参考材料放在 skill 自己的 `references/` 中
-5. 将确定性脚本放在 skill 自己的 `scripts/` 中
+3. 明确其输入、输出、边界和禁止的行动；保持角色范围集中
+4. prompt 只承载生成与判断；确定性逻辑写到 `tools/`，排序写到 `driver/loops/`，而不是仅自然语言流程
 
-### 11.3 添加智能体
-
-1. 创建 `.claude/agents/<agent-name>.md`
-2. 明确其输入、输出、边界和禁止的行动
-3. 保持智能体范围集中。一个智能体应完成一个明确的子任务
-4. 如果智能体需要确定性逻辑，写到 `tools/` 而不是仅自然语言流程
-
-### 11.4 添加工具
+### 11.3 添加工具
 
 1. 放在 `tools/` 或 `tools/<domain>/`
 2. 尽可能让工具从 `task.toml` 读取配置，而不是硬编码特定任务
