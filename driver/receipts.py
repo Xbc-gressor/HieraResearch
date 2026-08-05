@@ -138,22 +138,40 @@ def build_receipt_server(
         {"receipt": dict},
     )
     async def submit_receipt(args: dict) -> dict:
-        payload = args.get("receipt")
-        problems = validate_receipt(schema, payload)
-        if problems:
-            return {
-                "content": [{"type": "text",
-                             "text": "receipt rejected: " + "; ".join(problems)}],
-                "isError": True,
-            }
-        store.persist_receipt(role_name, invocation_id, payload)
-        accepted.append(payload)
-        return {
-            "content": [{"type": "text",
-                         "text": f"receipt accepted "
-                                 f"({store.receipt_path(role_name, invocation_id).name})"}]
-        }
+        return await handle_submit_receipt(
+            schema, store, role_name, invocation_id, accepted, args
+        )
 
     server = create_sdk_mcp_server(name="receipts", version="1.0.0",
                                    tools=[submit_receipt])
     return server, accepted
+
+
+async def handle_submit_receipt(
+    schema: dict[str, Any],
+    store: ReceiptStore,
+    role_name: str,
+    invocation_id: int,
+    accepted: list[dict],
+    args: dict,
+) -> dict:
+    """Validate and persist a submitted receipt; body of the submit_receipt tool.
+
+    Rejections must use ``is_error`` (snake_case): that is the key the
+    claude_agent_sdk checks when converting tool results.
+    """
+    payload = args.get("receipt")
+    problems = validate_receipt(schema, payload)
+    if problems:
+        return {
+            "content": [{"type": "text",
+                         "text": "receipt rejected: " + "; ".join(problems)}],
+            "is_error": True,
+        }
+    store.persist_receipt(role_name, invocation_id, payload)
+    accepted.append(payload)
+    return {
+        "content": [{"type": "text",
+                     "text": f"receipt accepted "
+                             f"({store.receipt_path(role_name, invocation_id).name})"}]
+    }

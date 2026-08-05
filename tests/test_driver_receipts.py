@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 import tempfile
@@ -7,7 +8,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from driver.receipts import ReceiptError, ReceiptStore, validate_receipt  # noqa: E402
+from driver.receipts import (ReceiptError, ReceiptStore,  # noqa: E402
+                             handle_submit_receipt, validate_receipt)
 
 SCHEMA = {
     "status": ("enum", "keep", "discard", "crash"),
@@ -86,6 +88,22 @@ class ReceiptStoreTests(unittest.TestCase):
             self.assertIsNone(store.load_session_id("idea-generator", 2))
             store.persist_session_id("idea-generator", 2, "sess-abc")
             self.assertEqual(store.load_session_id("idea-generator", 2), "sess-abc")
+
+
+class SubmitReceiptContractTests(unittest.TestCase):
+    def test_rejection_sets_sdk_is_error_key(self) -> None:
+        """Rejected receipts must surface is_error (snake_case) so the SDK
+        reports a tool error instead of a successful result."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReceiptStore(Path(tmp))
+            accepted: list[dict] = []
+            result = asyncio.run(handle_submit_receipt(
+                {"edited": "bool"}, store, "hillclimb-editor", 1, accepted,
+                {"receipt": {"edited": "yes"}},
+            ))
+            self.assertTrue(result.get("is_error"))
+            self.assertEqual(accepted, [])
+            self.assertFalse(list(store._dir().glob("*.json")))
 
 
 if __name__ == "__main__":
