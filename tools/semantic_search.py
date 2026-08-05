@@ -80,7 +80,7 @@ GAIN_CONTEXT_SCHEMA_VERSION = 3
 PREDICTION_SCHEMA_VERSION = 3
 CONDITIONED_PREDICTION_SCHEMA_VERSION = 2
 LEGACY_PREDICTION_SCHEMA_VERSION = 1
-POLICY_RECEIPT_SCHEMA_VERSION = 7
+POLICY_RECEIPT_SCHEMA_VERSION = 8
 POLICIES = {"coverage", "coverage_experience", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
 DEFAULT_POLICY_CONFIG = {
     "coverage_weight": 0.10,
@@ -1228,6 +1228,8 @@ def select_proposal(
     selection_index: int = 1,
     experience: Any = None,
     ledger: dict[str, Any] | None = None,
+    forced_point_id: str | None = None,
+    predict: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     errors = validate_proposal_set(proposal_set)
     if errors:
@@ -1393,9 +1395,24 @@ def select_proposal(
     # penalized through the carrier prior instead of a forced budget lane.
     # `budget_lane` is still computed in build_proposal_set for backward
     # readability but no longer affects selection.
-    selected_item = ranked[0]
-    base_rank = 1
     final_ranked = ranked
+    if forced_point_id is None:
+        selected_item = ranked[0]
+        base_rank = 1
+    else:
+        # A PREDICT winner. Acquisition still ranks the field and still gates
+        # eligibility; the tournament only chooses among points acquisition
+        # already ranked, so a forced id outside the set is a protocol error
+        # rather than a widening of the space.
+        index = next(
+            (i for i, item in enumerate(ranked) if item[1] == forced_point_id), None
+        )
+        if index is None:
+            raise ContractError(
+                f"forced point {forced_point_id!r} is not in this proposal set"
+            )
+        selected_item = ranked[index]
+        base_rank = index + 1
     score, selected_id, selected, components = selected_item
     prediction = prediction_by_id.get(selected_id)
     snapshot = _experience_snapshot_receipt(experience)
@@ -1421,6 +1438,7 @@ def select_proposal(
         ),
         "rationale": rationale,
     }
+    predict_receipt = _predict_receipt(predict, selected_id, forced_point_id)
     receipt = {
         "schema_version": POLICY_RECEIPT_SCHEMA_VERSION,
         "space_revision": proposal_set["space"]["space_revision"],
@@ -1443,7 +1461,84 @@ def select_proposal(
         },
         "ranked_point_ids": [item[1] for item in final_ranked],
     }
+    if predict_receipt is not None:
+        # Only carry the key when a tournament actually ran, so a schema-8
+        # receipt from a plain acquisition selection stays shape-identical to
+        # schema 7 and "has a predict block" means "was reordered by PREDICT".
+        receipt["predict"] = predict_receipt
     return selected["point"], receipt
+
+
+def _predict_receipt(
+    predict: dict[str, Any] | None,
+    selected_id: str,
+    forced_point_id: str | None,
+) -> dict[str, Any] | None:
+    """Validate and normalize the PREDICT block of a schema-8 receipt.
+
+    ``None`` means no tournament ran and acquisition's argmax stands — a valid,
+    fully backward-readable schema-7-shaped decision. When a tournament did run,
+    its winner and the selected point must be the same thing; anything else
+    means the receipt would misattribute the decision.
+    """
+    if predict is None:
+        if forced_point_id is not None and forced_point_id != selected_id:
+            raise ContractError("forced point id does not match the selected point")
+        return None
+    if not isinstance(predict, dict):
+        raise ContractError("predict receipt must be an object")
+    winner = predict.get("winner")
+    if winner != selected_id:
+        raise ContractError(
+            f"predict winner {winner!r} does not match selected point {selected_id!r}"
+        )
+    method = predict.get("method")
+    if not isinstance(method, str) or not method:
+        raise ContractError("predict receipt must name its method")
+    candidates = predict.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) < 2:
+        raise ContractError("predict receipt must list at least 2 candidates")
+    return {
+        "method": method,
+        "winner": winner,
+        "candidates": list(candidates),
+        "votes": predict.get("votes"),
+        "coverage": predict.get("coverage"),
+        "abstentions": predict.get("abstentions"),
+        "decided_by": predict.get("decided_by"),
+        "ranking": predict.get("ranking"),
+    }
+
+
+def shortlist_proposals(
+    proposal_set: dict[str, Any],
+    *,
+    size: int,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Top-``size`` points under the configured acquisition policy.
+
+    Reuses ``select_proposal`` so the shortlist is exactly the head of the
+    ranking that would otherwise have been argmax'd — the PREDICT step reorders
+    within this head, it never reaches past acquisition's judgment of what is
+    eligible or promising.
+    """
+    if size < 2:
+        raise ContractError("--size must be >= 2 for a tournament shortlist")
+    _, receipt = select_proposal(proposal_set, **kwargs)
+    ranked_ids = receipt["ranked_point_ids"][:size]
+    by_id = {
+        proposal["point_id"]: proposal for proposal in proposal_set["proposals"]
+    }
+    return [
+        {
+            "rank": index + 1,
+            "point_id": point_id,
+            "point": by_id[point_id]["point"],
+            "coverage": by_id[point_id]["coverage"],
+        }
+        for index, point_id in enumerate(ranked_ids)
+    ]
 
 
 def _framework_policy_config(
@@ -1556,7 +1651,13 @@ def cmd_gain_context(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_select(args: argparse.Namespace) -> int:
+def _selection_inputs(args: argparse.Namespace) -> dict[str, Any]:
+    """Shared preamble for `select` and `shortlist`.
+
+    Both must see the same policy config, the same frozen reliability prior, and
+    the same freshness gates: a shortlist built against a stale overlay would
+    otherwise hand PREDICT a set that `select` must then reject.
+    """
     proposals = _load_object(args.proposals)
     predictions = _load_object(args.predictions) if args.predictions else None
     configured_policy, configured_weights = _framework_policy_config(args.ledger)
@@ -1587,7 +1688,7 @@ def cmd_select(args: argparse.Namespace) -> int:
             prior_policy = (
                 prior_receipt.get("policy")
                 if isinstance(prior_receipt, dict)
-                and prior_receipt.get("schema_version") in {6, 7}
+                and prior_receipt.get("schema_version") in {6, 7, 8}
                 else None
             )
             prior_config = (
@@ -1648,14 +1749,30 @@ def cmd_select(args: argparse.Namespace) -> int:
             f"ledger's current search space state revision {current_revision}; "
             "re-propose against the current overlay before selecting"
         )
+    return {
+        "proposals": proposals,
+        "policy": policy,
+        "predictions": predictions,
+        "config": config,
+        "selection_index": len(records) + 1,
+        "experience": ledger.get("experience"),
+        "ledger": ledger,
+    }
+
+
+def cmd_select(args: argparse.Namespace) -> int:
+    inputs = _selection_inputs(args)
+    proposals = inputs.pop("proposals")
+    policy = inputs["policy"]
+    predict = _load_object(args.predict) if getattr(args, "predict", None) else None
+    forced = getattr(args, "force_point_id", None)
+    if predict is not None and forced is None:
+        forced = predict.get("winner")
     point, receipt = select_proposal(
         proposals,
-        policy=policy,
-        predictions=predictions,
-        config=config,
-        selection_index=len(records) + 1,
-        experience=ledger.get("experience"),
-        ledger=ledger,
+        **inputs,
+        forced_point_id=forced,
+        predict=predict,
     )
     _write_object(args.point_output, point)
     _write_object(args.receipt_output, receipt)
@@ -1669,6 +1786,40 @@ def cmd_select(args: argparse.Namespace) -> int:
                 "receipt_output": str(args.receipt_output),
                 "components": receipt["components"],
                 "budget": receipt["budget"],
+                "predict": receipt.get("predict"),
+            },
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def cmd_shortlist(args: argparse.Namespace) -> int:
+    inputs = _selection_inputs(args)
+    proposals = inputs.pop("proposals")
+    size = args.size
+    if size is None:
+        from semantic_predict import predict_cfg
+
+        size = int(predict_cfg(args.ledger or args.proposals)["shortlist_size"])
+    entries = shortlist_proposals(proposals, size=size, **inputs)
+    payload = {
+        "schema_version": PROPOSAL_SCHEMA_VERSION,
+        "proposal_set_revision": proposals["proposal_set_revision"],
+        "search_space_state_revision": proposals["search_space_state_revision"],
+        "action": proposals["action"],
+        "policy": inputs["policy"],
+        "shortlist": entries,
+    }
+    _write_object(args.output, payload)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "policy": inputs["policy"],
+                "size": len(entries),
+                "point_ids": [entry["point_id"] for entry in entries],
+                "output": str(args.output),
             },
             separators=(",", ":"),
         )
@@ -1723,7 +1874,32 @@ def build_parser() -> argparse.ArgumentParser:
     select.add_argument("--cfg", help="JSON acquisition-weight overrides")
     select.add_argument("--point-output", type=Path, required=True)
     select.add_argument("--receipt-output", type=Path, required=True)
+    select.add_argument(
+        "--predict",
+        type=Path,
+        help=(
+            "semantic_predict.py tally result; its winner becomes the selected "
+            "point and the receipt records the tournament"
+        ),
+    )
+    select.add_argument(
+        "--force-point-id",
+        help="select this ranked point instead of the argmax (implied by --predict)",
+    )
     select.set_defaults(func=cmd_select)
+
+    shortlist = sub.add_parser(
+        "shortlist",
+        help="top-k ranked points to send into the PREDICT tournament",
+    )
+    shortlist.add_argument("--proposals", type=Path, required=True)
+    shortlist.add_argument("--policy", choices=sorted(POLICIES))
+    shortlist.add_argument("--predictions", type=Path)
+    shortlist.add_argument("--ledger", type=Path)
+    shortlist.add_argument("--cfg", help="JSON acquisition-weight overrides")
+    shortlist.add_argument("--size", type=int, default=None)
+    shortlist.add_argument("--output", type=Path, required=True)
+    shortlist.set_defaults(func=cmd_shortlist)
     return parser
 
 

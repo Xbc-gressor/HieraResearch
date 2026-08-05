@@ -939,7 +939,7 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     transfer = record.get("parameter_transfer")
     policy = record.get("policy_receipt")
     is_new_contract = (
-        isinstance(policy, dict) and policy.get("schema_version") in {5, 6, 7}
+        isinstance(policy, dict) and policy.get("schema_version") in {5, 6, 7, 8}
     )
     nonfresh = record.get("op") in {"improve", "crossover"}
     terminal_noncrash = record.get("status") in NONCRASH_TERMINAL_STATUSES
@@ -1623,7 +1623,7 @@ def matched_inherited_control(
         or parent.get("status") not in NONCRASH_TERMINAL_STATUSES
         or child.get("status") not in NONCRASH_TERMINAL_STATUSES
         or not isinstance(child.get("policy_receipt"), dict)
-        or child["policy_receipt"].get("schema_version") not in {6, 7}
+        or child["policy_receipt"].get("schema_version") not in {6, 7, 8}
         or validate_parameter_transfer_binding(ledger, child)
     ):
         return None

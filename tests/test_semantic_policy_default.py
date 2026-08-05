@@ -616,7 +616,7 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
             self.assertEqual(result, 0)
             receipt = json.loads(receipt_path.read_text())
             self.assertEqual(receipt["policy"]["name"], "coverage_experience")
-            self.assertEqual(receipt["schema_version"], 7)
+            self.assertEqual(receipt["schema_version"], 8)
             self.assertIsNone(receipt["components"]["llm_judgment_weight"])
             self.assertIsNone(receipt["components"]["predicted_gain"])
             self.assertIsNone(receipt["components"]["uncertainty"])
@@ -824,7 +824,7 @@ class CoverageExperiencePolicyTests(unittest.TestCase):
             selected_assignments(point).get("dim-data-curation"),
             "hyp-data-filtered",
         )
-        self.assertEqual(receipt["schema_version"], 7)
+        self.assertEqual(receipt["schema_version"], 8)
         self.assertEqual(receipt["policy"]["name"], "coverage_experience")
         self.assertEqual(receipt["budget"]["fallback"], "lanes_removed")
 
