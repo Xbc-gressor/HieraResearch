@@ -10,21 +10,25 @@ implementer, not a researcher.
 
 The caller passes **one** thing:
 
-- **`target_candidate_dir`** — absolute path to the candidate directory the
+- **`candidate_dir`** — absolute path to the candidate directory the
   `train.py` goes in (e.g. `runs/<task>/<tag>/candidates/007`). The caller has
   already copied `prepare.py` here. For a non-fresh candidate, `train.py` is an
   exact helper-pinned copy of its primary parent; for a provided-baseline seed,
   it is the exact task-provided entrypoint.
 
-Derive everything else from `target_candidate_dir` (do not ask the caller):
+For provided-baseline admissions the context additionally carries an `expect`
+key describing the required no-op outcome (`status: existing, wrote: false`) —
+honor it exactly.
+
+Derive everything else from `candidate_dir` (do not ask the caller):
 
 | value | how |
 |---|---|
 | `run_id` | the dir's name (e.g. `007`) |
 | `run_dir` | the dir's grandparent — `runs/<task>/<tag>/` |
-| the file you write | `<target_candidate_dir>/train.py` |
-| implementation brief | `<target_candidate_dir>/_candidate_brief.json` |
-| `prepare.py` (readonly) | `<target_candidate_dir>/prepare.py` — read for its API surface, never edit |
+| the file you write | `<candidate_dir>/train.py` |
+| implementation brief | `<candidate_dir>/_candidate_brief.json` |
+| `prepare.py` (readonly) | `<candidate_dir>/prepare.py` — read for its API surface, never edit |
 | `task_dir` | `tasks/<task>`, where `<task>` is the `runs/<task>/` segment of the path |
 
 Then read **`_candidate_brief.json`**. `new_candidate.py` generated this compact,
@@ -85,14 +89,14 @@ are authoritative.
 Decide what to do from the file system, in this order:
 
 1. **Provided entrypoint → do not write.** When `implementation_source.kind` is
-   `provided_entrypoint`, require `<target_candidate_dir>/train.py` to exist.
+   `provided_entrypoint`, require `<candidate_dir>/train.py` to exist.
    The copied file IS the candidate. Read it, run the sanity checks below, and
    return the verdict with `wrote: false`. Never "improve" it. An existing file
    without that helper receipt is an invalid upstream collision; block rather
    than guessing.
 2. **Primary-parent snapshot → edit the existing copy.** Require
    `source_run_ids[0]`, `primary_parent`, and `implementation_source` to agree,
-   and require `<target_candidate_dir>/train.py` to exist. Preserve the parent's
+   and require `<candidate_dir>/train.py` to exist. Preserve the parent's
    working strategy and tuner structure, then implement only the requested
    semantic delta. This existing file is expected, not an upstream collision.
    For crossover, consult secondary parents as references without replacing the

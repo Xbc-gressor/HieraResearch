@@ -144,6 +144,31 @@ def _reconcile(run_dir, cmd, repo_root, events) -> None:
                 "recovery: reserved attempt interrupted before outcome row")
 
 
+def _restore_best(run_dir, events) -> None:
+    """Crash-recovery row 2: a kill between the keep row and the best.py
+    snapshot leaves best.py stale. The TSV is authoritative: restore best.py
+    from the best step's history snapshot when one exists and differs."""
+    finite = []
+    for i, row in enumerate(_tsv_rows(run_dir)):
+        try:
+            score = float(row[1])
+        except (IndexError, ValueError):
+            continue
+        if math.isfinite(score):
+            finite.append((i, score))
+    if not finite:
+        return
+    best_step = min(finite, key=lambda p: p[1])[0]
+    snapshot = run_dir / "history" / f"{best_step:03d}.py"
+    if not snapshot.exists():
+        return  # no snapshot to restore from; leave best.py alone
+    best = run_dir / "best.py"
+    if best.exists() and best.read_bytes() == snapshot.read_bytes():
+        return
+    shutil.copy(snapshot, best)
+    events.emit("reconcile_recovery_row", restore_best_step=best_step)
+
+
 # --- editor escalation ----------------------------------------------------------
 
 
@@ -178,9 +203,18 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                max_evaluations, timeout, cmd, events)
         write_metadata(run_dir, model, cli_path)
     else:
-        for warning in warn_on_mismatch(run_dir, model, cli_path):
-            events.emit("metadata_mismatch", warning=warning)
+        metadata_path = run_dir / "run_metadata.json"
+        if metadata_path.exists():
+            for warning in warn_on_mismatch(run_dir, model, cli_path):
+                events.emit("metadata_mismatch", warning=warning)
+        elif model is not None:  # killed before setup wrote the metadata
+            write_metadata(run_dir, model, cli_path)
+        else:
+            events.emit("metadata_mismatch",
+                        warning="run_metadata.json missing and no model "
+                                "supplied; metadata not written")
         _reconcile(run_dir, cmd, repo_root, events)
+        _restore_best(run_dir, events)
         common.preflight_env(task, run_dir, repo_root, cmd)
 
     cfg_text = (run_dir / "framework_cfg.json").read_text(encoding="utf-8")
@@ -212,11 +246,9 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     "crash" if not math.isfinite(score) else "keep", "baseline")
             if math.isfinite(score):
                 _keep(run_dir, 0)
-            else:
-                stop_condition = "baseline evaluation crashed"
-                events.emit("blocked", reason=stop_condition)
-                return _status(task, tag, run_dir, metric, stop_condition,
-                               repo_root, cmd)
+            # A crashed baseline CONTINUES (same semantics as the resume
+            # path): the editor starts from the crashed train.py, _revert
+            # no-ops without best.py, and the first finite score keeps.
 
     best_before = min(_finite_scores(run_dir), default=None)
     needs_editor = True

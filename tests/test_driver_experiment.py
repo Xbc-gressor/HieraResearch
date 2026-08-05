@@ -42,6 +42,7 @@ class ExperimentCmd:
         self.brief_queue: list[dict] = []
         self.reached: list[bool] = []
         self.fail_next: set[str] = set()
+        self.raise_once: set[str] = set()
 
     @property
     def run_dir(self) -> Path:
@@ -62,6 +63,11 @@ class ExperimentCmd:
             if marker in joined:
                 self.fail_next.discard(marker)
                 return subprocess.CompletedProcess(args, 1, "", "boom")
+        for marker in list(self.raise_once):
+            if marker in joined:
+                self.raise_once.discard(marker)
+                raise subprocess.CalledProcessError(
+                    1, args, "", f"helper refused: {marker}")
 
         if "init_run.py" in joined:
             self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +78,8 @@ class ExperimentCmd:
         if "ledger.py" in joined and "brief" in joined:
             brief = self.brief_queue.pop(0) if self.brief_queue else {
                 "records": self._ledger()["records"],
+                "pending_run_ids": [r["run_id"] for r in self._ledger()["records"]
+                                    if r.get("status") == "pending"],
                 "experience_refresh_required": False}
             return self._ok(json.dumps(brief))
         if "evaluation_budget.py" in joined and "status" in joined:
@@ -90,6 +98,14 @@ class ExperimentCmd:
             for record in ledger["records"]:
                 if record["run_id"] == run_id:
                     record["status"] = status
+            self._save_ledger(ledger)
+            return self._ok("")
+        if "resolve-unevaluated" in joined:
+            run_id = args[args.index("--run-id") + 1]
+            ledger = self._ledger()
+            for record in ledger["records"]:
+                if record["run_id"] == run_id:
+                    record["status"] = "unevaluated"
             self._save_ledger(ledger)
             return self._ok("")
         if "set-phase" in joined:
@@ -272,6 +288,113 @@ class ExperimentTests(unittest.TestCase):
                                 repo_root=self.repo, cmd=cmd)
         self.assertTrue(any("resolve-unevaluated" in c for c in cmd.calls))
         self.assertNotEqual(cmd._ledger().get("phase"), "blocked")
+
+    def _seed_resumed_run(self, records: list[dict]) -> None:
+        """A run killed after setup: cfg/background exist, no metadata."""
+        write_task(self.repo)
+        run_dir = self.repo / "runs" / "fake-task" / "t1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "framework_cfg.json").write_text(json.dumps(
+            {"max_evaluations": 3, "dimension_strategy": "catalog_subset"}))
+        (run_dir / "background.md").write_text("# bg\n")
+        (run_dir / "background_retrieval.json").write_text("{}")
+        (run_dir / "ledger.json").write_text(json.dumps({"records": records}))
+
+    def test_pending_record_resumed_in_place_before_ideation(self) -> None:
+        self._seed_resumed_run([{"run_id": "000", "status": "pending"}])
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, False, True]
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"receipt": {"actions": []}},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        roles = [name for name, _ in runner.calls]
+        # the pending record is implemented BEFORE any idea-generator run
+        self.assertEqual(roles, ["candidate-writer", "tunable-contract-extractor",
+                                 "idea-generator", "tuner-orchestrator"])
+        writer_ctx = runner.calls[0][1]
+        self.assertEqual(writer_ctx.run_id, "000")
+        self.assertTrue(any("new_candidate.py" in c and " 000 " in c
+                            for c in cmd.calls))
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+
+    def test_set_phase_completed_refusal_blocks_cleanly(self) -> None:
+        self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [True]
+        cmd.raise_once = {"phase completed"}  # set-phase completed refused once
+        runner = FakeSessionRunner([])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        events = (cmd.run_dir / "driver_events.jsonl").read_text()
+        self.assertIn("set-phase completed refused", events)
+
+    def test_tuner_first_failure_then_contradiction_no_unbound_local(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, True]
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: (
+                 (ctx.run_dir / "background.md").write_text("# bg\n"),
+                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"fail": ["tuner session died"]},
+            # fresh reconciliation returns a CONTRADICTORY receipt (ledger has
+            # no tune flag for 000); with no live tuner session the corrective
+            # follow-up must run fresh (resume_from=None), not crash
+            {"receipt": {"tuned_run_id": "000", "tuned": True,
+                         "ledger_updated": True}},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        tuner_calls = [ctx for name, ctx in runner.calls
+                       if name == "tuner-orchestrator"]
+        self.assertEqual(len(tuner_calls), 3)
+        self.assertIsNone(tuner_calls[1].resume_session_id)
+        self.assertIsNone(tuner_calls[2].resume_session_id)
+        self.assertIn("reconcile_note", tuner_calls[1].extra)
+
+    def test_resume_missing_background_reruns_researcher(self) -> None:
+        self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
+        run_dir = self.repo / "runs" / "fake-task" / "t1"
+        (run_dir / "background.md").unlink()  # killed mid-setup
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [True]
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: (
+                 (ctx.run_dir / "background.md").write_text("# bg\n"),
+                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        roles = [name for name, _ in runner.calls]
+        self.assertEqual(roles, ["background-researcher"])
+        self.assertTrue((run_dir / "background.md").exists())
+        self.assertTrue((run_dir / "run_metadata.json").exists())
 
 
 if __name__ == "__main__":

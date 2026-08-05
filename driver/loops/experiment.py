@@ -141,6 +141,16 @@ def _record_crash(run_dir, run_id, repo_root, cmd) -> None:
          "--status", "crash"], repo_root)
 
 
+def _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd) -> None:
+    """new_candidate.py refuses a non-empty candidate dir; on resume the dir
+    may already be materialized, so only run the helper when it is not."""
+    candidate_dir = run_dir / "candidates" / run_id
+    if candidate_dir.exists() and any(candidate_dir.iterdir()):
+        return
+    cmd(["python", "tools/new_candidate.py", task, tag, run_id,
+         "--skip-entrypoint"], repo_root)
+
+
 def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                          cmd, events) -> None:
     """candidate-writer + extractor with evidence-branched escalation."""
@@ -209,6 +219,7 @@ def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str):
 
 def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
           events) -> None:
+    tuner_inv = None  # set only on a successful first invocation
     try:
         receipt, tuner_inv = _invoke(runner, store, "tuner-orchestrator",
                                      task, tag, run_dir, round_no=round_no)
@@ -417,10 +428,27 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _setup(runner, store, task, tag, run_dir, task_toml, repo_root,
                    cmd, events, max_evaluations, timeout, dimension_strategy,
                    llm_intelligence_score, model, cli_path)
-        else:  # resume: re-run the env gate; warn on metadata drift
-            for warning in warn_on_mismatch(run_dir, model, cli_path):
-                events.emit("metadata_mismatch", warning=warning)
+        else:  # resume: complete setup step-wise, then re-run the env gate
+            if (run_dir / "run_metadata.json").exists():
+                for warning in warn_on_mismatch(run_dir, model, cli_path):
+                    events.emit("metadata_mismatch", warning=warning)
+            else:  # killed before setup finished write_metadata
+                write_metadata(run_dir, model, cli_path)
             common.preflight_env(task, run_dir, repo_root, cmd)
+            if not (run_dir / "background.md").exists() or \
+                    not (run_dir / "background_retrieval.json").exists():
+                # killed mid-setup: background research never completed
+                strategy = json.loads(
+                    (run_dir / "framework_cfg.json")
+                    .read_text(encoding="utf-8")).get("dimension_strategy")
+                try:
+                    _invoke(runner, store, "background-researcher", task, tag,
+                            run_dir)
+                except InvocationFailed as exc:
+                    _or_block(run_dir, repo_root, cmd, events,
+                              f"background-researcher failed: {exc.problems}")
+                _validate_background(runner, store, task, tag, run_dir,
+                                     repo_root, cmd, events, strategy)
 
         round_no = 0
         while True:
@@ -428,11 +456,29 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # first rounds skip straight to ideation)
             ledger_exists = (run_dir / "ledger.json").exists()
             brief = _brief(run_dir, repo_root, cmd) if ledger_exists else None
+            # crash-recovery row 1: a pending record (admitted but never
+            # implemented) resumes IN PLACE before any new ideation; its
+            # resolution consumes no new ideation slot.
+            pending_ids = (brief or {}).get("pending_run_ids") or []
+            if pending_ids:
+                for pending_id in pending_ids:
+                    if budget_status(run_dir, repo_root, cmd).get("reached"):
+                        break  # budget governs pending resolution too
+                    _materialize_candidate(task, tag, run_dir, pending_id,
+                                           repo_root, cmd)
+                    _implement_candidate(runner, store, task, tag, run_dir,
+                                         pending_id, repo_root, cmd, events)
+                brief = _brief(run_dir, repo_root, cmd)
             if brief is not None and budget_status(run_dir, repo_root, cmd).get("reached"):
                 if brief.get("experience_refresh_required"):
                     _refresh(runner, store, task, tag, run_dir, repo_root,
                              cmd, events)
-                common.set_phase(run_dir, repo_root, cmd, "completed")
+                try:
+                    common.set_phase(run_dir, repo_root, cmd, "completed")
+                except subprocess.CalledProcessError as exc:
+                    detail = (exc.stderr or str(exc)).strip()
+                    _or_block(run_dir, repo_root, cmd, events,
+                              f"set-phase completed refused: {detail}")
                 break
 
             # step 1: bounded belief refresh at a refresh boundary
@@ -461,8 +507,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 if budget_status(run_dir, repo_root, cmd).get("reached"):
                     break  # mid-round budget stop; step 0 finalizes
                 run_id = str(action_item["run_id"])
-                cmd(["python", "tools/new_candidate.py", task, tag, run_id,
-                     "--skip-entrypoint"], repo_root)
+                _materialize_candidate(task, tag, run_dir, run_id,
+                                       repo_root, cmd)
                 _implement_candidate(runner, store, task, tag, run_dir,
                                      run_id, repo_root, cmd, events)
 

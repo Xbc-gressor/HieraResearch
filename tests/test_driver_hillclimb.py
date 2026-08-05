@@ -241,6 +241,46 @@ class HillclimbTests(unittest.TestCase):
         self.assertEqual(rows[1][1:3], ["inf", "crash"])  # recovery row
         self.assertIn("recovery", rows[1][3])
 
+    def test_resume_restores_stale_best_from_history(self) -> None:
+        # kill between the keep row (step 1) and the best.py snapshot:
+        # results.tsv says step 1 is best, but best.py holds stale content
+        run_dir = self.run_dir()
+        run_dir.mkdir(parents=True)
+        (run_dir / "results.tsv").write_text(
+            "step\tscore\tstatus\tdescription\n"
+            "0\t-0.700000\tkeep\tbaseline\n"
+            "1\t-0.850000\tkeep\timprovement\n")
+        (run_dir / "history").mkdir()
+        (run_dir / "history" / "000.py").write_text("# v1\n")
+        (run_dir / "history" / "001.py").write_text("# v2-best\n")
+        (run_dir / "best.py").write_text("# stale\n")
+        (run_dir / "train.py").write_text("# v2-best\n")
+        (run_dir / "framework_cfg.json").write_text(json.dumps({"max_evaluations": 0}))
+        cmd = FakeCmd(self.repo, scores=[])
+        runner = FakeSessionRunner([])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd)
+        self.assertEqual((run_dir / "best.py").read_text(), "# v2-best\n")
+        events = (run_dir / "driver_events.jsonl").read_text()
+        self.assertIn("restore_best_step", events)
+        # resume with no metadata file writes it (setup atomicity)
+        self.assertTrue((run_dir / "run_metadata.json").exists())
+
+    def test_baseline_crash_continues_with_repair_semantics(self) -> None:
+        # fresh path: baseline crashes — the loop continues (same as resume)
+        cmd = FakeCmd(self.repo, scores=[None, -0.60])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "fixed"},
+             "side_effects": edit_train_py("# fixed\n")},
+        ])
+        status = run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                               repo_root=self.repo, cmd=cmd, max_evaluations=2)
+        rows = self.rows()
+        self.assertEqual(rows[0][1:3], ["inf", "crash"])      # crashed baseline
+        self.assertEqual(rows[1][1:3], ["-0.600000", "keep"])  # first finite keeps
+        self.assertEqual((self.run_dir() / "best.py").read_text(), "# fixed\n")
+        self.assertEqual(status["active_stop_condition"], "none")
+
 
 if __name__ == "__main__":
     unittest.main()
