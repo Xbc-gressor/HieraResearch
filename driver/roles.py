@@ -1,0 +1,240 @@
+"""Role registry: prompt file, capability set, receipt schema, postconditions.
+
+The positive capability set mirrors each retired agent's frontmatter
+``tools:`` list minus Agent/Task/Skill; ``disallowed`` is defense in depth
+under the fail-closed PreToolUse hook (session.py). Postconditions are
+driver-side checks run after a session returns; each returns an error
+string or None.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
+
+Postcondition = Callable[["InvocationContext"], "str | None"]
+
+
+@dataclass
+class InvocationContext:
+    task: str
+    tag: str
+    run_dir: Path
+    invocation_id: int
+    run_id: str | None = None
+    round_no: int | None = None
+    extra: dict = field(default_factory=dict)
+    resume_session_id: str | None = None
+
+    def user_message(self) -> str:
+        """Paths and compact ids only — durable artifacts are the payload."""
+        lines = [
+            f"task: {self.task}",
+            f"tag: {self.tag}",
+            f"run_dir: {self.run_dir}",
+        ]
+        if self.run_id is not None:
+            lines.append(f"run_id: {self.run_id}")
+        if self.round_no is not None:
+            lines.append(f"round: {self.round_no}")
+        for key, value in self.extra.items():
+            lines.append(f"{key}: {value}")
+        return "\n".join(lines)
+
+    def postcondition_checklist(self, role: "RoleDefinition") -> str:
+        items = "\n".join(f"- {check.__doc__}" for check in role.postconditions)
+        return (
+            "The driver will verify ALL of the following after you return. "
+            "Complete every item, then call mcp__receipts__submit_receipt:\n"
+            f"{items or '- (receipt only)'}"
+        )
+
+
+@dataclass(frozen=True)
+class RoleDefinition:
+    name: str
+    prompt_file: str  # relative to driver/prompts/
+    tools: tuple[str, ...]
+    disallowed: tuple[str, ...]
+    receipt_schema: dict
+    postconditions: tuple[Postcondition, ...] = ()
+    corrective_attempts: int = 3
+
+
+# --- helpers shared by postconditions -------------------------------------
+#
+# `ledger.py brief` deliberately omits per-record data (its docstring: "omit
+# records and large experience text"), so anything that needs a specific
+# record's status reads `ledger.json` directly. Reading is allowed; only
+# hand-editing is banned — `tools/ledger.py` remains the sole mutator.
+
+
+def ledger_brief(run_dir: Path) -> dict:
+    out = subprocess.run(
+        [sys.executable, "tools/ledger.py", "brief",
+         "--ledger", str(run_dir / "ledger.json")],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    )
+    return json.loads(out.stdout)
+
+
+def _ledger_records(run_dir: Path) -> list[dict]:
+    path = run_dir / "ledger.json"
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    return [r for r in data.get("records", []) if isinstance(r, dict)]
+
+
+def record_status(run_dir: Path, run_id: str) -> str | None:
+    for record in _ledger_records(run_dir):
+        if record.get("run_id") == run_id:
+            return record.get("status")
+    return None
+
+
+# --- postconditions ---------------------------------------------------------
+
+
+def background_artifacts_exist(ctx: InvocationContext) -> str | None:
+    """background.md and background_retrieval.json exist in run_dir."""
+    missing = [
+        name
+        for name in ("background.md", "background_retrieval.json")
+        if not (ctx.run_dir / name).exists()
+    ]
+    return f"missing background artifacts: {missing}" if missing else None
+
+
+def candidate_train_py_exists(ctx: InvocationContext) -> str | None:
+    """candidates/<run_id>/train.py exists."""
+    path = ctx.run_dir / "candidates" / str(ctx.run_id) / "train.py"
+    return None if path.exists() else f"missing candidate file: {path}"
+
+
+def record_is_terminal(ctx: InvocationContext) -> str | None:
+    """the ledger record for run_id is keep/discard/crash, never pending."""
+    status = record_status(ctx.run_dir, str(ctx.run_id))
+    if status in ("keep", "discard", "crash"):
+        return None
+    return f"record {ctx.run_id} status is {status!r}, expected keep/discard/crash"
+
+
+def refresh_flag_cleared(ctx: InvocationContext) -> str | None:
+    """ledger brief reports experience_refresh_required == false."""
+    brief = ledger_brief(ctx.run_dir)
+    if brief.get("experience_refresh_required"):
+        return "experience_refresh_required still true after refresh"
+    return None
+
+
+def actions_admitted(ctx: InvocationContext) -> str | None:
+    """every action run_id named in extra['action_run_ids'] has a ledger record."""
+    admitted = {r.get("run_id") for r in _ledger_records(ctx.run_dir)}
+    missing = [r for r in ctx.extra.get("action_run_ids", []) if r not in admitted]
+    return f"actions not admitted to ledger: {missing}" if missing else None
+
+
+def editor_train_py_exists(ctx: InvocationContext) -> str | None:
+    """the hillclimb working copy train.py exists in run_dir."""
+    return None if (ctx.run_dir / "train.py").exists() else "missing working copy train.py"
+
+
+# --- registry -----------------------------------------------------------------
+
+_BASE_DISALLOWED = ("Agent", "Task", "Skill")
+
+ROLES: dict[str, RoleDefinition] = {
+    "background-researcher": RoleDefinition(
+        name="background-researcher",
+        prompt_file="background-researcher.md",
+        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={
+            "status": ("enum", "ok"),
+            "background": "str",
+            "retrieval_manifest": "str",
+        },
+        postconditions=(background_artifacts_exist,),
+    ),
+    "idea-generator": RoleDefinition(
+        name="idea-generator",
+        prompt_file="idea-generator.md",
+        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={"actions": "list"},
+        postconditions=(actions_admitted,),
+    ),
+    "candidate-writer": RoleDefinition(
+        name="candidate-writer",
+        prompt_file="candidate-writer.md",
+        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={
+            "status": ("enum", "written", "existing"),
+            "wrote": "bool",
+            "candidate_dir": "str",
+        },
+        postconditions=(candidate_train_py_exists,),
+    ),
+    "tunable-contract-extractor": RoleDefinition(
+        name="tunable-contract-extractor",
+        prompt_file="tunable-contract-extractor.md",
+        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={
+            "run_id": "str",
+            "status": ("enum", "keep", "discard", "crash", "unevaluated"),
+            "ledger_updated": "bool",
+        },
+        postconditions=(record_is_terminal,),
+    ),
+    "tuner-orchestrator": RoleDefinition(
+        name="tuner-orchestrator",
+        prompt_file="tuner-orchestrator.md",
+        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={
+            "tuned_run_id": "str",
+            "tuned": "bool",
+            "ledger_updated": "bool",
+        },
+    ),
+    "experience-extractor": RoleDefinition(
+        name="experience-extractor",
+        prompt_file="experience-extractor.md",
+        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={
+            "search_space_state_revision": "int",
+            "decision_ids": "list",
+        },
+        postconditions=(refresh_flag_cleared,),
+    ),
+    "crash-diagnosis": RoleDefinition(
+        name="crash-diagnosis",
+        prompt_file="crash-diagnosis.md",
+        tools=("Read", "Bash", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED + ("Edit", "Write"),
+        receipt_schema={
+            "verdict": ("enum", "config_invalid", "code_incompatible", "abandon"),
+            "summary": "str",
+            "evidence": "list",
+        },
+    ),
+    "hillclimb-editor": RoleDefinition(
+        name="hillclimb-editor",
+        prompt_file="hillclimb-editor.md",
+        tools=("Read", "Write", "Edit", "Bash", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={"edited": "bool", "summary": "str"},
+        postconditions=(editor_train_py_exists,),
+    ),
+}
