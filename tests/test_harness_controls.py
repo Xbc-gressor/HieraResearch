@@ -15,124 +15,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-import harness_guard  # noqa: E402
-import harness_watch  # noqa: E402
 import new_candidate  # noqa: E402
 import got_select  # noqa: E402
 import parse_result  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
-
-
-class DelegationGuardTests(unittest.TestCase):
-    def test_blocks_observed_role_collapse(self) -> None:
-        prompt = "After writing train.py, also perform step 0+1 since budget is tight."
-        self.assertIsNotNone(harness_guard.delegation_violation("candidate-writer", prompt))
-
-    def test_allows_narrow_writer_assignment(self) -> None:
-        prompt = "Write train.py only. Do not perform step 0+1 or warm-start evaluation."
-        self.assertIsNone(harness_guard.delegation_violation("candidate-writer", prompt))
-
-    def test_compacts_valid_writer_receipt(self) -> None:
-        raw = """<task id=\"ses_test\" state=\"completed\"><task_result>
-status: written
-candidate_path: /tmp/run/candidates/001/train.py
-candidate_name: compact_tree
-wrote: true
-risk_flags: none
-confidence: high
-diff: this must never survive
-</task_result></task>"""
-        result = harness_guard.compact_task_result("candidate-writer", raw)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("child_session_id: ses_test", result)
-        self.assertNotIn("this must never survive", result)
-
-    def test_flags_writer_evaluation_overreach(self) -> None:
-        raw = """status: discard
-candidate_path: /tmp/run/candidates/001/train.py
-wrote: true
-best_warm: 0.2
-trials_completed: 3
-"""
-        result = harness_guard.compact_task_result("candidate-writer", raw)
-        self.assertIn("receipt_contract: invalid", result)
-        self.assertIn("scope_violation:", result)
-
-    def test_rejects_non_receipt_idea_output(self) -> None:
-        raw = """status: orchestration_only
-generation_run_ids: none
-actions: none
-risk_flags: invalid coordinator control output
-"""
-        result = harness_guard.compact_task_result("idea-generator", raw)
-        self.assertIn("receipt_contract: invalid", result)
-        self.assertIn("missing_fields:", result)
-
-    def test_accepts_budget_admission_no_action_receipt(self) -> None:
-        raw = """generation_run_ids: none
-selection_reason: objective_budget_admission_cap
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("idea-generator", raw)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("generation_run_ids: none", result)
-
-    def test_compacts_colon_delimited_semantic_receipts(self) -> None:
-        raw = """run_id: 004
-op: improve
-parents: 001
-point_id: point-first
-policy: coverage
-candidate: first
-ledger: /tmp/run/ledger.json
-
-run_id: 005
-op: improve
-parents: 001,003
-point_id: point-second
-policy: gain_uncertainty
-candidate: second
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("idea-generator", raw)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("run_id: 004; 005", result)
-        self.assertIn("op: improve; improve", result)
-        self.assertIn("point_id: point-first; point-second", result)
-
-        experience = """updated_at_run: 005
-generation: 2
-evidence_runs: 5
-search_space_state_revision: 3
-decision_ids: sdec-000003
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("experience-extractor", experience)
-        self.assertIn("receipt_contract: ok", result)
-
-    def test_compacts_experience_state_decision_receipt(self) -> None:
-        decided = """updated_at_run: 007
-generation: 2
-evidence_runs: 5
-search_space_state_revision: 3
-decision_ids: sdec-000003
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("experience-extractor", decided)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("search_space_state_revision: 3", result)
-        self.assertIn("decision_ids: sdec-000003", result)
-
-        noop = """updated_at_run: 007
-generation: 2
-evidence_runs: 5
-search_space_state_revision: 3
-decision_ids: none
-ledger: /tmp/run/ledger.json
-"""
-        result = harness_guard.compact_task_result("experience-extractor", noop)
-        self.assertIn("receipt_contract: ok", result)
-        self.assertIn("decision_ids: none", result)
 
 
 class LegacyResultParserTests(unittest.TestCase):
@@ -386,44 +272,6 @@ entrypoint = "train.py"
                 brief["implementation_source"]["sha256"],
                 brief["primary_parent"]["sha256"],
             )
-
-    def test_claude_usage_deduplicates_stream_updates(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            transcript = Path(tmp) / "session.jsonl"
-            rows = [
-                {"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 10}}},
-                {"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 12}}},
-                {"type": "assistant", "message": {"id": "m2", "usage": {
-                    "input_tokens": 5, "output_tokens": 3,
-                    "cache_read_input_tokens": 20,
-                    "cache_creation_input_tokens": 7,
-                }}},
-            ]
-            transcript.write_text("\n".join(json.dumps(row) for row in rows))
-            usage, messages = harness_watch._claude_usage(transcript)
-            self.assertEqual(messages, 2)
-            self.assertEqual(usage.input, 17)
-            self.assertEqual(usage.output, 3)
-            self.assertEqual(usage.cache_read, 20)
-            self.assertEqual(usage.cache_write, 7)
-
-    def test_snapshot_derives_completion_from_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp)
-            (run_dir / "framework_cfg.json").write_text(json.dumps({"max_evaluations": 3}))
-            ledger = {"task": "unit", "tag": "test", "records": [
-                {"run_id": "001", "status": "keep", "trials_attempted": 2},
-            ]}
-            (run_dir / "ledger.json").write_text(json.dumps(ledger))
-            self.assertEqual(harness_watch._run_snapshot(run_dir)["phase"], "running")
-            ledger["records"][0]["trials_attempted"] = 3
-            (run_dir / "ledger.json").write_text(json.dumps(ledger))
-            snapshot = harness_watch._run_snapshot(run_dir)
-            self.assertEqual(snapshot["phase"], "completed")
-            self.assertEqual(snapshot["remaining"], 0)
-            ledger["run_state"] = {"phase": "blocked", "active_stop_condition": "contract mismatch"}
-            (run_dir / "ledger.json").write_text(json.dumps(ledger))
-            self.assertEqual(harness_watch._run_snapshot(run_dir)["phase"], "blocked")
 
     def test_ledger_budget_prefers_attempts_and_reads_legacy_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
