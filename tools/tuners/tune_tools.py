@@ -3283,7 +3283,12 @@ def select_candidate(
     bouts additionally require the legacy gate: population >= n_min AND the
     best untuned candidate in the top (100-top_percentile)% by warm score.
     Continuations (tuning_bouts >= 1) skip the percentile gate but require
-    `last_bout_improved` not False — a non-responder is never re-tuned.
+    `last_bout_improved` not False — a non-responder is never re-tuned, with
+    one exception: a candidate whose single bout improved nothing AND which
+    holds the run's best final score earns one confirmation bout, ranked
+    below waiting responders (a first bout is mostly TPE startup, so one
+    non-response is weak evidence — but only the incumbent's ceiling
+    justifies the extra trials).
 
     Ranking is like-for-like and alternates: when the run's last finalized
     bout was a first bout (last_bout_was_first=True), a waiting responder is
@@ -3391,10 +3396,33 @@ def select_candidate(
         if r.get("tune") and r.get("last_bout_improved") is False and eligible(r)
     ]
 
+    # Incumbent retry: exactly one failed bout + the run's best final score
+    # earns one confirmation bout. A first bout is mostly TPE startup, so a
+    # single non-response is weak evidence — but only the incumbent's ceiling
+    # justifies the extra trials. tuning_bouts >= 2 means the retry is spent.
+    retry = None
+    if non_responders:
+        finals = [
+            float(r["final_best_score"])
+            for r in cands
+            if _is_finite_score(r.get("final_best_score"))
+        ]
+        if finals:
+            best_final = min(finals)
+            for r in non_responders:
+                if (
+                    int(r.get("tuning_bouts") or 1) == 1
+                    and _is_finite_score(r.get("final_best_score"))
+                    and float(r["final_best_score"]) == best_final
+                ):
+                    retry = r
+                    break
+
     selected = None
     is_continuation = False
     pct = None
     alternation = False
+    incumbent_retry = False
     if last_bout_was_first and continuations:
         # Alternation: a completed first bout guarantees a waiting responder
         # the next bout before any new first bout starts.
@@ -3407,6 +3435,11 @@ def select_candidate(
         )
         is_continuation = True
         alternation = True
+    if selected is None and last_bout_was_first and retry is not None:
+        selected = retry
+        is_continuation = True
+        alternation = True
+        incumbent_retry = True
     if selected is None and fresh:
         best_fresh = min(fresh, key=lambda r: r["best_warm_score"])
         value = best_fresh["best_warm_score"]
@@ -3426,6 +3459,10 @@ def select_candidate(
             ),
         )
         is_continuation = True
+    if selected is None and retry is not None:
+        selected = retry
+        is_continuation = True
+        incumbent_retry = True
 
     if selected is None:
         if fresh and pct is not None and non_responders and not continuations:
@@ -3467,6 +3504,11 @@ def select_candidate(
             f"continuation: responder with fewest bouts ({tuning_bouts}) and "
             "best tuned score"
         )
+        if incumbent_retry:
+            reason = (
+                "incumbent retry: run-best candidate's first bout improved "
+                "nothing; one confirmation bout"
+            )
         if alternation:
             reason = (
                 "alternation: responder follows last round's first bout; "

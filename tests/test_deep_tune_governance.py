@@ -1337,14 +1337,15 @@ class ProgressiveSelectCandidateTest(unittest.TestCase):
 
     def test_non_responders_never_selected(self):
         # Fresh gate fails (percentile 75) and the only tuned candidate did
-        # not improve in its last bout.
+        # not improve in its last bout — and it is not the run-best
+        # (004's 1.00 beats its 1.05), so no incumbent retry either.
         ledger = self._ledger([
             _candidate_record("001", 1.30),
             _candidate_record("002", 1.20),
             _candidate_record("003", 1.10),
             _candidate_record("004", 1.00),
             _candidate_record("005", 0.95, tune=True, bouts=1,
-                              improved=False, final=0.70),
+                              improved=False, final=1.05),
         ])
         result = select_candidate(ledger, n_min=5, top_percentile=80.0)
         self.assertIsNone(result["run_id"])
@@ -1441,6 +1442,85 @@ class ProgressiveSelectCandidateTest(unittest.TestCase):
         )
         self.assertEqual(result["run_id"], "001")
         self.assertIs(result["is_continuation"], False)
+
+    def test_incumbent_retry_after_failed_first_bout(self):
+        # Fresh candidates carry the worst warm scores (gate fails); the only
+        # tuned candidate failed its first bout but holds the run's best final
+        # score — it earns one confirmation bout.
+        ledger = self._ledger([
+            _candidate_record("001", 1.30),
+            _candidate_record("002", 1.20),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.00),
+            _candidate_record("005", 0.95, tune=True, bouts=1,
+                              improved=False, final=0.70),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertEqual(result["run_id"], "005")
+        self.assertIs(result["is_continuation"], True)
+        self.assertIn("incumbent retry", result["reason"])
+
+    def test_non_incumbent_non_responder_not_retried(self):
+        # Same shape, but a better final score exists elsewhere: no retry.
+        ledger = self._ledger([
+            _candidate_record("001", 1.30),
+            _candidate_record("002", 1.20),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 0.80),  # better than the non-responder
+            _candidate_record("005", 0.95, tune=True, bouts=1,
+                              improved=False, final=0.90),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        # 004 passes the fresh gate (best fresh, percentile 100).
+        self.assertEqual(result["run_id"], "004")
+        self.assertIs(result["is_continuation"], False)
+
+    def test_retry_used_up_after_two_bouts(self):
+        ledger = self._ledger([
+            _candidate_record("001", 1.30),
+            _candidate_record("002", 1.20),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.00),
+            _candidate_record("005", 0.95, tune=True, bouts=2,
+                              improved=False, final=0.70),
+        ])
+        result = select_candidate(ledger, n_min=5, top_percentile=80.0)
+        self.assertIsNone(result["run_id"])
+
+    def test_responder_outranks_incumbent_retry(self):
+        ledger = self._ledger([
+            _candidate_record("001", 1.30),
+            _candidate_record("002", 1.20),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.00),
+            _candidate_record("005", 0.95, tune=True, bouts=1,
+                              improved=False, final=0.70),
+            _candidate_record("006", 1.05, tune=True, bouts=1,
+                              improved=True, final=0.75),
+        ])
+        result = select_candidate(
+            ledger, n_min=5, top_percentile=80.0, last_bout_was_first=True
+        )
+        self.assertEqual(result["run_id"], "006")
+        self.assertIs(result["is_continuation"], True)
+
+    def test_incumbent_retry_beats_fresh_under_alternation(self):
+        # After a first bout, the incumbent's confirmation bout precedes the
+        # fresh gate even when the best fresh candidate passes it.
+        ledger = self._ledger([
+            _candidate_record("001", 0.90),
+            _candidate_record("002", 1.00),
+            _candidate_record("003", 1.10),
+            _candidate_record("004", 1.20),
+            _candidate_record("005", 1.30),
+            _candidate_record("006", 0.85, tune=True, bouts=1,
+                              improved=False, final=0.80),
+        ])
+        result = select_candidate(
+            ledger, n_min=5, top_percentile=80.0, last_bout_was_first=True
+        )
+        self.assertEqual(result["run_id"], "006")
+        self.assertIs(result["is_continuation"], True)
 
 
 class LastBoutWasFirstTest(unittest.TestCase):

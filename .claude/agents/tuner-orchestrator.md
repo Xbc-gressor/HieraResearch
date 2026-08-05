@@ -73,10 +73,13 @@ population (non-crash, has `best_warm_score`) ≥ `N_min` (derived as 5 for
 P=80) **and** the best untuned candidate in the top (100−`P`)% by
 `best_warm_score`. Continuations skip the percentile gate but require the
 candidate's last bout to have improved on its pre-bout incumbent
-(`last_bout_improved`); a non-responder is never re-tuned. First bouts and
-continuations **alternate**: after a first bout, a waiting responder is
-selected before the fresh gate runs; after a continuation (or when no
-responder waits), the fresh gate decides. Continuations rank by fewest
+(`last_bout_improved`); a non-responder is never re-tuned — with one
+exception: a candidate whose **single** bout improved nothing and which holds
+the run's best final score earns one confirmation bout, ranked below waiting
+responders. First bouts and
+continuations **alternate**: after a first bout, a waiting responder (or the
+retry-eligible incumbent) is selected before the fresh gate runs; after a
+continuation (or when no continuation waits), the fresh gate decides. Continuations rank by fewest
 bouts, then best tuned score — warm and tuned scores are never compared
 against each other. A candidate with an unresolved primary descendant is
 temporarily ineligible. `budget_allocation.trial_cap` is

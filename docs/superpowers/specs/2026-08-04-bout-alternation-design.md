@@ -39,6 +39,21 @@ definition (no underived noise floor; the cap bounds noise-riding).
 
 ### 1. Alternation in `select_candidate` (`tools/tuners/tune_tools.py`)
 
+**Incumbent retry (added after review of the completed remoteV run).** A
+non-improving first bout normally disqualifies a candidate from continuations
+— but a single 8–10-trial bout is mostly TPE startup, so one non-response is
+weak evidence, and in remoteV it permanently locked out the run's best
+candidate (013). New rule: a candidate with **exactly one bout** that failed
+to improve **and** the run's current best `final_best_score` earns one
+confirmation bout. It ranks below waiting responders in the continuation
+pool; if the retry improves, the candidate is a normal responder, and if it
+fails, `tuning_bouts == 2` makes it permanently ineligible. Ledger-only —
+no report reads, no new fields.
+
+Selection order: in the alternation slot (last bout was a first bout) —
+responders, then the incumbent retry, then the fresh gate; otherwise — the
+fresh gate, then responders, then the incumbent retry.
+
 New optional parameter `last_bout_was_first: bool | None = None`:
 
 - `None` (no prior bout, or last bout not yet finalized) → current ordering
