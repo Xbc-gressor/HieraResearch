@@ -191,7 +191,10 @@ proposes configs for first bouts and never edits `SEARCH_SPACE` or
 No structural change. `phase_c` reservations in `evaluation_attempts.jsonl`
 are unchanged; the lifetime per-candidate cap already accumulates across
 invocations and now simply spans bouts; the optional run-level
-`deep_tune_budget_fraction` stays as-is (default null). `bout_trials` only
+`deep_tune_budget_fraction` stays as-is (default null). The default is null
+because a fixed run-level share capped the only mechanism that ever lowered
+a score: run 0802-sonnet-ex125-1 spent its 37 post-cap evaluations on
+screening, which improved nothing all run. `bout_trials` only
 shapes `budget_allocation.trial_cap` per invocation. `got_select`'s
 screening-admission cap is untouched.
 
