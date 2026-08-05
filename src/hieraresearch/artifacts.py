@@ -23,6 +23,44 @@ class StaleInferenceError(ArtifactError):
     pass
 
 
+# Failure dispositions recorded on an invocation receipt.
+#
+# `replay_permitted` answers one narrow question: may a future process reissue
+# this exact request, bound to this exact input revision? Only a provider
+# rejection of the immutable request makes replay unsafe, because the request
+# is what it rejected. Everything else may be reissued.
+#
+# `disposition` is the human- and audit-facing classification. It exists
+# because `replay_permitted` was previously spelled `retryable`, which readers
+# reasonably but wrongly took to mean "the coordinator will retry this". It
+# will not: only transient upstream faults drive coordinator backoff, and those
+# are a strict subset of the receipts a boolean marked true.
+DISPOSITIONS = {
+    # Transient provider/transport fault. The coordinator's upstream backoff
+    # owns the retry; the same request is expected to succeed later.
+    "upstream_transient",
+    # Complete but malformed model output. A bounded correction re-prompt can
+    # act on it; reissuing the identical request cannot.
+    "contract_correction_eligible",
+    # Terminal contract failure with no payload to correct: refusal,
+    # truncation, unparseable JSON, or an edit that produced no outputs.
+    "contract_terminal",
+    # The provider rejected the immutable request itself. Replay is unsafe.
+    "request_rejected",
+    # Inputs changed underneath the call; the result must be discarded and a
+    # fresh revision-bound request constructed.
+    "stale_inputs",
+    # Deterministic validation rejected the model's work product.
+    "validation_rejected",
+    # The process was interrupted. For edit calls, files may be partly written,
+    # so recovery depends on durable reconciliation rather than a plain reissue.
+    "interrupted",
+    # Any other failure at this boundary. Callers degrade or close the
+    # candidate rather than retry.
+    "failed",
+}
+
+
 def canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -224,7 +262,7 @@ class InvocationJournal:
                 )
         return None
 
-    def nonretryable_failure(
+    def replay_forbidden_failure(
         self,
         *,
         purpose: str,
@@ -252,10 +290,14 @@ class InvocationJournal:
                 raise ArtifactError(
                     f"invocation receipt must be an object: {receipt_path}"
                 )
+            # `retryable` is the pre-rename spelling. Receipts from earlier runs
+            # are durable artifacts and are never rewritten, so both keys are
+            # read here; only an explicit False forbids replay.
+            permitted = receipt.get("replay_permitted", receipt.get("retryable"))
             if (
                 receipt.get("purpose") != purpose
                 or receipt.get("status") != "failed"
-                or receipt.get("retryable") is not False
+                or permitted is not False
             ):
                 continue
             try:
@@ -276,7 +318,7 @@ class InvocationJournal:
                 error = receipt.get("error")
                 if not isinstance(error, str) or not error:
                     raise ArtifactError(
-                        f"non-retryable invocation lacks its error: {path}"
+                        f"replay-forbidden invocation lacks its error: {path}"
                     )
                 return error
         return None
@@ -401,8 +443,11 @@ class InvocationJournal:
         path: Path,
         error: BaseException,
         *,
-        retryable: bool = True,
+        replay_permitted: bool = True,
+        disposition: str = "failed",
     ) -> None:
+        if disposition not in DISPOSITIONS:
+            raise ValueError(f"unknown failure disposition: {disposition!r}")
         receipt_path = path / "receipt.json"
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -413,5 +458,6 @@ class InvocationJournal:
         receipt["status"] = "failed"
         receipt["error"] = f"{type(error).__name__}: {error}"
         receipt["error_type"] = type(error).__name__
-        receipt["retryable"] = retryable
+        receipt["replay_permitted"] = replay_permitted
+        receipt["disposition"] = disposition
         atomic_write_json(receipt_path, receipt)

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .artifacts import ArtifactError, CoordinatorStore
+from .artifacts import ArtifactError, CoordinatorStore, atomic_write_json
 from .background import BackgroundBuilder
 from .candidate import CandidateBuildError, CandidatePipeline
 from .experience import ExperienceRefresh
@@ -23,7 +23,7 @@ from .models import (
     Transition,
 )
 from .process import ProcessError, ProcessInterrupted
-from .semantic import SemanticAdmission
+from .semantic import IdeationContractError, SemanticAdmission
 from .state_machine import next_transition
 from .toolchain import ToolFailure, Toolchain, read_task_config
 from .tuning import DeepTuner
@@ -328,6 +328,10 @@ class ExperimentCoordinator:
         active = self.state.active_round
         assert active is not None
         assert self.semantic is not None
+        dropped: list[RoundAction] = []
+        reserved: set[str] = {
+            action.run_id for action in active.actions if action.run_id is not None
+        }
         for action in active.actions:
             if action.admitted:
                 continue
@@ -340,25 +344,83 @@ class ExperimentCoordinator:
                 run_id = current.get("next_run_id")
                 if not isinstance(run_id, str) or not run_id.isdigit():
                     raise ValueError(f"invalid next run id: {run_id!r}")
+                # A dropped admission never reaches `admit_candidate`, so the
+                # ledger's `next_run_id` does not advance past it. Without this
+                # guard the next action in the same round would take the same
+                # id, overwrite the first one's audit receipt, and — when the
+                # inputs happen to match — replay its journaled inference.
+                while run_id in reserved:
+                    run_id = f"{int(run_id) + 1:0{len(run_id)}d}"
                 action.run_id = run_id
                 self.store.save(self.state)
+            reserved.add(action.run_id)
             existing = (
                 self.toolchain.ledger_record(self.identity.run_dir, action.run_id)
                 if self.identity.ledger_path.exists()
                 else None
             )
             if existing is None:
-                self.semantic.admit(
-                    run_id=action.run_id,
-                    op=action.op,
-                    parents=action.parents,
-                )
+                try:
+                    self.semantic.admit(
+                        run_id=action.run_id,
+                        op=action.op,
+                        parents=action.parents,
+                    )
+                except IdeationContractError as exc:
+                    if self._drop_failed_admission(action, exc):
+                        dropped.append(action)
+                        continue
+                    raise
             else:
                 self._verify_admitted_record(action, existing)
             action.admitted = True
             self.store.save(self.state)
+        for action in dropped:
+            active.actions.remove(action)
         active.admission_complete = True
         self.store.save(self.state)
+
+    def _drop_failed_admission(
+        self,
+        action: RoundAction,
+        exc: "IdeationContractError",
+    ) -> bool:
+        """Fail one admission without parking the run, when policy allows it.
+
+        Ideation runs before the candidate has a ledger record, so the
+        candidate-crash path that later stages degrade through does not exist
+        yet: ``record-run`` requires ``add-record`` first. The durable receipt
+        below is what keeps the drop auditable instead of silent. Returns False
+        when the configured policy is ``block_run``, leaving the caller to
+        propagate.
+        """
+        assert self.semantic is not None
+        if self.semantic.ideation_failure_mode() != "drop_action":
+            return False
+        directory = (
+            self.identity.run_dir / ".orchestrator" / "admission_failures"
+        )
+        round_id = self.state.active_round.round_id
+        # The op/parents are part of the name because a dropped id can recur in
+        # a later round: the ledger never advanced past it.
+        stem = f"round-{round_id}-{action.run_id}"
+        path = directory / f"{stem}.json"
+        if path.exists():
+            existing = sorted(directory.glob(f"{stem}-*.json"))
+            path = directory / f"{stem}-{len(existing) + 2}.json"
+        atomic_write_json(
+            path,
+            {
+                "schema_version": 1,
+                "kind": "ideation_failure",
+                "run_id": action.run_id,
+                "op": action.op,
+                "parents": action.parents,
+                "outcome": "action_dropped",
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        return True
 
     def _materialize_and_implement(self) -> None:
         action = self._next_unresolved_action()

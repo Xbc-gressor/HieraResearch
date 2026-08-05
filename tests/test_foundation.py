@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from hieraresearch.artifacts import (  # noqa: E402
     ArtifactError,
     InvocationJournal,
+    StaleInferenceError,
     atomic_write_json,
     file_revision,
     json_revision,
@@ -37,7 +38,11 @@ from hieraresearch.llm import (  # noqa: E402
     PathPolicy,
 )
 from hieraresearch.models import IdeaProposal, RunIdentity  # noqa: E402
-from hieraresearch.process import ProcessResult, ProcessRunner  # noqa: E402
+from hieraresearch.process import (  # noqa: E402
+    ProcessInterrupted,
+    ProcessResult,
+    ProcessRunner,
+)
 from hieraresearch.schemas import tuning_values_schema  # noqa: E402
 from hieraresearch.toolchain import (  # noqa: E402
     ToolFailure,
@@ -59,6 +64,20 @@ class StructuredStub:
         if self.mutate is not None:
             self.mutate.write_text("changed", encoding="utf-8")
         return self.response, {"backend": "stub"}
+
+
+class SequencedStructuredStub:
+    """Return one scripted response per call, recording each purpose."""
+
+    def __init__(self, responses: list[object]):
+        self.responses = list(responses)
+        self.purposes: list[str] = []
+
+    def generate(self, **kwargs):
+        self.purposes.append(kwargs["purpose"])
+        if not self.responses:
+            raise AssertionError(f"unexpected call: {kwargs['purpose']}")
+        return self.responses.pop(0), {"backend": "stub"}
 
 
 class UnusedEditor:
@@ -281,7 +300,7 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(warm_configs["minItems"], 1)
         self.assertNotIn("maxItems", warm_configs)
 
-    def test_invalid_provider_request_is_nonretryable_for_exact_revision(self) -> None:
+    def test_invalid_provider_request_forbids_replay_for_exact_revision(self) -> None:
         import anthropic
         import httpx
 
@@ -334,7 +353,7 @@ class FoundationTests(unittest.TestCase):
             ):
                 gateway.infer(**request)
             with self.assertRaisesRegex(
-                InferenceRequestError, "recorded non-retryable"
+                InferenceRequestError, "recorded replay-forbidden"
             ):
                 gateway.infer(**request)
 
@@ -347,6 +366,168 @@ class FoundationTests(unittest.TestCase):
             with self.assertRaises(InferenceRequestError):
                 gateway.infer(**changed_request)
             self.assertEqual(messages.calls, 2)
+
+            # A provider rejection of the immutable request is the one case that
+            # forbids replay, and it must say so under its own name.
+            receipts = [
+                json.loads((path / "receipt.json").read_text(encoding="utf-8"))
+                for path in (root / ".orchestrator" / "invocations").iterdir()
+            ]
+            self.assertTrue(receipts)
+            for receipt in receipts:
+                self.assertFalse(receipt["replay_permitted"])
+                self.assertEqual(receipt["disposition"], "request_rejected")
+
+    def test_failure_dispositions_name_the_distinct_recovery_paths(self) -> None:
+        """Each boundary failure records what recovery it actually admits.
+
+        The single `retryable` boolean this replaces marked a validation
+        rejection, a terminal refusal and a transient 503 identically, so a
+        parked run's receipt read as an imminent auto-retry. Replay safety and
+        recovery classification are separate questions and are now separate
+        fields.
+        """
+        import anthropic
+        import httpx
+
+        def upstream_error() -> BaseException:
+            request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+            return anthropic.InternalServerError(
+                "overloaded",
+                response=httpx.Response(503, request=request),
+                body=None,
+            )
+
+        cases = [
+            # (exception, disposition, replay_permitted)
+            (
+                InferenceContractError("bad fields", rejected_response={"a": 1}),
+                "contract_correction_eligible",
+                True,
+            ),
+            (InferenceContractError("stopped with refusal"), "contract_terminal", True),
+            (InferenceRequestError("schema rejected"), "request_rejected", False),
+            (StaleInferenceError("inputs moved"), "stale_inputs", True),
+            (
+                ValidationRejected(
+                    "selector",
+                    ProcessResult(
+                        args=("selector",),
+                        returncode=1,
+                        output="rejected",
+                        elapsed_seconds=0.0,
+                    ),
+                ),
+                "validation_rejected",
+                True,
+            ),
+            (
+                ProcessInterrupted(
+                    ProcessResult(
+                        args=("worker",),
+                        returncode=-2,
+                        output="",
+                        elapsed_seconds=0.0,
+                        interrupted=True,
+                    )
+                ),
+                "interrupted",
+                True,
+            ),
+            (KeyboardInterrupt(), "interrupted", True),
+            (upstream_error(), "upstream_transient", True),
+            (InferenceError("sdk exploded"), "failed", True),
+        ]
+
+        for exc, expected_disposition, expected_replay in cases:
+            with self.subTest(disposition=expected_disposition):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    source = root / "input.txt"
+                    source.write_text("stable", encoding="utf-8")
+
+                    class RaisingBackend:
+                        def generate(self, **kwargs):
+                            del kwargs
+                            raise exc
+
+                    gateway = ModelGateway(
+                        model="test-model",
+                        journal=InvocationJournal(root),
+                        structured_backend=RaisingBackend(),
+                        edit_backend=UnusedEditor(),
+                    )
+                    with self.assertRaises(type(exc)):
+                        gateway.infer(
+                            purpose="probe:001",
+                            schema_version=1,
+                            system_prompt="s",
+                            prompt="p",
+                            schema={"type": "object"},
+                            input_paths=[source],
+                            parser=lambda value: value,
+                            max_corrections=0,
+                        )
+
+                    receipt_paths = list(
+                        (root / ".orchestrator" / "invocations").iterdir()
+                    )
+                    self.assertEqual(len(receipt_paths), 1)
+                    receipt = json.loads(
+                        (receipt_paths[0] / "receipt.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(receipt["status"], "failed")
+                    self.assertEqual(receipt["disposition"], expected_disposition)
+                    self.assertEqual(receipt["replay_permitted"], expected_replay)
+
+    def test_legacy_retryable_receipts_still_forbid_replay(self) -> None:
+        """Receipts written before the rename are durable and must still parse.
+
+        `retryable: false` was the only load-bearing value of the old field, so
+        an old run resumed against new code must not reissue a request the
+        provider structurally rejected.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.txt"
+            source.write_text("stable", encoding="utf-8")
+            journal = InvocationJournal(root)
+            request = {
+                "kind": "structured",
+                "purpose": "tuning_values:001",
+                "schema_version": 1,
+                "model": "test-model",
+                "prompt": "p",
+                "input_paths": [str(source.resolve())],
+            }
+            invocation = journal.begin(
+                purpose="tuning_values:001",
+                schema_version=1,
+                model="test-model",
+                input_revision=json_revision(request),
+                request=request,
+            )
+            receipt_path = invocation / "receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt.update(
+                {
+                    "status": "failed",
+                    "error": "InferenceRequestError: invalid JSON schema",
+                    "error_type": "InferenceRequestError",
+                    "retryable": False,
+                }
+            )
+            atomic_write_json(receipt_path, receipt)
+
+            self.assertEqual(
+                journal.replay_forbidden_failure(
+                    purpose="tuning_values:001",
+                    schema_version=1,
+                    input_revision=json_revision(request),
+                    model="test-model",
+                ),
+                "InferenceRequestError: invalid JSON schema",
+            )
 
     def test_model_receipt_replays_exact_input_and_rejects_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -387,6 +568,125 @@ class FoundationTests(unittest.TestCase):
             atomic_write_json(invocation / "response.json", tampered)
             with self.assertRaisesRegex(ArtifactError, "response revision mismatch"):
                 gateway.infer(**request)
+
+    def test_contract_error_gets_one_bounded_journaled_correction(self) -> None:
+        """A malformed response is re-prompted once, then propagates.
+
+        The regression this guards is a live one: a single stochastic field-set
+        error from a non-Anthropic endpoint parked a whole GPU run because
+        candidate ideation had no correction at all.
+        """
+        valid = {
+            "idea": "try a bounded representation change",
+            "change": "replace the candidate representation",
+            "candidate_name_hint": "bounded-representation",
+            "description": "A recorded structured proposal.",
+        }
+        malformed = {**valid, "unexpected_field": "extra"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.txt"
+            source.write_text("stable", encoding="utf-8")
+            request = {
+                "purpose": "candidate_idea:001",
+                "schema_version": 1,
+                "system_prompt": "system",
+                "prompt": "prompt",
+                "schema": {"type": "object"},
+                "input_paths": [source],
+                "parser": IdeaProposal.from_dict,
+            }
+
+            backend = SequencedStructuredStub([malformed, valid])
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root / "recovers"),
+                structured_backend=backend,
+                edit_backend=UnusedEditor(),
+            )
+            self.assertEqual(gateway.infer(**request), IdeaProposal(**valid))
+            self.assertEqual(
+                backend.purposes,
+                ["candidate_idea:001", "candidate_idea:001:contract_correction"],
+            )
+            # Both attempts are durable: the failed one and its correction.
+            receipts = sorted(
+                json.loads((path / "receipt.json").read_text(encoding="utf-8"))[
+                    "status"
+                ]
+                for path in (gateway.journal.root).iterdir()
+            )
+            self.assertEqual(receipts, ["completed", "failed"])
+
+            # The correction prompt must carry the validator error and the
+            # rejected payload, or the model is being asked to guess.
+            correction = next(
+                path
+                for path in gateway.journal.root.iterdir()
+                if path.name.startswith("candidate_idea-001-contract_correction")
+            )
+            sent = json.loads((correction / "request.json").read_text(encoding="utf-8"))
+            self.assertIn("fields must be exactly", sent["prompt"])
+            self.assertIn("unexpected_field", sent["prompt"])
+
+            second_strike = SequencedStructuredStub([malformed, malformed])
+            strict = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root / "second-strike"),
+                structured_backend=second_strike,
+                edit_backend=UnusedEditor(),
+            )
+            with self.assertRaises(InferenceContractError):
+                strict.infer(**request)
+            self.assertEqual(len(second_strike.purposes), 2)
+
+            opted_out = SequencedStructuredStub([malformed, valid])
+            no_correction = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root / "opted-out"),
+                structured_backend=opted_out,
+                edit_backend=UnusedEditor(),
+            )
+            with self.assertRaises(InferenceContractError):
+                no_correction.infer(**request, max_corrections=0)
+            self.assertEqual(opted_out.purposes, ["candidate_idea:001"])
+
+    def test_backend_contract_failures_are_not_re_prompted(self) -> None:
+        """Refusal/truncation/malformed JSON carry no payload to correct."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.txt"
+            source.write_text("stable", encoding="utf-8")
+
+            class RefusingBackend:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def generate(self, **kwargs):
+                    del kwargs
+                    self.calls += 1
+                    raise InferenceContractError(
+                        "Claude Messages stopped with 'refusal'"
+                    )
+
+            backend = RefusingBackend()
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(root),
+                structured_backend=backend,
+                edit_backend=UnusedEditor(),
+            )
+            with self.assertRaisesRegex(InferenceContractError, "refusal"):
+                gateway.infer(
+                    purpose="candidate_idea:002",
+                    schema_version=1,
+                    system_prompt="system",
+                    prompt="prompt",
+                    schema={"type": "object"},
+                    input_paths=[source],
+                    parser=IdeaProposal.from_dict,
+                )
+            self.assertEqual(backend.calls, 1)
 
     def test_model_gateway_rejects_live_stale_and_malformed_responses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

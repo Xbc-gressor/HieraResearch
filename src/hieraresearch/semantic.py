@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import atomic_write_json
-from .llm import ModelGateway
+from .llm import InferenceContractError, ModelGateway
 from .models import IdeaProposal, RunIdentity
 from .prompts import IDEA_SYSTEM, SEMANTIC_PREDICTION_SYSTEM
 from .schemas import IDEA_SCHEMA, prediction_schema
@@ -15,6 +15,21 @@ from .toolchain import Toolchain, ValidationRejected
 
 
 GAIN_POLICIES = {"gain", "gain_uncertainty", "gain_uncertainty_nocost"}
+
+IDEATION_FAILURE_MODES = {"drop_action", "block_run"}
+DEFAULT_IDEATION_FAILURE = "drop_action"
+
+
+class IdeationContractError(InferenceContractError):
+    """A contract failure raised specifically by the idea-proposal call.
+
+    ``admit`` performs two inferences under gain policies — semantic
+    prediction, then ideation — and only the second is what the drop-action
+    policy is about. Without this distinction a prediction failure would be
+    dropped and journaled as ``kind: ideation_failure``, which is false
+    provenance. Subclassing keeps the coordinator's existing
+    ``InferenceContractError`` mapping intact for the ``block_run`` path.
+    """
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -123,6 +138,29 @@ class SemanticAdmission:
             raise ValueError(f"{path}: semantic_search.policy must be a string")
         return policy
 
+    def ideation_failure_mode(self) -> str:
+        """Terminal policy for a round action whose ideation cannot be repaired.
+
+        ``drop_action`` fails that admission and lets the round continue; the
+        coordinator's existing no-progress guard blocks if a round ends up with
+        no actions at all. ``block_run`` parks the whole run instead, which is
+        correct when an operator wants every selected graph action to be
+        accounted for rather than silently skipped.
+        """
+        path = self.identity.run_dir / "framework_cfg.json"
+        if not path.is_file():
+            return DEFAULT_IDEATION_FAILURE
+        section = _read_json(path).get("semantic_search", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{path}: semantic_search must be an object")
+        mode = section.get("ideation_failure", DEFAULT_IDEATION_FAILURE)
+        if mode not in IDEATION_FAILURE_MODES:
+            raise ValueError(
+                f"{path}: semantic_search.ideation_failure must be one of "
+                f"{sorted(IDEATION_FAILURE_MODES)}, got {mode!r}"
+            )
+        return mode
+
     def _select_with_predictions(
         self,
         *,
@@ -221,19 +259,34 @@ class SemanticAdmission:
             + "\n\nParent records (bounded):\n"
             + json.dumps(parent_records, ensure_ascii=False)[:30_000]
         )
-        return self.models.infer(
-            purpose=f"candidate_idea:{run_id}",
-            schema_version=1,
-            system_prompt=IDEA_SYSTEM,
-            prompt=prompt,
-            schema=IDEA_SCHEMA,
-            input_paths=[
-                point,
-                policy_receipt,
-                run_dir / "background.md",
-                run_dir / "ledger.json",
-                self.identity.repo_root / "tasks" / self.identity.task_name / "TASK.md",
-                self.identity.repo_root / "tasks" / self.identity.task_name / "task.toml",
-            ],
-            parser=IdeaProposal.from_dict,
-        )
+        try:
+            return self.models.infer(
+                purpose=f"candidate_idea:{run_id}",
+                schema_version=1,
+                system_prompt=IDEA_SYSTEM,
+                prompt=prompt,
+                schema=IDEA_SCHEMA,
+                input_paths=[
+                    point,
+                    policy_receipt,
+                    run_dir / "background.md",
+                    run_dir / "ledger.json",
+                    self.identity.repo_root
+                    / "tasks"
+                    / self.identity.task_name
+                    / "TASK.md",
+                    self.identity.repo_root
+                    / "tasks"
+                    / self.identity.task_name
+                    / "task.toml",
+                ],
+                parser=IdeaProposal.from_dict,
+            )
+        except IdeationContractError:
+            raise
+        except InferenceContractError as exc:
+            # Re-tag so the coordinator can tell an unrepairable ideation
+            # failure from a prediction failure earlier in the same admission.
+            raise IdeationContractError(
+                str(exc), rejected_response=exc.rejected_response
+            ) from exc

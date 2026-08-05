@@ -18,6 +18,8 @@ from .artifacts import (
     json_revision,
     paths_revision,
 )
+from .process import ProcessInterrupted
+from .toolchain import ValidationRejected
 
 
 T = TypeVar("T")
@@ -32,12 +34,55 @@ T = TypeVar("T")
 MODEL_MAX_OUTPUT_TOKENS = 128_000
 
 
+def _failure_disposition(exc: BaseException) -> str:
+    """Classify a boundary failure for its receipt.
+
+    One place decides, so a receipt's disposition cannot drift from the
+    behaviour the coordinator actually applies. Ordered most specific first:
+    the contract subclasses are checked before their base, and the upstream
+    test runs before the generic ``InferenceError`` fallback.
+    """
+    from .upstream import is_retryable_upstream_failure
+
+    if isinstance(exc, InferenceRequestError):
+        return "request_rejected"
+    if isinstance(exc, InferenceContractError):
+        # Only a rejected-payload contract error can be corrected; refusal,
+        # truncation and unparseable JSON carry nothing to show the model.
+        return (
+            "contract_correction_eligible"
+            if exc.rejected_response is not None
+            else "contract_terminal"
+        )
+    if isinstance(exc, StaleInferenceError):
+        return "stale_inputs"
+    if isinstance(exc, (KeyboardInterrupt, ProcessInterrupted)):
+        return "interrupted"
+    if isinstance(exc, ValidationRejected):
+        return "validation_rejected"
+    if is_retryable_upstream_failure(exc):
+        return "upstream_transient"
+    return "failed"
+
+
 class InferenceError(RuntimeError):
     pass
 
 
 class InferenceContractError(InferenceError):
-    pass
+    """The model's response did not satisfy its declared schema contract.
+
+    ``rejected_response`` carries the raw payload when the failure was a parser
+    rejection of an otherwise complete response. That is the only case a
+    bounded re-prompt can act on, because it is the only one where there is a
+    concrete payload to show the model alongside the validator's complaint.
+    Backend-level contract failures — refusal, truncation, malformed JSON —
+    leave it ``None`` and are therefore never corrected.
+    """
+
+    def __init__(self, message: str, *, rejected_response: Any | None = None):
+        super().__init__(message)
+        self.rejected_response = rejected_response
 
 
 class InferenceRequestError(InferenceError):
@@ -132,6 +177,64 @@ class ModelGateway:
         input_paths: Sequence[Path],
         parser: Callable[[Any], T],
         max_tokens: int = MODEL_MAX_OUTPUT_TOKENS,
+        max_corrections: int = 1,
+    ) -> T:
+        """Infer one structured value, re-prompting once on a parser rejection.
+
+        Malformed model output is the expected steady-state failure of this
+        boundary, not an exceptional one: endpoints conform to a declared
+        schema stochastically. A single journaled ``:correction`` re-prompt
+        carrying the validator's error and the rejected payload recovers the
+        common blip; the second strike propagates so a genuinely unusable
+        model still reaches its call site's terminal policy. Call sites keep
+        only that terminal choice, not their own attempt bookkeeping.
+
+        ``max_corrections=0`` opts out, for the one call site that owns durable
+        per-attempt state a resume must replay exactly.
+        """
+        if max_corrections < 0:
+            raise ValueError("max_corrections must be non-negative")
+        attempt_prompt = prompt
+        attempt_purpose = purpose
+        corrections = 0
+        while True:
+            try:
+                return self._infer_once(
+                    purpose=attempt_purpose,
+                    schema_version=schema_version,
+                    system_prompt=system_prompt,
+                    prompt=attempt_prompt,
+                    schema=schema,
+                    input_paths=input_paths,
+                    parser=parser,
+                    max_tokens=max_tokens,
+                )
+            except InferenceContractError as exc:
+                if corrections >= max_corrections or exc.rejected_response is None:
+                    raise
+                corrections += 1
+                attempt_purpose = f"{purpose}:contract_correction"
+                attempt_prompt = (
+                    prompt
+                    + "\n\nYour previous response did not satisfy the response "
+                    "contract. Correct it once; return the same intended content "
+                    "in a valid shape and change nothing else.\nError:\n"
+                    + str(exc)
+                    + "\nRejected response:\n"
+                    + json.dumps(exc.rejected_response, ensure_ascii=False)[:30_000]
+                )
+
+    def _infer_once(
+        self,
+        *,
+        purpose: str,
+        schema_version: int,
+        system_prompt: str,
+        prompt: str,
+        schema: dict[str, Any],
+        input_paths: Sequence[Path],
+        parser: Callable[[Any], T],
+        max_tokens: int,
     ) -> T:
         path_revision = paths_revision(input_paths)
         request = {
@@ -161,7 +264,7 @@ class ModelGateway:
                     f"recorded {purpose} response no longer satisfies schema {schema_version}: {exc}"
                 ) from exc
 
-        failed = self.journal.nonretryable_failure(
+        failed = self.journal.replay_forbidden_failure(
             purpose=purpose,
             schema_version=schema_version,
             input_revision=input_revision,
@@ -169,7 +272,7 @@ class ModelGateway:
         )
         if failed is not None:
             raise InferenceRequestError(
-                f"recorded non-retryable {purpose} request failure: {failed}"
+                f"recorded replay-forbidden {purpose} request failure: {failed}"
             )
 
         invocation = self.journal.begin(
@@ -196,7 +299,8 @@ class ModelGateway:
                 parsed = parser(response)
             except (TypeError, ValueError, KeyError) as exc:
                 raise InferenceContractError(
-                    f"{purpose} returned an invalid schema-{schema_version} response: {exc}"
+                    f"{purpose} returned an invalid schema-{schema_version} response: {exc}",
+                    rejected_response=response,
                 ) from exc
             self.journal.complete(invocation, response=response, metadata=metadata)
             return parsed
@@ -204,7 +308,8 @@ class ModelGateway:
             self.journal.fail(
                 invocation,
                 exc,
-                retryable=not isinstance(exc, InferenceRequestError),
+                replay_permitted=not isinstance(exc, InferenceRequestError),
+                disposition=_failure_disposition(exc),
             )
             raise
 
@@ -239,7 +344,7 @@ class ModelGateway:
             "max_turns": spec.max_turns,
         }
         input_revision = json_revision(request)
-        failed = self.journal.nonretryable_failure(
+        failed = self.journal.replay_forbidden_failure(
             purpose=spec.purpose,
             schema_version=spec.schema_version,
             input_revision=input_revision,
@@ -247,7 +352,7 @@ class ModelGateway:
         )
         if failed is not None:
             raise InferenceRequestError(
-                f"recorded non-retryable {spec.purpose} request failure: {failed}"
+                f"recorded replay-forbidden {spec.purpose} request failure: {failed}"
             )
 
         invocation = self.journal.begin(
@@ -299,10 +404,17 @@ class ModelGateway:
             self.journal.complete(invocation, response=response, metadata=metadata)
             return validated
         except BaseException as exc:
+            # `replay_permitted` stays a pure request-safety question: only a
+            # provider rejection of the immutable request forbids reissue.
+            # An interrupted edit may have half-written its write paths, but
+            # poisoning it here would make Ctrl-C unresumable; that
+            # reconciliation is owned by the caller's revision checks, and the
+            # `interrupted` disposition is what makes it legible.
             self.journal.fail(
                 invocation,
                 exc,
-                retryable=not isinstance(exc, InferenceRequestError),
+                replay_permitted=not isinstance(exc, InferenceRequestError),
+                disposition=_failure_disposition(exc),
             )
             raise
 

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -14,15 +15,30 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from fixtures import background_text, fixture_registry  # noqa: E402
-from hieraresearch.artifacts import atomic_write_json  # noqa: E402
+from hieraresearch.artifacts import InvocationJournal, atomic_write_json  # noqa: E402
+from hieraresearch.coordinator import (  # noqa: E402
+    ExperimentCoordinator,
+    RunControls,
+)
 from hieraresearch.experience import ExperienceRefresh  # noqa: E402
-from hieraresearch.models import RunIdentity  # noqa: E402
+from hieraresearch.debug import parse_debug_response  # noqa: E402
+from hieraresearch.llm import InferenceContractError, ModelGateway  # noqa: E402
+from hieraresearch.models import (  # noqa: E402
+    ActiveRound,
+    CoordinatorPhase,
+    CoordinatorState,
+    RoundAction,
+    RunIdentity,
+)
 from hieraresearch.process import (  # noqa: E402
     ProcessInterrupted,
     ProcessResult,
     ProcessRunner,
 )
-from hieraresearch.semantic import SemanticAdmission  # noqa: E402
+from hieraresearch.semantic import (  # noqa: E402
+    IdeationContractError,
+    SemanticAdmission,
+)
 from hieraresearch.toolchain import (  # noqa: E402
     ToolFailure,
     Toolchain,
@@ -636,6 +652,264 @@ class ModelValidationBoundaryTests(unittest.TestCase):
         proposals = proposal_dir / "proposals.json"
         proposals.write_text("{}\n", encoding="utf-8")
         return identity, proposals
+
+
+class IdeationFailureTerminalPolicyTests(unittest.TestCase):
+    """Terminal outcome when ideation cannot be repaired.
+
+    Ideation runs before the candidate has a ledger record, so the
+    candidate-crash degradation that later stages use is unreachable here.
+    The regression guarded is a live one: with no policy at all, one malformed
+    idea response parked a whole GPU run.
+    """
+
+    @staticmethod
+    def _coordinator(root: Path, *, mode: str | None):
+        identity = RunIdentity(root, "toy", "ideation")
+        identity.run_dir.mkdir(parents=True)
+        config: dict[str, Any] = {}
+        if mode is not None:
+            config["semantic_search"] = {"ideation_failure": mode}
+        atomic_write_json(identity.run_dir / "framework_cfg.json", config)
+
+        class RefusingAdmission(SemanticAdmission):
+            def __init__(self, identity):
+                super().__init__(identity, toolchain=None, models=None)
+                self.attempts = 0
+                self.run_ids: list[str] = []
+
+            def admit(self, *, run_id, op, parents, baseline_only=False):
+                del op, parents, baseline_only
+                self.attempts += 1
+                self.run_ids.append(run_id)
+                raise IdeationContractError(
+                    f"candidate_idea:{run_id} returned an invalid schema-1 response: "
+                    "idea response fields must be exactly "
+                    "['candidate_name_hint', 'change', 'description', 'idea']"
+                )
+
+        # `got_select.py decide` emits bare `{"op": "fresh"}` entries: ids are
+        # assigned here from the ledger, so the fixture must not pre-assign them.
+        toolchain = SimpleNamespace(
+            ledger_brief=lambda run_dir: {"next_run_id": "001"},
+            ledger_record=lambda run_dir, run_id: None,
+        )
+        identity.ledger_path.write_text("{}", encoding="utf-8")
+        coordinator = ExperimentCoordinator(
+            identity,
+            toolchain=toolchain,
+            models=SimpleNamespace(),
+            controls=RunControls(),
+        )
+        coordinator.state = CoordinatorState(task_name="toy", tag="ideation")
+        coordinator.state.active_round = ActiveRound(
+            round_id=0,
+            actions=[
+                RoundAction(op="fresh", parents=[]),
+                RoundAction(op="fresh", parents=[]),
+            ],
+        )
+        coordinator.semantic = RefusingAdmission(identity)
+        return coordinator, identity
+
+    def test_drop_action_fails_one_admission_and_continues_the_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, identity = self._coordinator(Path(tmp), mode="drop_action")
+
+            coordinator._admit_round(None)
+
+            # Both actions failed ideation, so the round is left empty rather
+            # than blocked; the no-progress guard is the run-level backstop.
+            self.assertEqual(coordinator.state.active_round.actions, [])
+            self.assertTrue(coordinator.state.active_round.admission_complete)
+            self.assertEqual(coordinator.state.phase, CoordinatorPhase.RUNNING)
+            self.assertEqual(coordinator.semantic.attempts, 2)
+
+            # A dropped admission never advances the ledger's `next_run_id`, so
+            # both actions would otherwise take id 001 — the second one silently
+            # overwriting the first one's receipt and possibly replaying its
+            # journaled inference.
+            self.assertEqual(coordinator.semantic.run_ids, ["001", "002"])
+
+            # The drop must be auditable, not silent.
+            failures = sorted(
+                (identity.run_dir / ".orchestrator" / "admission_failures").iterdir()
+            )
+            self.assertEqual(
+                [path.name for path in failures],
+                ["round-0-001.json", "round-0-002.json"],
+            )
+            receipt = json.loads(failures[0].read_text(encoding="utf-8"))
+            self.assertEqual(receipt["kind"], "ideation_failure")
+            self.assertEqual(receipt["outcome"], "action_dropped")
+            self.assertEqual(receipt["run_id"], "001")
+            self.assertIn("fields must be exactly", receipt["error"])
+
+    def test_drop_action_is_the_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _ = self._coordinator(Path(tmp), mode=None)
+
+            coordinator._admit_round(None)
+
+            self.assertEqual(coordinator.state.active_round.actions, [])
+
+    def test_block_run_propagates_to_the_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, identity = self._coordinator(Path(tmp), mode="block_run")
+
+            with self.assertRaises(InferenceContractError):
+                coordinator._admit_round(None)
+
+            # First failure stops the loop: no action is dropped and no
+            # receipt is written, because the run itself is the terminal.
+            self.assertEqual(coordinator.semantic.attempts, 1)
+            self.assertEqual(len(coordinator.state.active_round.actions), 2)
+            self.assertFalse(
+                (identity.run_dir / ".orchestrator" / "admission_failures").exists()
+            )
+
+    def test_unknown_mode_is_surfaced_not_defaulted_away(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _ = self._coordinator(Path(tmp), mode="carry_on")
+
+            with self.assertRaisesRegex(ValueError, "ideation_failure must be one of"):
+                coordinator._admit_round(None)
+
+    def test_candidate_idea_recovers_a_malformed_response_end_to_end(self) -> None:
+        """The exact failure that blocked run 0804-ds-smk-2 now recovers."""
+        valid = {
+            "idea": "bound the representation change",
+            "change": "from scratch at point-1",
+            "candidate_name_hint": "bounded-representation",
+            "description": "A structured proposal.",
+        }
+        # The observed live response: right content, wrong field set.
+        malformed = {**valid, "rationale": "extra field the endpoint invented"}
+
+        class SequencedBackend:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.purposes = []
+
+            def generate(self, **kwargs):
+                self.purposes.append(kwargs["purpose"])
+                return self.responses.pop(0), {"backend": "stub"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity, proposals = ModelValidationBoundaryTests._semantic_case(root)
+            point = proposals.parent / "point.json"
+            receipt = proposals.parent / "policy.json"
+            point.write_text("{}\n", encoding="utf-8")
+            receipt.write_text("{}\n", encoding="utf-8")
+
+            backend = SequencedBackend([malformed, valid])
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(identity.run_dir),
+                structured_backend=backend,
+                edit_backend=SimpleNamespace(),
+            )
+            admission = SemanticAdmission(
+                identity,
+                toolchain=SimpleNamespace(
+                    ledger_record=lambda run_dir, parent: {}
+                ),
+                models=gateway,
+            )
+
+            idea = admission._propose_idea(
+                run_id="001",
+                op="fresh",
+                parents=[],
+                point=point,
+                policy_receipt=receipt,
+            )
+
+            self.assertEqual(idea.candidate_name_hint, "bounded-representation")
+            self.assertEqual(
+                backend.purposes,
+                ["candidate_idea:001", "candidate_idea:001:contract_correction"],
+            )
+
+    def test_prediction_failure_is_not_recorded_as_an_ideation_failure(self) -> None:
+        """A gain-policy prediction failure must not be dropped as ideation.
+
+        `admit` runs two inferences under gain policies. Attributing the first
+        one's contract failure to ideation would write a false
+        `kind: ideation_failure` receipt and drop an action whose ideation never
+        ran.
+        """
+
+        class PredictionFailingAdmission(SemanticAdmission):
+            def __init__(self, identity):
+                super().__init__(identity, toolchain=None, models=None)
+                self.attempts = 0
+
+            def admit(self, *, run_id, op, parents, baseline_only=False):
+                del op, parents, baseline_only
+                self.attempts += 1
+                raise InferenceContractError(
+                    f"semantic_predictions:{run_id} returned an invalid "
+                    "schema-3 response: response must be an object"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, identity = self._coordinator(Path(tmp), mode="drop_action")
+            coordinator.semantic = PredictionFailingAdmission(identity)
+
+            # Policy is drop_action, but this is not an ideation failure.
+            with self.assertRaises(InferenceContractError):
+                coordinator._admit_round(None)
+
+            self.assertEqual(coordinator.semantic.attempts, 1)
+            self.assertFalse(
+                (identity.run_dir / ".orchestrator" / "admission_failures").exists()
+            )
+
+    def test_debug_analysis_does_not_spend_a_second_reserved_call(self) -> None:
+        """The one-call analyzer reservation bounds backend calls, not attempts.
+
+        `DebugPolicy.reserve_analysis` grants exactly one analyzer call per
+        candidate/failure fingerprint and writes that reservation durably. A
+        gateway correction here would issue a second, unrecorded backend call.
+        """
+
+        class CountingBackend:
+            def __init__(self):
+                self.calls = 0
+
+            def generate(self, **kwargs):
+                del kwargs
+                self.calls += 1
+                return {"not": "a valid debug decision"}, {"backend": "stub"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = RunIdentity(Path(tmp), "toy", "debug")
+            identity.run_dir.mkdir(parents=True)
+            backend = CountingBackend()
+            gateway = ModelGateway(
+                model="test-model",
+                journal=InvocationJournal(identity.run_dir),
+                structured_backend=backend,
+                edit_backend=SimpleNamespace(),
+            )
+            probe = identity.run_dir / "probe.txt"
+            probe.write_text("evidence\n", encoding="utf-8")
+
+            with self.assertRaises(InferenceContractError):
+                gateway.infer(
+                    purpose="debug:001:fingerprint",
+                    schema_version=1,
+                    system_prompt="s",
+                    prompt="p",
+                    schema={"type": "object"},
+                    input_paths=[probe],
+                    parser=parse_debug_response,
+                    max_corrections=0,
+                )
+
+            self.assertEqual(backend.calls, 1)
 
 
 if __name__ == "__main__":

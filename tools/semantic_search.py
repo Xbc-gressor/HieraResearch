@@ -1398,7 +1398,12 @@ def _framework_policy_config(
     section = root.get("semantic_search", {})
     if not isinstance(section, dict):
         raise ContractError(f"{path}: semantic_search must be an object")
-    unknown = sorted(set(section) - ({"policy"} | set(DEFAULT_POLICY_CONFIG)))
+    # `ideation_failure` is read by the coordinator's admission loop, not by
+    # this selector; it is allow-listed here so a valid run config does not
+    # fail the deterministic key check.
+    unknown = sorted(
+        set(section) - ({"policy", "ideation_failure"} | set(DEFAULT_POLICY_CONFIG))
+    )
     if unknown:
         raise ContractError(f"{path}: unknown semantic_search keys {unknown}")
     policy = section.get("policy")

@@ -1696,6 +1696,11 @@ class CandidatePipeline:
                         k=k,
                         expected_keys=schema_keys,
                     ),
+                    # This loop owns its own bounded correction: each attempt is
+                    # durably admitted, writes a Python-owned diagnostic, and is
+                    # replayed exactly on resume. A second correction inside the
+                    # gateway would spend attempts the durable state never saw.
+                    max_corrections=0,
                 )
             except InferenceRequestError as exc:
                 values_state = {
@@ -2673,6 +2678,12 @@ class CandidatePipeline:
                 schema=DEBUG_SCHEMA,
                 input_paths=input_paths,
                 parser=parse_debug_response,
+                # `reserve_analysis` above grants exactly one analyzer call per
+                # candidate/failure fingerprint, and that reservation is already
+                # durably written. A gateway correction would spend a second
+                # backend call against a one-call allowance without recording
+                # it, so a malformed diagnosis degrades to a crash instead.
+                max_corrections=0,
             )
         except InferenceContractError:
             return False
@@ -2973,6 +2984,28 @@ class CandidatePipeline:
                         # the candidate through the normal crash path instead
                         # of letting a rejected repair strand the run on
                         # resume without a completed edit receipt.
+                        self._write_contract_diagnostic(
+                            run_id,
+                            stage="debug_repair",
+                            error=exc,
+                        )
+                        self._write_phase_a_repair_status(
+                            run_id, repair, "rejected"
+                        )
+                        return False
+                    except InferenceError as exc:
+                        if is_retryable_upstream_failure(exc):
+                            # Transient provider fault: the coordinator's
+                            # upstream backoff owns this retry, and the receipt
+                            # stays `planned` so the resume re-enters here.
+                            raise
+                        # Max turns, SDK error, or a request/contract rejection
+                        # leaves exactly the state an invalid edit does: a
+                        # consumed reservation and possibly half-repaired
+                        # source.  Degrade identically rather than parking the
+                        # whole run — the candidate closes as a crash, which is
+                        # what the debug analysis sibling already does for its
+                        # own inference failures.
                         self._write_contract_diagnostic(
                             run_id,
                             stage="debug_repair",

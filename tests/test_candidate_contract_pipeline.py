@@ -905,7 +905,7 @@ class CandidateContractPipelineTests(unittest.TestCase):
                 {},
             )
             with self.assertRaisesRegex(
-                InferenceRequestError, "recorded non-retryable"
+                InferenceRequestError, "recorded replay-forbidden"
             ):
                 unchanged.build_contract(action)
             self.assertEqual(backend.calls, 1)

@@ -86,6 +86,27 @@ calls use the Agent SDK with explicit read roots, exact write paths, bounded
 turns, and a pre-tool path policy that denies shell access. Every call records
 its purpose, schema version, model, input revision, response, and outcome.
 
+### Failed invocation receipts
+
+A failed receipt carries two independent fields. They answer different
+questions and must not be conflated:
+
+- `replay_permitted` — may a future process reissue this exact request, bound
+  to this exact input revision? Only `false` is load-bearing, and only an
+  `InferenceRequestError` sets it: the provider rejected the immutable request,
+  so replay would fail identically. The journal refuses such a replay.
+- `disposition` — what recovery this failure actually admits, one of
+  `upstream_transient`, `contract_correction_eligible`, `contract_terminal`,
+  `request_rejected`, `stale_inputs`, `validation_rejected`, `interrupted`,
+  `failed`. Classification lives in one place (`llm.py:_failure_disposition`).
+
+Only `upstream_transient` drives coordinator backoff. `replay_permitted: true`
+therefore does **not** mean the run will retry — it means the journal does not
+forbid a future attempt. These were previously one boolean named `retryable`,
+which read as an imminent auto-retry on receipts belonging to permanently
+parked runs. Receipts written before the rename are durable and are never
+rewritten, so the reader still honours a legacy `retryable: false`.
+
 An evidenced candidate failure may consume one diagnostic reservation per
 failure fingerprint. An accepted repair is followed by deterministic syntax,
 contract/search-space, and no-score preflight validation before objective work

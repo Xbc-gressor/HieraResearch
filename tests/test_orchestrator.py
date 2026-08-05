@@ -2307,6 +2307,183 @@ class OrchestratorBoundaryTests(unittest.TestCase):
             self.assertEqual(models.infer_calls, 1)
             self.assertEqual(models.edit_calls, 1)
 
+    def _debug_repair_case(self, tmp: Path, models):
+        """Stage one evidenced Phase-A code incompatibility ready for repair."""
+        repo_root = tmp
+        identity = RunIdentity(repo_root, "toy", "run")
+        task_dir = repo_root / "tasks" / "toy"
+        candidate_dir = identity.run_dir / "candidates" / "001"
+        task_dir.mkdir(parents=True)
+        candidate_dir.mkdir(parents=True)
+        (task_dir / "TASK.md").write_text("# task\n", encoding="utf-8")
+        (task_dir / "task.toml").write_text("", encoding="utf-8")
+        (candidate_dir / "prepare.py").write_text("", encoding="utf-8")
+        (candidate_dir / "train.py").write_text("VALUE = 1\n", encoding="utf-8")
+        atomic_write_json(
+            candidate_dir / "_candidate_brief.json",
+            {"implementation_source": {"kind": "generated"}},
+        )
+        atomic_write_json(candidate_dir / "_warm_configs.json", [{"x": 1}])
+        atomic_write_json(candidate_dir / "_search_space.json", {"x": ["int", 1, 2]})
+        atomic_write_json(
+            identity.run_dir / "framework_cfg.json", {"tuner": {"K_eval": 2}}
+        )
+        atomic_write_json(
+            candidate_dir / "_failures" / "fail-3333333333333333.json",
+            {"failure_id": "fail-3333333333333333"},
+        )
+        revision = execution_revision_fixture()
+        reservation = {
+            "schema_version": 1,
+            "kind": "score_attempt",
+            "attempt_id": "eval-000001",
+            "run_id": "001",
+            "phase": "phase_a",
+            "method": "warmstart",
+            "params_sha256": json_revision({"x": 1}),
+        }
+        terminal = {
+            "status": "crashed",
+            "phase": "a",
+            "crash_index": 0,
+            "crash_params": {"x": 1},
+            "objective_slot_consumed": True,
+            "failure_category": "candidate_code_incompatibility",
+            "candidate_execution_revision": revision,
+            "objective_attempt_id": "eval-000001",
+            "objective_reservation": reservation,
+            "failure_receipt": {
+                "frames": [{"path": str(candidate_dir / "train.py"), "line": 1}]
+            },
+            "failure_ref": immutable_failure_ref("fail-3333333333333333"),
+        }
+        atomic_write_json(
+            candidate_dir / "tune_report.json",
+            {
+                "phase_a": {
+                    "status": "crashed",
+                    "trials_attempted": 1,
+                    "warm_start_configs": [],
+                    "candidate_code_revision": revision,
+                    "terminal_failure": terminal,
+                }
+            },
+        )
+        toolchain = CrashClosureToolchainStub(attempts=1, receipts=[reservation])
+        pipeline = CandidatePipeline(
+            identity,
+            toolchain=toolchain,
+            models=models,
+            task_config={},
+        )
+        action = RoundAction(op="fresh", run_id="001", admitted=True)
+        return pipeline, identity, candidate_dir, toolchain, action
+
+    @staticmethod
+    def _code_incompatible_decision():
+        return parse_debug_response(
+            {
+                "verdict": "code_incompatible",
+                "rationale": "the implementation rejects a legal value",
+                "corrected_config": [],
+                "repair_instructions": "accept the legal value",
+            }
+        )
+
+    def test_debug_repair_sdk_failure_closes_candidate_as_crash(self) -> None:
+        """A non-upstream edit failure must not park the whole run.
+
+        The repair reservation is already consumed and the source may be
+        half-written — the same state an invalid edit leaves. Blocking here was
+        the last place one bounded LLM failure could terminate a run that the
+        candidate-crash path could absorb.
+        """
+
+        class FailingEditModelStub(DebugModelStub):
+            def edit(self, spec, *, validate):
+                del spec, validate
+                self.edit_calls += 1
+                raise InferenceError("debug_repair edit hit max turns")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            models = FailingEditModelStub(self._code_incompatible_decision())
+            (
+                pipeline,
+                identity,
+                candidate_dir,
+                toolchain,
+                action,
+            ) = self._debug_repair_case(Path(tmp), models)
+
+            outcome = pipeline.evaluate(action)
+
+            self.assertEqual(outcome.status, "crash")
+            self.assertTrue(toolchain.crashed)
+            self.assertEqual(models.edit_calls, 1)
+            repair = json.loads(
+                (candidate_dir / CandidatePipeline.PHASE_A_REPAIR_RECEIPT).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(repair["status"], "rejected")
+            diagnostic = json.loads(
+                (
+                    identity.run_dir
+                    / ".orchestrator"
+                    / "candidate_contract_diagnostics"
+                    / "001-debug_repair.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(diagnostic["stage"], "debug_repair")
+            self.assertEqual(diagnostic["error_type"], "InferenceError")
+
+            # The rejected receipt is terminal: a resume must not re-infer or
+            # re-edit against a consumed reservation.
+            resumed = CandidatePipeline(
+                identity,
+                toolchain=toolchain,
+                models=models,
+                task_config={},
+            )
+            replay = resumed.evaluate(action)
+
+            self.assertEqual(replay.status, "crash")
+            self.assertEqual(models.infer_calls, 1)
+            self.assertEqual(models.edit_calls, 1)
+
+    def test_debug_repair_upstream_failure_still_propagates(self) -> None:
+        """Transient provider faults stay with the coordinator's backoff."""
+
+        class UpstreamFailingEditModelStub(DebugModelStub):
+            def edit(self, spec, *, validate):
+                del spec, validate
+                self.edit_calls += 1
+                raise InferenceError(
+                    "debug_repair edit failed: APIConnectionError: bad gateway"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            models = UpstreamFailingEditModelStub(self._code_incompatible_decision())
+            (
+                pipeline,
+                _identity,
+                candidate_dir,
+                toolchain,
+                action,
+            ) = self._debug_repair_case(Path(tmp), models)
+
+            with self.assertRaises(InferenceError):
+                pipeline.evaluate(action)
+
+            self.assertFalse(toolchain.crashed)
+            # The receipt stays `planned` so the resume re-enters the edit.
+            repair = json.loads(
+                (candidate_dir / CandidatePipeline.PHASE_A_REPAIR_RECEIPT).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(repair["status"], "planned")
+
     def test_preflight_timeout_terminal_closes_candidate_via_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             identity = RunIdentity(Path(tmp), "toy", "run")
