@@ -164,6 +164,24 @@ class HillclimbTests(unittest.TestCase):
         self.assertEqual((self.run_dir() / "best.py").read_text(),
                          "# baseline implementation\n")
 
+    def test_successful_crash_repair_retries_repaired_copy(self) -> None:
+        cmd = FakeCmd(self.repo, scores=[-0.73, None, -0.85])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "broken idea"},
+             "side_effects": edit_train_py("# broken\n")},
+            {"receipt": {"verdict": "code_incompatible", "summary": "typo",
+                         "evidence": []}},
+            {"receipt": {"edited": True, "summary": "fixed"},
+             "side_effects": edit_train_py("# fixed\n")},
+        ])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd, max_evaluations=3,
+                      crash_repairs=1)
+        rows = self.rows()
+        self.assertEqual(rows[1][1:3], ["inf", "crash"])
+        self.assertEqual(rows[2][1:3], ["-0.850000", "keep"])
+        self.assertEqual((self.run_dir() / "best.py").read_text(), "# fixed\n")
+
     def test_reserve_exit_4_stops_without_launching(self) -> None:
         cmd = FakeCmd(self.repo, scores=[-0.73])
         runner = FakeSessionRunner([

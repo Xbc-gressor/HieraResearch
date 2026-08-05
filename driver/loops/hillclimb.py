@@ -212,18 +212,22 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 return _status(task, tag, run_dir, metric, stop_condition,
                                repo_root, cmd)
 
+    best_before = min(_finite_scores(run_dir), default=None)
+    needs_editor = True
     while True:
         if budget_status(run_dir, repo_root, cmd).get("reached"):
             break
-        _revert(run_dir)
-        best_before = min(_finite_scores(run_dir), default=None)
-        try:
-            last_editor = _editor_session(runner, store, task, tag, run_dir,
-                                          resume_from=last_editor)
-        except InvocationFailed as exc:
-            stop_condition = f"editor invocation failed: {exc.problems}"
-            events.emit("blocked", reason=stop_condition)
-            break
+        if needs_editor:
+            _revert(run_dir)
+            best_before = min(_finite_scores(run_dir), default=None)
+            try:
+                last_editor = _editor_session(runner, store, task, tag, run_dir,
+                                              resume_from=last_editor)
+            except InvocationFailed as exc:
+                stop_condition = f"editor invocation failed: {exc.problems}"
+                events.emit("blocked", reason=stop_condition)
+                break
+        needs_editor = True  # a fresh idea next round starts from best.py
 
         if _preflight(task, run_dir, repo_root, cmd).returncode != 0:
             # Preflight failures consume no slot; one diagnosis cycle, else
@@ -274,6 +278,8 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     break
             if not repaired:
                 _revert(run_dir)
+            else:
+                needs_editor = False
             continue  # a repair re-enters the loop; its retry reserves anew
 
         status = "keep" if (best_before is None or score < best_before) else "discard"
