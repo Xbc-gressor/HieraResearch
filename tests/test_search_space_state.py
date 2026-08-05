@@ -620,7 +620,7 @@ class ExperienceTransitionTests(unittest.TestCase):
         self.assertEqual(len(first), 1)
         self.assertEqual(first[0]["from_status"], "active")
         self.assertEqual(first[0]["to_status"], "deprioritized")
-        self.assertEqual(first[0]["schema_version"], 3)
+        self.assertEqual(first[0]["schema_version"], 4)
         self.assertEqual(
             validate_search_space_state(self.registry, self.ledger), []
         )
@@ -650,10 +650,11 @@ class ExperienceTransitionTests(unittest.TestCase):
         self.assertEqual(second[0]["from_status"], "deprioritized")
         self.assertEqual(second[0]["to_status"], "pruned")
 
-    def test_two_lightly_tuned_edges_do_not_transition(self) -> None:
-        # Exactly two lightly-tuned direct edges (zero tuned) cover the
-        # comparator but stay below the contradiction-grade depth bar, so the
-        # recommendation is gated out and the target stays active.
+    def test_two_lightly_tuned_edges_deprioritize_via_carrier_rule(self) -> None:
+        # Exactly two lightly-tuned direct edges (zero tuned) stay below the
+        # strict contradiction-grade depth bar, but they are two independent
+        # negative carrier contexts — under the degraded demotion gates that
+        # suffices to deprioritize.
         self._regrade_lightly("001", "003")
         self.assertEqual(
             target_evaluation_state(
@@ -675,14 +676,16 @@ class ExperienceTransitionTests(unittest.TestCase):
             "crash_edges": 0,
         }
         self.ledger["experience"] = experience
-        self.assertEqual(
-            append_experience_transitions(self.registry, self.ledger), []
-        )
-        self.assertEqual(self.ledger["search_space_state"]["revision"], 0)
+        first = append_experience_transitions(self.registry, self.ledger)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["to_status"], "deprioritized")
+        self.assertEqual(self.ledger["search_space_state"]["revision"], 1)
         replayed = replay_search_space_state(
             self.registry, self.ledger["search_space_state"]
         )
-        self.assertEqual(replayed["hypotheses"]["hyp-data-filtered"], "active")
+        self.assertEqual(
+            replayed["hypotheses"]["hyp-data-filtered"], "deprioritized"
+        )
 
     def test_mixed_matched_control_directions_cannot_contract_target(self) -> None:
         # Keep two direct controls but make the second one favor the selected
@@ -2464,3 +2467,131 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def _carrier_ledger_and_experience(registry: dict, *, prune: bool = False) -> dict:
+    """Confounded ledger with 2 (or 3) negative contexts + a demoting belief."""
+    baseline = complete_point(registry)
+    filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+    rows = [
+        ("000", [], baseline, "keep", 0.40),
+        ("001", ["000"], filtered, "discard", 0.50),
+        ("002", [], baseline, "keep", 0.41),
+        ("003", ["002"], filtered, "discard", 0.52),
+    ]
+    if prune:
+        rows += [
+            ("004", [], baseline, "keep", 0.42),
+            ("005", ["004"], filtered, "discard", 0.53),
+        ]
+    records = []
+    for revision, (run_id, parents, point, status, score) in enumerate(rows, 1):
+        record = {
+            "run_id": run_id, "source_run_ids": parents,
+            "semantic_point": point, "status": status,
+            "final_best_score": score, "evaluation_depth": "screening",
+            "dag_revision": revision,
+        }
+        record["semantic_edges"] = build_semantic_edges(records, record)
+        records.append(record)
+    pairs = [("000", "001"), ("002", "003")] + ([("004", "005")] if prune else [])
+    edge_ids = [f"sedge-{parent}-{child}" for parent, child in pairs]
+    run_ids = [row[0] for row in rows]
+    entry = {
+        "target_id": "hyp-data-filtered",
+        "assessment": "unpromising",
+        "confidence": "high" if prune else "med",
+        "recommended_status": "pruned" if prune else "deprioritized",
+        "claim": "Repeated independent negative contexts.",
+        "uncertainty": "Implementation drift possible.",
+        "reopen_when": "Any independent improving context.",
+        "evidence_run_ids": run_ids,
+        "evidence_edge_ids": edge_ids,
+    }
+    experience = {
+        "schema_version": 4,
+        "updated_at_run": run_ids[-1],
+        "generation": 1,
+        "dag_revision": len(rows),
+        "summary": "test",
+        "promising_regions": [],
+        "lessons": [],
+        "bottlenecks": [],
+        "dimension_evidence": [],
+        "hypothesis_evidence": [entry],
+    }
+    return {"records": records, "dag_revision": len(rows),
+            "experience": experience,
+            "search_space_state": empty_search_space_state()}
+
+
+class CarrierTransitionTests(unittest.TestCase):
+    def test_deprioritize_fires_on_carrier_rule(self) -> None:
+        registry = fixture_registry()
+        ledger = _carrier_ledger_and_experience(registry)
+        transitions = derive_experience_transitions(registry, ledger)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0]["target"]["id"], "hyp-data-filtered")
+        self.assertEqual(transitions[0]["from_status"], "active")
+        self.assertEqual(transitions[0]["to_status"], "deprioritized")
+        self.assertEqual(transitions[0]["schema_version"], 4)
+        self.assertEqual(
+            transitions[0]["carrier_contexts"]["negative"], ["000", "002"]
+        )
+
+    def test_staging_still_applies_to_prune_recommendation(self) -> None:
+        registry = fixture_registry()
+        ledger = _carrier_ledger_and_experience(registry, prune=True)
+        transitions = derive_experience_transitions(registry, ledger)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0]["to_status"], "deprioritized")
+
+    def test_advance_to_pruned_on_new_negative_context(self) -> None:
+        registry = fixture_registry()
+        ledger = _carrier_ledger_and_experience(registry)
+        append_experience_transitions(registry, ledger)
+        baseline = complete_point(registry)
+        filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+        records = ledger["records"]
+        for run_id, parents, point, status, score, revision in (
+            ("004", [], baseline, "keep", 0.42, 5),
+            ("005", ["004"], filtered, "discard", 0.53, 6),
+        ):
+            record = {
+                "run_id": run_id, "source_run_ids": parents,
+                "semantic_point": point, "status": status,
+                "final_best_score": score, "evaluation_depth": "screening",
+                "dag_revision": revision,
+            }
+            record["semantic_edges"] = build_semantic_edges(records, record)
+            records.append(record)
+        experience = ledger["experience"]
+        experience["generation"] = 2
+        experience["dag_revision"] = 6
+        experience["updated_at_run"] = "005"
+        entry = experience["hypothesis_evidence"][0]
+        entry["recommended_status"] = "pruned"
+        entry["confidence"] = "high"
+        entry["evidence_run_ids"] = ["000", "001", "002", "003", "004", "005"]
+        entry["evidence_edge_ids"] = [
+            "sedge-000-001", "sedge-002-003", "sedge-004-005"
+        ]
+        transitions = derive_experience_transitions(registry, ledger)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0]["from_status"], "deprioritized")
+        self.assertEqual(transitions[0]["to_status"], "pruned")
+
+    def test_no_transition_when_evidence_unchanged(self) -> None:
+        registry = fixture_registry()
+        ledger = _carrier_ledger_and_experience(registry)
+        append_experience_transitions(registry, ledger)
+        # Same evidence, but a later generation now recommends prune: without
+        # advancing evidence the stage cannot advance.
+        experience = ledger["experience"]
+        experience["generation"] = 2
+        experience["dag_revision"] = 5
+        entry = experience["hypothesis_evidence"][0]
+        entry["recommended_status"] = "pruned"
+        entry["confidence"] = "high"
+        self.assertEqual(derive_experience_transitions(registry, ledger), [])

@@ -835,6 +835,24 @@ def _like_for_like_delta(
     return None
 
 
+def _carrier_delta(
+    ledger: dict[str, Any],
+    receipt: dict[str, Any],
+    parent: dict[str, Any],
+    child: dict[str, Any],
+) -> float | None:
+    """One carrier edge's signed effect, best attribution first.
+
+    A matched semantic control's deconfounded ``semantic_delta`` outranks the
+    raw like-for-like score delta, which includes tuning/implementation
+    drift.  Positive means the child is worse (scores are lower-is-better).
+    """
+    matched = matched_inherited_control(ledger, receipt)
+    if matched is not None:
+        return float(matched["semantic_delta"])
+    return _like_for_like_delta(parent, child)
+
+
 def hypothesis_carriers(
     ledger: dict[str, Any],
     *,
@@ -844,11 +862,13 @@ def hypothesis_carriers(
     """Count independent contexts where adding ``target_id`` hurt or helped.
 
     A carrier edge's child point adds the hypothesis relative to the edge's
-    parent.  Contexts group by parent run id: a context is negative when
-    every carrier delta in it is strictly worse (positive — scores are
-    lower-is-better) and positive when every delta is strictly better.
-    Mixed, zero-delta, crash, and depth-unpaired edges never count.  When
-    ``edge_ids`` is given, only those cited edges are considered.
+    parent.  Each edge uses the best available attribution: a matched
+    semantic control's ``semantic_delta`` when one exists, else the
+    like-for-like score delta.  Contexts group by parent run id: a context is
+    negative when every carrier delta in it is strictly worse (positive —
+    scores are lower-is-better) and positive when every delta is strictly
+    better.  Mixed, zero-delta, crash, and depth-unpaired edges never count.
+    When ``edge_ids`` is given, only those cited edges are considered.
     """
     allowed = None if edge_ids is None else {str(value) for value in edge_ids}
     records = _records_by_id(ledger)
@@ -883,7 +903,7 @@ def hypothesis_carriers(
                 or parent.get("status") not in NONCRASH_TERMINAL_STATUSES
             ):
                 continue
-            delta = _like_for_like_delta(parent, record)
+            delta = _carrier_delta(ledger, receipt, parent, record)
             if delta is None or abs(delta) <= 1e-12:
                 continue
             contexts.setdefault(str(receipt.get("parent_run_id")), []).append(delta)

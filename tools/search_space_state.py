@@ -35,6 +35,7 @@ from semantic_evidence import (
     _contradiction_depth_bar,
     comparator_coverage,
     edge_observation,
+    hypothesis_carriers,
     mechanical_gain_direction,
     normalize_coverage,
     target_evaluation_state,
@@ -43,14 +44,17 @@ from semantic_space import dimension_map, hypothesis_map, selected_assignments
 
 
 STATE_SCHEMA_VERSION = 1
-DECISION_SCHEMA_VERSION = 3
+DECISION_SCHEMA_VERSION = 4
+# Decision schema 4 adds `carrier_contexts` (the independent negative/positive
+# carrier contexts behind a carrier-rule demotion); schema 1–3 receipts are
+# append-only history and stay valid — the field is simply absent there.
 # Decision schema 3 carries the five-key `comparator_coverage` that split
 # `direct_lightly_tuned_edges` out of the direct bucket (schema 2 had four
 # keys, schema 1 three). Schema-1/2 receipts are append-only history and stay
 # valid: their coverage normalizes forward on read with the newer
 # direct-depth buckets at 0. New decisions are always written at the current
 # version.
-READABLE_DECISION_SCHEMA_VERSIONS = {1, 2, 3}
+READABLE_DECISION_SCHEMA_VERSIONS = {1, 2, 3, 4}
 RUNTIME_STATUSES = {"active", "deprioritized", "pruned"}
 LEGAL_TRANSITIONS = {
     ("active", "deprioritized"),
@@ -81,6 +85,7 @@ DECISION_FIELDS = {
     "evidence_edge_ids",
     "comparator_coverage",
     "evidence_observations",
+    "carrier_contexts",
 }
 TARGET_FIELDS = {"kind", "dimension_id", "id"}
 OBSERVATION_FIELDS = {
@@ -329,6 +334,11 @@ def validate_search_space_state(registry: dict[str, Any], ledger: dict[str, Any]
         if unknown:
             errors.append(f"{item_where} has unknown fields {unknown}")
         missing = sorted(DECISION_FIELDS - set(decision))
+        if (
+            decision.get("schema_version") in {1, 2, 3}
+            and "carrier_contexts" in missing
+        ):
+            missing.remove("carrier_contexts")
         if missing:
             errors.append(f"{item_where} is missing fields {missing}")
         if decision.get("schema_version") not in READABLE_DECISION_SCHEMA_VERSIONS:
@@ -479,26 +489,33 @@ def _effective_recommendation(
     *,
     target_kind: str,
     mechanical_direction: str,
+    carrier_demote: bool = False,
+    carrier_prune: bool = False,
 ) -> str | None:
     """Gate the authored recommendation on mechanically recomputed evidence.
 
-    A ``pruned`` recommendation that only meets the deprioritize gate is
-    carried out as a deprioritization; a recommendation whose gates fail
-    yields no transition at all (``None``), never a reopening.
+    Demotion passes either the strict comparator path or the carrier rule
+    (repeated independent negative contexts, zero positive).  A ``pruned``
+    recommendation that only meets the deprioritize gate is carried out as a
+    deprioritization; a recommendation whose gates fail yields no transition
+    at all (``None``), never a reopening.
     """
     recommended = belief.get("recommended_status")
     if recommended == "active":
         return "active"
     if recommended not in {"deprioritized", "pruned"}:
         return None
+    strict = evaluation_state == "comparator_covered" and _contradiction_depth_bar(
+        coverage
+    )
     deprioritize_ok = (
         belief.get("assessment") == "unpromising"
         and belief.get("confidence") in {"med", "high"}
-        and evaluation_state == "comparator_covered"
-        and _contradiction_depth_bar(coverage)
+        and (strict or carrier_demote)
         and (
             target_kind != "hypothesis"
             or mechanical_direction == "negative"
+            or carrier_demote
         )
         and _nonempty(belief.get("reopen_when"))
     )
@@ -506,11 +523,7 @@ def _effective_recommendation(
         return None
     if recommended == "deprioritized":
         return "deprioritized"
-    prune_ok = (
-        belief.get("confidence") == "high"
-        and evaluation_state == "comparator_covered"
-        and _contradiction_depth_bar(coverage)
-    )
+    prune_ok = belief.get("confidence") == "high" and (strict or carrier_prune)
     return "pruned" if prune_ok else "deprioritized"
 
 
@@ -583,6 +596,16 @@ def _normalized_beliefs(
                 target_id=target_id,
                 evidence_edge_ids=edge_ids,
             )
+            carriers = (
+                hypothesis_carriers(ledger, target_id=target_id, edge_ids=edge_ids)
+                if target_kind == "hypothesis"
+                else {
+                    "negative": 0,
+                    "positive": 0,
+                    "negative_contexts": [],
+                    "positive_contexts": [],
+                }
+            )
             beliefs[(target_kind, target_id)] = {
                 "assessment": item.get("assessment"),
                 "confidence": item.get("confidence"),
@@ -599,6 +622,7 @@ def _normalized_beliefs(
                     for basic, raw in zip(observations, raw_observations)
                     if raw.get("score_basis") == "paired_semantic_control"
                 ],
+                "_carriers": carriers,
                 "comparator_coverage": coverage,
                 "evaluation_state": evaluation_state,
                 "recommended_status": _effective_recommendation(
@@ -607,6 +631,12 @@ def _normalized_beliefs(
                     coverage,
                     target_kind=target_kind,
                     mechanical_direction=direction,
+                    carrier_demote=(
+                        carriers["negative"] >= 2 and carriers["positive"] == 0
+                    ),
+                    carrier_prune=(
+                        carriers["negative"] >= 3 and carriers["positive"] == 0
+                    ),
                 ),
                 "experience_generation": generation,
                 "experience_dag_revision": dag_revision,
@@ -647,12 +677,27 @@ def _has_advancing_evidence(belief: dict[str, Any], last: dict | None) -> bool:
         for item in prior_observations
         if isinstance(item, dict) and isinstance(item.get("edge_id"), str)
     }
-    return any(
+    if any(
         isinstance(item, dict)
         and isinstance(item.get("edge_id"), str)
         and prior_by_edge.get(item["edge_id"]) != item
         for item in direct_current
-    )
+    ):
+        return True
+    # Carrier path: a changed set of independent contexts is advancing
+    # evidence — a new negative context advances demotion, a new positive
+    # context advances reopening.  Legacy receipts without carrier_contexts
+    # fail closed.
+    last_carriers = last.get("carrier_contexts")
+    if isinstance(last_carriers, dict):
+        current_carriers = belief.get("_carriers") or {}
+        return (
+            list(current_carriers.get("negative_contexts") or [])
+            != list(last_carriers.get("negative") or [])
+            or list(current_carriers.get("positive_contexts") or [])
+            != list(last_carriers.get("positive") or [])
+        )
+    return False
 
 
 def _recommended_transition(current: str, belief: dict[str, Any], last: dict | None) -> str | None:
@@ -743,6 +788,10 @@ def _decision_receipt(
         "evidence_edge_ids": list(belief["evidence_edge_ids"]),
         "comparator_coverage": dict(belief["comparator_coverage"]),
         "evidence_observations": observations,
+        "carrier_contexts": {
+            "negative": list(belief["_carriers"]["negative_contexts"]),
+            "positive": list(belief["_carriers"]["positive_contexts"]),
+        },
     }
 
 
