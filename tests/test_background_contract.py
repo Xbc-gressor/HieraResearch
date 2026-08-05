@@ -899,3 +899,113 @@ class ExperienceSchema3Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def _confounded_ledger(registry: dict) -> dict:
+    """belief_ledger's shape WITHOUT matched transfers: confounded edges only.
+
+    Both children adding hyp-data-filtered are worse than their baseline
+    parents (0.50 > 0.40, 0.52 > 0.41) — two independent negative carrier
+    contexts, zero comparator coverage.
+    """
+    baseline = complete_point(registry)
+    filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+    records = [
+        {
+            "run_id": "000", "source_run_ids": [], "semantic_point": baseline,
+            "semantic_edges": [], "status": "keep", "final_best_score": 0.40,
+            "evaluation_depth": "screening", "dag_revision": 1,
+        },
+        {
+            "run_id": "001", "source_run_ids": ["000"], "semantic_point": filtered,
+            "status": "discard", "final_best_score": 0.50,
+            "evaluation_depth": "screening", "dag_revision": 2,
+        },
+        {
+            "run_id": "002", "source_run_ids": [], "semantic_point": baseline,
+            "semantic_edges": [], "status": "keep", "final_best_score": 0.41,
+            "evaluation_depth": "screening", "dag_revision": 3,
+        },
+        {
+            "run_id": "003", "source_run_ids": ["002"], "semantic_point": filtered,
+            "status": "discard", "final_best_score": 0.52,
+            "evaluation_depth": "screening", "dag_revision": 4,
+        },
+    ]
+    records[1]["semantic_edges"] = build_semantic_edges(records[:1], records[1])
+    records[3]["semantic_edges"] = build_semantic_edges(records[:3], records[3])
+    return {"records": records, "dag_revision": 4}
+
+
+def _carrier_demote_entry() -> dict:
+    return {
+        "target_id": "hyp-data-filtered",
+        "evaluation_state": "observed",
+        "assessment": "unpromising",
+        "recommended_status": "deprioritized",
+        "claim": "Two independent confounded contexts were both strictly worse.",
+        "evidence_run_ids": ["000", "001", "002", "003"],
+        "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
+        "comparator_coverage": {
+            "direct_tuned_edges": 0,
+            "direct_noncrash_edges": 0,
+            "confounded_noncrash_edges": 2,
+            "crash_edges": 0,
+        },
+        "confidence": "med",
+        "uncertainty": "Implementation drift is an alternative explanation.",
+        "reopen_when": "Any independent context where adding it improves the parent.",
+    }
+
+
+class CarrierDemotionGateTests(unittest.TestCase):
+    def _validate(self, ledger: dict, entry: dict) -> list:
+        registry = fixture_registry()
+        experience = _base_experience()
+        experience["hypothesis_evidence"] = [entry]
+        return validate_experience(experience, registry, ledger)
+
+    def test_deprioritize_accepted_on_two_negative_contexts(self) -> None:
+        registry = fixture_registry()
+        errors = self._validate(_confounded_ledger(registry), _carrier_demote_entry())
+        self.assertEqual(errors, [])
+
+    def test_prune_rejected_on_only_two_negative_contexts(self) -> None:
+        registry = fixture_registry()
+        entry = _carrier_demote_entry()
+        entry["recommended_status"] = "pruned"
+        entry["confidence"] = "high"
+        errors = self._validate(_confounded_ledger(registry), entry)
+        self.assertTrue(any("pruned" in error for error in errors), errors)
+
+    def test_positive_context_blocks_demotion(self) -> None:
+        registry = fixture_registry()
+        ledger = _confounded_ledger(registry)
+        ledger["records"][3]["final_best_score"] = 0.39  # 003 now BEATS parent 002
+        errors = self._validate(ledger, _carrier_demote_entry())
+        self.assertTrue(any("deprioritized" in error for error in errors), errors)
+
+    def test_promising_still_requires_comparator_coverage(self) -> None:
+        registry = fixture_registry()
+        entry = _carrier_demote_entry()
+        entry["assessment"] = "promising"
+        entry["recommended_status"] = "active"
+        errors = self._validate(_confounded_ledger(registry), entry)
+        self.assertTrue(any("promising" in error for error in errors), errors)
+
+    def test_uncited_negative_contexts_do_not_count(self) -> None:
+        # The ledger holds two negative contexts, but the entry cites only
+        # one edge: beliefs must be justified by their cited evidence.
+        registry = fixture_registry()
+        entry = _carrier_demote_entry()
+        entry["evidence_run_ids"] = ["000", "001"]
+        entry["evidence_edge_ids"] = ["sedge-000-001"]
+        entry["comparator_coverage"] = {
+            "direct_tuned_edges": 0,
+            "direct_noncrash_edges": 0,
+            "confounded_noncrash_edges": 1,
+            "crash_edges": 0,
+        }
+        errors = self._validate(_confounded_ledger(registry), entry)
+        self.assertTrue(any("deprioritized" in error for error in errors), errors)

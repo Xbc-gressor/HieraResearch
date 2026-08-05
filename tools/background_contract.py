@@ -49,6 +49,7 @@ from semantic_evidence import (
     _contradiction_depth_bar,
     comparator_coverage,
     edge_index,
+    hypothesis_carriers,
     mechanical_gain_direction,
     normalize_coverage,
     render_target_evidence,
@@ -2288,47 +2289,61 @@ def _validate_target_evidence(
                 f"{target} with evaluation_state '{state}' must keep assessment "
                 "unknown, confidence low, and recommended_status active"
             )
+        carriers = (
+            hypothesis_carriers(ledger, target_id=target_id, edge_ids=edge_ids)
+            if target_kind == "hypothesis"
+            else {"negative": 0, "positive": 0}
+        )
+        carrier_demote = carriers["negative"] >= 2 and carriers["positive"] == 0
+        carrier_prune = carriers["negative"] >= 3 and carriers["positive"] == 0
+        strict_demote = state == "comparator_covered" and depth_bar
         if recommended == "deprioritized" and not (
             assessment == "unpromising"
             and confidence in {"med", "high"}
-            and state == "comparator_covered"
-            and depth_bar
+            and (strict_demote or carrier_demote)
             and _nonempty(item.get("reopen_when"))
         ):
             errors.append(
                 f"{target}.recommended_status deprioritized requires assessment "
-                "unpromising, confidence med or high, evaluation_state "
-                "comparator_covered, at least two direct tuned edges, or at "
-                "least three direct edges at tuned_lightly or deeper, "
-                "and a non-empty reopen_when"
+                "unpromising, confidence med or high, a non-empty reopen_when, "
+                "and either comparator_covered evaluation_state with at least "
+                "two direct tuned edges, or at least three direct edges at "
+                "tuned_lightly or deeper, or at least two independent negative "
+                "carrier contexts with no positive context"
             )
         if recommended == "pruned" and not (
             assessment == "unpromising"
             and confidence == "high"
-            and state == "comparator_covered"
-            and depth_bar
+            and (strict_demote or carrier_prune)
             and _nonempty(item.get("reopen_when"))
         ):
             errors.append(
                 f"{target}.recommended_status pruned requires assessment "
-                "unpromising, confidence high, evaluation_state "
-                "comparator_covered, at least two direct tuned edges, or at "
-                "least three direct edges at tuned_lightly or deeper, "
-                "and a non-empty reopen_when"
+                "unpromising, confidence high, a non-empty reopen_when, and "
+                "either comparator_covered evaluation_state with at least two "
+                "direct tuned edges, or at least three direct edges at "
+                "tuned_lightly or deeper, or at least three independent "
+                "negative carrier contexts with no positive context"
             )
-        if assessment in {"promising", "unpromising"} and not (
-            state == "comparator_covered" and depth_bar
-        ):
+        if assessment == "promising" and not strict_demote:
             errors.append(
-                f"{target} assessment promising or unpromising requires "
-                "comparator_covered evaluation_state with at least two direct "
-                "tuned edges, or at least three direct edges at tuned_lightly "
-                "or deeper"
+                f"{target} assessment promising requires comparator_covered "
+                "evaluation_state with at least two direct tuned edges, or at "
+                "least three direct edges at tuned_lightly or deeper"
             )
-        if target_kind == "hypothesis" and assessment in {
-            "promising",
-            "unpromising",
-        }:
+        if assessment == "unpromising" and not (strict_demote or carrier_demote):
+            errors.append(
+                f"{target} assessment unpromising requires comparator_covered "
+                "evaluation_state with at least two direct tuned edges, or at "
+                "least three direct edges at tuned_lightly or deeper, or at "
+                "least two independent negative carrier contexts with no "
+                "positive context"
+            )
+        if (
+            target_kind == "hypothesis"
+            and assessment in {"promising", "unpromising"}
+            and not (assessment == "unpromising" and carrier_demote)
+        ):
             required_direction = (
                 "positive" if assessment == "promising" else "negative"
             )

@@ -835,15 +835,22 @@ def _like_for_like_delta(
     return None
 
 
-def hypothesis_carriers(ledger: dict[str, Any], *, target_id: str) -> dict[str, Any]:
+def hypothesis_carriers(
+    ledger: dict[str, Any],
+    *,
+    target_id: str,
+    edge_ids: list[str] | None = None,
+) -> dict[str, Any]:
     """Count independent contexts where adding ``target_id`` hurt or helped.
 
     A carrier edge's child point adds the hypothesis relative to the edge's
     parent.  Contexts group by parent run id: a context is negative when
     every carrier delta in it is strictly worse (positive — scores are
     lower-is-better) and positive when every delta is strictly better.
-    Mixed, zero-delta, crash, and depth-unpaired edges never count.
+    Mixed, zero-delta, crash, and depth-unpaired edges never count.  When
+    ``edge_ids`` is given, only those cited edges are considered.
     """
+    allowed = None if edge_ids is None else {str(value) for value in edge_ids}
     records = _records_by_id(ledger)
     contexts: dict[str, list[float]] = {}
     for record in ledger.get("records", []):
@@ -856,6 +863,8 @@ def hypothesis_carriers(ledger: dict[str, Any], *, target_id: str) -> dict[str, 
             continue
         for receipt in receipts:
             if not isinstance(receipt, dict):
+                continue
+            if allowed is not None and receipt.get("edge_id") not in allowed:
                 continue
             changes = receipt.get("changes")
             if not isinstance(changes, list):
