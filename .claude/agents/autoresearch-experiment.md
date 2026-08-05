@@ -160,7 +160,7 @@ After background validation and before the experiment loop, inspect `[seed]` in
 `train.py`), that file is the run's observed control:
 
 1. On an empty run, build only the complete all-baselines point and its ordinary
-   schema-6 coverage receipt:
+   schema-7 `coverage_experience` receipt:
 
    ```bash
    python tools/semantic_search.py propose \
@@ -169,7 +169,7 @@ After background validation and before the experiment loop, inspect `[seed]` in
      --output <run_dir>/.semantic/000/proposals.json
    python tools/semantic_search.py select \
      --proposals <run_dir>/.semantic/000/proposals.json \
-     --policy coverage --ledger <run_dir>/ledger.json \
+     --policy coverage_experience --ledger <run_dir>/ledger.json \
      --point-output <run_dir>/.semantic/000/point.json \
      --receipt-output <run_dir>/.semantic/000/policy.json
    ```

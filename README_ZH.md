@@ -100,7 +100,7 @@ background-researcher: 解析维度策略 → 多后端知识侦察 → backgrou
 idea-generator:
     SELECT-1: got_select.py decide → 获取图行动与数字父代
             (bootstrap/stall → fresh; 否则在前沿上 PUCB → ≤B improve/crossover)
-    SELECT-2: semantic_search.py → 合法点集 → coverage/gain/gain_uncertainty/gain_uncertainty_nocost 选点
+    SELECT-2: semantic_search.py → 合法点集 → coverage_experience/coverage/gain/gain_uncertainty/gain_uncertainty_nocost 选点
     IDEATE: 将点落成完整方案 → ledger.py add-record（祖先、点、策略收据分开）
         ↓
 对每个行动: tools/new_candidate.py --skip-entrypoint → 创建候选目录(prepare.py + 精简 _candidate_brief.json)
@@ -130,7 +130,7 @@ step 0+1: tunable-contract-extractor
 - 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage` 是无需 LLM 打分的确定性探索基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。`llm_intelligence_score` 是运行前固定的 `[0,100]` 启发式可信度先验：以 `score/100` 缩放完整的 LLM 判断项，不缩放确定性的 coverage，也不改写原始预测；它不是校准概率。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage_experience` 是默认策略（确定性 coverage 加上按账本边统计的 carrier 先验，无需 LLM 打分）；`coverage` 是仅用覆盖度的确定性基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。`llm_intelligence_score` 是运行前固定的 `[0,100]` 启发式可信度先验：以 `score/100` 缩放完整的 LLM 判断项，不缩放确定性的 coverage，也不改写原始预测；它不是校准概率。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
@@ -204,7 +204,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 外层搜索的 LLM 着陆点，通过三步产生下一代：
 
 - **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
-- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的门控 adjustment 得到最终 predicted gain / uncertainty；自由文本经验不会进入 acquisition。schema-6 `policy_receipt` 固定 experience revision、目标与 proposal relation、比较覆盖、证据 id、机械 gain direction、配置的 LLM intelligence score 及实际权重；零调整始终合法，非零 gain 必须来自至少两个方向一致、同一份子代代码内只改变语义开关的 control/treatment 配对。仅继承父代超参数的 config 0 不足以隔离代码语义变化，只能增加 uncertainty，不能制造 signed gain。
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage_experience`（默认：确定性 coverage 加上按账本边计算的 carrier 先验——每个假设在独立上下文中变差的次数惩罚、变好的次数小额奖励）/ `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的门控 adjustment 得到最终 predicted gain / uncertainty；自由文本经验不会进入 acquisition。schema-7 `policy_receipt` 固定 experience revision、目标与 proposal relation、比较覆盖、证据 id、机械 gain direction、配置的 LLM intelligence score 及实际权重（coverage_experience 下另记 carrier 先验与分假设计数）；零调整始终合法，非零 gain 必须来自至少两个方向一致、同一份子代代码内只改变语义开关的 control/treatment 配对。仅继承父代超参数的 config 0 不足以隔离代码语义变化，只能增加 uncertainty，不能制造 signed gain。
 - **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。

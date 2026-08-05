@@ -99,8 +99,8 @@ The helper deterministically completes baselines, explicit conditional
 inactivity, requirements, and exclusions. It also owns effective eligibility:
 it composes the frozen space with the current `search_space_state` overlay,
 excludes runtime-pruned hypotheses from new proposals, pins runtime-pruned
-dimensions to their explicit baselines, assigns every remaining point to an
-`active` or `deprioritized` budget lane, and stamps the proposal set with
+dimensions to their explicit baselines, flags each point's deprioritized
+hypotheses, and stamps the proposal set with
 `search_space_state_revision`. It emits bounded valid local choices:
 
 - `fresh`: under-covered baseline/intervention points, including bounded pairs;
@@ -116,9 +116,13 @@ attribution, not a full program specification.
 
 ## Step 3 — Apply the configured semantic policy
 
-Read `framework_cfg.json.semantic_search`. If absent, use `coverage`.
-Supported policies are:
+Read `framework_cfg.json.semantic_search`. If absent, use
+`coverage_experience`. Supported policies are:
 
+- `coverage_experience` (default): deterministic coverage plus the carrier
+  prior — per-hypothesis counts of independent contexts where adding the
+  hypothesis made its parent strictly worse (penalty) or better (smaller
+  bonus), computed from ledger edges; no LLM scores;
 - `coverage`: no LLM scores; select by under-covered hypotheses and point
   novelty;
 - `gain`: predicted gain minus cost, with a small deterministic coverage term;
@@ -134,13 +138,13 @@ pre-scale them. The deterministic selector maps the score to
 `llm_judgment_weight = score / 100` and applies it to the complete LLM-authored
 gain/uncertainty/cost term while leaving deterministic coverage unscaled.
 This is not a calibrated probability or a leaderboard-relative percentile.
-The `coverage` policy ignores it.
+The `coverage` and `coverage_experience` policies ignore it.
 
-For `coverage`, select directly:
+For `coverage` or `coverage_experience`, select directly:
 
 ```bash
 python tools/semantic_search.py select \
-  --proposals <...>/proposals.json --policy coverage \
+  --proposals <...>/proposals.json --policy coverage_experience \
   --ledger <run_dir>/ledger.json \
   --point-output <...>/point.json --receipt-output <...>/policy.json
 ```
@@ -251,24 +255,21 @@ python tools/semantic_search.py select \
   --point-output <...>/point.json --receipt-output <...>/policy.json
 ```
 
-`deprioritized` is a real outer-search budget class, not a display label or a
-score penalty. The helper uses
-`semantic_search.deprioritized_budget_interval` (default `5`): every Nth
-one-based semantic admission is reserved for the best proposal in the
-deprioritized lane, while all other admissions select only from the active
-lane. Acquisition scores rank proposals only within the scheduled lane; a high
-gain estimate cannot move a deprioritized proposal into an active slot. If the
-scheduled lane has no proposal, the other lane may fill the slot and the
-schema-6 policy receipt records the reliability prior and applied weight plus
-the deterministic fallback, selection index,
-scheduled/selected lanes, interval, and pre-lane base rank.
+`deprioritized` content stays eligible but is penalized in selection, not
+lane-scheduled: the deterministic carrier prior subtracts from a point's
+acquisition score for every independent negative carrier context its
+hypotheses carry, so repeated disasters push a point down the ranking while a
+later positive context can lift it again. The schema-7 policy receipt records
+the prior and per-hypothesis carrier counts under `components` plus the
+selection index in `budget`; the legacy lane fields are null with
+`fallback: lanes_removed`.
 
 `select` also checks that the proposal set's `search_space_state_revision`
 equals the ledger's current overlay revision. A stale set is a protocol
 violation: re-run `propose` against the current overlay before selecting; never
 re-stamp or hand-edit a proposal set or receipt. The run-local config supplies
 the policy and weights. Correct a rejected prediction file at most once. If it
-still fails, use `--policy coverage` and let the receipt truthfully record the
+still fails, use `--policy coverage_experience` and let the receipt truthfully record the
 policy actually used; do not loop, preserve a failed model score, or invent
 missing scores.
 

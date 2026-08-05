@@ -177,43 +177,50 @@ receipts) copied from the target-evidence block. Deduplicate semantically. If
 evidence is sparse, emit fewer entries and explicit uncertainty rather than
 filling the limits.
 
-Recommendation gates are exact and identical for both target levels:
+Recommendation gates are exact. Unless noted, they are identical for both
+target levels:
 
 - `unevaluated`/`failed` targets keep `assessment: unknown`,
   `confidence: low`, and `recommended_status: active`.
 - `deprioritized` requires `assessment: unpromising`, `confidence: med` or
-  `high`, `evaluation_state: comparator_covered`, the depth bar (≥2 direct
-  tuned edges, or ≥3 direct edges at `tuned_lightly` or deeper), and a
-  non-empty `reopen_when`.
-- `pruned` requires `assessment: unpromising`, `confidence: high`,
-  `evaluation_state: comparator_covered`, the depth bar (≥2 direct tuned
-  edges, or ≥3 direct edges at `tuned_lightly` or deeper), and a non-empty
-  `reopen_when`.
-- Every `promising` or `unpromising` assessment requires
-  `comparator_covered` with the depth bar (≥2 direct tuned edges, or ≥3
-  direct edges at `tuned_lightly` or deeper), regardless of prose
-  confidence.
+  `high`, a non-empty `reopen_when`, and either the strict path
+  (`evaluation_state: comparator_covered` with the depth bar — ≥2 direct
+  tuned edges, or ≥3 direct edges at `tuned_lightly` or deeper) or, for
+  hypotheses only, the carrier rule: at least two independent negative
+  carrier contexts among the cited edges (distinct parents whose children
+  adding the hypothesis scored strictly worse at like-for-like depth,
+  counting a matched semantic control's deconfounded delta first) and zero
+  positive contexts. Crash edges never count.
+- `pruned` requires `assessment: unpromising`, `confidence: high`, a
+  non-empty `reopen_when`, and either the strict path or the carrier rule at
+  three or more independent negative carrier contexts with zero positive.
+- A `promising` assessment still requires `comparator_covered` with the
+  depth bar, regardless of prose confidence. An `unpromising` assessment
+  passes on either the strict path or the carrier rule.
 - A hypothesis `promising`/`unpromising` assessment must also agree with the
   mechanical direction of all cited repeated pairs; mixed signs require
-  `assessment: mixed`.
+  `assessment: mixed`. The carrier rule itself satisfies direction agreement
+  for `unpromising`.
 
 `unpromising` is a judgment about the low expected marginal value of spending
 another outer-search evaluation on the target, not a synonym for
-“worse-than-parent.” Final-score deltas are observations, never a sufficient
-decision rule. Before using `unpromising`, weigh the comparator coverage and
-attribution, consistency across implementations or contexts, a plausible
+“worse-than-parent.” Before using `unpromising`, weigh the comparator coverage
+and attribution, consistency across implementations or contexts, a plausible
 mechanism or recurring failure mode, counterevidence, untested conditions or
 adjacent hypotheses, residual uncertainty/value of information, and evaluation
 cost. Explain that reasoning in `claim` and preserve the main caveat in
-`uncertainty`. If the evidence is only a worse score, the semantic change is
-implementation-confounded, or important variants remain untested, use
-`assessment: mixed` and keep the target `active`.
+`uncertainty`. A single worse score remains insufficient on its own — but once
+the cited evidence meets the carrier rule (≥2 independent negative contexts,
+zero positive), the consistency requirement is satisfied and `unpromising` is
+the right call even without comparator coverage.
 
 An entry only recommends. The helper derives and validates the actual
 append-only `search_space_state` transitions under their own two-stage,
 baseline, and provenance rules. A later generation alone cannot advance
-`deprioritized -> pruned` or reopen a target: the later snapshot must cite a new
-paired-control target edge or a corrected durable paired receipt. A crash,
+`deprioritized -> pruned` or reopen a target: the later snapshot must cite a
+new paired-control target edge, a corrected durable paired receipt, or a
+changed set of independent carrier contexts (a new negative context advances
+demotion; a new positive one advances reopening). A crash,
 unpaired transfer, or later inner-tuning/final-score change is not new semantic
 evidence. A
 dimension can contract only when every selectable adjacent non-baseline

@@ -94,7 +94,7 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `op` | structural graph action: `fresh`, `improve`, or `crossover` |
 | `source_run_ids` | numeric parents only: 0 / 1 / 2 for the three ops |
 | `semantic_point` | complete mapping over all selected dimensions, including explicit conditional inactivity |
-| `policy_receipt` | policy name/config, action, proposal-set digest, selected point, separate prior/experience-adjusted gain and uncertainty plus cost/coverage components, experience receipt, evidence, and ranking |
+| `policy_receipt` | policy name/config, action, proposal-set digest, selected point, separate prior/experience-adjusted gain and uncertainty plus cost/coverage components (or, under `coverage_experience`, the deterministic carrier prior and per-hypothesis context counts), experience receipt, evidence, and ranking |
 | `parameter_transfer` | for non-fresh candidates, the full self-hashed primary-parent incumbent projection, semantic-control qualification, mandatory warm config-0 pointer, and scored control rows |
 | `applied_incumbent` | exact applied params/schema plus candidate/report hashes represented by this record's score; descendants bind to this durable snapshot |
 | `idea` | self-contained complete solution, not merely a list of hypotheses |
@@ -123,7 +123,7 @@ deterministic `coverage` separate. It also records the configured
 `llm_intelligence_score` and derived `llm_judgment_weight`; this heuristic
 prior scales the complete LLM-authored acquisition term, never the raw
 prediction or deterministic coverage, and is not a calibrated probability.
-The first schema-6 admission freezes the configured score for the run.
+The first schema-6/7 admission freezes the configured score for the run.
 `direct_comparator_capability` is the production gate for the paired branch.
 It is currently `unavailable`: no runtime evaluator may stamp a same-child-code
 semantic control/treatment pair, so direct coverage, mechanical gain direction,
@@ -205,48 +205,54 @@ are also confounded.
 `recommended_status` is `active`, `deprioritized`, or `pruned`; `confidence`
 is `low`, `med`, or `high`.
 
-Recommendation gates are exact and identical for both levels:
+Recommendation gates are exact. Unless noted, they are identical for both
+levels:
 
 - `unevaluated`/`failed` targets keep `assessment: unknown`,
   `confidence: low`, and `recommended_status: active`; a crash alone never
   contradicts a semantic element.
 - `deprioritized` requires `assessment: unpromising`, `confidence: med` or
-  `high`, `evaluation_state: comparator_covered`, at least two direct tuned
-  edges or at least three direct edges at `tuned_lightly` or deeper, and a
-  non-empty `reopen_when`.
-- `pruned` requires `assessment: unpromising`, `confidence: high`,
-  `evaluation_state: comparator_covered`, at least two direct tuned edges
-  or at least three direct edges at `tuned_lightly` or deeper, and a
-  non-empty `reopen_when`.
-- Every `promising` or `unpromising` claim requires
-  `comparator_covered` with at least two direct tuned edges or at least
-  three direct edges at `tuned_lightly` or deeper.
+  `high`, a non-empty `reopen_when`, and either the strict path
+  (`evaluation_state: comparator_covered` with at least two direct tuned
+  edges or at least three direct edges at `tuned_lightly` or deeper) or, for
+  hypotheses only, the carrier rule: at least two independent negative
+  carrier contexts among the cited edges (distinct parents whose children
+  adding the hypothesis scored strictly worse at like-for-like depth,
+  counting a matched semantic control's deconfounded delta first) and zero
+  positive contexts. Crash edges never count.
+- `pruned` requires `assessment: unpromising`, `confidence: high`, a
+  non-empty `reopen_when`, and either the strict path or the carrier rule at
+  three or more independent negative carrier contexts with zero positive.
+- A `promising` claim still requires `comparator_covered` with the depth
+  bar. An `unpromising` claim passes on either the strict path or the
+  carrier rule.
 
 `unpromising` means that another outer-search evaluation has low expected
 marginal value after considering attribution, consistency, mechanism,
 counterevidence, untested variants, residual uncertainty/value of information,
-and cost. A worse final score or score delta alone is never sufficient; when
-attribution is weak or relevant variants remain, use `mixed` and keep the
-target active.
+and cost. A single worse score or delta remains insufficient on its own — but
+once the cited evidence meets the carrier rule (≥2 independent negative
+contexts, zero positive), consistency is established and `unpromising` is
+appropriate even without comparator coverage.
 
 Belief recommendations stay separate from runtime eligibility: an entry only
 recommends. Actual `deprioritized`/`pruned` transitions are append-only
 `search_space_state` decisions with their own two-stage, baseline, and
 provenance rules. Second-stage pruning or reopening also requires a later
-snapshot with changed evidence for that target, not merely a newer generation
-or an unrelated DAG update. Dimension contraction requires every selectable
-adjacent non-baseline hypothesis to be equivalently contracted or independently
-gate-qualified in the same generation. The experience extractor may use mechanically rendered
+snapshot with changed evidence for that target — a new paired-control edge, a
+corrected paired receipt, or a changed set of independent carrier contexts —
+not merely a newer generation or an unrelated DAG update. Dimension contraction
+requires every selectable adjacent non-baseline hypothesis to be equivalently
+contracted or independently gate-qualified in the same generation. The
+experience extractor may use mechanically rendered
 point coverage, parent diffs, and bounded target evidence as context, but it
 must not rewrite the space or present membership as causal support.
 
-Runtime `deprioritized` is a real semantic-admission budget lane. Policy
-receipt schema 6 records the one-based selection index, configured
-`deprioritized_budget_interval`, scheduled and selected lanes, fallback, and
-pre-lane rank. Every Nth admission is reserved for the deprioritized lane
-(default 5, or 20%); other admissions are active-lane only. A lane may be
-crossed only when it is empty, and that deterministic fallback must be
-recorded.
+Runtime `deprioritized` content stays eligible but is penalized in selection:
+policy receipt schema 7 records the deterministic carrier prior per selected
+point (`components.experience_prior` and per-hypothesis context counts), and
+repeated negative carrier contexts push a point down the acquisition ranking.
+Pruned content is excluded from proposals outright.
 
 Validate before storing a snapshot:
 
