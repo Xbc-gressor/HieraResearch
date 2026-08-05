@@ -372,7 +372,7 @@ class TuningFinalizationTests(unittest.TestCase):
             report = json.loads(report_path.read_text())
             report["phase_c"]["stages"][0]["trials"] = [
                 {"params": {"x": 1.5 + i / 100.0}, "score": 1.5 + i / 100.0}
-                for i in range(16)
+                for i in range(20)
             ]
             report_path.write_text(json.dumps(report, indent=2))
             finalize_tuning.finalize(

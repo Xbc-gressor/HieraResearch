@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic delegation boundary checks for Claude/OpenCode agent calls."""
+"""Deterministic delegation boundary checks for Claude Code agent calls."""
 
 from __future__ import annotations
 
@@ -183,17 +183,10 @@ def _claude_hook() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--opencode-check", metavar="AGENT")
     parser.add_argument("--compact-result", metavar="AGENT")
     args = parser.parse_args()
     if args.compact_result is not None:
         print(compact_task_result(args.compact_result, sys.stdin.read()))
-        return 0
-    if args.opencode_check is not None:
-        reason = delegation_violation(args.opencode_check, sys.stdin.read())
-        if reason:
-            print(reason)
-            return 3
         return 0
     return _claude_hook()
 
