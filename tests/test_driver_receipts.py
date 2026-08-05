@@ -82,6 +82,17 @@ class ReceiptStoreTests(unittest.TestCase):
             self.assertEqual(stored, {"tuned": False})
             self.assertFalse(list(path.parent.glob("*.tmp")))
 
+    def test_persist_receipt_allow_replace_overwrites_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReceiptStore(Path(tmp))
+            path = store.persist_receipt("tuner-orchestrator", 7, {"tuned": False})
+            replaced = store.persist_receipt(
+                "tuner-orchestrator", 7, {"tuned": True}, allow_replace=True)
+            self.assertEqual(replaced, path)
+            stored = json.loads(path.read_text())
+            self.assertEqual(stored, {"tuned": True})
+            self.assertFalse(list(path.parent.glob("*.tmp")))
+
     def test_session_id_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ReceiptStore(Path(tmp))
@@ -104,6 +115,28 @@ class SubmitReceiptContractTests(unittest.TestCase):
             self.assertTrue(result.get("is_error"))
             self.assertEqual(accepted, [])
             self.assertFalse(list(store._dir().glob("*.json")))
+    def test_resubmission_replaces_receipt_latest_wins(self) -> None:
+        """A corrective follow-up re-submission within one invocation must
+        succeed: accepted keeps both payloads and the disk holds the last."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReceiptStore(Path(tmp))
+            accepted: list[dict] = []
+            first = {"status": "keep", "run_id": "003", "ledger_updated": False}
+            second = {"status": "keep", "run_id": "003", "ledger_updated": True}
+            result1 = asyncio.run(handle_submit_receipt(
+                SCHEMA, store, "idea-generator", 3, accepted,
+                {"receipt": first},
+            ))
+            result2 = asyncio.run(handle_submit_receipt(
+                SCHEMA, store, "idea-generator", 3, accepted,
+                {"receipt": second},
+            ))
+            self.assertFalse(result1.get("is_error"))
+            self.assertFalse(result2.get("is_error"))
+            self.assertEqual(accepted, [first, second])
+            path = store.receipt_path("idea-generator", 3)
+            self.assertEqual(json.loads(path.read_text()), second)
+            self.assertFalse(list(path.parent.glob("*.tmp")))
 
 
 if __name__ == "__main__":

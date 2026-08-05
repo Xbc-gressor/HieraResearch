@@ -92,9 +92,10 @@ class ReceiptStore:
                 highest = max(highest, int(match.group(1)))
         return highest + 1
 
-    def persist_receipt(self, role: str, invocation_id: int, payload: dict) -> Path:
+    def persist_receipt(self, role: str, invocation_id: int, payload: dict,
+                        allow_replace: bool = False) -> Path:
         path = self.receipt_path(role, invocation_id)
-        if path.exists():
+        if path.exists() and not allow_replace:
             raise ReceiptError(f"receipt already exists: {path}")
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -168,7 +169,7 @@ async def handle_submit_receipt(
                          "text": "receipt rejected: " + "; ".join(problems)}],
             "is_error": True,
         }
-    store.persist_receipt(role_name, invocation_id, payload)
+    store.persist_receipt(role_name, invocation_id, payload, allow_replace=True)
     accepted.append(payload)
     return {
         "content": [{"type": "text",
