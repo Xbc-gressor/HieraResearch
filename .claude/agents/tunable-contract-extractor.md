@@ -135,6 +135,28 @@ many warm configs; otherwise **K = 5** (the default). This lets a Phase-3 OFAT
 trial sweep `K` per run with no code edits (mirrors how
 `got_select`/`select-candidate`/`bo_search` read that file).
 
+**Read the hardware ceiling before choosing upper bounds.**
+
+```bash
+python tools/tuners/tune_tools.py vram-brief --run-dir <run_dir>
+```
+
+Returns `feasible_ceiling_mb` (the VRAM peak above which the search-space clamp
+rejects a point) plus `observations`: measured `(params -> peak_vram_mb)` pairs
+from this run. `available: false` or empty `observations` means no anchor — then
+keep upper bounds near the base config rather than inventing a multiple.
+
+Total VRAM alone is misleading: an 80 GB card whose base config already peaks at
+47 GB leaves ~1.4x of room, not 2x. Reason from the **ratio** between a measured
+peak and `feasible_ceiling_mb`, not from the card's size. Which keys drive peak
+is visible in `make_model` (you re-read it in 2b-bis) — in the baseline task
+depth and per-device batch do; gradient accumulation does not, since it
+micro-batches at fixed device batch. Observations may come from structurally
+different candidates, so treat them as approximate and stay conservative.
+
+This only avoids proposing a corner that is obviously infeasible. The clamp
+remains the feasibility authority and will still probe.
+
 Over the `PARAM_SCHEMA` keys, propose together:
 
 **K warm configs** — `[{key: value, ...}]`, each key present, kinds respected.

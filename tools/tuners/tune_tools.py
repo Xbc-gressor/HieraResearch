@@ -31,6 +31,10 @@ Subcommands:
                     proposed --space-json is overwritten in place with finalized_space
                     (apply_search_space.py then writes it into train.py); exit 1 on a
                     hard error.
+- vram-brief      : run_dir -> hardware VRAM ceiling + measured
+                    (params -> peak_vram_mb) anchors from this run, so a
+                    proposed SEARCH_SPACE corner is not obviously infeasible.
+                    Advisory; the search-space clamp stays authoritative.
 - lineage-evidence : run_dir + parent run_ids -> {per_parent} — per parent its
                     idea, best config+score, searched space, explored ranges, and
                     a few whole trials (top-by-score + farthest-point diverse, so
@@ -3613,6 +3617,147 @@ def cmd_summarize(args) -> int:
     return 0
 
 
+# ---------- VRAM brief (hardware anchor for numeric proposal) ----------
+
+# Mirrors _common.SPACE_CLAMP_HEADROOM. Re-declared rather than imported
+# because _common imports numpy at module level and this module must stay
+# stdlib-only (no uv env); tests assert the two stay equal.
+SPACE_CLAMP_HEADROOM = 0.85
+
+VRAM_BRIEF_SCHEMA_VERSION = 1
+VRAM_BRIEF_MAX_OBSERVATIONS = 6
+
+
+def _observation_rank(obs: dict) -> tuple:
+    """Dedupe preference: a worst-case-covering probe beats one that isn't,
+    then the higher peak (the binding measurement for the same params)."""
+    return (obs.get("envelope_covers_worst_case") is not False, obs["peak_vram_mb"])
+
+
+def _vram_observations(run_dir: Path) -> tuple[list[dict], int]:
+    """Every (params -> peak_vram_mb) measurement recorded in this run.
+
+    Reads `preflight.attempts[]`, not the clamp's `probes[]`: probe records
+    carry only a label, while `append_preflight_attempt` persists the full
+    params beside the result. Attempts land for every candidate that clears
+    warmstart, from both 'warmstart' and 'space_clamp' sources.
+    """
+    found: list[dict] = []
+    skipped = 0
+    for report_path in sorted((run_dir / "candidates").glob("*/tune_report.json")):
+        try:
+            report = json.loads(report_path.read_text())
+        except (OSError, ValueError):
+            skipped += 1
+            continue
+        if not isinstance(report, dict):
+            skipped += 1
+            continue
+        attempts = (report.get("preflight") or {}).get("attempts")
+        if not isinstance(attempts, list):
+            continue
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or attempt.get("status") != "ok":
+                continue
+            result, params = attempt.get("result"), attempt.get("params")
+            if not isinstance(result, dict) or not isinstance(params, dict):
+                continue
+            try:
+                peak = float(result["peak_vram_mb"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if peak <= 0:
+                continue
+            found.append({
+                "run_id": report_path.parent.name,
+                "params": params,
+                "peak_vram_mb": peak,
+                "envelope_covers_worst_case": result.get("envelope_covers_worst_case"),
+                "source": attempt.get("source"),
+            })
+    return found, skipped
+
+
+def _select_observations(
+    observations: list[dict], limit: int = VRAM_BRIEF_MAX_OBSERVATIONS
+) -> tuple[list[dict], int]:
+    """Deterministic dedupe, then a bounded spread across the peak range.
+
+    Returns (selected, distinct_count). The highest peak is always kept — it is
+    the binding constraint — and the lowest too, so the consumer can see how
+    peak scales rather than only where the ceiling is.
+    """
+    by_params: dict[str, dict] = {}
+    for obs in observations:
+        key = json.dumps(obs["params"], sort_keys=True, default=str)
+        prior = by_params.get(key)
+        if prior is None or _observation_rank(obs) > _observation_rank(prior):
+            by_params[key] = obs
+    unique = sorted(by_params.values(), key=lambda o: (-o["peak_vram_mb"], o["run_id"]))
+    if len(unique) <= limit or limit < 2:
+        selected = unique[:limit] if limit >= 0 else unique
+    else:
+        picks = sorted(
+            {round(i * (len(unique) - 1) / (limit - 1)) for i in range(limit)}
+        )
+        selected = [unique[i] for i in picks]
+    return (
+        sorted(selected, key=lambda o: (o["run_id"], -o["peak_vram_mb"])),
+        len(unique),
+    )
+
+
+def build_vram_brief(run_dir: Path) -> dict:
+    """Hardware VRAM ceiling plus measured peak anchors from this run.
+
+    Advisory input to numeric proposal only. `clamp_search_space_to_preflight`
+    remains the feasibility authority; this exists so a proposed space's upper
+    corner is not obviously infeasible before the clamp has to probe it.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise SystemExit(f"run dir not found: {run_dir}")
+    brief: dict = {"schema_version": VRAM_BRIEF_SCHEMA_VERSION}
+
+    try:
+        env = json.loads((run_dir / "environment_preflight.json").read_text())
+    except (OSError, ValueError):
+        env = None
+    hook = env.get("hook_result") if isinstance(env, dict) else None
+    total = None
+    if isinstance(hook, dict):
+        try:
+            total = float(hook["total_vram_mb"])
+        except (KeyError, TypeError, ValueError):
+            total = None
+    if total is None or total <= 0:
+        brief["available"] = False
+        brief["reason"] = "no usable hook_result.total_vram_mb in environment_preflight.json"
+        return brief
+
+    device = hook.get("device")
+    found, skipped = _vram_observations(run_dir)
+    selected, distinct = _select_observations(found)
+    brief.update({
+        "available": True,
+        "device": device if isinstance(device, str) else None,
+        "total_vram_mb": total,
+        "headroom": SPACE_CLAMP_HEADROOM,
+        "feasible_ceiling_mb": round(SPACE_CLAMP_HEADROOM * total, 1),
+        "observations": selected,
+        "observation_count": len(found),
+        "distinct_count": distinct,
+        "truncated": len(selected) < distinct,
+        "skipped_reports": skipped,
+    })
+    return brief
+
+
+def cmd_vram_brief(args) -> int:
+    print(json.dumps(build_vram_brief(args.run_dir), indent=2))
+    return 0
+
+
 def cmd_render_failure(args) -> int:
     line_range = None
     if args.view == "lines":
@@ -3840,6 +3985,16 @@ def build_parser() -> argparse.ArgumentParser:
     vpr.add_argument("--tune-report-json", required=True, type=Path)
     vpr.add_argument("--proposals-json", required=True, type=Path)
     vpr.set_defaults(func=cmd_validate_proposals)
+
+    vb = sub.add_parser(
+        "vram-brief",
+        help=(
+            "Hardware VRAM ceiling plus measured (params -> peak_vram_mb) "
+            "anchors from this run, for proposing a feasible SEARCH_SPACE."
+        ),
+    )
+    vb.add_argument("--run-dir", required=True, type=Path)
+    vb.set_defaults(func=cmd_vram_brief)
 
     le = sub.add_parser("lineage-evidence",
                         help="Assemble per-hyperparam (value, score) evidence from parent candidates.")
