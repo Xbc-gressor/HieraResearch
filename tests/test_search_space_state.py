@@ -2030,7 +2030,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 0)
         self.assertTrue(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 8)
+        self.assertEqual(receipt["schema_version"], 7)
         self.assertEqual(receipt["search_space_state_revision"], 0)
 
         # A revision-0 historical record selects the hypothesis to be pruned.
@@ -2070,7 +2070,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         for active, dep in mixed_pairs:
             self.assertLess(positions[active["point_id"]], positions[dep["point_id"]])
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 8)
+        self.assertEqual(receipt["schema_version"], 7)
         self.assertEqual(receipt["search_space_state_revision"], 1)
         self.assertIsNone(receipt["budget"]["selected_lane"])
         self.assertEqual(receipt["budget"]["fallback"], "lanes_removed")
@@ -2085,7 +2085,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(proposals["search_space_state_revision"], 2)
         self.assertFalse(any(self._selects_filtered(p) for p in proposals["proposals"]))
         _, receipt = select_proposal(proposals, policy="coverage")
-        self.assertEqual(receipt["schema_version"], 8)
+        self.assertEqual(receipt["schema_version"], 7)
         self.assertEqual(receipt["search_space_state_revision"], 2)
 
         # 4. The revision-0 historical record remains ledger-valid.
@@ -2291,7 +2291,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             proposals_path.write_text(json.dumps(current))
             self.assertEqual(cmd_select(args), 0)
             written = json.loads(receipt_path.read_text())
-        self.assertEqual(written["schema_version"], 8)
+        self.assertEqual(written["schema_version"], 7)
         self.assertEqual(written["search_space_state_revision"], 1)
 
     def test_schema6_llm_weight_is_auditable_and_schema5_remains_readable(

@@ -36,12 +36,6 @@
     "carrier_neg_weight": 0.2,
     "carrier_neg_cap": 3
   },
-  "predict": {
-    "enabled": true,
-    "shortlist_size": 3,
-    "similarity_threshold": 0.4,
-    "max_precedents": 8
-  },
   "tuner": {
     "K": 5,
     "K_eval": 2,
@@ -79,10 +73,6 @@
     "semantic_search.carrier_pos_cap": "experience prior: maximum positive contexts counted per hypothesis (default 2).",
     "semantic_search.carrier_neg_weight": "experience prior: acquisition penalty per independent negative carrier context for a hypothesis (default 0.2 — deliberately larger than the positive weight: re-probing a deadend wastes budget, a missed exploration costs nothing measurable).",
     "semantic_search.carrier_neg_cap": "experience prior: maximum negative contexts counted per hypothesis (default 3).",
-    "predict.enabled": "outer PREDICT step: when true, the idea-generator shortlists the acquisition head, sketches each shortlisted point, and runs a strict-consensus pairwise tournament before writing one full candidate. Set false to select the acquisition top-1 directly (the pre-PREDICT behavior). The step spends judge tokens, not evaluation slots — it never touches max_evaluations.",
-    "predict.shortlist_size": "outer PREDICT step: how many top-ranked proposals enter the tournament (default 3, allowed [2,8]). Cost is quadratic: a shortlist of N costs N*(N-1) judge calls because every pair is judged in both presentation orders. 3 = 6 calls.",
-    "predict.similarity_threshold": "outer PREDICT step: minimum similarity for a prior ledger record to be shown as a precedent (default 0.40). Below it, loosely related attempts get pulled in; the source reported flat selective accuracy across 0.40-0.55. A thin precedent list is the correct output for a genuinely novel candidate — the layer does not pad it.",
-    "predict.max_precedents": "outer PREDICT step: maximum precedents rendered per shortlisted candidate (default 8). Each renders as one line carrying only the change description and a binary worked/did-not-work label; adding failure reasons or summaries measurably lowered selective accuracy in the source ablation.",
     "tuner.K": "inner: number of warm-start configs the tunable-contract-extractor PROPOSES per candidate (default 5; read by the AGENT). OFAT {3,5,8} — highest-impact inner knob.",
     "tuner.K_eval": "inner: how many of the K proposed warm configs are uniformly sampled without replacement and EVALUATED at step 0+1 (default 2, minimum 2; best-of-K_eval = screening score). Was 3; lowered because screening is where budget goes to die — run 0802-sonnet-ex125-1 spent 74 of 124 evaluations on it for zero score improvements. 2 is the floor that still gives a non-fresh candidate one inherited fidelity control plus one selectable treatment row. Also raises got_select's admission cap floor(remaining/max(2,K_eval)), so fewer slots end up unspendable at the end of a run. The sampled permutation is persisted in tune_report.phase_a.warm_config_selection for exact resume; list order has no screening priority. The remaining K−K_eval are DEFERRED — stored params-only in tune_report.phase_a.deferred_configs and evaluated by the deep-tuner FIRST (bo enqueue / grid prepend) ONLY if the candidate is promoted. Saves (K−K_eval) evals on every un-promoted candidate; budget-neutral for promoted ones (deferred are extra initial trials). K_eval>=K disables deferral (evaluate all).",
     "tuner.n_min": "inner: min population before deep-tune fires. NOW DERIVED from top_percentile = ceil(100/(100-P)) (P=80→5); this key is only an explicit OVERRIDE.",
