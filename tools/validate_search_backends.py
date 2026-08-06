@@ -73,24 +73,25 @@ def main() -> int:
         assert response["metadata"]["corpus_id"] == "fixture-v1"
 
         manifest_path = Path(tmp) / "retrieval.json"
+        search_cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("search_backends.py")),
+            "search",
+            "--manifest",
+            str(manifest_path),
+            "--frozen-corpus",
+            str(corpus_path),
+            "--query-spec",
+            json.dumps(
+                {
+                    "text": "regularized trees",
+                    "target_dimension_ids": ["dim-method-choice"],
+                    "evidence_roles": ["hypothesis"],
+                }
+            ),
+        ]
         search_run = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("search_backends.py")),
-                "search",
-                "--manifest",
-                str(manifest_path),
-                "--frozen-corpus",
-                str(corpus_path),
-                "--query-spec",
-                json.dumps(
-                    {
-                        "text": "regularized trees",
-                        "target_dimension_ids": ["dim-method-choice"],
-                        "evidence_roles": ["hypothesis"],
-                    }
-                ),
-            ],
+            search_cmd,
             text=True,
             capture_output=True,
             check=False,
@@ -118,6 +119,71 @@ def main() -> int:
         assert frozen_manifest["backend_calls"][0]["raw_response"]
         assert frozen_manifest["visits"][0]["content_sha256"]
         assert validate_manifest(frozen_manifest) == []
+
+        research_run = subprocess.run(
+            search_cmd,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert research_run.returncode == 0, research_run.stderr or research_run.stdout
+        researched_manifest = json.loads(manifest_path.read_text())
+        assert [visit["url"] for visit in researched_manifest["visits"]] == [
+            "https://paper.test/trees"
+        ], "re-running search must retain prior visit receipts"
+        assert validate_manifest(researched_manifest) == []
+
+        corpus_path_2 = Path(tmp) / "frozen-v2.json"
+        corpus_path_2.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "corpus_id": "fixture-v2",
+                    "cutoff": "2025-06-01",
+                    "created_at": "2025-06-02T00:00:00Z",
+                    "provenance": "Synthetic network-free regression fixture, revised.",
+                    "prepared_before_task_ids": True,
+                    "items": [
+                        {
+                            "url": "https://paper.test/trees-v2",
+                            "title": "Regularized trees revisited",
+                            "abstract": "Regularized tree models, revised edition.",
+                            "text": "Revised retained method and results for regularized trees.",
+                        }
+                    ],
+                }
+            )
+        )
+        other_corpus_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "search",
+                "--manifest",
+                str(manifest_path),
+                "--frozen-corpus",
+                str(corpus_path_2),
+                "--query-spec",
+                json.dumps(
+                    {
+                        "text": "regularized trees",
+                        "target_dimension_ids": ["dim-method-choice"],
+                        "evidence_roles": ["hypothesis"],
+                    }
+                ),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert other_corpus_run.returncode == 0, (
+            other_corpus_run.stderr or other_corpus_run.stdout
+        )
+        other_corpus_manifest = json.loads(manifest_path.read_text())
+        assert other_corpus_manifest["visits"] == [], (
+            "re-search under a different frozen corpus must not retain prior visits"
+        )
+        assert validate_manifest(other_corpus_manifest) == []
 
         implicit_external = subprocess.run(
             [
@@ -151,6 +217,27 @@ import sys
 args = sys.argv[1:]
 if args == ["--version"]:
     print("deepxiv fake-1")
+elif args and args[0] == "search":
+    print(json.dumps({"result": [
+        {
+            "arxiv_id": "2409.05591",
+            "title": "Progressive fixture",
+            "abstract": "A metadata-only abstract.",
+            "score": 0.87,
+            "categories": ["cs.LG", "stat.ML"],
+            "venue": "ICLR",
+            "citation_count": 12
+        },
+        {
+            "arxiv_id": "2409.05592",
+            "title": "Second fixture",
+            "tldr": "Second fixture summary.",
+            "score": 0.41,
+            "categories": ["cs.CV"],
+            "venue": None,
+            "citation_count": 0
+        }
+    ]}))
 elif args and args[0] == "paper" and "--head" in args:
     paper_id = args[1]
     print(json.dumps({
@@ -278,6 +365,147 @@ else:
         assert head_only_manifest["visits"][-1]["status"] == "failed"
         assert validate_manifest(head_only_manifest) == []
 
+        deepxiv_search_path = Path(tmp) / "deepxiv-search.json"
+        deepxiv_search_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "search",
+                "--manifest",
+                str(deepxiv_search_path),
+                "--lane",
+                "grounding",
+                "--query-spec",
+                json.dumps(
+                    {
+                        "text": "fixture mechanism",
+                        "target_dimension_ids": ["dim-method-choice"],
+                        "evidence_roles": ["hypothesis"],
+                    }
+                ),
+                "--backend",
+                "deepxiv",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert deepxiv_search_run.returncode == 0, (
+            deepxiv_search_run.stderr or deepxiv_search_run.stdout
+        )
+        deepxiv_manifest = json.loads(deepxiv_search_path.read_text())
+        assert [item["external_id"] for item in deepxiv_manifest["results"]] == [
+            "2409.05591",
+            "2409.05592",
+        ]
+        assert deepxiv_manifest["results"][0]["retrieval_signals"] == [
+            {
+                "query_id": "q-01",
+                "backend": "deepxiv",
+                "rank": 1,
+                "score": 0.87,
+                "categories": ["cs.LG", "stat.ML"],
+                "venue": "ICLR",
+                "citation_count": 12,
+            }
+        ]
+        assert deepxiv_manifest["results"][1]["retrieval_signals"][0]["score"] == 0.41
+        assert deepxiv_manifest["results"][1]["retrieval_signals"][0]["venue"] is None
+        assert validate_manifest(deepxiv_manifest) == []
+
+        fetched = Path(tmp) / "fetched-content.txt"
+        fetched.write_text("external web evidence " * 50)
+        record_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "record-visit",
+                "--manifest",
+                str(deepxiv_search_path),
+                "--lane",
+                "grounding",
+                "--backend",
+                "claude-webfetch",
+                "--view",
+                "page",
+                "--status",
+                "success",
+                "--content-file",
+                str(fetched),
+                "--url",
+                "https://example.test/evidence",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert record_run.returncode == 0, record_run.stderr or record_run.stdout
+
+        deepxiv_spec = json.dumps(
+            {
+                "text": "fixture mechanism",
+                "target_dimension_ids": ["dim-method-choice"],
+                "evidence_roles": ["hypothesis"],
+            }
+        )
+        same_condition_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "search",
+                "--manifest",
+                str(deepxiv_search_path),
+                "--lane",
+                "grounding",
+                "--query-spec",
+                deepxiv_spec,
+                "--backend",
+                "deepxiv",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert same_condition_run.returncode == 0, (
+            same_condition_run.stderr or same_condition_run.stdout
+        )
+        assert len(json.loads(deepxiv_search_path.read_text())["visits"]) == 1, (
+            "re-search under the same retrieval condition must retain visits"
+        )
+
+        changed_condition_run = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "search",
+                "--manifest",
+                str(deepxiv_search_path),
+                "--lane",
+                "grounding",
+                "--query-spec",
+                json.dumps(
+                    {
+                        "text": "regularized trees",
+                        "target_dimension_ids": ["dim-method-choice"],
+                        "evidence_roles": ["hypothesis"],
+                    }
+                ),
+                "--frozen-corpus",
+                str(corpus_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert changed_condition_run.returncode == 0, (
+            changed_condition_run.stderr or changed_condition_run.stdout
+        )
+        assert json.loads(deepxiv_search_path.read_text())["visits"] == [], (
+            "re-search under a changed retrieval condition must not retain visits"
+        )
+
     queries = [
         {
             "id": "q-01",
@@ -302,16 +530,18 @@ else:
                     "url": "https://arxiv.org/abs/2203.11171v2",
                     "title": "Shared paper",
                     "snippet": "short",
+                    "score": 0.05,
                 },
-                {"url": "https://only-a.test", "title": "A", "snippet": "a"},
+                {"url": "https://only-a.test", "title": "A", "snippet": "a", "score": 0.01},
             ],
             "tree baseline failures": [
                 {
                     "url": "https://arxiv.org/abs/2203.11171",
                     "title": "Shared paper",
                     "snippet": "longer shared snippet",
+                    "score": 0.05,
                 },
-                {"url": "https://only-b.test", "title": "B", "snippet": "b"},
+                {"url": "https://only-b.test", "title": "B", "snippet": "b", "score": 0.99},
             ],
         },
     )
@@ -332,10 +562,46 @@ else:
     assert len(failures) == 2
 
     merged = merge_candidates(raw)
+    assert [item["canonical_key"] for item in merged] == [
+        "arxiv:2203.11171",
+        "only-a.test/",
+        "only-b.test/",
+    ], "retrieval scores must not influence merge ordering"
     shared = next(item for item in merged if item["canonical_key"] == "arxiv:2203.11171")
     assert shared["query_support"] == 2
     assert shared["backend_support"] == 2
     assert shared["snippet"] == "longer shared snippet"
+    assert shared["retrieval_signals"] == [
+        {
+            "query_id": "q-01",
+            "backend": "deepxiv",
+            "rank": 1,
+            "score": 0.05,
+            "categories": None,
+            "venue": None,
+            "citation_count": None,
+        },
+        {
+            "query_id": "q-01",
+            "backend": "jina",
+            "rank": 1,
+            "score": None,
+            "categories": None,
+            "venue": None,
+            "citation_count": None,
+        },
+        {
+            "query_id": "q-02",
+            "backend": "deepxiv",
+            "rank": 1,
+            "score": 0.05,
+            "categories": None,
+            "venue": None,
+            "citation_count": None,
+        },
+    ]
+    only_b = next(item for item in merged if item["canonical_key"] == "only-b.test/")
+    assert only_b["retrieval_signals"][0]["score"] == 0.99
 
     selected = select_balanced(merged, ["q-01", "q-02"])
     assert selected[0] == "arxiv:2203.11171"

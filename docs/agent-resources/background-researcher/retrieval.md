@@ -34,23 +34,32 @@ condition.
 
 ## Search dispatch
 
-Dispatch the planned questions together through the local adapter. Replace
-each placeholder dimension with an exact id from the resolved registry:
+Dispatch the planned questions together through the local adapter. Keep each
+query atomic: one named mechanism or evidence target, phrased as a short
+paper-like noun phrase. Split compound architecture+optimizer+schedule
+questions before dispatch, and avoid overloaded generic terms that retrieval
+backends latch onto. Route by source type: paper-shaped questions go to the
+frozen corpus or DeepXiv; repositories and practitioner systems (e.g.
+nanoGPT, nanochat, LLM101n) are never arXiv search targets — in an open-world
+condition, route them to the runtime web fallback lane; in a frozen
+condition, which never mixes in live evidence, cover them only from the
+pinned corpus or declare a coverage exemption. Replace each placeholder
+dimension with an exact id from the resolved registry:
 
 ```bash
 # Reproducible condition:
 python tools/search_backends.py search \
   --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --query-spec '{"text":"Which mechanisms address the dominant task failure under its declared constraints?","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","counterevidence"]}' \
-  --query-spec '{"text":"Which results are the standard strong comparators for this problem class?","target_dimension_ids":[],"evidence_roles":["baseline"]}' \
-  --query-spec '{"text":"Which numeric ranges are stable for the task-declared parameters?","target_dimension_ids":[],"evidence_roles":["inner_hpo_prior"]}' \
+  --query-spec '{"text":"muP hyperparameter transfer","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","counterevidence"]}' \
+  --query-spec '{"text":"sequence-length warmup","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis"]}' \
+  --query-spec '{"text":"GPT-2 small learning rate","target_dimension_ids":[],"evidence_roles":["inner_hpo_prior"]}' \
   --coverage-exemption '{"dimension_id":"<exact-uncovered-dim-id>","rationale":"<why applicable literature evidence is unavailable>"}' \
   --frozen-corpus <pinned-corpus.json>
 
 # Or, explicitly, an open-world condition:
 python tools/search_backends.py search \
   --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --query-spec '{"text":"<bounded evidence question>","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","baseline"]}' \
+  --query-spec '{"text":"<atomic mechanism or evidence target>","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","baseline"]}' \
   --backend deepxiv
 ```
 
@@ -61,6 +70,16 @@ unavailable/failing backends, canonicalizes URLs, deduplicates across backends
 and queries, ranks by the number of **distinct** supporting queries, then
 balances the selected set so one broad query cannot erase the others. Backend
 and query agreement are retrieval signals, not scientific corroboration.
+Each merged result also carries `retrieval_signals` — one entry per hit with
+its `query_id`, `backend`, `rank`, and, when the backend provides them,
+`score`, `categories`, `venue`, and `citation_count`. Use them to triage the
+selected set before reading; they inform reading order and rejection
+decisions, but they are not relevance guarantees and never replace a
+substantive visit. Re-running `search` against an existing manifest replaces
+queries, results, and the selected set, and retains previously recorded visit
+receipts only when the retrieval condition and the frozen corpus (matched by
+SHA-256) are unchanged; under a different condition or corpus, prior visits
+are dropped rather than mixed into the new evidence base.
 
 ## Visits and progressive reading
 

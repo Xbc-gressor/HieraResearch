@@ -532,6 +532,10 @@ class DeepXivBackend(SearchBackend):
                     "title": row.get("title") or "No title",
                     "snippet": row.get("abstract") or row.get("tldr") or "",
                     "external_id": paper_id,
+                    "score": row.get("score"),
+                    "categories": row.get("categories"),
+                    "venue": row.get("venue"),
+                    "citation_count": row.get("citation_count"),
                 }
             )
         return {
@@ -623,8 +627,20 @@ def merge_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "rank_sum": 0,
                 "hit_count": 0,
                 "external_id": candidate.get("external_id"),
+                "retrieval_signals": [],
             }
             merged[key] = current
+        current["retrieval_signals"].append(
+            {
+                "query_id": candidate.get("query_id"),
+                "backend": candidate.get("backend"),
+                "rank": candidate.get("rank"),
+                "score": candidate.get("score"),
+                "categories": candidate.get("categories"),
+                "venue": candidate.get("venue"),
+                "citation_count": candidate.get("citation_count"),
+            }
+        )
         current["rank_sum"] += candidate.get("rank", 9999)
         current["hit_count"] += 1
         current["best_rank"] = min(current["best_rank"], candidate.get("rank", 9999))
@@ -1122,10 +1138,6 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "errors": plan_errors}, indent=2), file=sys.stderr)
         return 1
 
-    if args.manifest.exists():
-        existing = load_manifest(args.manifest)
-        _reject_legacy_manifest(existing)
-    manifest = new_manifest()
     names = args.backend or (["frozen"] if args.frozen_corpus else [])
     if not names:
         print(
@@ -1141,6 +1153,31 @@ def cmd_search(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    condition = (
+        "frozen"
+        if set(names) == {"frozen"}
+        else "open_world"
+        if "frozen" not in names
+        else "mixed"
+    )
+    corpus_sha256 = (
+        hashlib.sha256(Path(args.frozen_corpus).read_bytes()).hexdigest()
+        if args.frozen_corpus
+        else None
+    )
+
+    prior_visits: list[dict[str, Any]] = []
+    if args.manifest.exists():
+        existing = load_manifest(args.manifest)
+        _reject_legacy_manifest(existing)
+        same_condition = existing.get("retrieval_condition") in (None, condition)
+        same_corpus = corpus_sha256 is None or existing.get("frozen_corpus_sha256") in (
+            None,
+            corpus_sha256,
+        )
+        if same_condition and same_corpus:
+            prior_visits = existing.get("visits", [])
+    manifest = new_manifest()
     backends, unavailable = build_backends(names, args.frozen_corpus)
     raw, failures, calls = asyncio.run(dispatch_search(queries, backends, args.max_results))
     for failure in unavailable:
@@ -1160,19 +1197,14 @@ def cmd_search(args: argparse.Namespace) -> int:
         {
             "schema_version": SCHEMA_VERSION,
             "lane_budgets": dict(LANE_BUDGETS),
-            "retrieval_condition": (
-                "frozen"
-                if set(names) == {"frozen"}
-                else "open_world"
-                if "frozen" not in names
-                else "mixed"
-            ),
+            "retrieval_condition": condition,
+            "frozen_corpus_sha256": corpus_sha256,
             "queries": queries,
             "coverage_exemptions": exemptions,
             "results": results,
             "selected_keys": select_balanced(results, [q["id"] for q in queries]),
             "backend_calls": calls,
-            "visits": [],
+            "visits": prior_visits,
             "backend_failures": unavailable + failures,
         }
     )

@@ -56,6 +56,12 @@ If `[seed].provided` declares the candidate entrypoint, note its path now. Under
 final: the supplied solution may ground baseline values, but must not determine
 which dimensions exist.
 
+If `<run_dir>/environment_preflight.json` exists, read it before writing any
+task framing. Hardware and runtime claims (GPU model, compute capability,
+package versions) must come from fields actually present in that receipt. If a
+fact is absent from the receipt, omit the claim — never infer an environment
+fact from the task name, prior runs, or general knowledge.
+
 ### Step 2 — Resolve and freeze the dimensions
 
 Read `<run_dir>/framework_cfg.json`. Resolve
@@ -158,6 +164,20 @@ design, pipeline construction, …):
   declared constraints.
 - Strong baselines, negative results, replications, and contradictions of
   attractive claims.
+
+Keep every query atomic and short: one named mechanism or evidence target per
+query, phrased as a paper-like noun phrase (e.g. "muP hyperparameter
+transfer", "sequence-length warmup", "Fixup initialization") rather than a
+multi-constraint natural-language question. Split questions that combine
+architecture, optimizer, and schedule concerns into separate queries, and
+avoid overloaded generic terms (such as "strong", "fixed", "metric") that
+retrieval backends latch onto instead of the intended entities. Route by
+source type: DeepXiv and the frozen corpus answer paper-shaped questions;
+repositories and practitioner systems (e.g. nanoGPT, nanochat, LLM101n) are
+not arXiv search targets — in an open-world condition, use the runtime web
+fallback lane for them; in a frozen condition, rely on the pinned corpus or
+record a coverage exemption instead. The number of queries follows from
+dimension and evidence-role coverage, not from a global cap.
 
 Then map each question to the search space. Record the exact `dim-*` ids it
 genuinely informs and its evidence roles (`hypothesis`, `baseline`,
