@@ -39,5 +39,33 @@ class MetadataTests(unittest.TestCase):
             self.assertEqual(metadata.warn_on_mismatch(Path(tmp), "m", None), [])
 
 
+class ResolveModelTests(unittest.TestCase):
+    def test_fresh_dir_returns_cli_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, warning = metadata.resolve_model("model-a", Path(tmp))
+            self.assertEqual((model, warning), ("model-a", None))
+
+    def test_fresh_dir_without_model_yields_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(metadata.resolve_model(None, Path(tmp)),
+                             (None, None))
+
+    def test_matching_cli_model_is_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            metadata.write_metadata(run_dir, "model-a", None)
+            self.assertEqual(metadata.resolve_model("model-a", run_dir),
+                             ("model-a", None))
+
+    def test_stored_model_wins_over_mismatching_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            metadata.write_metadata(run_dir, "model-a", None)
+            model, warning = metadata.resolve_model("model-b", run_dir)
+            self.assertEqual(model, "model-a")
+            self.assertIn("--model model-b ignored", warning)
+            self.assertIn("model-a", warning)
+
+
 if __name__ == "__main__":
     unittest.main()

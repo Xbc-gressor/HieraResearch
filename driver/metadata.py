@@ -52,6 +52,23 @@ def collect_metadata(model: str, cli_path: str | None) -> dict:
     }
 
 
+def resolve_model(cli_model: str | None, run_dir: Path) -> tuple[str | None, str | None]:
+    """Resolve the effective model. Returns (model, warning).
+
+    On resume (run_metadata.json exists) the stored model always wins; an
+    explicit --model that differs yields a warning, never an override.
+    """
+    stored_path = run_dir / "run_metadata.json"
+    if stored_path.exists():
+        stored = json.loads(stored_path.read_text(encoding="utf-8")).get("model")
+        warning = None
+        if cli_model is not None and cli_model != stored:
+            warning = (f"--model {cli_model} ignored; resumed run keeps "
+                       f"stored model {stored}")
+        return stored, warning
+    return cli_model, None
+
+
 def write_metadata(run_dir: Path, model: str, cli_path: str | None) -> dict:
     meta = collect_metadata(model, cli_path)
     run_dir.mkdir(parents=True, exist_ok=True)

@@ -123,6 +123,15 @@ def _load_loop_state(path: Path) -> dict[str, str]:
     return state
 
 
+def exit_code_for(status: dict, loop: str) -> int:
+    """CLI exit code (Level-3 contract): a blocked run exits non-zero."""
+    if loop == "experiment":
+        return 1 if status.get("phase") == "blocked" else 0
+    if loop == "hillclimb":
+        return 1 if status.get("active_stop_condition") not in (None, "none") else 0
+    return 0
+
+
 def compact_status(task: str, tag: str, run_dir: Path,
                    repo_root: Path = REPO_ROOT, cmd=None) -> dict:
     ledger = _load_json(run_dir / "ledger.json")

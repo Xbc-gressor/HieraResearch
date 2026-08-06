@@ -8,7 +8,12 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from driver.status import budget_status, compact_status, derive_phase  # noqa: E402
+from driver.status import (  # noqa: E402
+    budget_status,
+    compact_status,
+    derive_phase,
+    exit_code_for,
+)
 
 
 class DerivePhaseTests(unittest.TestCase):
@@ -159,6 +164,29 @@ class CompactStatusTests(unittest.TestCase):
             status = compact_status("unit", "t5", run_dir, ROOT, cmd)
             self.assertEqual(status["phase"], "running")
             self.assertNotIn("next_run_id", status)
+
+
+class ExitCodeTests(unittest.TestCase):
+    def test_experiment_blocked_exits_1(self) -> None:
+        self.assertEqual(
+            exit_code_for({"phase": "blocked"}, "experiment"), 1)
+
+    def test_experiment_completed_and_running_exit_0(self) -> None:
+        self.assertEqual(
+            exit_code_for({"phase": "completed"}, "experiment"), 0)
+        self.assertEqual(
+            exit_code_for({"phase": "running"}, "experiment"), 0)
+
+    def test_hillclimb_none_stop_condition_exits_0(self) -> None:
+        self.assertEqual(
+            exit_code_for({"active_stop_condition": "none"}, "hillclimb"), 0)
+        self.assertEqual(
+            exit_code_for({"active_stop_condition": None}, "hillclimb"), 0)
+
+    def test_hillclimb_concrete_stop_condition_exits_1(self) -> None:
+        self.assertEqual(
+            exit_code_for({"active_stop_condition": "editor bootstrap failed"},
+                          "hillclimb"), 1)
 
 
 if __name__ == "__main__":

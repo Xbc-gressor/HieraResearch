@@ -23,6 +23,8 @@ project = "tasks/fake-task"
 [result]
 metric = "neg_acc"
 [run]
+working_dir = "tasks/fake-task"
+prepare_command = "uv run python prepare.py"
 [constraints]
 editable_files = ["train.py"]
 readonly_files = ["prepare.py"]
@@ -39,6 +41,7 @@ class ExperimentCmd:
     def __init__(self, repo: Path):
         self.repo = repo
         self.calls: list[str] = []
+        self.cwds: list = []
         self.brief_queue: list[dict] = []
         self.reached: list[bool] = []
         self.fail_next: set[str] = set()
@@ -59,6 +62,7 @@ class ExperimentCmd:
         args = [str(a) for a in args]
         joined = " ".join(args)
         self.calls.append(joined)
+        self.cwds.append(kw.get("cwd"))
         for marker in self.fail_next:
             if marker in joined:
                 self.fail_next.discard(marker)
@@ -395,6 +399,93 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(roles, ["background-researcher"])
         self.assertTrue((run_dir / "background.md").exists())
         self.assertTrue((run_dir / "run_metadata.json").exists())
+
+    def test_prepare_runs_in_task_working_dir(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, True]
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: (
+                 (ctx.run_dir / "background.md").write_text("# bg\n"),
+                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        idx = cmd.calls.index("uv run python prepare.py")
+        self.assertEqual(cmd.cwds[idx], self.repo / "tasks" / "fake-task")
+
+    def test_prepare_failure_blocks_run(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.raise_once = {"prepare.py"}
+        runner = FakeSessionRunner([])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        events = (cmd.run_dir / "driver_events.jsonl").read_text()
+        self.assertIn("prepare_command failed", events)
+
+    def _seed_resumed_provided_run(self, ledger: dict | None) -> Path:
+        """Killed after init_run/background but before add-record 000."""
+        write_task(self.repo, provided=True)
+        run_dir = self.repo / "runs" / "fake-task" / "t1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "framework_cfg.json").write_text(json.dumps(
+            {"max_evaluations": 3, "dimension_strategy": "catalog_subset"}))
+        (run_dir / "background.md").write_text("# bg\n")
+        (run_dir / "background_retrieval.json").write_text("{}")
+        if ledger is not None:
+            (run_dir / "ledger.json").write_text(json.dumps(ledger))
+        return run_dir
+
+    def test_resume_reconciles_missing_provided_baseline(self) -> None:
+        # resume-shaped run with a provided seed and NO ledger: the baseline
+        # must be admitted before any ideation, not skipped
+        self._seed_resumed_provided_run(ledger=None)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [True]  # budget exhausted at the first step-0 check
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "existing", "wrote": False,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger()["records"][0]["run_id"], "000")
+        roles = [name for name, _ in runner.calls]
+        self.assertNotIn("idea-generator", roles)
+        self.assertEqual(roles, ["candidate-writer",
+                                 "tunable-contract-extractor"])
+
+    def test_resume_blocks_when_baseline_record_lost(self) -> None:
+        # ledger has records but no 000: retrofitting the control is
+        # forbidden, so the run blocks instead of ideating on
+        run_dir = self._seed_resumed_provided_run(
+            ledger={"records": [{"run_id": "001", "status": "keep"}]})
+        cmd = ExperimentCmd(self.repo)
+        runner = FakeSessionRunner([])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        events = (run_dir / "driver_events.jsonl").read_text()
+        self.assertIn("retrofitting the control", events)
+        roles = [name for name, _ in runner.calls]
+        self.assertNotIn("idea-generator", roles)
 
 
 if __name__ == "__main__":

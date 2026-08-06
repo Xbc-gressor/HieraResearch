@@ -22,8 +22,10 @@ def write_task(repo: Path, with_entrypoint: bool = True) -> None:
 project = "tasks/fake-task"
 [result]
 metric = "neg_acc"
+required_patterns = ["^neg_acc:", "^best_model:"]
 [run]
-prepare_command = ""
+working_dir = "tasks/fake-task"
+prepare_command = "uv run python prepare.py"
 [constraints]
 editable_files = ["train.py"]
 readonly_files = ["prepare.py"]
@@ -38,7 +40,9 @@ allow_dependencies = false
 class FakeCmd:
     """Fakes tools/ helper + entrypoint subprocesses keyed by argv content.
 
-    scores: queue of metric values the entrypoint 'prints' into run.log.
+    scores: queue of outcomes the entrypoint 'prints' into run.log. Each item
+    is a float/None (metric value) or a dict {"score", "exit", "companion"}
+    for adversarial cases (nonzero exit, missing required companion line).
     reserve_exhausted: when True, reserve exits 4.
     """
 
@@ -47,6 +51,8 @@ class FakeCmd:
         self.scores = list(scores)
         self.reserved = 0
         self.calls: list[list[str]] = []
+        self.cwds: list = []
+        self.raise_once: set[str] = set()
 
     def _budget_cap(self) -> float:
         cfg = self.run_dir / "framework_cfg.json"
@@ -62,8 +68,14 @@ class FakeCmd:
 
     def __call__(self, args, repo_root, check=True, capture=True, **kw):
         self.calls.append(list(args))
+        self.cwds.append(kw.get("cwd"))
         joined = " ".join(str(a) for a in args)
         run_dir = self.run_dir
+        for marker in list(self.raise_once):
+            if marker in joined:
+                self.raise_once.discard(marker)
+                raise subprocess.CalledProcessError(
+                    1, args, "", f"helper refused: {marker}")
 
         if "init_run.py" in joined:
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -83,11 +95,21 @@ class FakeCmd:
         if "preflight_candidate.py" in joined or "preflight_env.py" in joined:
             return self._ok("{}")
         if "timed_run.py" in joined or joined.endswith("train.py"):
-            # the entrypoint run: write run.log with the next scripted score
-            score = self.scores.pop(0) if self.scores else None
-            kw["stdout"].write(
-                "training...\n" + (f"neg_acc: {score}\n" if score is not None else ""))
-            return subprocess.CompletedProcess(args, 0, "", "")
+            # the entrypoint run: write run.log with the next scripted outcome
+            item = self.scores.pop(0) if self.scores else None
+            if isinstance(item, dict):
+                score = item.get("score")
+                exit_code = item.get("exit", 0)
+                companion = item.get("companion", True)
+            else:
+                score, exit_code, companion = item, 0, True
+            text = "training...\n"
+            if score is not None:
+                text += f"neg_acc: {score}\n"
+            if companion:
+                text += "best_model: checkpoint.pt\n"
+            kw["stdout"].write(text)
+            return subprocess.CompletedProcess(args, exit_code, "", "")
         return self._ok("{}")
 
     @staticmethod
@@ -280,6 +302,70 @@ class HillclimbTests(unittest.TestCase):
         self.assertEqual(rows[1][1:3], ["-0.600000", "keep"])  # first finite keeps
         self.assertEqual((self.run_dir() / "best.py").read_text(), "# fixed\n")
         self.assertEqual(status["active_stop_condition"], "none")
+
+    def test_prepare_runs_in_task_working_dir(self) -> None:
+        cmd = FakeCmd(self.repo, scores=[-0.50])
+        runner = FakeSessionRunner([])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd, max_evaluations=1)
+        idx = next(i for i, c in enumerate(cmd.calls)
+                   if " ".join(str(a) for a in c) == "uv run python prepare.py")
+        self.assertEqual(cmd.cwds[idx], self.repo / "tasks" / "fake-task")
+
+    def test_prepare_failure_blocks_without_traceback(self) -> None:
+        cmd = FakeCmd(self.repo, scores=[])
+        cmd.raise_once = {"prepare.py"}
+        runner = FakeSessionRunner([])
+        status = run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                               repo_root=self.repo, cmd=cmd, max_evaluations=3)
+        self.assertIn("prepare_command failed",
+                      status["active_stop_condition"])
+
+    def test_missing_companion_pattern_scores_crash(self) -> None:
+        # metric line present but the required best_model line absent: the
+        # process did not complete its contract, so the score must not count
+        cmd = FakeCmd(self.repo,
+                      scores=[-0.73, {"score": -0.80, "companion": False}])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "x"},
+             "side_effects": edit_train_py("# v2\n")},
+        ])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd, max_evaluations=2,
+                      crash_repairs=0)
+        rows = self.rows()
+        self.assertEqual(rows[0][1:3], ["-0.730000", "keep"])
+        self.assertEqual(rows[1][1:3], ["inf", "crash"])
+
+    def test_nonzero_exit_despite_metric_line_scores_crash(self) -> None:
+        cmd = FakeCmd(self.repo,
+                      scores=[-0.73, {"score": -0.80, "exit": 1}])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "x"},
+             "side_effects": edit_train_py("# v2\n")},
+        ])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd, max_evaluations=2,
+                      crash_repairs=0)
+        rows = self.rows()
+        self.assertEqual(rows[0][1:3], ["-0.730000", "keep"])
+        self.assertEqual(rows[1][1:3], ["inf", "crash"])
+
+    def test_keep_snapshot_and_best_are_identical(self) -> None:
+        # snapshot-before-row ordering: after any keep, history/<step>.py and
+        # best.py hold the same content, so _restore_best can always repair
+        cmd = FakeCmd(self.repo, scores=[-0.50, -0.81])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "bigger model"},
+             "side_effects": edit_train_py("# v2\n")},
+        ])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd, max_evaluations=3)
+        run_dir = self.run_dir()
+        self.assertEqual((run_dir / "history" / "000.py").read_text(),
+                         "# baseline implementation\n")
+        self.assertEqual((run_dir / "history" / "001.py").read_text(),
+                         (run_dir / "best.py").read_text())
 
 
 if __name__ == "__main__":

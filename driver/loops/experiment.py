@@ -274,13 +274,14 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
     cmd(["uv", "--directory", f"tasks/{task}", "sync"], repo_root)
-    prepare = task_toml.get("run", {}).get("prepare_command")
-    if prepare:
-        # the protocol gates this on "required assets absent"; the task
-        # contract exposes no deterministic signal for that, so a declared
-        # prepare command runs on fresh setup (same choice as the hillclimb
-        # port). A non-idempotent prepare command is a task-contract bug.
-        cmd(prepare.split(), repo_root)
+    # the protocol gates this on "required assets absent"; the task
+    # contract exposes no deterministic signal for that, so a declared
+    # prepare command runs on fresh setup (same choice as the hillclimb
+    # port). A non-idempotent prepare command is a task-contract bug.
+    try:
+        common.run_prepare(task, task_toml, repo_root, cmd)
+    except RuntimeError as exc:
+        _or_block(run_dir, repo_root, cmd, events, str(exc))
     common.preflight_env(task, run_dir, repo_root, cmd)
     write_metadata(run_dir, model, cli_path)
 
@@ -294,11 +295,6 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
                   f"background-researcher failed: {exc.problems}")
     _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
                          events, strategy)
-
-    seed = task_toml.get("seed", {})
-    if seed.get("provided"):
-        _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
-                           events, seed)
 
 
 def _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
@@ -449,6 +445,21 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                               f"background-researcher failed: {exc.problems}")
                 _validate_background(runner, store, task, tag, run_dir,
                                      repo_root, cmd, events, strategy)
+
+        # seed contract reconciliation (fresh setup AND resume): a kill
+        # between init_run and the baseline's add-record must not resume
+        # into seedless ideation.
+        seed = task_toml.get("seed", {})
+        if seed.get("provided"):
+            records = _ledger_records(run_dir)
+            if not records:
+                _provided_baseline(runner, store, task, tag, run_dir,
+                                   repo_root, cmd, events, seed)
+            elif all(r.get("run_id") != "000" for r in records):
+                _or_block(run_dir, repo_root, cmd, events,
+                          "seed.provided baseline missing: the ledger has "
+                          "records but no 000; the protocol forbids "
+                          "retrofitting the control after ideation")
 
         round_no = 0
         while True:

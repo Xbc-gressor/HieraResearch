@@ -30,18 +30,18 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "run":
         import json
-        from pathlib import Path
 
         from driver.loops.hillclimb import run_hillclimb
+        from driver.metadata import resolve_model
         from driver.roles import REPO_ROOT
         from driver.session import SDKSessionRunner
+        from driver.status import exit_code_for
         from driver.events import EventsLog
 
         run_dir = REPO_ROOT / "runs" / args.task / args.tag
-        model = args.model
-        metadata_path = run_dir / "run_metadata.json"
-        if model is None and metadata_path.exists():
-            model = json.loads(metadata_path.read_text(encoding="utf-8"))["model"]
+        model, warning = resolve_model(args.model, run_dir)
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
         if model is None:
             print("error: --model is required for a new run", file=sys.stderr)
             return 2
@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
                 cli_path=args.cli_path,
             )
             print(json.dumps(status, indent=2, sort_keys=True))
-            return 0
+            return exit_code_for(status, args.loop)
         from driver.loops.experiment import run_experiment
         runner = SDKSessionRunner(model=model, events=EventsLog(run_dir),
                                   cli_path=args.cli_path)
@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             cli_path=args.cli_path,
         )
         print(json.dumps(status, indent=2, sort_keys=True))
-        return 0
+        return exit_code_for(status, args.loop)
     return 0
 
 

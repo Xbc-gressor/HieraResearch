@@ -58,21 +58,33 @@ class SDKSessionRunner:
         """Fail-closed: deny every tool outside the role's positive set.
 
         A PreToolUse hook (not canUseTool — that callback is shadowed under
-        bypassPermissions and never reached; hooks still run).
+        bypassPermissions and never reached; hooks still run). When the role
+        declares bash_patterns, Bash commands must also start with one of
+        those prefixes.
         """
         allowed = set(role.tools) | {RECEIPT_TOOL}
+
+        def deny(reason: str) -> dict:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
 
         async def hook(input_data, tool_use_id, context):
             name = input_data.get("tool_name", "")
             if name not in allowed:
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason":
-                            f"role {role.name} may not use tool {name}",
-                    }
-                }
+                return deny(f"role {role.name} may not use tool {name}")
+            if name == "Bash" and role.bash_patterns:
+                # Coarse prefix matching — compound commands (&&, ;, |) can
+                # evade it. This is minimal containment, not a sandbox.
+                command = (input_data.get("tool_input") or {}).get("command", "")
+                if not any(command.startswith(p) for p in role.bash_patterns):
+                    return deny(
+                        f"role {role.name} may only run Bash commands starting "
+                        f"with: {', '.join(role.bash_patterns)}")
             return {}
 
         return hook

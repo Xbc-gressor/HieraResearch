@@ -66,6 +66,9 @@ class RoleDefinition:
     receipt_schema: dict
     postconditions: tuple[Postcondition, ...] = ()
     corrective_attempts: int = 3
+    # When non-empty, Bash calls must start with one of these prefixes
+    # (enforced by the PreToolUse hook in session.py).
+    bash_patterns: tuple[str, ...] = ()
 
 
 # --- helpers shared by postconditions -------------------------------------
@@ -228,6 +231,8 @@ ROLES: dict[str, RoleDefinition] = {
             "summary": "str",
             "evidence": "list",
         },
+        # the diagnosis methodology needs exactly one Bash command family
+        bash_patterns=("python tools/tuners/tune_tools.py render-failure",),
     ),
     "hillclimb-editor": RoleDefinition(
         name="hillclimb-editor",

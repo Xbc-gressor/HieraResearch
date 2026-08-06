@@ -49,6 +49,45 @@ class CapabilityHookTests(unittest.TestCase):
             self.assertEqual(verdict, {}, name)
 
 
+class BashPatternTests(unittest.TestCase):
+    def _hook(self, role: RoleDefinition):
+        runner = SDKSessionRunner(model="m", events=EventsLog(Path(tempfile.mkdtemp())))
+        return runner._capability_hook(role)
+
+    def test_denies_bash_command_off_prefix(self) -> None:
+        hook = self._hook(ROLES["crash-diagnosis"])
+        verdict = asyncio.run(hook(
+            {"tool_name": "Bash", "tool_input": {"command": "rm -rf x"}},
+            None, {}))
+        decision = verdict["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("crash-diagnosis", decision["permissionDecisionReason"])
+        self.assertIn("render-failure", decision["permissionDecisionReason"])
+
+    def test_allows_render_failure_command(self) -> None:
+        hook = self._hook(ROLES["crash-diagnosis"])
+        verdict = asyncio.run(hook(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "python tools/tuners/tune_tools.py "
+                                       "render-failure --run-dir runs/t/x"}},
+            None, {}))
+        self.assertEqual(verdict, {})
+
+    def test_role_without_bash_patterns_keeps_name_only(self) -> None:
+        role = RoleDefinition(
+            name="shell-role",
+            prompt_file="shell-role.md",
+            tools=("Bash",),
+            disallowed=(),
+            receipt_schema={},
+        )
+        hook = self._hook(role)
+        verdict = asyncio.run(hook(
+            {"tool_name": "Bash", "tool_input": {"command": "rm -rf x"}},
+            None, {}))
+        self.assertEqual(verdict, {})
+
+
 class FakeSystemMessage:
     def __init__(self, session_id: str):
         self.subtype = "init"

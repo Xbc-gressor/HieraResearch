@@ -6,6 +6,7 @@ monolithic session did by diligence; the editor session only edits.
 from __future__ import annotations
 
 import math
+import re
 import shutil
 from pathlib import Path
 
@@ -53,11 +54,16 @@ def _record(run_dir: Path, step: int, score: float, status: str, desc: str) -> N
         fh.write(f"{step}\t{rendered}\t{status}\t{desc}\n")
 
 
-def _keep(run_dir: Path, step: int) -> None:
-    shutil.copy(run_dir / "train.py", run_dir / "best.py")
+def _record_keep(run_dir: Path, step: int, score: float, desc: str) -> None:
+    """Snapshot BEFORE the TSV row, best.py AFTER it. A kill before the row
+    leaves an orphaned snapshot — harmless: the reserved attempt still gets
+    its crash-recovery row from _reconcile. A kill after the row leaves the
+    snapshot available for _restore_best to repair best.py."""
     history = run_dir / "history"
     history.mkdir(exist_ok=True)
     shutil.copy(run_dir / "train.py", history / f"{step:03d}.py")
+    _record(run_dir, step, score, "keep", desc)
+    shutil.copy(history / f"{step:03d}.py", run_dir / "best.py")
 
 
 def _revert(run_dir: Path) -> None:
@@ -84,7 +90,7 @@ def _reserve(run_dir, repo_root, cmd) -> bool:
     return result.returncode == 0
 
 
-def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd) -> Path:
+def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd) -> tuple[Path, int]:
     log_path = run_dir / "run.log"
     entrypoint = run_dir / "train.py"
     if per_runtime_limit:
@@ -94,13 +100,22 @@ def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd) -> Path:
     else:
         argv = ["uv", "--project", f"tasks/{task}", "run", "python", entrypoint]
     with log_path.open("w", encoding="utf-8") as fh:
-        cmd(argv, repo_root, check=False, capture=False, stdout=fh)
-    return log_path
+        result = cmd(argv, repo_root, check=False, capture=False, stdout=fh)
+    return log_path, result.returncode
 
 
-def _parse_score(log_path: Path, metric: str) -> float:
+def _evaluate_outcome(log_path: Path, returncode: int, metric: str,
+                      required_patterns: list[str]) -> float:
+    """Metric from a COMPLETE successful run only: a non-zero exit, a missing
+    required line, or a missing/unparseable metric line all score +inf."""
+    if returncode != 0:
+        return math.inf
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    if any(not re.search(pattern, text, re.MULTILINE)
+           for pattern in required_patterns):
+        return math.inf
     prefix = f"{metric}:"
-    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in text.splitlines():
         if line.startswith(prefix):
             try:
                 return float(line[len(prefix):].strip())
@@ -123,8 +138,7 @@ def _setup(task, tag, run_dir, task_toml, repo_root, max_evaluations, timeout,
         if source.exists():
             shutil.copy(source, run_dir / editable)
     cmd(["uv", "--project", f"tasks/{task}", "sync"], repo_root)
-    if task_toml.get("run", {}).get("prepare_command"):
-        cmd(task_toml["run"]["prepare_command"].split(), repo_root)
+    common.run_prepare(task, task_toml, repo_root, cmd)
     common.preflight_env(task, run_dir, repo_root, cmd)
     _tsv_path(run_dir).write_text(TSV_HEADER, encoding="utf-8")
     cmd(["python", "tools/evaluation_budget.py", "status",
@@ -196,11 +210,18 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
     events = EventsLog(run_dir)
     task_toml = common.load_task_toml(task, repo_root)
     metric = task_toml["result"]["metric"]
+    required_patterns = task_toml["result"].get("required_patterns", [])
     stop_condition = "none"
 
     if fresh:
-        _setup(task, tag, run_dir, task_toml, repo_root,
-               max_evaluations, timeout, cmd, events)
+        try:
+            _setup(task, tag, run_dir, task_toml, repo_root,
+                   max_evaluations, timeout, cmd, events)
+        except RuntimeError as exc:  # prepare_command failed: block, no traceback
+            stop_condition = str(exc)
+            events.emit("blocked", reason=stop_condition)
+            return _status(task, tag, run_dir, metric, stop_condition,
+                           repo_root, cmd)
         write_metadata(run_dir, model, cli_path)
     else:
         metadata_path = run_dir / "run_metadata.json"
@@ -240,12 +261,13 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
     # Baseline: exactly one evaluation of the unmodified copy.
     if not _tsv_rows(run_dir):
         if _reserve(run_dir, repo_root, cmd):
-            log = _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd)
-            score = _parse_score(log, metric)
-            _record(run_dir, 0, score,
-                    "crash" if not math.isfinite(score) else "keep", "baseline")
+            log, rc = _run_entrypoint(task, run_dir, per_runtime_limit,
+                                      repo_root, cmd)
+            score = _evaluate_outcome(log, rc, metric, required_patterns)
             if math.isfinite(score):
-                _keep(run_dir, 0)
+                _record_keep(run_dir, 0, score, "baseline")
+            else:
+                _record(run_dir, 0, score, "crash", "baseline")
             # A crashed baseline CONTINUES (same semantics as the resume
             # path): the editor starts from the crashed train.py, _revert
             # no-ops without best.py, and the first finite score keeps.
@@ -291,8 +313,9 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
 
         if not _reserve(run_dir, repo_root, cmd):
             break  # normal budget completion (exit 4), never a crash
-        log = _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd)
-        score = _parse_score(log, metric)
+        log, rc = _run_entrypoint(task, run_dir, per_runtime_limit,
+                                  repo_root, cmd)
+        score = _evaluate_outcome(log, rc, metric, required_patterns)
         step = len(_tsv_rows(run_dir))
         if not math.isfinite(score):
             _record(run_dir, step, math.inf, "crash", "run produced no metric")
@@ -321,9 +344,10 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
             continue  # a repair re-enters the loop; its retry reserves anew
 
         status = "keep" if (best_before is None or score < best_before) else "discard"
-        _record(run_dir, step, score, status, "")
         if status == "keep":
-            _keep(run_dir, step)
+            _record_keep(run_dir, step, score, "")
+        else:
+            _record(run_dir, step, score, "discard", "")
 
     return _status(task, tag, run_dir, metric, stop_condition, repo_root, cmd)
 

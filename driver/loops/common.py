@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import tomllib
 from pathlib import Path
@@ -15,9 +16,33 @@ class RunBlocked(Exception):
     """Raised to unwind the loop after block() persisted the blocked phase."""
 
 
-def run_cmd(args, repo_root, check=True, capture=True, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run([str(a) for a in args], cwd=repo_root,
+def run_cmd(args, repo_root, check=True, capture=True, cwd=None, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run([str(a) for a in args], cwd=cwd or repo_root,
                           capture_output=capture, text=True, check=check, **kw)
+
+
+def run_prepare(task, task_toml, repo_root, cmd) -> None:
+    """Run [run].prepare_command in the task's declared working directory.
+
+    cwd resolution: [run].working_dir when declared, else [env].project,
+    else repo_root. A failed prepare raises RuntimeError; callers decide
+    whether that blocks the run.
+    """
+    run_cfg = task_toml.get("run", {})
+    prepare = run_cfg.get("prepare_command")
+    if not prepare:
+        return
+    working_dir = run_cfg.get("working_dir")
+    if working_dir:
+        cwd = repo_root / working_dir
+    else:
+        project = task_toml.get("env", {}).get("project")
+        cwd = repo_root / project if project else repo_root
+    try:
+        cmd(shlex.split(prepare), repo_root, cwd=cwd)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or str(exc)).strip()
+        raise RuntimeError(f"prepare_command failed: {detail}") from exc
 
 
 def load_task_toml(task: str, repo_root: Path) -> dict:
