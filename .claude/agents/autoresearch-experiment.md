@@ -303,6 +303,12 @@ empty action list is valid and leaves the remaining slots for deep tuning.
 
 For each returned action, in order:
 
+Do not overlap candidate pipelines: wait for one candidate's
+`tunable-contract-extractor` to return a terminal receipt before creating or
+spawning work for the next action. The deterministic evaluator lease prevents
+GPU overlap if this orchestration rule is violated, but queued extractors waste
+agent capacity and obscure run progress.
+
 1. Create the target directory without copying an entrypoint:
 
    ```bash

@@ -29,6 +29,9 @@ Tuner scripts persist trial-level history to tune_report.json
 incrementally — see `append_trial` and `read_prior_trials`. Phase C also holds
 a candidate-local nonblocking file lock, so an accidental second orchestrator
 cannot race report writes or objective reservations for the same candidate.
+Every GPU-using probe and objective additionally takes one host-wide blocking
+lease. Lock ordering is candidate-local Phase C lock, then GPU lease; no path
+may acquire them in reverse or nest ``timed_preflight`` inside ``timed_eval``.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ import json
 import math
 import os
 import signal
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -66,6 +70,7 @@ DEFAULT_SCORE_FN = "evaluate_config"
 DEFAULT_PREFLIGHT_LIMIT = 180.0
 DEEP_TUNE_INVOCATION_STARTED_AT = "invocation_started_at_epoch_seconds"
 PHASE_C_LOCK_FILENAME = ".phase_c.lock"
+GPU_LOCK_PATH_ENV = "HIERARESEARCH_GPU_LOCK_PATH"
 
 
 class DeepTuneStageAdmissionError(RuntimeError):
@@ -99,6 +104,71 @@ class _PhaseCLock:
 
     def __del__(self):
         self.close()
+
+
+class _GpuLease(_PhaseCLock):
+    """Host-wide GPU lease whose release invariant is close(), never LOCK_UN.
+
+    The evaluation child inherits a duplicate of the same open file
+    description. Calling LOCK_UN in the parent would therefore release the
+    child's lease too; closing each process's descriptor preserves it until the
+    last holder exits.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        flags = os.O_CREAT | os.O_RDWR
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        self.fd = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(self.fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError(f"GPU lease is not a regular file: {path}")
+            if info.st_uid != os.getuid():
+                raise RuntimeError(
+                    f"GPU lease must be owned by uid {os.getuid()}: {path}"
+                )
+            os.set_inheritable(self.fd, True)
+        except BaseException:
+            self.close()
+            raise
+
+
+def _gpu_lock_path() -> Path:
+    override = os.environ.get(GPU_LOCK_PATH_ENV)
+    if override:
+        return Path(override)
+    if not hasattr(os, "getuid"):
+        raise RuntimeError("single-GPU evaluation locking requires POSIX")
+    return Path(f"/tmp/hieraresearch-gpu-evaluation-{os.getuid()}.lock")
+
+
+def _acquire_gpu_lease() -> _GpuLease:
+    """Wait for exclusive host GPU access; contention is not an error."""
+    if fcntl is None:
+        raise RuntimeError("single-GPU evaluation locking requires POSIX flock")
+    lease = _GpuLease(_gpu_lock_path())
+    try:
+        fcntl.flock(lease.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.stderr.write(
+            f"GPU_LEASE waiting path={lease.path} pid={os.getpid()}\n"
+        )
+        sys.stderr.flush()
+        try:
+            fcntl.flock(lease.fd, fcntl.LOCK_EX)
+        except BaseException:
+            lease.close()
+            raise
+        sys.stderr.write(
+            f"GPU_LEASE acquired path={lease.path} pid={os.getpid()}\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        lease.close()
+        raise
+    return lease
 
 
 def is_finite_score(value: Any) -> bool:
@@ -742,11 +812,14 @@ def _communicate_with_limit(
     *,
     limit: float,
     label: str,
+    inherited_fds: tuple[int, ...] = (),
 ) -> tuple[str, str, int]:
     posix = os.name == "posix"
     kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
     if posix:
         kwargs["start_new_session"] = True
+        if inherited_fds:
+            kwargs["pass_fds"] = inherited_fds
     elif os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(command, **kwargs)
@@ -808,92 +881,92 @@ def timed_eval(
     Outside Phase C, no task limit keeps the historical in-process fast path.
     Whenever either ``per_runtime_limit`` or a Phase-C remaining allocation is
     supplied, run in a fresh subprocess and hard-kill its process group at the
-    smaller limit. The objective reservation happens first, so a subprocess
-    timeout remains an admitted/charged evaluation attempt.
+    smaller limit. The GPU lease is acquired before objective reservation;
+    after admission the reservation happens before score execution, so a
+    subprocess timeout remains an admitted/charged evaluation attempt.
 
     Timeouts, child-process errors, missing results, and non-finite scores raise
     so callers record an auditable failed trial instead of caching ``+inf`` as
     if it were a successful score.
     """
-    # Fail before reservation when the caller already knows no Phase-C time
-    # remains. A live supplier is resolved again after atomic reservation so
-    # lock contention/I/O cannot grant the child a stale, overly large timeout.
+    # Fail before waiting when the caller already knows no Phase-C time remains.
     phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
-    reserve_evaluation(
-        candidate_path,
-        params=params,
-        phase=phase,
-        method=method,
-    )
+    lease = _acquire_gpu_lease()
     try:
+        # Re-read a live limit after queue admission, but still before objective
+        # reservation. Waiting for the GPU can never burn an evaluation slot.
         phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
-    except DeepTuneTimeExhausted as exc:
-        raise DeepTuneTimeExhausted(
-            str(exc),
-            attempt_reserved=True,
-        ) from None
-    runtime_limit = read_runtime_limit(candidate_path)
-    if runtime_limit is None and phase_limit is None:
-        score = float(evaluate(make_model, params))
-        if not is_finite_score(score):
-            raise ValueError(f"evaluation returned non-finite score: {score!r}")
-        return score
-    phase_binds = (
-        phase_limit is not None
-        and (runtime_limit is None or phase_limit <= runtime_limit)
-    )
-    if runtime_limit is None:
-        limit = float(phase_limit)
-    elif phase_limit is None:
-        limit = runtime_limit
-    else:
-        limit = min(runtime_limit, phase_limit)
-    eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
-    try:
-        out, err, returncode = _communicate_with_limit(
-            [
-                sys.executable,
-                eval_one,
-                str(candidate_path),
-                json.dumps(params),
-                json.dumps(expected_execution_revision),
-            ],
-            limit=limit,
-            label=(
-                "evaluation exceeded Phase-C remaining wall time"
-                if phase_binds
-                else "evaluation exceeded per_runtime_limit"
-            ),
+        reserve_evaluation(
+            candidate_path,
+            params=params,
+            phase=phase,
+            method=method,
         )
-    except TimeoutError as exc:
-        if phase_binds:
-            raise DeepTuneTimeExhausted(
-                str(exc),
-                attempt_reserved=True,
-            ) from None
-        raise
-    for line in out.splitlines():
-        if line.startswith("RESULT:"):
-            try:
-                score = float(line[len("RESULT:"):])
-            except ValueError:
-                raise ValueError(
-                    f"evaluation subprocess printed invalid result: {line!r}"
-                ) from None
+        runtime_limit = read_runtime_limit(candidate_path)
+        if runtime_limit is None and phase_limit is None:
+            score = float(evaluate(make_model, params))
             if not is_finite_score(score):
                 raise ValueError(f"evaluation returned non-finite score: {score!r}")
             return score
+        phase_binds = (
+            phase_limit is not None
+            and (runtime_limit is None or phase_limit <= runtime_limit)
+        )
+        if runtime_limit is None:
+            limit = float(phase_limit)
+        elif phase_limit is None:
+            limit = runtime_limit
+        else:
+            limit = min(runtime_limit, phase_limit)
+        eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
+        try:
+            out, err, returncode = _communicate_with_limit(
+                [
+                    sys.executable,
+                    eval_one,
+                    str(candidate_path),
+                    json.dumps(params),
+                    json.dumps(expected_execution_revision),
+                ],
+                limit=limit,
+                label=(
+                    "evaluation exceeded Phase-C remaining wall time"
+                    if phase_binds
+                    else "evaluation exceeded per_runtime_limit"
+                ),
+                inherited_fds=(lease.fd,),
+            )
+        except TimeoutError as exc:
+            if phase_binds:
+                raise DeepTuneTimeExhausted(
+                    str(exc),
+                    attempt_reserved=True,
+                ) from None
+            raise
+        for line in out.splitlines():
+            if line.startswith("RESULT:"):
+                try:
+                    score = float(line[len("RESULT:"):])
+                except ValueError:
+                    raise ValueError(
+                        f"evaluation subprocess printed invalid result: {line!r}"
+                    ) from None
+                if not is_finite_score(score):
+                    raise ValueError(f"evaluation returned non-finite score: {score!r}")
+                return score
 
-    detail = err.strip()
-    if len(detail) > 4000:
-        detail = "...[stderr truncated]...\n" + detail[-4000:]
-    message = (
-        f"evaluation subprocess exited with code {returncode} "
-        "without a RESULT line"
-    )
-    if detail:
-        message += f"\nchild stderr:\n{detail}"
-    raise RuntimeError(message)
+        detail = err.strip()
+        if len(detail) > 4000:
+            detail = "...[stderr truncated]...\n" + detail[-4000:]
+        message = (
+            f"evaluation subprocess exited with code {returncode} "
+            "without a RESULT line"
+        )
+        if detail:
+            message += f"\nchild stderr:\n{detail}"
+        raise RuntimeError(message)
+    finally:
+        lease.close()
 
 
 def timed_preflight(
@@ -935,27 +1008,32 @@ def timed_preflight(
         if phase_limit is None
         else min(configured_limit, phase_limit)
     )
+    lease = _acquire_gpu_lease()
     try:
-        out, err, returncode = _communicate_with_limit(
-            [
-                sys.executable,
-                preflight_one,
-                str(candidate_path),
-                json.dumps(params),
-                json.dumps(expected_execution_revision),
-                probe_mode,
-            ],
-            limit=limit,
-            label=(
-                "preflight exceeded Phase-C remaining wall time"
-                if phase_binds
-                else "preflight exceeded preflight_runtime_limit"
-            ),
-        )
-    except TimeoutError as exc:
-        if phase_binds:
-            raise DeepTuneTimeExhausted(str(exc)) from None
-        raise
+        try:
+            out, err, returncode = _communicate_with_limit(
+                [
+                    sys.executable,
+                    preflight_one,
+                    str(candidate_path),
+                    json.dumps(params),
+                    json.dumps(expected_execution_revision),
+                    probe_mode,
+                ],
+                limit=limit,
+                label=(
+                    "preflight exceeded Phase-C remaining wall time"
+                    if phase_binds
+                    else "preflight exceeded preflight_runtime_limit"
+                ),
+                inherited_fds=(lease.fd,),
+            )
+        except TimeoutError as exc:
+            if phase_binds:
+                raise DeepTuneTimeExhausted(str(exc)) from None
+            raise
+    finally:
+        lease.close()
     for line in out.splitlines():
         if not line.startswith("PREFLIGHT:"):
             continue

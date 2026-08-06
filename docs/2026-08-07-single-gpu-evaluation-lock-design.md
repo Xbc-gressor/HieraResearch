@@ -44,10 +44,17 @@ candidate-local.
 Add a host-wide, per-user POSIX `flock` lease in `tools/tuners/_common.py`, the
 shared boundary already used by all framework tuner backends.
 
-The lock file has one stable path in the system temporary directory, scoped by
-the current numeric user id. It is intentionally shared across repository
+The lock file has one stable path scoped by the current numeric user id:
+`/tmp/hieraresearch-gpu-evaluation-<uid>.lock`. Tests override this literal
+production path through `HIERARESEARCH_GPU_LOCK_PATH`; production does not
+derive the path from `TMPDIR`, so separate sessions cannot silently acquire
+different leases. It is intentionally shared across repository
 checkouts, run tags, candidates, and tuner methods on the host. The project is
 currently single-GPU, so no device-selection abstraction is introduced.
+
+The lock file is opened with `O_NOFOLLOW` and its `fstat` result must be a
+regular file owned by the current uid. The descriptor is marked inheritable
+and explicitly included in the evaluation subprocess's `pass_fds` set.
 
 `timed_preflight()` acquires the lease before starting `_preflight_one.py` and
 holds it until that subprocess exits. This covers both correctness probes and
@@ -64,9 +71,22 @@ the child's open descriptor keeps the `flock` active. Normal child completion
 or process-group termination closes the final descriptor and releases the lock
 automatically.
 
+Release always means closing the local descriptor, never calling `LOCK_UN`.
+An inherited descriptor refers to the same open file description, so an
+explicit unlock in the parent would also remove the still-running child's
+protection.
+
 Lock acquisition is blocking and has no application-level timeout. A living
 evaluation is normal queue contention, not a blocked experiment. No lock-wait
-exception or ledger state is introduced.
+exception or ledger state is introduced. A contending evaluator writes one
+`GPU_LEASE waiting` line to stderr and a matching `GPU_LEASE acquired` line
+after admission so detached-job polling remains informative.
+
+Phase C acquires its candidate-local writer lock before entering an objective
+and therefore before waiting for the GPU lease. No path acquires the Phase-C
+lock while holding the GPU lease, so the ordering has no cycle. The GPU lease
+is non-reentrant: `timed_preflight` must not be nested inside `timed_eval` (and
+is not nested by any current caller).
 
 The experiment-agent contract will continue to require candidates to be
 processed in order. This reduces idle queued extractor processes, but safety
@@ -107,13 +127,20 @@ serialization and crash cleanup directly.
 - Failure to open or use the lock is a framework-environment error, not an
   objective attempt, because it occurs before reservation. This is distinct
   from ordinary contention, which only waits.
+- `reserve_evaluation()` runs inside the lease's `try/finally`; budget
+  exhaustion and reservation I/O errors close the descriptor before
+  propagating.
 - Non-POSIX platforms fail before GPU execution rather than silently running
   concurrently. The supported experiment runtime is POSIX.
 
 ## Tests
 
-Tests use real subprocesses and a temporary lock path override so they exercise
-kernel lock behavior without touching the host's production lease.
+An autouse session fixture sets a suite-wide temporary lock path override before
+any test acquires a lease. Existing tests that call the real, unmocked
+`timed_eval` or `timed_preflight` therefore never wait on a live production
+evaluation. New concurrency tests use real subprocesses and that same override
+so they exercise kernel lock behavior without touching the host's production
+lease.
 
 1. Two independent processes enter the evaluation boundary; their GPU critical
    sections must not overlap.
