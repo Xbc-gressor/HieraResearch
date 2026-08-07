@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from driver.events import EventsLog  # noqa: E402
-from driver.receipts import ReceiptStore  # noqa: E402
+from driver.receipts import ReceiptStore, build_receipt_server  # noqa: E402
 from driver.roles import ROLES, InvocationContext, RoleDefinition  # noqa: E402
 from driver.session import (  # noqa: E402
     FakeSessionRunner,
@@ -190,6 +190,21 @@ class FakeSessionRunnerTests(unittest.TestCase):
             self.assertTrue(receipt["edited"])
             with self.assertRaises(InvocationFailed):
                 runner.run(ROLES["hillclimb-editor"], make_ctx(run_dir))
+
+
+class OptionsTests(unittest.TestCase):
+    def test_options_set_is_sandbox_and_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            store = ReceiptStore(run_dir)
+            server, _ = build_receipt_server(
+                "hillclimb-editor", SIMPLE_ROLE.receipt_schema, store, 1)
+            runner = SDKSessionRunner(model="m", events=EventsLog(run_dir))
+            options = runner._build_options(SIMPLE_ROLE, make_ctx(run_dir), server)
+            # Claude Code refuses bypassPermissions under root without this.
+            self.assertEqual(options.env.get("IS_SANDBOX"), "1")
+            self.assertEqual(options.permission_mode, "bypassPermissions")
+            self.assertEqual(options.setting_sources, [])
 
 
 if __name__ == "__main__":

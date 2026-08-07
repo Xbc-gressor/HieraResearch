@@ -121,6 +121,10 @@ class SDKSessionRunner:
             cwd=REPO_ROOT,
             model=self.model,
             permission_mode="bypassPermissions",
+            # Claude Code refuses bypassPermissions under root unless it is
+            # told the session runs in a sandbox; our runs do (dedicated
+            # server/container). Harmless for non-root users.
+            env={"IS_SANDBOX": "1"},
             setting_sources=[],
             disallowed_tools=list(role.disallowed),
             mcp_servers={"receipts": server},
