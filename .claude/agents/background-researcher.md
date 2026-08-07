@@ -223,9 +223,12 @@ All retrieval is recorded in the run-local manifest
 `<run_dir>/background_retrieval.json`, written only through
 `tools/search_backends.py`. Dispatch the planned queries together in the
 `grounding` lane, then read selected sources progressively through the adapter
-so visits are recorded. For arXiv sources, normally use `--view auto`; it must
-produce a substantive section or preview receipt after head triage. Never stop
-at `head`/`brief` metadata or use it to support a registry claim.
+so visits are recorded. Read sources in batches of 4–6 by repeating `--url` in
+one `visit` invocation, exactly as search dispatches its queries together;
+never run concurrent `visit` processes against one manifest. For arXiv sources,
+normally use `--view auto`; it must produce a substantive section or preview
+receipt after head triage. Never stop at `head`/`brief` metadata or use it to
+support a registry claim.
 
 ### Step 5 — Define relations and distill the search space
 
@@ -256,6 +259,12 @@ and use it as the exact output format. If the resource cannot be read, stop
 here and report the missing path. `background.md` and its retrieval manifest
 are run-local artifacts (under `runs/`, gitignored) that downstream agents
 read.
+
+Build `background.md` incrementally — append each completed dimension block to
+the file as you finish it, rather than holding the whole registry in context
+for one terminal write. This stage has run for over two hours with nothing on
+disk, so a single failure loses all of it; per-block writes also leave an mtime
+trail that makes the stage's cost attributable afterwards.
 
 After writing it, run:
 

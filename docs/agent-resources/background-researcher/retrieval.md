@@ -76,34 +76,59 @@ its `query_id`, `backend`, `rank`, and, when the backend provides them,
 selected set before reading; they inform reading order and rejection
 decisions, but they are not relevance guarantees and never replace a
 substantive visit. Re-running `search` against an existing manifest replaces
-queries, results, and the selected set, and retains previously recorded visit
+queries, results, coverage exemptions, and the selected set — it prints to
+stderr how much of each it discards — and retains previously recorded visit
 receipts only when the retrieval condition and the frozen corpus (matched by
 SHA-256) are unchanged; under a different condition or corpus, prior visits
-are dropped rather than mixed into the new evidence base.
+are dropped rather than mixed into the new evidence base, and the stderr note
+says which.
 
 ## Visits and progressive reading
 
-Read selected sources through the adapter so visits are recorded. Background
-research always uses the `grounding` lane (6000-token budget):
+Read selected sources through the adapter so visits are recorded. Repeat
+`--url` to read several sources in one invocation: the adapter fetches them
+concurrently and writes the manifest exactly once. Background research always
+uses the `grounding` lane (6000-token budget):
 
 ```bash
 python tools/search_backends.py visit \
   --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --url <url> --view <head|section|preview|full_text|auto> --section <name>
+  --url <url> --url <url> --url <url> --view auto
 ```
 
-Omit `--section` unless `--view section` is used. For papers, triage metadata
-and section maps first, then read relevant method, results, or limitations
-sections. Use `--view auto` for normal DeepXiv-backed arXiv reading: the adapter
-records `head` as triage, ranks up to three available body sections against the
-source's retrieval questions and evidence roles, fetches those sections, and
-falls back to `preview` when no section body can be obtained. The head and body
-receipts share the lane's total retained-content budget. If DeepXiv returns
-metadata but no section or preview body, the visit fails; head-only retrieval
-never grounds a source.
+Batch 4–6 URLs at a time. Every source's retained content is printed, so a
+larger batch risks a truncated tool result that silently loses text the
+manifest records as read. **Never run several `visit` processes concurrently
+against one manifest** — each rewrites the whole file, so parallel `Bash` calls
+drop receipts. Batching is the supported way to parallelize.
 
+Exit status is `0` when every URL succeeded, `2` when some did and some did
+not, and `1` when all failed. On `2`, stderr names each failed URL with its
+error; re-issue only those.
+
+A single-URL read with an explicit view keeps the older form:
+
+```bash
+python tools/search_backends.py visit \
+  --manifest <run_dir>/background_retrieval.json --lane grounding \
+  --url <url> --view <head|section|preview|full_text> --section <name>
+```
+
+Omit `--section` unless `--view section` is used, and pass only one `--url`
+with it. For papers, triage metadata and section maps first, then read relevant
+method, results, or limitations sections. Use `--view auto` for normal
+DeepXiv-backed arXiv reading: the adapter records `head` as triage, ranks up to
+three available body sections against the source's retrieval questions and
+evidence roles, fetches those sections, and falls back to `preview` when no
+section body can be obtained. The head and body receipts share the lane's total
+retained-content budget. If DeepXiv returns metadata but no section or preview
+body, the visit fails; head-only retrieval never grounds a source.
+
+`--view auto` is the default reading mode and should stay the default choice.
 Use explicit `--view head` only for triage and explicit `--view section` when
-you need to override the automatic selection. In the frozen condition, append
+you need to override the automatic selection. A section name that does not
+exist now falls back to `auto` ranking automatically and records both receipts
+— do not retry with another guessed name. In the frozen condition, append
 `--frozen-corpus <pinned-corpus.json>` to replay retained content without
 network access. Outside that condition, `auto` uses progressive DeepXiv reading
 for arXiv and a direct HTTP fetch for other sources; Jina visiting is explicit
@@ -141,9 +166,19 @@ grounding lane before using it in a hypothesis.
 
 If all specialized backends fail, continue with your runtime's web-tool
 fallback and record the coverage limitation. Never silently replace missing
-primary evidence with a generic blog summary. The official DeepXiv CLI may
-auto-register its free anonymous token in `~/.env` on first use; never expose
-it in logs or run files. Do not install the package merely to obtain the CLI.
+primary evidence with a generic blog summary.
+
+DeepXiv reports **every** HTTP 429 as "daily limit reached" (`当前 token 已到日
+使用上限`) regardless of cause, so that wording is not evidence of an exhausted
+quota. A background run issues on the order of 100–170 DeepXiv calls against a
+daily limit in the thousands, so read it as a burst rate limit. The adapter
+already retries such errors with backoff and halves its own concurrency under
+sustained throttling; the correct response to a residual failure is to re-issue
+the failed URLs, not to reduce coverage. Registering a token raises the daily
+volume cap, which is not the binding constraint here — consider it only for
+genuinely heavy days. The official DeepXiv CLI may auto-register its free
+anonymous token in `~/.env` on first use; never expose it in logs or run files.
+Do not install the package merely to obtain the CLI.
 
 ## Source-quality checks while reading
 

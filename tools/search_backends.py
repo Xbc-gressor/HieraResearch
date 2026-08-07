@@ -15,11 +15,13 @@ import hashlib
 import html
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +29,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import stage_timings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +51,17 @@ MAX_SELECTED = 18
 HTTP_TIMEOUT = 45
 DEEPXIV_MAX_SECTIONS = 3
 SUBSTANTIVE_VIEWS = {"section", "preview", "full_text", "page"}
+DEFAULT_VISIT_CONCURRENCY = 4
+RETRY_ATTEMPTS = 3
+RETRY_BASE_SECONDS = float(os.environ.get("HIERA_RETRY_BASE_SECONDS") or 2)
+RATE_LIMIT_TRIP = 3
+_RATE_LIMIT_MARKERS = (
+    "daily limit reached",
+    "data.rag.ac.cn/register",
+    "tommy@chien.io",
+    "日使用上限",
+    "429",
+)
 
 _ARXIV_RE = re.compile(
     r"(?:arxiv\.org|alphaxiv\.org)/(?:abs|pdf)/([a-z-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?",
@@ -125,6 +140,47 @@ def is_substantive_grounding_visit(visit: Any) -> bool:
         and visit.get("lane") == "grounding"
         and visit.get("view") in SUBSTANTIVE_VIEWS
     )
+
+
+def is_rate_limited(error: Any) -> bool:
+    """Whether a backend error is 429-class.
+
+    DeepXiv maps every HTTP 429 to a fixed "daily limit reached" string, and
+    this module only ever sees the CLI's last stderr line, so the stated cause
+    cannot be trusted: a burst throttle and an exhausted daily quota are
+    indistinguishable in the text. A background run issues on the order of
+    100-170 calls against a daily limit in the thousands, so a 429 here is a
+    rate limit and the answer is to slow down, not to stop.
+    """
+    text = str(error or "").casefold()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+def retry_count_of(error: BaseException) -> int:
+    value = getattr(error, "retry_count", 0)
+    return value if isinstance(value, int) else 0
+
+
+def call_with_retry(
+    operation: Any, *, attempts: int = RETRY_ATTEMPTS, base: float | None = None
+) -> tuple[Any, int]:
+    """Run a backend call, retrying 429-class failures with jittered backoff.
+
+    Returns ``(value, retries)``. A terminal failure is re-raised unchanged so
+    callers keep the backend's own error text, with the attempt count attached
+    as ``retry_count`` for the receipt.
+    """
+    delay = RETRY_BASE_SECONDS if base is None else base
+    retries = 0
+    while True:
+        try:
+            return operation(), retries
+        except Exception as exc:
+            if retries >= attempts - 1 or not is_rate_limited(exc):
+                exc.retry_count = retries  # type: ignore[attr-defined]
+                raise
+            time.sleep(delay * (2**retries) * (1.0 + random.random() * 0.5))
+            retries += 1
 
 
 def new_manifest() -> dict[str, Any]:
@@ -501,7 +557,10 @@ class DeepXivBackend(SearchBackend):
         self.version = (version.stdout or version.stderr).strip() or "installed-cli-unknown"
 
     async def search(self, query: str, max_results: int) -> dict[str, Any]:
-        return await asyncio.to_thread(self._search_sync, query, max_results)
+        def attempt() -> dict[str, Any]:
+            return call_with_retry(lambda: self._search_sync(query, max_results))[0]
+
+        return await asyncio.to_thread(attempt)
 
     def _search_sync(self, query: str, max_results: int) -> dict[str, Any]:
         process = subprocess.run(
@@ -956,12 +1015,12 @@ def _select_deepxiv_sections(
 
 
 def _deepxiv_progressive_read(
-    url: str, manifest: dict[str, Any]
+    url: str, manifest: dict[str, Any], *, backend: DeepXivBackend | None = None
 ) -> list[dict[str, Any]]:
     """Triage an arXiv paper, then fetch evidence-bearing body content."""
-    backend = DeepXivBackend()
-    head, backend_name, backend_version = _deepxiv_read(
-        url, "head", None, backend=backend
+    backend = backend or DeepXivBackend()
+    (head, backend_name, backend_version), head_retries = call_with_retry(
+        lambda: _deepxiv_read(url, "head", None, backend=backend)
     )
     attempts: list[dict[str, Any]] = [
         {
@@ -972,6 +1031,7 @@ def _deepxiv_progressive_read(
             "status": "success",
             "content": head,
             "error": None,
+            "retry_count": head_retries,
         }
     ]
     query_text, evidence_roles = _source_query_context(manifest, url)
@@ -980,8 +1040,10 @@ def _deepxiv_progressive_read(
     )
     for section_name in section_names:
         try:
-            content, _, _ = _deepxiv_read(
-                url, "section", section_name, backend=backend
+            (content, _, _), retries = call_with_retry(
+                lambda name=section_name: _deepxiv_read(
+                    url, "section", name, backend=backend
+                )
             )
             attempts.append(
                 {
@@ -992,6 +1054,7 @@ def _deepxiv_progressive_read(
                     "status": "success",
                     "content": content,
                     "error": None,
+                    "retry_count": retries,
                 }
             )
         except Exception as exc:
@@ -1004,6 +1067,7 @@ def _deepxiv_progressive_read(
                     "status": "failed",
                     "content": None,
                     "error": f"{type(exc).__name__}: {exc}",
+                    "retry_count": retry_count_of(exc),
                 }
             )
     if not any(
@@ -1011,7 +1075,9 @@ def _deepxiv_progressive_read(
         for attempt in attempts
     ):
         try:
-            content, _, _ = _deepxiv_read(url, "preview", None, backend=backend)
+            (content, _, _), retries = call_with_retry(
+                lambda: _deepxiv_read(url, "preview", None, backend=backend)
+            )
             attempts.append(
                 {
                     "backend": backend_name,
@@ -1021,6 +1087,7 @@ def _deepxiv_progressive_read(
                     "status": "success",
                     "content": content,
                     "error": None,
+                    "retry_count": retries,
                 }
             )
         except Exception as exc:
@@ -1033,6 +1100,7 @@ def _deepxiv_progressive_read(
                     "status": "failed",
                     "content": None,
                     "error": f"{type(exc).__name__}: {exc}",
+                    "retry_count": retry_count_of(exc),
                 }
             )
     return attempts
@@ -1062,6 +1130,7 @@ def add_visit(
     manifest: dict[str, Any], *, url: str, lane: str, backend: str, view: str,
     status: str, content: str | None = None, error: str | None = None,
     backend_version: str = "unknown", section: str | None = None,
+    retry_count: int = 0,
 ) -> None:
     budgets = manifest.setdefault("lane_budgets", dict(LANE_BUDGETS))
     manifest.setdefault("visits", []).append(
@@ -1082,6 +1151,7 @@ def add_visit(
             "content": content,
             "retrieved_at": datetime.now(timezone.utc).isoformat(),
             "error": error,
+            "retry_count": retry_count,
         }
     )
 
@@ -1167,6 +1237,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     )
 
     prior_visits: list[dict[str, Any]] = []
+    notes: list[str] = []
     if args.manifest.exists():
         existing = load_manifest(args.manifest)
         _reject_legacy_manifest(existing)
@@ -1175,8 +1246,27 @@ def cmd_search(args: argparse.Namespace) -> int:
             None,
             corpus_sha256,
         )
+        discarded = {
+            field: len(existing.get(field) or [])
+            for field in ("queries", "results", "coverage_exemptions", "selected_keys")
+        }
+        if any(discarded.values()):
+            notes.append(
+                "search replaces the existing plan: "
+                + ", ".join(f"{count} {field}" for field, count in discarded.items())
+            )
+        held = len(existing.get("visits") or [])
         if same_condition and same_corpus:
             prior_visits = existing.get("visits", [])
+            if held:
+                notes.append(f"retaining {held} visit receipts")
+        elif held:
+            reason = (
+                "the retrieval condition changed"
+                if not same_condition
+                else "the frozen corpus changed"
+            )
+            notes.append(f"dropping {held} visit receipts because {reason}")
     manifest = new_manifest()
     backends, unavailable = build_backends(names, args.frozen_corpus)
     raw, failures, calls = asyncio.run(dispatch_search(queries, backends, args.max_results))
@@ -1208,101 +1298,335 @@ def cmd_search(args: argparse.Namespace) -> int:
             "backend_failures": unavailable + failures,
         }
     )
+    for note in notes:
+        print(f"search: {note}", file=sys.stderr)
     save_manifest(args.manifest, manifest)
     errors = validate_manifest(manifest)
+    stage_timings.record(
+        args.manifest, stage="retrieve", action="search", ok=not errors,
+        detail=f"{len(queries)} queries, {len(results)} merged results",
+    )
     print(json.dumps({"ok": not errors, "selected": manifest["selected_keys"],
                       "failures": manifest["backend_failures"], "errors": errors}, indent=2))
     return 0 if results and not errors else 1
+
+
+def _attempt(
+    *, backend: str, backend_version: str, view: str, section: str | None,
+    status: str, content: str | None = None, error: str | None = None,
+    retries: int = 0,
+) -> dict[str, Any]:
+    return {
+        "backend": backend,
+        "backend_version": backend_version,
+        "view": view,
+        "section": section,
+        "status": status,
+        "content": content,
+        "error": error,
+        "retry_count": retries,
+    }
+
+
+def _read_deepxiv_section(
+    url: str, *, section: str | None, manifest: dict[str, Any],
+    budget_chars: int, acquire: Any,
+) -> tuple[list[dict[str, Any]], str]:
+    """Read a named section, falling back to `auto` ranking when it is absent."""
+    backend = acquire()
+    try:
+        (content, name, version), retries = call_with_retry(
+            lambda: _deepxiv_read(url, "section", section, backend=backend)
+        )
+    except Exception as exc:
+        if is_rate_limited(exc):
+            raise
+        failed = _attempt(
+            backend="deepxiv", backend_version=backend.version, view="section",
+            section=section, status="failed",
+            error=f"{type(exc).__name__}: {exc}", retries=retry_count_of(exc),
+        )
+        try:
+            fallback = _deepxiv_progressive_read(url, manifest, backend=backend)
+        except Exception as head_exc:
+            fallback = [
+                _attempt(
+                    backend="deepxiv", backend_version=backend.version, view="head",
+                    section=None, status="failed",
+                    error=f"{type(head_exc).__name__}: {head_exc}",
+                    retries=retry_count_of(head_exc),
+                )
+            ]
+        return [failed] + fallback, "progressive"
+    return [
+        _attempt(
+            backend=name, backend_version=version, view="section", section=section,
+            status="success", content=content[:budget_chars], retries=retries,
+        )
+    ], "explicit"
+
+
+def _read_source(
+    url: str, *, view: str, section: str | None, manifest: dict[str, Any],
+    budget_chars: int, frozen_corpus: Path | None, visit_backend: str, acquire_deepxiv: Any,
+) -> tuple[list[dict[str, Any]], str]:
+    """Read one source and return its receipts plus the success mode.
+
+    Never mutates the manifest — the caller applies every receipt, so a whole
+    batch writes the manifest exactly once. Mode `progressive` means DeepXiv
+    produced several views and success requires a substantive one; `explicit`
+    means one named view was requested and success is that read returning
+    content.
+    """
+    if frozen_corpus:
+        frozen = FrozenCorpusBackend(frozen_corpus)
+        content, backend, backend_version = frozen.read(url), "frozen", frozen.version
+    elif visit_backend == "jina":
+        content, backend = _jina_visit(url)
+        backend_version = "hosted-api-unknown" if backend == "jina-reader" else "stdlib"
+    elif visit_backend == "direct":
+        content, backend = _direct_visit(url), "direct"
+        backend_version = "stdlib"
+    elif arxiv_id(url) and view == "auto":
+        return _deepxiv_progressive_read(
+            url, manifest, backend=acquire_deepxiv()
+        ), "progressive"
+    elif arxiv_id(url) and view == "section":
+        return _read_deepxiv_section(
+            url, section=section, manifest=manifest, budget_chars=budget_chars,
+            acquire=acquire_deepxiv,
+        )
+    elif arxiv_id(url) and view in {"brief", "head", "preview", "full_text"}:
+        (content, backend, backend_version), retries = call_with_retry(
+            lambda: _deepxiv_read(url, view, section, backend=acquire_deepxiv())
+        )
+        return [
+            _attempt(
+                backend=backend, backend_version=backend_version, view=view,
+                section=section, status="success", content=content[:budget_chars],
+                retries=retries,
+            )
+        ], "explicit"
+    else:
+        content, backend = _direct_visit(url), "direct"
+        backend_version = "stdlib"
+    return [
+        _attempt(
+            backend=backend, backend_version=backend_version,
+            view="full_text" if view == "auto" else view, section=section,
+            status="success", content=content[:budget_chars],
+        )
+    ], "explicit"
+
+
+def _visit_source(url: str, **kwargs: Any) -> dict[str, Any]:
+    """Fetch one URL and return its receipts and batch-level outcome."""
+    view, section = kwargs["view"], kwargs["section"]
+    try:
+        attempts, mode = _read_source(url, **kwargs)
+        if mode == "progressive":
+            _retain_progressive_content(attempts, kwargs["budget_chars"])
+    except Exception as exc:
+        attempts = [
+            _attempt(
+                backend="auto", backend_version="unknown", view=view, section=section,
+                status="failed", error=f"{type(exc).__name__}: {exc}",
+                retries=retry_count_of(exc),
+            )
+        ]
+        mode = "explicit"
+    for attempt in attempts:
+        if attempt["status"] == "success" and not (attempt["content"] or "").strip():
+            attempt["status"] = "failed"
+            attempt["content"] = None
+            attempt["error"] = "RuntimeError: backend returned empty content"
+
+    if mode == "progressive":
+        ok = any(
+            attempt["status"] == "success" and attempt["view"] in SUBSTANTIVE_VIEWS
+            for attempt in attempts
+        )
+    else:
+        ok = any(attempt["status"] == "success" for attempt in attempts)
+
+    reasons = [
+        attempt["error"]
+        for attempt in attempts
+        if attempt["status"] == "failed" and attempt["error"]
+    ]
+    error = None
+    if not ok:
+        got_head = any(
+            attempt["status"] == "success" and attempt["view"] == "head"
+            for attempt in attempts
+        )
+        if mode == "progressive" and got_head:
+            error = (
+                "DeepXiv returned head metadata but no substantive section or "
+                "preview content"
+            )
+            if reasons:
+                error += f" (last error: {reasons[-1]})"
+        else:
+            error = reasons[-1] if reasons else "backend returned no content"
+
+    rendered: list[str] = []
+    for attempt in attempts:
+        if attempt["status"] != "success" or not attempt["content"]:
+            continue
+        if mode == "progressive":
+            label = attempt["view"]
+            if attempt["section"]:
+                label += f": {attempt['section']}"
+            rendered.append(f"## DeepXiv {label}\n\n{attempt['content']}")
+        else:
+            rendered.append(attempt["content"])
+    return {
+        "url": url,
+        "attempts": attempts,
+        "ok": ok,
+        "error": error,
+        "rate_limited": not ok and any(is_rate_limited(reason) for reason in reasons),
+        "rendered": "\n\n".join(rendered),
+    }
+
+
+def _skipped_outcome(url: str, *, view: str, section: str | None) -> dict[str, Any]:
+    message = (
+        "RuntimeError: skipped without a request after sustained DeepXiv rate limiting"
+    )
+    return {
+        "url": url,
+        "attempts": [
+            _attempt(
+                backend="auto", backend_version="unknown", view=view, section=section,
+                status="failed", error=message,
+            )
+        ],
+        "ok": False,
+        "error": message,
+        "rate_limited": True,
+        "rendered": "",
+    }
+
+
+async def _dispatch_visits(
+    urls: list[str], *, max_concurrency: int, read_kwargs: dict[str, Any]
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch URLs concurrently, halving concurrency under sustained 429s."""
+    outcomes: list[dict[str, Any]] = []
+    limit = max(1, max_concurrency)
+    streak = 0
+    index = 0
+    gave_up = False
+    while index < len(urls):
+        wave = urls[index : index + limit]
+        index += len(wave)
+        for outcome in await asyncio.gather(
+            *(asyncio.to_thread(_visit_source, url, **read_kwargs) for url in wave)
+        ):
+            outcomes.append(outcome)
+            streak = streak + 1 if outcome["rate_limited"] else 0
+        if streak >= RATE_LIMIT_TRIP:
+            streak = 0
+            if limit > 1:
+                limit = max(1, limit // 2)
+            else:
+                gave_up = True
+                break
+    for url in urls[index:]:
+        outcomes.append(
+            _skipped_outcome(url, view=read_kwargs["view"], section=read_kwargs["section"])
+        )
+    return outcomes, gave_up
 
 
 def cmd_visit(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     _reject_legacy_manifest(manifest)
     budget = manifest.get("lane_budgets", LANE_BUDGETS).get(args.lane, LANE_BUDGETS[args.lane])
-    view = args.view
-    if args.section and view != "section":
+    urls = list(dict.fromkeys(args.url))
+    if args.section and args.view != "section":
         print("visit failed: --section is only valid with --view section", file=sys.stderr)
         return 1
-    try:
-        if args.frozen_corpus:
-            frozen = FrozenCorpusBackend(args.frozen_corpus)
-            content = frozen.read(args.url)
-            backend = "frozen"
-            backend_version = frozen.version
-            if view == "auto":
-                view = "full_text"
-        elif args.visit_backend == "jina":
-            content, backend = _jina_visit(args.url)
-            backend_version = "hosted-api-unknown" if backend == "jina-reader" else "stdlib"
-            if view == "auto":
-                view = "full_text"
-        elif args.visit_backend == "direct":
-            content, backend = _direct_visit(args.url), "direct"
-            backend_version = "stdlib"
-            if view == "auto":
-                view = "full_text"
-        elif arxiv_id(args.url) and view == "auto":
-            attempts = _deepxiv_progressive_read(args.url, manifest)
-            _retain_progressive_content(attempts, budget * 4)
-            for attempt in attempts:
-                add_visit(
-                    manifest,
-                    url=args.url,
-                    lane=args.lane,
-                    backend=attempt["backend"],
-                    view=attempt["view"],
-                    status=attempt["status"],
-                    content=attempt["content"],
-                    error=attempt["error"],
-                    backend_version=attempt["backend_version"],
-                    section=attempt["section"],
-                )
-            save_manifest(args.manifest, manifest)
-            body_attempts = [
-                attempt
-                for attempt in attempts
-                if attempt["status"] == "success"
-                and attempt["view"] in SUBSTANTIVE_VIEWS
-            ]
-            rendered = []
-            for attempt in attempts:
-                if attempt["status"] != "success":
-                    continue
-                label = attempt["view"]
-                if attempt["section"]:
-                    label += f": {attempt['section']}"
-                rendered.append(f"## DeepXiv {label}\n\n{attempt['content']}")
-            if rendered:
-                print("\n\n".join(rendered))
-            if not body_attempts:
-                print(
-                    "visit failed: DeepXiv returned head metadata but no substantive "
-                    "section or preview content",
-                    file=sys.stderr,
-                )
-                return 1
-            return 0
-        elif arxiv_id(args.url) and view in {"brief", "head", "preview", "section", "full_text"}:
-            content, backend, backend_version = _deepxiv_read(args.url, view, args.section)
-        else:
-            content, backend = _direct_visit(args.url), "direct"
-            backend_version = "stdlib"
-            if view == "auto":
-                view = "full_text"
-        content = content[: budget * 4]
-        add_visit(manifest, url=args.url, lane=args.lane, backend=backend, view=view,
-                  status="success", content=content, backend_version=backend_version,
-                  section=args.section)
-        save_manifest(args.manifest, manifest)
-        print(content)
-        return 0
-    except Exception as exc:
-        add_visit(manifest, url=args.url, lane=args.lane, backend="auto", view=view,
-                  status="failed", error=f"{type(exc).__name__}: {exc}",
-                  backend_version="unknown", section=args.section)
-        save_manifest(args.manifest, manifest)
-        print(f"visit failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    if args.section and len(urls) > 1:
+        print(
+            "visit failed: --section names one paper's section; pass a single --url",
+            file=sys.stderr,
+        )
         return 1
+
+    deepxiv: DeepXivBackend | None = None
+    deepxiv_error: Exception | None = None
+    if (
+        not args.frozen_corpus
+        and args.visit_backend == "auto"
+        and any(arxiv_id(url) for url in urls)
+    ):
+        try:
+            deepxiv = DeepXivBackend()
+        except Exception as exc:  # reported per URL, exactly as before
+            deepxiv_error = exc
+
+    def acquire_deepxiv() -> DeepXivBackend:
+        """One shared handle per invocation, so the version probe runs once."""
+        if deepxiv is None:
+            raise deepxiv_error or RuntimeError("deepxiv executable not found on PATH")
+        return deepxiv
+
+    outcomes, gave_up = asyncio.run(
+        _dispatch_visits(
+            urls,
+            max_concurrency=args.max_concurrency,
+            read_kwargs={
+                "view": args.view,
+                "section": args.section,
+                "budget_chars": budget * 4,
+                "manifest": manifest,
+                "frozen_corpus": args.frozen_corpus,
+                "visit_backend": args.visit_backend,
+                "acquire_deepxiv": acquire_deepxiv,
+            },
+        )
+    )
+    for outcome in outcomes:
+        for attempt in outcome["attempts"]:
+            add_visit(
+                manifest, url=outcome["url"], lane=args.lane, backend=attempt["backend"],
+                view=attempt["view"], status=attempt["status"], content=attempt["content"],
+                error=attempt["error"], backend_version=attempt["backend_version"],
+                section=attempt["section"], retry_count=attempt["retry_count"],
+            )
+    save_manifest(args.manifest, manifest)
+    failed = [outcome for outcome in outcomes if not outcome["ok"]]
+    stage_timings.record(
+        args.manifest, stage="retrieve", action="visit", ok=not failed,
+        detail=f"{len(urls) - len(failed)}/{len(urls)} sources read",
+    )
+
+    batch = len(urls) > 1
+    rendered = [
+        f"===== {outcome['url']} =====\n\n{outcome['rendered']}"
+        if batch
+        else outcome["rendered"]
+        for outcome in outcomes
+        if outcome["rendered"]
+    ]
+    if rendered:
+        print("\n\n".join(rendered))
+    for outcome in failed:
+        where = f"{outcome['url']}: " if batch else ""
+        print(f"visit failed: {where}{outcome['error']}", file=sys.stderr)
+    if gave_up:
+        print(
+            "visit: DeepXiv refused sustained sequential requests; the remaining URLs "
+            'were skipped without backoff. Its "daily limit" wording accompanies every '
+            "HTTP 429 and is not evidence of an exhausted quota.",
+            file=sys.stderr,
+        )
+    if not failed:
+        return 0
+    return 1 if len(failed) == len(outcomes) else 2
 
 
 def cmd_record_visit(args: argparse.Namespace) -> int:
@@ -1361,10 +1685,21 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--max-results", type=int, default=10)
     search.set_defaults(func=cmd_search)
 
-    visit = sub.add_parser("visit", help="read a source and append a visit receipt")
+    visit = sub.add_parser("visit", help="read sources and append visit receipts")
     visit.add_argument("--manifest", type=Path, required=True)
-    visit.add_argument("--url", required=True)
+    visit.add_argument(
+        "--url",
+        action="append",
+        required=True,
+        help="repeat to read several sources in one invocation and one manifest write",
+    )
     visit.add_argument("--lane", choices=sorted(LANE_BUDGETS), default="grounding")
+    visit.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=DEFAULT_VISIT_CONCURRENCY,
+        help="parallel reads per wave; halved automatically under sustained rate limiting",
+    )
     visit.add_argument(
         "--view", choices=["auto", "brief", "head", "preview", "section", "full_text"],
         default="auto",

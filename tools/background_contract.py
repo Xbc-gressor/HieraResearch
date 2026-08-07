@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import stage_timings
 from search_backends import (
     canonical_key,
     is_substantive_grounding_visit,
@@ -2836,6 +2837,10 @@ def cmd_catalog(args: argparse.Namespace) -> int:
 
 def cmd_validate(args: argparse.Namespace) -> int:
     registry, _, errors = _validated_inputs(args)
+    stage_timings.record(
+        args.background, stage="write", action="validate", ok=not errors,
+        detail=f"{len(errors)} errors" if errors else None,
+    )
     result = {
         "ok": not errors,
         "schema_version": registry.get("schema_version"),

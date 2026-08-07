@@ -212,7 +212,9 @@ def main() -> int:
         fake_deepxiv.write_text(
             """#!/usr/bin/env python3
 import json
+import os
 import sys
+from pathlib import Path
 
 args = sys.argv[1:]
 if args == ["--version"]:
@@ -240,6 +242,13 @@ elif args and args[0] == "search":
     ]}))
 elif args and args[0] == "paper" and "--head" in args:
     paper_id = args[1]
+    if paper_id in {"2409.05594", "2409.05595"}:
+        state = Path(os.environ["FAKE_DEEPXIV_STATE"]) / (paper_id + ".count")
+        seen = int(state.read_text()) if state.exists() else 0
+        state.write_text(str(seen + 1))
+        if paper_id == "2409.05595" or seen < 2:
+            print("Daily limit reached. Visit https://data.rag.ac.cn/register", file=sys.stderr)
+            raise SystemExit(1)
     print(json.dumps({
         "title": "Progressive fixture",
         "abstract": "A metadata-only abstract.",
@@ -253,6 +262,9 @@ elif args and args[0] == "paper" and "--head" in args:
     }))
 elif args and args[0] == "paper" and "--section" in args:
     name = args[args.index("--section") + 1]
+    if name == "Nonexistent":
+        print("ValueError: Section 'Nonexistent' not found", file=sys.stderr)
+        raise SystemExit(1)
     print(json.dumps({
         "section": name,
         "content": "Primary source body for " + name + ". " + ("evidence " * 100)
@@ -272,6 +284,10 @@ else:
         progressive_manifest_path.write_text(json.dumps(new_manifest()))
         progressive_env = dict(os.environ)
         progressive_env["PATH"] = str(Path(tmp)) + os.pathsep + progressive_env.get("PATH", "")
+        state_dir = Path(tmp) / "fake-state"
+        state_dir.mkdir()
+        progressive_env["FAKE_DEEPXIV_STATE"] = str(state_dir)
+        progressive_env["HIERA_RETRY_BASE_SECONDS"] = "0"
         progressive_run = subprocess.run(
             [
                 sys.executable,
@@ -364,6 +380,151 @@ else:
         ]
         assert head_only_manifest["visits"][-1]["status"] == "failed"
         assert validate_manifest(head_only_manifest) == []
+
+        def visit_args(manifest_path, *urls, extra=()):
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("search_backends.py")),
+                "visit",
+                "--manifest",
+                str(manifest_path),
+            ]
+            for url in urls:
+                command += ["--url", url]
+            return command + list(extra)
+
+        # A batch reads every URL in one process and writes the manifest once.
+        batch_manifest_path = Path(tmp) / "batch.json"
+        batch_manifest_path.write_text(json.dumps(new_manifest()))
+        batch_run = subprocess.run(
+            visit_args(
+                batch_manifest_path,
+                "https://arxiv.org/abs/2409.05591",
+                "https://arxiv.org/abs/2409.05592",
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert batch_run.returncode == 0, batch_run.stderr or batch_run.stdout
+        batch_manifest = json.loads(batch_manifest_path.read_text())
+        assert {visit["canonical_key"] for visit in batch_manifest["visits"]} == {
+            "arxiv:2409.05591",
+            "arxiv:2409.05592",
+        }
+        assert "arxiv.org/abs/2409.05591 =====" in batch_run.stdout
+        assert validate_manifest(batch_manifest) == []
+
+        # Partial failure is its own exit code, and names the failed URL.
+        mixed_manifest_path = Path(tmp) / "mixed-batch.json"
+        mixed_manifest_path.write_text(json.dumps(new_manifest()))
+        mixed_run = subprocess.run(
+            visit_args(
+                mixed_manifest_path,
+                "https://arxiv.org/abs/2409.05591",
+                "https://arxiv.org/abs/2409.05593",
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert mixed_run.returncode == 2, mixed_run.stderr or mixed_run.stdout
+        assert "2409.05593" in mixed_run.stderr
+        assert "2409.05591" not in mixed_run.stderr
+        assert validate_manifest(json.loads(mixed_manifest_path.read_text())) == []
+
+        all_failed_manifest_path = Path(tmp) / "all-failed-batch.json"
+        all_failed_manifest_path.write_text(json.dumps(new_manifest()))
+        all_failed_run = subprocess.run(
+            visit_args(
+                all_failed_manifest_path,
+                "https://arxiv.org/abs/2409.05593",
+                "https://arxiv.org/abs/2409.05595",
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert all_failed_run.returncode == 1, all_failed_run.stdout
+
+        # An explicit head read is a success even though head is not substantive.
+        head_view_manifest_path = Path(tmp) / "head-view.json"
+        head_view_manifest_path.write_text(json.dumps(new_manifest()))
+        head_view_run = subprocess.run(
+            visit_args(
+                head_view_manifest_path,
+                "https://arxiv.org/abs/2409.05593",
+                extra=("--view", "head"),
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert head_view_run.returncode == 0, head_view_run.stderr or head_view_run.stdout
+        head_view_manifest = json.loads(head_view_manifest_path.read_text())
+        assert [visit["view"] for visit in head_view_manifest["visits"]] == ["head"]
+        assert validate_manifest(head_view_manifest) == []
+
+        # A 429-class failure is retried; a non-429 failure is not.
+        retry_manifest_path = Path(tmp) / "retry.json"
+        retry_manifest_path.write_text(json.dumps(new_manifest()))
+        retry_run = subprocess.run(
+            visit_args(retry_manifest_path, "https://arxiv.org/abs/2409.05594"),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert retry_run.returncode == 0, retry_run.stderr or retry_run.stdout
+        retry_manifest = json.loads(retry_manifest_path.read_text())
+        assert retry_manifest["visits"][0]["retry_count"] == 2, retry_manifest["visits"][0]
+        assert validate_manifest(retry_manifest) == []
+
+        rate_limited_manifest_path = Path(tmp) / "rate-limited.json"
+        rate_limited_manifest_path.write_text(json.dumps(new_manifest()))
+        rate_limited_run = subprocess.run(
+            visit_args(rate_limited_manifest_path, "https://arxiv.org/abs/2409.05595"),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        assert rate_limited_run.returncode == 1
+        rate_limited_manifest = json.loads(rate_limited_manifest_path.read_text())
+        assert rate_limited_manifest["visits"][0]["retry_count"] == 2
+
+        section_failure_manifest_path = Path(tmp) / "section-no-retry.json"
+        section_failure_manifest_path.write_text(json.dumps(new_manifest()))
+        section_failure_run = subprocess.run(
+            visit_args(
+                section_failure_manifest_path,
+                "https://arxiv.org/abs/2409.05592",
+                extra=("--view", "section", "--section", "Nonexistent"),
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=progressive_env,
+        )
+        # The named section is absent, so the read falls back to auto ranking
+        # and both receipts are kept. 2409.05592 has no sections, so the
+        # fallback lands on preview.
+        assert section_failure_run.returncode == 0, section_failure_run.stderr
+        section_failure_manifest = json.loads(section_failure_manifest_path.read_text())
+        assert [visit["view"] for visit in section_failure_manifest["visits"]] == [
+            "section",
+            "head",
+            "preview",
+        ]
+        assert section_failure_manifest["visits"][0]["status"] == "failed"
+        assert section_failure_manifest["visits"][0]["retry_count"] == 0, (
+            "a missing section is not a rate limit and must not be retried"
+        )
+        assert validate_manifest(section_failure_manifest) == []
 
         deepxiv_search_path = Path(tmp) / "deepxiv-search.json"
         deepxiv_search_run = subprocess.run(
@@ -647,6 +808,49 @@ else:
     assert any("content_chars must be positive" in error for error in errors), errors
 
     assert LANE_BUDGETS["grounding"] > LANE_BUDGETS["novelty"]
+
+    # Sustained rate limiting halves concurrency rather than aborting, and only
+    # gives up once there is nothing left to slow down.
+    import search_backends
+
+    waves: list[int] = []
+    original_visit_source = search_backends._visit_source
+
+    def stub(url: str, **kwargs) -> dict:
+        return {
+            "url": url,
+            "attempts": [],
+            "ok": False,
+            "error": "RuntimeError: Daily limit reached.",
+            "rate_limited": True,
+            "rendered": "",
+        }
+
+    original_gather = asyncio.gather
+
+    async def counting_gather(*coroutines, **kwargs):
+        waves.append(len(coroutines))
+        return await original_gather(*coroutines, **kwargs)
+
+    search_backends._visit_source = stub
+    asyncio.gather = counting_gather
+    try:
+        outcomes, gave_up = asyncio.run(
+            search_backends._dispatch_visits(
+                [f"https://arxiv.org/abs/24{index:02d}.00001" for index in range(12)],
+                max_concurrency=4,
+                read_kwargs={"view": "auto", "section": None},
+            )
+        )
+    finally:
+        search_backends._visit_source = original_visit_source
+        asyncio.gather = original_gather
+    # Each trip halves and restarts the streak, so three more consecutive
+    # rate-limited URLs are needed before halving again.
+    assert waves == [4, 2, 2, 1, 1, 1], waves
+    assert gave_up, "a trip at concurrency 1 must stop issuing requests"
+    assert len(outcomes) == 12, "every URL still gets a receipt-bearing outcome"
+    assert sum(1 for outcome in outcomes if "skipped" in (outcome["error"] or "")) == 1
 
     def plan_query(roles, targets=()):
         return {
