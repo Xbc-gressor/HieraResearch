@@ -15,10 +15,9 @@ You own the two outer-search layers after setup:
 
 1. **SELECT (structure):** `got_select.py` chooses `fresh`, `improve`, or
    `crossover` and numeric parents from the development DAG.
-2. **SELECT (semantic point) + PREDICT + IDEATE:** `semantic_search.py` builds
-   valid points for that action; a replaceable acquisition policy ranks them;
-   `semantic_predict.py` runs a pairwise tournament over the ranking head; you
-   turn the winner into a complete concrete implementation idea.
+2. **SELECT (semantic point) + IDEATE:** `semantic_search.py` builds valid points
+   for that action; a replaceable acquisition policy chooses one; you turn it
+   into a complete concrete implementation idea.
 
 Do not let semantic scores alter the graph action or parent choice. Do not let
 observations, beliefs, or policy predictions mutate `background.md`.
@@ -31,15 +30,11 @@ You receive one `run_dir`. Infer the task and read only:
 - `tools/ledger.py brief` and action-local parent records;
 - `tools/background_contract.py render` (bounded hierarchy and coverage);
 - the `gain-context.json` bounded experience view generated below when needed;
-- the proposal file for the current action;
-- the `shortlist.json` / `precedents.json` / `pairs.json` artifacts the PREDICT
-  step generates.
+- the proposal file for the current action.
 
 Do not read candidate code, full run logs, the full global DAG, or raw retrieval
-documents. In particular, `precedents.json` is the complete precedent payload:
-do not open the ledger records behind it to recover a failure reason. The
-deterministic tools validate structure; your job is semantic judgment and a
-concrete solution.
+documents. The deterministic tools validate structure; your job is semantic
+judgment and a concrete solution.
 
 ## Preconditions
 
@@ -264,7 +259,7 @@ python tools/semantic_search.py select \
 lane-scheduled: the deterministic carrier prior subtracts from a point's
 acquisition score for every independent negative carrier context its
 hypotheses carry, so repeated disasters push a point down the ranking while a
-later positive context can lift it again. The schema-8 policy receipt records
+later positive context can lift it again. The schema-7 policy receipt records
 the prior and per-hypothesis carrier counts under `components` plus the
 selection index in `budget`; the legacy lane fields are null with
 `fallback: lanes_removed`.
@@ -277,90 +272,6 @@ the policy and weights. Correct a rejected prediction file at most once. If it
 still fails, use `--policy coverage_experience` and let the receipt truthfully record the
 policy actually used; do not loop, preserve a failed model score, or invent
 missing scores.
-
-## Step 3b — PREDICT before executing
-
-Acquisition ranks the whole proposal set but commits on rank 1 alone. PREDICT
-spends judge tokens — never evaluation slots — to re-order the top of that
-ranking before any candidate is built. Read `framework_cfg.json.predict`; when
-`enabled` is false, skip this step entirely and select as in Step 3.
-
-Take the acquisition head instead of selecting immediately:
-
-```bash
-python tools/semantic_search.py shortlist \
-  --proposals <...>/proposals.json --policy <policy> \
-  [--predictions <...>/predictions.json] --ledger <run_dir>/ledger.json \
-  --output <...>/shortlist.json
-```
-
-`shortlist` runs the same acquisition and the same freshness gates as `select`;
-it is the ranking head, not a second policy. Its `size` comes from
-`predict.shortlist_size` (default 3).
-
-For each shortlisted point write a **sketch**, not a candidate: one short
-paragraph naming the mechanism and its parent-relative delta. Write
-`<...>/sketches.json` as `{"sketches": [{"candidate_id": "<point-id>",
-"point_id": "<point-id>", "change": "<one-line delta>", "idea": "<sketch>"}]}`.
-Sketching all N and implementing one is the point of the step; do not run the
-Step 4 IDEATE for a candidate that has not won.
-
-```bash
-python tools/semantic_predict.py precedents \
-  --ledger <run_dir>/ledger.json --sketches <...>/sketches.json \
-  --output <...>/precedents.json
-python tools/semantic_predict.py pairs \
-  --sketches <...>/sketches.json --output <...>/pairs.json
-```
-
-`precedents` returns, per sketch, the prior attempts in this run's ledger whose
-change description is similar enough to be informative, each as a single line
-carrying the change and a binary `worked` / `did not work` label. That is the
-whole retrieval payload by design: adding failure reasons, summaries, or the
-full history measurably degraded judgment in the source ablation. Do not go
-read the underlying records to enrich it, and do not treat a thin or empty list
-as a gap to fill — for a genuinely novel candidate, no precedent is the correct
-and informative answer.
-
-Judge every entry in `pairs.json`. Each is an ordered presentation of one
-unordered pair, and every pair appears twice with the sides swapped. Answer
-each independently: which candidate is more likely to improve the task score,
-given the two sketches and their precedent lines. Do not look up which side you
-picked in the other order, and do not try to be consistent — the disagreement
-rate is the signal. Write `<...>/verdicts.json` as `{"verdicts": [{"a": "...",
-"b": "...", "winner": "<a-or-b>", "confidence": 0.0-1.0}]}`, one entry per
-ordered pair.
-
-```bash
-python tools/semantic_predict.py tally \
-  --verdicts <...>/verdicts.json --shortlist <...>/shortlist.json \
-  --output <...>/predict.json
-```
-
-A pair scores a vote only when both presentation orders name the same winner; a
-disagreement is an abstention and gives no vote to either side. Ties break by
-mean confidence over won comparisons, then by acquisition rank. If every pair
-abstains, the acquisition ranking stands and the receipt records
-`decided_by: acquisition_rank_fallback`. Never fill in an abstention by hand.
-
-Then select the winner through the same helper:
-
-```bash
-python tools/semantic_search.py select \
-  --proposals <...>/proposals.json --policy <policy> \
-  [--predictions <...>/predictions.json] --ledger <run_dir>/ledger.json \
-  --predict <...>/predict.json \
-  --point-output <...>/point.json --receipt-output <...>/policy.json
-```
-
-`select` re-runs acquisition, checks the winner is a point acquisition actually
-ranked, and rejects any id outside the proposal set. The schema-8 receipt keeps
-`ranked_point_ids` in acquisition order and records the winner's true position
-in `budget.base_rank`, so a reader can see exactly how far the tournament moved
-the choice; the tournament itself is recorded under `predict`. A receipt that
-selects below rank 1 without a `predict` block is rejected. Do not hand-author
-`predict.json`, and do not pass `--force-point-id` to express a preference of
-your own — it exists for the tallied winner.
 
 ## Step 4 — IDEATE a complete candidate at the selected point
 
@@ -427,7 +338,6 @@ op: <op>
 parents: <ids-or-none>
 point_id: <point-id>
 policy: <coverage_experience|coverage|gain|gain_uncertainty|gain_uncertainty_nocost>
-predict: <base_rank>/<shortlist-size> votes=<winner-votes> abstentions=<n> | off
 candidate: <name>
 ledger: <run_dir>/ledger.json
 ```
@@ -443,7 +353,5 @@ The ledger, semantic point, and policy receipt are the durable payload.
   a non-baseline value for a pruned dimension by hand-editing a point.
 - Do not hand-author, re-stamp, or alter a proposal set, semantic point, or
   policy receipt.
-- Do not hand-author or edit a tournament result, resolve an abstention
-  yourself, or use `--force-point-id` for anything but the tallied winner.
 - Keep ancestry, semantic attribution, policy predictions, derived belief, and
   score observations distinct.

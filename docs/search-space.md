@@ -228,8 +228,8 @@ subset `S_r ⊆ S`:
 - a runtime-`pruned` dimension is pinned to its explicit
   `baseline_hypothesis_id`, so `S_r` restricts the dimension's coordinate to
   the baseline value;
-- `deprioritized` content stays fully in `S_r` and is penalized in the
-  acquisition score through the carrier prior rather than lane-scheduled;
+- `deprioritized` content stays in `S_r` but receives only its configured
+  semantic-admission budget (default one of every five slots);
   externally `excluded` content was never in any `S_r`.
 
 Pruning a dimension pins its baseline rather than changing point arity or
@@ -250,55 +250,6 @@ The loop at revision `r`:
 `ledger.dag_revision` counts graph-visible score/status changes only;
 `search_space_state.revision` counts append-only decisions. The two cursors
 are independent by construction.
-
-## PREDICT is a filter on the ranking, not on the space
-
-Acquisition induces a total order on the proposals in `S_r`. Selecting rank 1
-commits an evaluation slot to a point no one has looked at as a *solution* —
-only as a coordinate. PREDICT inserts a pre-execution filter between the two:
-
-    rank S_r by acquisition -> take the head of size k -> sketch each ->
-    judge every unordered pair in both presentation orders ->
-    strict-consensus tally -> execute the winner
-
-It is deliberately confined to the ranking. It cannot admit a point outside
-`S_r`, cannot change `space_revision` or `search_space_state`, and cannot alter
-the acquisition score — `select` recomputes the full ranking and rejects a
-winner that acquisition never ranked. Its only effect is *which element of the
-head* becomes a candidate.
-
-Two properties make the tally evidence rather than a vote of confidence. A pair
-scores only when both presentation orders agree; a disagreement abstains and
-gives no vote to either side, so position bias cannot manufacture a winner. And
-the receipt keeps `ranked_point_ids` in acquisition order while
-`budget.base_rank` records the winner's true position, so `base_rank > 1` is a
-directly countable measure of how often, and how far, the tournament overrode
-acquisition. A run in which `base_rank` is always 1 has bought nothing.
-
-Precedent retrieval feeding the judges is outcome-labeled and deliberately
-lossy: one line per prior attempt, carrying the change description and a binary
-worked / did-not-work label, above a similarity floor. Richer serializations —
-failure reasons, summaries, whole-history dumps — measurably degraded selective
-accuracy in the source ablation this design follows, so the loss is the
-mechanism, not a budget compromise.
-
-## Status: what is landed but unvalidated
-
-The overlay's demotion and pruning machinery is implemented, validated, and
-reversible, but it is not yet *evidenced*. Across the completed
-progressive-tuning runs it recorded zero decisions: no hypothesis accumulated
-the independent negative carrier contexts that a demotion requires, because the
-runs did not evaluate enough points per dimension to produce them. Its
-transition rules are therefore untested against real data, and its thresholds
-(≥2 independent negative parents to deprioritize, ≥3 to prune) are asserted,
-not measured.
-
-Treat the demotion path as dormant. Do not tune its thresholds, extend it, or
-cite it as a working mechanism until a run produces decisions; the honest
-current claim is that the machinery exists and has never fired. The same
-caution applies to reading the carrier prior as a validated selection signal —
-it penalizes a hypothesis by the contexts in which it hurt, which is a
-directional heuristic over an under-sampled history, not a calibrated estimate.
 
 ## Bounded evidence and round-serial admission
 

@@ -848,66 +848,6 @@ def validate_candidate_point(point: Any, registry: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _validate_predict_receipt(
-    predict: Any,
-    ranked: Any,
-    receipt: dict[str, Any],
-    where: str,
-) -> list[str]:
-    """Bind a schema-8 PREDICT tournament to the acquisition ranking it reordered.
-
-    The tournament is allowed to choose a different point than acquisition
-    ranked first, but only from inside the shortlist acquisition itself
-    produced. Checking that here — rather than trusting the prompt that ran the
-    tournament — is what keeps a receipt from claiming a winner the search
-    space never offered.
-    """
-    if predict is None:
-        return []
-    label = f"{where}.policy_receipt.predict"
-    if not isinstance(predict, dict):
-        return [f"{label} must be an object"]
-    errors: list[str] = []
-    method = predict.get("method")
-    if not isinstance(method, str) or not method.strip():
-        errors.append(f"{label}.method must be a non-empty string")
-    winner = predict.get("winner")
-    if winner != receipt.get("selected_point_id"):
-        errors.append(f"{label}.winner must match selected_point_id")
-    candidates = predict.get("candidates")
-    if (
-        not isinstance(candidates, list)
-        or len(candidates) < 2
-        or any(not isinstance(item, str) for item in candidates)
-        or len(candidates) != len(set(candidates))
-    ):
-        errors.append(f"{label}.candidates must be 2 or more unique point ids")
-    else:
-        if winner not in candidates:
-            errors.append(f"{label}.candidates must contain the winner")
-        if isinstance(ranked, list):
-            outside = sorted(set(candidates) - set(ranked))
-            if outside:
-                errors.append(
-                    f"{label}.candidates must come from ranked_point_ids; "
-                    f"{outside} were never ranked"
-                )
-    allowed = {
-        "method",
-        "winner",
-        "candidates",
-        "votes",
-        "coverage",
-        "abstentions",
-        "decided_by",
-        "ranking",
-    }
-    unknown = sorted(set(predict) - allowed)
-    if unknown:
-        errors.append(f"{label} has unknown fields {unknown}")
-    return errors
-
-
 def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     receipt = record.get("policy_receipt")
     point = record.get("semantic_point")
@@ -916,9 +856,9 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     point_object = point if isinstance(point, dict) else {}
     errors: list[str] = []
     receipt_schema = receipt.get("schema_version")
-    if receipt_schema not in {2, 3, 4, 5, 6, 7, 8}:
+    if receipt_schema not in {2, 3, 4, 5, 6, 7}:
         errors.append(
-            f"{where}.policy_receipt.schema_version must be 2, 3, 4, 5, 6, 7, or 8"
+            f"{where}.policy_receipt.schema_version must be 2, 3, 4, 5, 6, or 7"
         )
     state_revision = receipt.get("search_space_state_revision")
     if (
@@ -966,7 +906,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     config_valid = True
     expected_config_keys = (
         POLICY_CONFIG_KEYS_V7
-        if receipt_schema in {7, 8}
+        if receipt_schema == 7
         else (
             POLICY_CONFIG_KEYS_V6
             if receipt_schema == 6
@@ -1038,16 +978,16 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     coverage_valid = False
     model_components_valid = False
     required_components = {"coverage", "predicted_gain", "uncertainty", "cost"}
-    if receipt_schema in {4, 5, 6, 7, 8}:
+    if receipt_schema in {4, 5, 6, 7}:
         required_components |= {
             "prior_gain",
             "experience_gain_adjustment",
             "prior_uncertainty",
             "experience_uncertainty_adjustment",
         }
-    if receipt_schema in {6, 7, 8}:
+    if receipt_schema in {6, 7}:
         required_components.add("llm_judgment_weight")
-    if receipt_schema in {7, 8}:
+    if receipt_schema == 7:
         required_components |= {"experience_prior", "carriers"}
     if not isinstance(components, dict) or set(components) != required_components:
         errors.append(
@@ -1076,11 +1016,11 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         llm_judgment_weight = components.get("llm_judgment_weight")
         if policy_name in {"coverage", "coverage_experience"}:
             model_components_valid = all(value is None for value in model_components)
-            if receipt_schema in {4, 5, 6, 7, 8}:
+            if receipt_schema in {4, 5, 6, 7}:
                 model_components_valid = model_components_valid and all(
                     value is None for value in conditioned_components
                 )
-            if receipt_schema in {6, 7, 8}:
+            if receipt_schema in {6, 7}:
                 model_components_valid = (
                     model_components_valid and llm_judgment_weight is None
                 )
@@ -1114,7 +1054,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     f"{where}.policy_receipt gain policies require separate finite "
                     "predicted_gain, uncertainty, and cost values in [0, 1]"
                 )
-        if receipt_schema in {4, 5, 6, 7, 8} and policy_name not in {
+        if receipt_schema in {4, 5, 6, 7} and policy_name not in {
             "coverage",
             "coverage_experience",
         }:
@@ -1181,7 +1121,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                         f"{where}.policy_receipt {label} must equal its prior "
                         "plus experience adjustment"
                     )
-        if receipt_schema in {6, 7, 8} and policy_name not in {
+        if receipt_schema in {6, 7} and policy_name not in {
             "coverage",
             "coverage_experience",
         }:
@@ -1212,7 +1152,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     f"{where}.policy_receipt.components.llm_judgment_weight "
                     "must equal policy.config.llm_intelligence_score / 100"
                 )
-        if receipt_schema in {7, 8}:
+        if receipt_schema == 7:
             carrier_prior = components.get("experience_prior")
             carrier_detail = components.get("carriers")
             if policy_name == "coverage_experience":
@@ -1261,7 +1201,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         errors.append(f"{where}.policy_receipt gain policies require selection evidence")
 
     experience_receipt = receipt.get("experience")
-    if receipt_schema in {4, 5, 6, 7, 8}:
+    if receipt_schema in {4, 5, 6, 7}:
         experience_fields = {
             "generation",
             "updated_at_run",
@@ -1270,7 +1210,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             "evidence_edge_ids",
             "rationale",
         }
-        if receipt_schema in {5, 6, 7, 8}:
+        if receipt_schema in {5, 6, 7}:
             experience_fields.add("conditioning")
         if (
             not isinstance(experience_receipt, dict)
@@ -1334,14 +1274,14 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 )
             if policy_name in {"coverage", "coverage_experience"}:
                 if run_ids or edge_ids or (
-                    receipt_schema in {5, 6, 7, 8}
+                    receipt_schema in {5, 6, 7}
                     and experience_receipt.get("conditioning") != []
                 ):
                     errors.append(
                         f"{where}.policy_receipt coverage policy must not cite "
                         "experience as a model-score input"
                     )
-            elif receipt_schema in {5, 6, 7, 8}:
+            elif receipt_schema in {5, 6, 7}:
                 conditioning = experience_receipt.get("conditioning")
                 errors.extend(
                     f"{where}.policy_receipt.experience: {error}"
@@ -1518,7 +1458,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     f"{where}.policy_receipt.budget.base_rank must be a "
                     "positive integer"
                 )
-    elif receipt_schema in {7, 8}:
+    elif receipt_schema == 7:
         budget_fields = {
             "selection_index",
             "deprioritized_interval",
@@ -1555,23 +1495,9 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 errors.append(
                     f"{where}.policy_receipt.budget.fallback must be lanes_removed"
                 )
-            base_rank = budget.get("base_rank")
-            if receipt_schema == 7:
-                if base_rank != 1:
-                    errors.append(
-                        f"{where}.policy_receipt.budget.base_rank must be 1 without lanes"
-                    )
-            elif (
-                not isinstance(base_rank, int)
-                or isinstance(base_rank, bool)
-                or base_rank < 1
-            ):
-                # Schema 8 lets a PREDICT winner sit below the acquisition top,
-                # so base_rank carries its real position instead of a constant.
-                # Its consistency with ranked_point_ids is checked there.
+            if budget.get("base_rank") != 1:
                 errors.append(
-                    f"{where}.policy_receipt.budget.base_rank must be a "
-                    "positive integer"
+                    f"{where}.policy_receipt.budget.base_rank must be 1 without lanes"
                 )
     elif budget is not None:
         errors.append(f"{where}.policy_receipt schema 2 must not contain budget")
@@ -1599,7 +1525,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 float(components["predicted_gain"])
                 + float(config["uncertainty_weight"]) * float(components["uncertainty"])
             )
-            if receipt_schema in {6, 7, 8}:
+            if receipt_schema in {6, 7}:
                 model_score *= float(components["llm_judgment_weight"])
             expected_score = model_score + float(config["coverage_weight"]) * coverage
         elif all(components[key] is not None for key in ("predicted_gain", "uncertainty", "cost")):
@@ -1611,7 +1537,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 model_score += float(config["uncertainty_weight"]) * float(
                     components["uncertainty"]
                 )
-            if receipt_schema in {6, 7, 8}:
+            if receipt_schema in {6, 7}:
                 model_score *= float(components["llm_judgment_weight"])
             expected_score = model_score + float(config["coverage_weight"]) * coverage
         else:
@@ -1623,53 +1549,19 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 f"{where}.policy_receipt.acquisition_score does not match its separate components"
             )
     ranked = receipt.get("ranked_point_ids")
-    predict = receipt.get("predict")
-    ranked_wellformed = (
-        isinstance(ranked, list)
-        and bool(ranked)
-        and len(ranked) <= 128
-        and all(isinstance(item, str) for item in ranked)
-        and len(ranked) == len(set(ranked))
-    )
-    if not ranked_wellformed:
+    if (
+        not isinstance(ranked, list)
+        or not ranked
+        or len(ranked) > 128
+        or any(not isinstance(item, str) for item in ranked)
+        or len(ranked) != len(set(ranked))
+        or ranked[0] != receipt.get("selected_point_id")
+    ):
         errors.append(
             f"{where}.policy_receipt.ranked_point_ids must be unique and start with the selected point"
         )
-    elif receipt_schema in {2, 3, 4, 5, 6, 7}:
-        if ranked[0] != receipt.get("selected_point_id"):
-            errors.append(
-                f"{where}.policy_receipt.ranked_point_ids must be unique and start with the selected point"
-            )
-    else:
-        # Schema 8 admits a PREDICT winner that acquisition did not rank first.
-        # `ranked_point_ids` therefore keeps the acquisition order untouched and
-        # `budget.base_rank` records where the winner sat in it, so a reader can
-        # see exactly how far the tournament moved the choice. Selecting off the
-        # top of the ranking without a tournament receipt would be an unaudited
-        # override, so it stays rejected.
-        selected_id = receipt.get("selected_point_id")
-        if selected_id not in ranked:
-            errors.append(
-                f"{where}.policy_receipt.selected_point_id must appear in ranked_point_ids"
-            )
-        elif ranked[0] != selected_id and not isinstance(predict, dict):
-            errors.append(
-                f"{where}.policy_receipt may only select below the top of "
-                "ranked_point_ids when it carries a predict receipt"
-            )
-        elif (
-            isinstance(budget, dict)
-            and isinstance(budget.get("base_rank"), int)
-            and not isinstance(budget.get("base_rank"), bool)
-            and budget["base_rank"] <= len(ranked)
-            and ranked[budget["base_rank"] - 1] != selected_id
-        ):
-            errors.append(
-                f"{where}.policy_receipt.budget.base_rank must be the selected "
-                "point's position in ranked_point_ids"
-            )
-    if ranked_wellformed and (
-        receipt_schema in {3, 4, 5, 6, 7, 8}
+    elif (
+        receipt_schema in {3, 4, 5, 6, 7}
         and isinstance(budget, dict)
         and isinstance(budget.get("base_rank"), int)
         and budget["base_rank"] > len(ranked)
@@ -1690,13 +1582,10 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         "evidence",
         "ranked_point_ids",
     }
-    if receipt_schema in {3, 4, 5, 6, 7, 8}:
+    if receipt_schema in {3, 4, 5, 6, 7}:
         allowed.add("budget")
-    if receipt_schema in {4, 5, 6, 7, 8}:
+    if receipt_schema in {4, 5, 6, 7}:
         allowed.add("experience")
-    if receipt_schema in {8}:
-        allowed.add("predict")
-        errors.extend(_validate_predict_receipt(predict, ranked, receipt, where))
     unknown = sorted(set(receipt) - allowed)
     if unknown:
         errors.append(f"{where}.policy_receipt has unknown fields {unknown}")
@@ -1840,7 +1729,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         # Replay the overlay at the record's historical selection revision, so
         # later pruning never invalidates an earlier admitted record.
         receipt = record.get("policy_receipt")
-        if isinstance(receipt, dict) and receipt.get("schema_version") in {6, 7, 8}:
+        if isinstance(receipt, dict) and receipt.get("schema_version") in {6, 7}:
             policy = receipt.get("policy")
             config = policy.get("config") if isinstance(policy, dict) else None
             score = (
@@ -1890,7 +1779,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     record.get("semantic_point"), registry, effective
                 )
                 errors.extend(f"{where}: {error}" for error in eligibility)
-                if isinstance(receipt, dict) and receipt.get("schema_version") in {3, 4, 5, 6, 7, 8}:
+                if isinstance(receipt, dict) and receipt.get("schema_version") in {3, 4, 5, 6, 7}:
                     budget = receipt.get("budget")
                     point = record.get("semantic_point")
                     if isinstance(point, dict) and receipt.get("schema_version") in {3, 4, 5, 6}:
@@ -1920,7 +1809,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                             f"{where}.policy_receipt.budget.selection_index must "
                             f"equal the one-based admission index {index + 1}"
                         )
-                    if receipt.get("schema_version") in {4, 5, 6, 7, 8}:
+                    if receipt.get("schema_version") in {4, 5, 6, 7}:
                         experience_receipt = receipt.get("experience")
                         if isinstance(experience_receipt, dict):
                             updated_at_run = experience_receipt.get("updated_at_run")
@@ -1969,7 +1858,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
             f"{where}: {error}"
             for error in validate_parameter_transfer_binding(ledger, record)
         )
-        if isinstance(receipt, dict) and receipt.get("schema_version") in {5, 6, 7, 8}:
+        if isinstance(receipt, dict) and receipt.get("schema_version") in {5, 6, 7}:
             experience_receipt = receipt.get("experience")
             conditioning = (
                 experience_receipt.get("conditioning")
