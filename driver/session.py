@@ -154,6 +154,12 @@ class SDKSessionRunner:
                     num_turns=msg.num_turns,
                     total_cost_usd=msg.total_cost_usd,
                     usage=msg.usage,
+                    # error detail matters most when is_error is true; these
+                    # are None/empty on success and cheap to carry always
+                    stop_reason=msg.stop_reason,
+                    api_error_status=msg.api_error_status,
+                    errors=msg.errors,
+                    result_excerpt=(msg.result or "")[:500] or None,
                 )
             # duck-typed test fakes
             elif getattr(msg, "subtype", None) == "init":
@@ -170,6 +176,11 @@ class SDKSessionRunner:
                     num_turns=msg.num_turns,
                     total_cost_usd=msg.total_cost_usd,
                     usage=msg.usage,
+                    stop_reason=getattr(msg, "stop_reason", None),
+                    api_error_status=getattr(msg, "api_error_status", None),
+                    errors=getattr(msg, "errors", None),
+                    result_excerpt=(getattr(msg, "result", None) or "")[:500]
+                                   or None,
                 )
 
     @staticmethod
