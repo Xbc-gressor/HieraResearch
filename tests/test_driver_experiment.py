@@ -330,6 +330,24 @@ class ExperimentTests(unittest.TestCase):
                             for c in cmd.calls))
         self.assertEqual(cmd._ledger().get("phase"), "completed")
 
+    def test_quiescent_rounds_complete_instead_of_spinning(self) -> None:
+        self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
+        cmd = ExperimentCmd(self.repo)  # budget never reached
+        runner = FakeSessionRunner([
+            {"receipt": {"actions": []}},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+            {"receipt": {"actions": []}},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        roles = [name for name, _ in runner.calls]
+        # exactly two zero-progress rounds, then normal completion
+        self.assertEqual(roles, ["idea-generator", "tuner-orchestrator"] * 2)
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+
     def test_set_phase_completed_refusal_blocks_cleanly(self) -> None:
         self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
         cmd = ExperimentCmd(self.repo)

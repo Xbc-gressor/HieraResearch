@@ -218,7 +218,8 @@ def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str):
 
 
 def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
-          events) -> None:
+          events) -> dict:
+    """Run the decoupled tuning step; return the effective tuner receipt."""
     tuner_inv = None  # set only on a successful first invocation
     try:
         receipt, tuner_inv = _invoke(runner, store, "tuner-orchestrator",
@@ -258,6 +259,8 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             _or_block(run_dir, repo_root, cmd, events,
                       "authoritative artifacts still contradict after "
                       "tuner reconciliation")
+        return corrected
+    return receipt
 
 
 # --- setup ---------------------------------------------------------------------
@@ -462,6 +465,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                           "retrofitting the control after ideation")
 
         round_no = 0
+        zero_progress_rounds = 0
         while True:
             # step 0: lifecycle + budget (only when a ledger exists — seedless
             # first rounds skip straight to ideation)
@@ -493,9 +497,11 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 break
 
             # step 1: bounded belief refresh at a refresh boundary
+            refreshed = False
             if brief is not None and brief.get("experience_refresh_required"):
                 _refresh(runner, store, task, tag, run_dir, repo_root, cmd,
                          events)
+                refreshed = True
 
             # step 2: generate + evaluate candidates
             result = cmd(["python", "tools/background_contract.py", "preflight",
@@ -524,9 +530,31 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                                      run_id, repo_root, cmd, events)
 
             # step 3: decoupled tuning (skipped when the budget ran out)
+            tuner_progressed = False
             if not budget_status(run_dir, repo_root, cmd).get("reached"):
-                _tune(runner, store, task, tag, run_dir, round_no, repo_root,
-                      cmd, events)
+                tuner_receipt = _tune(runner, store, task, tag, run_dir,
+                                      round_no, repo_root, cmd, events)
+                tuner_progressed = bool(tuner_receipt.get("tuned"))
+
+            # Quiescence guard: got_select caps actions by
+            # floor(remaining_slots / max(2, K_eval)), so a nearly-exhausted
+            # budget yields empty ideation rounds forever. Two consecutive
+            # rounds with no new candidates, no tuning, no refresh, and no
+            # pending resolutions mean no progress is possible within the
+            # remaining budget — complete normally instead of spinning.
+            progressed = (bool(actions) or tuner_progressed or refreshed
+                          or bool(pending_ids))
+            zero_progress_rounds = 0 if progressed else zero_progress_rounds + 1
+            if zero_progress_rounds >= 2:
+                events.emit("quiescent", round_no=round_no,
+                            reason="two consecutive zero-progress rounds")
+                try:
+                    common.set_phase(run_dir, repo_root, cmd, "completed")
+                except subprocess.CalledProcessError as exc:
+                    detail = (exc.stderr or str(exc)).strip()
+                    _or_block(run_dir, repo_root, cmd, events,
+                              f"set-phase completed refused: {detail}")
+                break
             round_no += 1
     except RunBlocked:
         pass
