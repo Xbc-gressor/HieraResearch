@@ -434,6 +434,16 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             else:  # killed before setup finished write_metadata
                 write_metadata(run_dir, model, cli_path)
             common.preflight_env(task, run_dir, repo_root, cmd)
+            # A run resumed after a blocked state is running again — reset
+            # the persisted phase so status consumers don't read a stale
+            # "blocked" while rounds progress.
+            ledger_path = run_dir / "ledger.json"
+            if ledger_path.exists():
+                phase = json.loads(ledger_path.read_text(encoding="utf-8")) \
+                    .get("run_state", {}).get("phase")
+                if phase == "blocked":
+                    common.set_phase(run_dir, repo_root, cmd, "running")
+                    events.emit("resumed_from_blocked")
             if not (run_dir / "background.md").exists() or \
                     not (run_dir / "background_retrieval.json").exists():
                 # killed mid-setup: background research never completed

@@ -348,6 +348,23 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(roles, ["idea-generator", "tuner-orchestrator"] * 2)
         self.assertEqual(cmd._ledger().get("phase"), "completed")
 
+    def test_resume_resets_stale_blocked_phase(self) -> None:
+        self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [True]  # budget exhausted: completes immediately
+        # a previously blocked run carries run_state.phase = "blocked"
+        import json as _json
+        ledger_path = self.repo / "runs" / "fake-task" / "t1" / "ledger.json"
+        ledger = _json.loads(ledger_path.read_text())
+        ledger["run_state"] = {"phase": "blocked"}
+        ledger_path.write_text(_json.dumps(ledger))
+        runner = FakeSessionRunner([])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        set_phases = [c for c in cmd.calls if "set-phase" in c]
+        self.assertTrue(any("--phase running" in c for c in set_phases),
+                        set_phases)
+
     def test_set_phase_completed_refusal_blocks_cleanly(self) -> None:
         self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
         cmd = ExperimentCmd(self.repo)
