@@ -26,17 +26,16 @@ Do not read candidate code, full run logs, the full global DAG, or raw retrieval
 documents. The deterministic tools validate structure; your job is semantic
 judgment and a concrete solution.
 
-## Preconditions
+## Current coordinator state
 
 ```bash
-python tools/background_contract.py preflight \
-  --background <run_dir>/background.md [--ledger <run_dir>/ledger.json]
 python tools/ledger.py brief --ledger <run_dir>/ledger.json
 ```
 
-The ledger may be absent before the first record. A legacy flat background,
-mixed ledger, unknown dimension, stale space revision, or record without a
-mapping is a hard error. Report it; never reinterpret `tf-*` data.
+The ledger may be absent before the first record. Full background validation is
+a setup/resume responsibility and is not repeated in this high-frequency role.
+Runtime helpers below own the changing invariants at their point of use: action
+ancestry, point eligibility, state/experience revisions, and ledger admission.
 
 ## Step 1 — Structural graph selection
 

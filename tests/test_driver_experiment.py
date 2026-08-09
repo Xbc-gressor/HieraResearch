@@ -122,8 +122,6 @@ class ExperimentCmd:
             (self.run_dir / "candidates" / run_id).mkdir(parents=True,
                                                          exist_ok=True)
             return self._ok("")
-        if "background_contract.py" in joined and "preflight" in joined:
-            return self._ok(json.dumps({"action": "none"}))
         return self._ok("{}")
 
     @staticmethod
@@ -182,6 +180,10 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(roles, ["background-researcher", "idea-generator",
                                  "candidate-writer", "tunable-contract-extractor",
                                  "tuner-orchestrator"])
+        self.assertEqual(
+            sum("background_contract.py validate" in call for call in cmd.calls),
+            1,
+        )
 
     def test_tuner_contradiction_corrected_in_same_session(self) -> None:
         write_task(self.repo)
@@ -347,6 +349,10 @@ class ExperimentTests(unittest.TestCase):
         # exactly two zero-progress rounds, then normal completion
         self.assertEqual(roles, ["idea-generator", "tuner-orchestrator"] * 2)
         self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(
+            sum("background_contract.py validate" in call for call in cmd.calls),
+            1,
+        )
 
     def test_resume_resets_stale_blocked_phase(self) -> None:
         self._seed_resumed_run([{"run_id": "000", "status": "keep"}])

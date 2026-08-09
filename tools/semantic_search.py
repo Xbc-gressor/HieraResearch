@@ -42,8 +42,6 @@ from background_contract import (
     ContractError,
     derive_hypothesis_selection,
     load_registry,
-    validate_background_markdown,
-    validate_registry,
 )
 from search_space_state import (
     compose_effective_selection,
@@ -67,8 +65,6 @@ from semantic_space import (
     incoming_activation_relations,
     point_diff,
     point_id,
-    resolve_dimension_catalog,
-    resolve_dimension_strategy,
     selected_assignments,
     space_receipt,
     validate_point,
@@ -1478,21 +1474,11 @@ def _framework_policy_config(
 
 
 def cmd_propose(args: argparse.Namespace) -> int:
+    # Setup validates and freezes background/catalog/source evidence.  Proposal
+    # generation is a high-frequency runtime projection and validates the
+    # changing action, ancestry, point eligibility, and state it consumes.
     registry = load_registry(args.background)
-    catalog_path = getattr(args, "catalog", None)
-    dimension_strategy = resolve_dimension_strategy(args.background)
-    catalog = resolve_dimension_catalog(args.background, explicit_path=catalog_path)
     ledger = _load_object(args.ledger) if args.ledger and args.ledger.exists() else {"records": []}
-    errors = validate_registry(
-        registry,
-        ledger=ledger,
-        catalog=catalog,
-        dimension_strategy=dimension_strategy,
-    )
-    errors.extend(validate_background_markdown(args.background, registry))
-    if errors:
-        print(json.dumps({"ok": False, "errors": errors}, indent=2))
-        return 1
     parents = [item.strip() for item in (args.parents or "").split(",") if item.strip()]
     if args.baseline_only:
         if args.op != "fresh" or parents:
@@ -1682,7 +1668,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     propose = sub.add_parser("propose", help="build bounded valid points for one graph action")
     propose.add_argument("--background", type=Path, required=True)
-    propose.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     propose.add_argument("--ledger", type=Path)
     propose.add_argument("--op", choices=["fresh", "improve", "crossover"], required=True)
     propose.add_argument("--parents", default="", help="comma-separated numeric parents")

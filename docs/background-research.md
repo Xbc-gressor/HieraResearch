@@ -42,8 +42,10 @@ Deterministic tools resolve the source through
 has the background researcher create a validated
 `<run_dir>/dimension_catalog.json` from the task contract before literature
 retrieval. Its instructions live in `docs/dimension-induction.md` and are loaded
-only for that strategy. An explicit `--catalog` path overrides the catalog
-source, not the configured selection semantics.
+only for that strategy. An explicit catalog path is a setup/validation input;
+once the background is frozen, high-frequency runtime commands such as
+`background_contract.py render` and `semantic_search.py propose` consume that
+frozen space and do not accept a catalog override.
 
 With `catalog_subset`, the catalog is broader than a task and background
 research selects a task-relevant subset. With `llm_induced`, the run-local
@@ -217,9 +219,11 @@ receipts, and validation rebuilds them and requires exact persisted equality.
 from parents while warning that they are attribution, not causal edges.
 
 The first ledger write preserves a top-level `search_space` receipt. Later
-candidate additions, experience replacements, and preflight checks fail if the
-background, catalog, mapping, ancestry, or policy receipt no longer matches.
-Records without a point are rejected; pre-P1 runs are not migrated.
+candidate additions and experience replacements fail if the mapping, ancestry,
+state revision, experience revision, or policy receipt no longer matches.
+Records without a point are rejected; pre-P1 runs are not migrated. Full
+background, catalog, retrieval, and human-view validation belongs to setup and
+the process-level resume boundary rather than each candidate-selection round.
 
 ## Search behavior and exploration/exploitation
 
@@ -572,9 +576,6 @@ python tools/background_contract.py validate \
   --background <run_dir>/background.md \
   --retrieval-manifest <run_dir>/background_retrieval.json \
   [--baseline-mechanisms <run_dir>/baseline_mechanisms.json]  # provided entrypoint
-
-python tools/background_contract.py preflight \
-  --background <run_dir>/background.md [--ledger <run_dir>/ledger.json]
 
 python tools/background_contract.py validate-point \
   --background <run_dir>/background.md --point <point.json>

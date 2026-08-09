@@ -322,7 +322,6 @@ runs/<task-name>/<tag>/loop_state.md
 - `catalog`：校验并输出内置目录或显式 `--path` 目录及内容摘要
 - `validate`：检查 schema-3 层级、目录解析、显式基线、关系、五轴范围、来源/指导证据、人类视图以及所有 ledger 点/祖先/策略收据/语义边收据与 `search_space_state` 覆盖层
 - `render`：输出有界的维度、假设、关系与覆盖视图
-- `preflight`：合法 P2 状态只返回 `none`；旧平面或 mixed-mode 直接拒绝，不迁移
 - `validate-point`：检查完整点、条件激活、requires 与 excludes
 - `lineage`：并列呈现数字祖先与机械 point diff，不生成因果边
 - `validate-experience`：校验 schema-3 快照——通用 belief 的 run-id 证据，以及双层 dimension/hypothesis 信念的引用边、评估状态与比较计数（按持久化收据机械重算，必须一致）

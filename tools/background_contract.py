@@ -2740,10 +2740,11 @@ def cmd_render(args: argparse.Namespace) -> int:
             )
         )
         return 1
-    registry, ledger, errors = _validated_inputs(args)
-    if errors:
-        print(json.dumps({"ok": False, "errors": errors}, separators=(",", ":")))
-        return 1
+    # Full background/source/Markdown validation is a setup responsibility.
+    # This high-frequency command is a bounded projection over the frozen
+    # registry and the current helper-owned ledger state.
+    registry = load_registry(args.background)
+    ledger = _load_json(args.ledger) if args.ledger else None
     print(
         json.dumps(
             render_space(registry, ledger, max_hypotheses=args.max_hypotheses),
@@ -2751,19 +2752,6 @@ def cmd_render(args: argparse.Namespace) -> int:
         )
     )
     return 0
-
-
-def cmd_preflight(args: argparse.Namespace) -> int:
-    registry, _, errors = _validated_inputs(args)
-    result = {
-        "ok": not errors,
-        "schema_version": registry.get("schema_version"),
-        "action": "none" if not errors else "reject",
-        "space": space_receipt(registry),
-        "errors": errors,
-    }
-    print(json.dumps(result, separators=(",", ":")))
-    return 0 if not errors else 1
 
 
 def cmd_validate_point(args: argparse.Namespace) -> int:
@@ -2862,16 +2850,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     render = sub.add_parser("render", help="bounded dimension/hypothesis/coverage view")
     render.add_argument("--background", type=Path, required=True)
-    render.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
     render.add_argument("--ledger", type=Path)
     render.add_argument("--max-hypotheses", type=int, default=6)
     render.set_defaults(func=cmd_render)
-
-    preflight = sub.add_parser("preflight", help="reject incompatible or mixed-mode run state")
-    preflight.add_argument("--background", type=Path, required=True)
-    preflight.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
-    preflight.add_argument("--ledger", type=Path)
-    preflight.set_defaults(func=cmd_preflight)
 
     point = sub.add_parser("validate-point", help="validate a complete candidate semantic point")
     point.add_argument("--background", type=Path, required=True)

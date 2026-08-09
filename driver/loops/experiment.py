@@ -1,7 +1,25 @@
-"""Deterministic port of the autoresearch-experiment protocol.
+"""Run the deterministic autoresearch experiment protocol.
 
-Python owns sequencing, budget/lifecycle checks, and escalation. tools/
-helpers own deterministic decisions; LLM sessions own generation/judgment.
+Responsibility is deliberately split three ways:
+
+* this module owns sequencing, lifecycle checks, and recovery;
+* ``tools/`` owns deterministic decisions and durable state changes;
+* role sessions own generation and judgment.
+
+The high-level lifecycle is:
+
+    setup or resume
+        -> reconcile an optional provided baseline
+        -> repeat rounds:
+             recover pending candidates
+             refresh bounded experience when required
+             generate and evaluate one candidate generation
+             run at most one decoupled tuning bout
+        -> complete on budget exhaustion or quiescence
+
+The helpers below are grouped by responsibility. Recovery policy stays close
+to the operation it recovers, while ``run_experiment`` remains a compact map of
+the complete lifecycle.
 """
 
 from __future__ import annotations
@@ -27,6 +45,11 @@ _RECONCILE_GUIDANCE = (
     "receipt.")
 
 
+# =============================================================================
+# Shared artifact and role-session helpers
+# =============================================================================
+
+
 def _brief(run_dir: Path, repo_root: Path, cmd) -> dict:
     out = cmd(["python", "tools/ledger.py", "brief",
                "--ledger", run_dir / "ledger.json"], repo_root)
@@ -49,6 +72,7 @@ def _tune_flag(run_dir: Path, run_id: str) -> bool:
 
 def _invoke(runner, store, role_name, task, tag, run_dir, *,
             run_id=None, round_no=None, extra=None, resume_from=None) -> dict:
+    """Invoke one role and return its persisted receipt plus invocation id."""
     inv_id = store.next_invocation_id()
     resume = (store.load_session_id(role_name, resume_from)
               if resume_from is not None else None)
@@ -61,15 +85,29 @@ def _invoke(runner, store, role_name, task, tag, run_dir, *,
     return json.loads(receipt_path.read_text(encoding="utf-8")), inv_id
 
 
-# --- escalations -------------------------------------------------------------
+# =============================================================================
+# Blocking and reconciliation
+# =============================================================================
 
 
 def _or_block(run_dir, repo_root, cmd, events, reason: str):
+    """Persist a blocked phase, then unwind to ``run_experiment``."""
     common.block(run_dir, repo_root, cmd, events, reason)
     raise RunBlocked(reason)
 
 
+def _complete_run(run_dir, repo_root, cmd, events) -> None:
+    """Persist normal completion, translating a refusal into a blocked run."""
+    try:
+        common.set_phase(run_dir, repo_root, cmd, "completed")
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or str(exc)).strip()
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"set-phase completed refused: {detail}")
+
+
 def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
+    """Refresh bounded experience, with one artifact-aware retry."""
     try:
         _invoke(runner, store, "experience-extractor", task, tag, run_dir)
         return
@@ -89,6 +127,7 @@ def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
 
 def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             events) -> list[dict]:
+    """Generate one action batch and ensure every returned action was admitted."""
     def admitted_missing(actions: list[dict]) -> list[str]:
         admitted = {r.get("run_id") for r in _ledger_records(run_dir)}
         return [a.get("run_id") for a in actions if a.get("run_id") not in admitted]
@@ -118,6 +157,11 @@ def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
         _or_block(run_dir, repo_root, cmd, events,
                   f"idea actions not admitted after retry: {missing}")
     return receipt.get("actions", [])
+
+
+# =============================================================================
+# Candidate materialization and step 0+1 evaluation
+# =============================================================================
 
 
 def _failure_evidence(candidate_dir: Path) -> str | None:
@@ -209,6 +253,11 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                   f"extractor failed for {run_id}: {exc3.problems}")
 
 
+# =============================================================================
+# Decoupled tuning
+# =============================================================================
+
+
 def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str):
     receipt, _ = _invoke(
         runner, store, "tuner-orchestrator", task, tag, run_dir,
@@ -263,7 +312,16 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
     return receipt
 
 
-# --- setup ---------------------------------------------------------------------
+# =============================================================================
+# Run setup and provided-baseline reconciliation
+# =============================================================================
+
+
+def _dimension_strategy(run_dir: Path) -> str | None:
+    """Read the strategy frozen into this run's framework config."""
+    config_path = run_dir / "framework_cfg.json"
+    return json.loads(config_path.read_text(encoding="utf-8")).get(
+        "dimension_strategy")
 
 
 def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
@@ -289,8 +347,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     write_metadata(run_dir, model, cli_path)
 
     # background-researcher runs ONCE, never in the loop
-    strategy = json.loads((run_dir / "framework_cfg.json")
-                          .read_text(encoding="utf-8")).get("dimension_strategy")
+    strategy = _dimension_strategy(run_dir)
     try:
         _invoke(runner, store, "background-researcher", task, tag, run_dir)
     except InvocationFailed as exc:
@@ -300,27 +357,35 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
                          events, strategy)
 
 
+def _background_validation_errors(run_dir, repo_root, cmd,
+                                  strategy) -> list[str]:
+    """Run all deterministic validators for background-research artifacts."""
+    checks = []
+    if strategy == "llm_induced":
+        checks.append([
+            "python", "tools/background_contract.py", "catalog",
+            "--path", run_dir / "dimension_catalog.json",
+        ])
+    checks.extend([
+        ["python", "tools/search_backends.py", "validate",
+         "--manifest", run_dir / "background_retrieval.json"],
+        ["python", "tools/background_contract.py", "validate",
+         "--background", run_dir / "background.md",
+         "--retrieval-manifest", run_dir / "background_retrieval.json"],
+    ])
+
+    errors = []
+    for check_args in checks:
+        result = cmd(check_args, repo_root, check=False)
+        if result.returncode != 0:
+            errors.append(result.stderr or "validation failed")
+    return errors
+
+
 def _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
                          events, strategy) -> None:
-    def validators():
-        checks = []
-        if strategy == "llm_induced":
-            checks.append(["python", "tools/background_contract.py", "catalog",
-                           "--path", run_dir / "dimension_catalog.json"])
-        checks.append(["python", "tools/search_backends.py", "validate",
-                       "--manifest", run_dir / "background_retrieval.json"])
-        checks.append(["python", "tools/background_contract.py", "validate",
-                       "--background", run_dir / "background.md",
-                       "--retrieval-manifest",
-                       run_dir / "background_retrieval.json"])
-        errors = []
-        for check_args in checks:
-            result = cmd(check_args, repo_root, check=False)
-            if result.returncode != 0:
-                errors.append(result.stderr or "validation failed")
-        return errors
-
-    errors = validators()
+    """Validate background artifacts and allow one in-session repair."""
+    errors = _background_validation_errors(run_dir, repo_root, cmd, strategy)
     if not errors:
         return
     # feed validator errors back in-session once; never migrate the frozen space
@@ -330,10 +395,54 @@ def _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
     except InvocationFailed as exc:
         _or_block(run_dir, repo_root, cmd, events,
                   f"background validation repair failed: {exc.problems}")
-    errors = validators()
+    errors = _background_validation_errors(run_dir, repo_root, cmd, strategy)
     if errors:
         _or_block(run_dir, repo_root, cmd, events,
                   f"background validation failed: {errors}")
+
+
+def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
+                  model, cli_path) -> None:
+    """Finish any interrupted setup work and restore a runnable phase."""
+    metadata_path = run_dir / "run_metadata.json"
+    if metadata_path.exists():
+        for warning in warn_on_mismatch(run_dir, model, cli_path):
+            events.emit("metadata_mismatch", warning=warning)
+    else:
+        # The run was killed before fresh setup reached write_metadata().
+        write_metadata(run_dir, model, cli_path)
+
+    common.preflight_env(task, run_dir, repo_root, cmd)
+
+    # Status consumers must not keep seeing a stale "blocked" phase after an
+    # explicit resume has started making progress again.
+    ledger_path = run_dir / "ledger.json"
+    if ledger_path.exists():
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if ledger.get("run_state", {}).get("phase") == "blocked":
+            common.set_phase(run_dir, repo_root, cmd, "running")
+            events.emit("resumed_from_blocked")
+
+    background_missing = (
+        not (run_dir / "background.md").exists()
+        or not (run_dir / "background_retrieval.json").exists()
+    )
+    if background_missing:
+        # The run was killed while the one-time background-research step was
+        # in progress. Resume that setup phase before entering ideation.
+        try:
+            _invoke(runner, store, "background-researcher", task, tag, run_dir)
+        except InvocationFailed as exc:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"background-researcher failed: {exc.problems}")
+
+    # A resume may follow a kill after the researcher wrote its files but
+    # before setup validated them.  Establish the frozen-space invariant once
+    # at this process boundary; rounds trust it.
+    _validate_background(
+        runner, store, task, tag, run_dir, repo_root, cmd, events,
+        _dimension_strategy(run_dir),
+    )
 
 
 def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
@@ -410,13 +519,76 @@ def _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
                   "provided baseline could not be evaluated; crash recorded")
 
 
-# --- main loop -------------------------------------------------------------------
+def _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
+                              repo_root, cmd, events) -> None:
+    """Install or reconcile the task-provided control before ideation."""
+    seed = task_toml.get("seed", {})
+    if not seed.get("provided"):
+        return
+
+    records = _ledger_records(run_dir)
+    if not records:
+        _provided_baseline(runner, store, task, tag, run_dir,
+                           repo_root, cmd, events, seed)
+        return
+
+    if all(record.get("run_id") != "000" for record in records):
+        _or_block(
+            run_dir, repo_root, cmd, events,
+            "seed.provided baseline missing: the ledger has records but no "
+            "000; the protocol forbids retrofitting the control after "
+            "ideation",
+        )
+
+
+# =============================================================================
+# One round of the experiment loop
+# =============================================================================
+
+
+def _resume_pending_candidates(runner, store, task, tag, run_dir, brief,
+                               repo_root, cmd, events) -> tuple[dict | None,
+                                                               list[str]]:
+    """Resume admitted-but-unimplemented candidates before new ideation."""
+    pending_ids = (brief or {}).get("pending_run_ids") or []
+    if not pending_ids:
+        return brief, pending_ids
+
+    for pending_id in pending_ids:
+        if budget_status(run_dir, repo_root, cmd).get("reached"):
+            break
+        _materialize_candidate(task, tag, run_dir, pending_id, repo_root, cmd)
+        _implement_candidate(runner, store, task, tag, run_dir, pending_id,
+                             repo_root, cmd, events)
+
+    return _brief(run_dir, repo_root, cmd), pending_ids
+
+
+def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
+                         repo_root, cmd, events) -> list[dict]:
+    """Generate one bounded action batch and take each action through step 0+1."""
+    actions = _ideate(runner, store, task, tag, run_dir, round_no,
+                      repo_root, cmd, events)
+    for action in actions:
+        if budget_status(run_dir, repo_root, cmd).get("reached"):
+            break
+        run_id = str(action["run_id"])
+        _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
+        _implement_candidate(runner, store, task, tag, run_dir, run_id,
+                             repo_root, cmd, events)
+    return actions
+
+
+# =============================================================================
+# Public entry point
+# =============================================================================
 
 
 def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    max_evaluations=None, timeout=None, dimension_strategy=None,
                    llm_intelligence_score=None, cli_path=None,
                    cmd=common.run_cmd) -> dict:
+    """Set up or resume a run, then advance it until blocked or complete."""
     run_dir = repo_root / "runs" / task / tag
     events = EventsLog(run_dir)
     task_toml = common.load_task_toml(task, repo_root)
@@ -427,125 +599,69 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _setup(runner, store, task, tag, run_dir, task_toml, repo_root,
                    cmd, events, max_evaluations, timeout, dimension_strategy,
                    llm_intelligence_score, model, cli_path)
-        else:  # resume: complete setup step-wise, then re-run the env gate
-            if (run_dir / "run_metadata.json").exists():
-                for warning in warn_on_mismatch(run_dir, model, cli_path):
-                    events.emit("metadata_mismatch", warning=warning)
-            else:  # killed before setup finished write_metadata
-                write_metadata(run_dir, model, cli_path)
-            common.preflight_env(task, run_dir, repo_root, cmd)
-            # A run resumed after a blocked state is running again — reset
-            # the persisted phase so status consumers don't read a stale
-            # "blocked" while rounds progress.
-            ledger_path = run_dir / "ledger.json"
-            if ledger_path.exists():
-                phase = json.loads(ledger_path.read_text(encoding="utf-8")) \
-                    .get("run_state", {}).get("phase")
-                if phase == "blocked":
-                    common.set_phase(run_dir, repo_root, cmd, "running")
-                    events.emit("resumed_from_blocked")
-            if not (run_dir / "background.md").exists() or \
-                    not (run_dir / "background_retrieval.json").exists():
-                # killed mid-setup: background research never completed
-                strategy = json.loads(
-                    (run_dir / "framework_cfg.json")
-                    .read_text(encoding="utf-8")).get("dimension_strategy")
-                try:
-                    _invoke(runner, store, "background-researcher", task, tag,
-                            run_dir)
-                except InvocationFailed as exc:
-                    _or_block(run_dir, repo_root, cmd, events,
-                              f"background-researcher failed: {exc.problems}")
-                _validate_background(runner, store, task, tag, run_dir,
-                                     repo_root, cmd, events, strategy)
+        else:
+            _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd,
+                          events, model, cli_path)
 
-        # seed contract reconciliation (fresh setup AND resume): a kill
-        # between init_run and the baseline's add-record must not resume
-        # into seedless ideation.
-        seed = task_toml.get("seed", {})
-        if seed.get("provided"):
-            records = _ledger_records(run_dir)
-            if not records:
-                _provided_baseline(runner, store, task, tag, run_dir,
-                                   repo_root, cmd, events, seed)
-            elif all(r.get("run_id") != "000" for r in records):
-                _or_block(run_dir, repo_root, cmd, events,
-                          "seed.provided baseline missing: the ledger has "
-                          "records but no 000; the protocol forbids "
-                          "retrofitting the control after ideation")
+        # Applies to both fresh setup and resume. A kill between init_run and
+        # add-record must not let a provided control silently become seedless.
+        _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
+                                  repo_root, cmd, events)
 
         round_no = 0
         zero_progress_rounds = 0
         while True:
-            # step 0: lifecycle + budget (only when a ledger exists — seedless
-            # first rounds skip straight to ideation)
+            # -----------------------------------------------------------------
+            # Round step 0: recover in-flight work, then honor the budget.
+            # Seedless first rounds have no ledger and proceed to ideation.
+            # -----------------------------------------------------------------
             ledger_exists = (run_dir / "ledger.json").exists()
             brief = _brief(run_dir, repo_root, cmd) if ledger_exists else None
-            # crash-recovery row 1: a pending record (admitted but never
-            # implemented) resumes IN PLACE before any new ideation; its
-            # resolution consumes no new ideation slot.
-            pending_ids = (brief or {}).get("pending_run_ids") or []
-            if pending_ids:
-                for pending_id in pending_ids:
-                    if budget_status(run_dir, repo_root, cmd).get("reached"):
-                        break  # budget governs pending resolution too
-                    _materialize_candidate(task, tag, run_dir, pending_id,
-                                           repo_root, cmd)
-                    _implement_candidate(runner, store, task, tag, run_dir,
-                                         pending_id, repo_root, cmd, events)
-                brief = _brief(run_dir, repo_root, cmd)
-            if brief is not None and budget_status(run_dir, repo_root, cmd).get("reached"):
+            brief, pending_ids = _resume_pending_candidates(
+                runner, store, task, tag, run_dir, brief,
+                repo_root, cmd, events,
+            )
+
+            if brief is not None and budget_status(
+                    run_dir, repo_root, cmd).get("reached"):
                 if brief.get("experience_refresh_required"):
                     _refresh(runner, store, task, tag, run_dir, repo_root,
                              cmd, events)
-                try:
-                    common.set_phase(run_dir, repo_root, cmd, "completed")
-                except subprocess.CalledProcessError as exc:
-                    detail = (exc.stderr or str(exc)).strip()
-                    _or_block(run_dir, repo_root, cmd, events,
-                              f"set-phase completed refused: {detail}")
+                _complete_run(run_dir, repo_root, cmd, events)
                 break
 
-            # step 1: bounded belief refresh at a refresh boundary
+            # -----------------------------------------------------------------
+            # Round step 1: refresh experience at a revision boundary.
+            # -----------------------------------------------------------------
             refreshed = False
             if brief is not None and brief.get("experience_refresh_required"):
                 _refresh(runner, store, task, tag, run_dir, repo_root, cmd,
                          events)
                 refreshed = True
 
-            # step 2: generate + evaluate candidates
-            result = cmd(["python", "tools/background_contract.py", "preflight",
-                          "--background", run_dir / "background.md"] +
-                         (["--ledger", run_dir / "ledger.json"]
-                          if ledger_exists else []),
-                         repo_root, check=False)
-            action = ""
-            try:
-                action = json.loads(result.stdout).get("action", "")
-            except (json.JSONDecodeError, AttributeError):
-                pass
-            if result.returncode != 0 or action != "none":
-                _or_block(run_dir, repo_root, cmd, events,
-                          "background preflight rejected the frozen space")
+            # -----------------------------------------------------------------
+            # Round step 2: generate candidates; evaluate each through step 0+1.
+            # Full background validation belongs to setup/resume; the
+            # high-frequency helpers enforce only the dynamic invariants they
+            # consume.
+            # -----------------------------------------------------------------
+            actions = _evaluate_generation(
+                runner, store, task, tag, run_dir, round_no,
+                repo_root, cmd, events,
+            )
 
-            actions = _ideate(runner, store, task, tag, run_dir, round_no,
-                              repo_root, cmd, events)
-            for action_item in actions:
-                if budget_status(run_dir, repo_root, cmd).get("reached"):
-                    break  # mid-round budget stop; step 0 finalizes
-                run_id = str(action_item["run_id"])
-                _materialize_candidate(task, tag, run_dir, run_id,
-                                       repo_root, cmd)
-                _implement_candidate(runner, store, task, tag, run_dir,
-                                     run_id, repo_root, cmd, events)
-
-            # step 3: decoupled tuning (skipped when the budget ran out)
+            # -----------------------------------------------------------------
+            # Round step 3: run at most one decoupled deep-tuning bout.
+            # -----------------------------------------------------------------
             tuner_progressed = False
             if not budget_status(run_dir, repo_root, cmd).get("reached"):
                 tuner_receipt = _tune(runner, store, task, tag, run_dir,
                                       round_no, repo_root, cmd, events)
                 tuner_progressed = bool(tuner_receipt.get("tuned"))
 
+            # -----------------------------------------------------------------
+            # Completion guard: stop if no operation can spend the budget.
+            # -----------------------------------------------------------------
             # Quiescence guard: got_select caps actions by
             # floor(remaining_slots / max(2, K_eval)), so a nearly-exhausted
             # budget yields empty ideation rounds forever. Two consecutive
@@ -558,12 +674,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             if zero_progress_rounds >= 2:
                 events.emit("quiescent", round_no=round_no,
                             reason="two consecutive zero-progress rounds")
-                try:
-                    common.set_phase(run_dir, repo_root, cmd, "completed")
-                except subprocess.CalledProcessError as exc:
-                    detail = (exc.stderr or str(exc)).strip()
-                    _or_block(run_dir, repo_root, cmd, events,
-                              f"set-phase completed refused: {detail}")
+                _complete_run(run_dir, repo_root, cmd, events)
                 break
             round_no += 1
     except RunBlocked:
