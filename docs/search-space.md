@@ -197,9 +197,9 @@ semantic delta.
 
 At a strict budget boundary, `ledger.py resolve-unevaluated` resolves a pending
 candidate with zero objective attempts. It proves global exhaustion and zero
-candidate attempts, stores a hashed `unevaluated_receipt`, and advances the
-lifecycle DAG cursor without creating score evidence. Final completion still
-waits for the resulting per-round experience refresh.
+candidate attempts, stores an `unevaluated_receipt` pinned to the exact attempt
+log, and advances the lifecycle DAG cursor without creating score evidence.
+Final completion still waits for the resulting per-round experience refresh.
 
 ## Persisted edges are attribution deltas
 

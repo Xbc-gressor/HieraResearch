@@ -895,9 +895,7 @@ def _applied_incumbent_from_report(
         "source": source,
         "score": score,
         "params": params_snapshot,
-        "params_sha256": _json_sha256(params_snapshot),
         "param_schema": param_schema_snapshot,
-        "param_schema_sha256": _json_sha256(param_schema_snapshot),
         "entrypoint_sha256": (
             "sha256:" + hashlib.sha256(candidate_path.read_bytes()).hexdigest()
         ),
@@ -906,6 +904,17 @@ def _applied_incumbent_from_report(
         ),
     }
     return snapshot
+
+
+def normalize_applied_incumbent(snapshot: Any) -> Any:
+    """Drop redundant hashes written by the legacy snapshot schema."""
+    if not isinstance(snapshot, dict):
+        return snapshot
+    return {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"params_sha256", "param_schema_sha256"}
+    }
 
 
 def _tuning_target(
@@ -1000,7 +1009,6 @@ def _capture_transfer_parent_snapshot(data: dict, child: dict) -> None:
         "applied_incumbent": copy.deepcopy(applied),
         "captured_by_run_id": str(child.get("run_id")),
     }
-    entry["receipt_sha256"] = _json_sha256(entry)
     snapshots.append(entry)
 
 
@@ -1448,7 +1456,6 @@ def resolve_unevaluated(
         "attempt_log": attempt_log.name,
         "attempt_log_sha256": attempt_log_sha256,
     }
-    receipt["receipt_sha256"] = _json_sha256(receipt)
     record["metric"] = data.get("metric")
     record["status"] = "unevaluated"
     record["final_best_score"] = None

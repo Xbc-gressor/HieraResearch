@@ -871,6 +871,8 @@ class TuningFinalizationTests(unittest.TestCase):
                 record["applied_incumbent"]["param_schema"],
                 {"x": ["float", "log"]},
             )
+            self.assertNotIn("params_sha256", record["applied_incumbent"])
+            self.assertNotIn("param_schema_sha256", record["applied_incumbent"])
             self.assertTrue(
                 finalize_tuning._ledger_committed_final_state(
                     ledger_path.resolve(),

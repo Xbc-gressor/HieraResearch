@@ -595,6 +595,10 @@ def evaluate_config(make_model, params):
                 [0],
             )
             self.assertEqual(phase_a["parameter_transfer"], receipt)
+            self.assertNotIn("param_schema_sha256", receipt["candidate"])
+            self.assertNotIn("defaults_sha256", receipt["candidate"])
+            self.assertNotIn("incumbent_params_sha256", receipt["primary_parent"])
+            self.assertNotIn("param_schema_sha256", receipt["primary_parent"])
             self.assertEqual(
                 phase_a["inherited_control"]["receipt_sha256"],
                 receipt["receipt_sha256"],

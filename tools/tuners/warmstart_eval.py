@@ -75,7 +75,6 @@ from tune_tools import (  # noqa: E402
     PARAMETER_TRANSFER_FILENAME,
     _bounds_violations,
     _candidate_execution_revision,
-    _json_sha256,
     _read_param_schema,
     _read_search_space,
     _validate_schema_values,
@@ -521,27 +520,9 @@ def main() -> int:
                 _admit_cache_row(trial)
 
     previous_cache = previous_phase_a.get("warm_score_cache")
-    previous_cache_payload = (
-        {
-            key: value
-            for key, value in previous_cache.items()
-            if key != "cache_sha256"
-        }
-        if isinstance(previous_cache, dict)
-        else None
-    )
-    try:
-        previous_cache_hash_valid = (
-            isinstance(previous_cache, dict)
-            and previous_cache.get("cache_sha256")
-            == _json_sha256(previous_cache_payload)
-        )
-    except (OverflowError, TypeError, ValueError):
-        previous_cache_hash_valid = False
     if (
         isinstance(previous_cache, dict)
         and previous_cache.get("schema_version") == 1
-        and previous_cache_hash_valid
         and previous_cache.get("candidate_execution_revision")
         == candidate_code_revision
         and isinstance(previous_cache.get("rows"), list)
@@ -564,7 +545,7 @@ def main() -> int:
     }
 
     def _cache_receipt() -> dict:
-        receipt = {
+        return {
             "schema_version": 1,
             "candidate_execution_revision": candidate_code_revision,
             "rows": [
@@ -572,8 +553,6 @@ def main() -> int:
                 for key in sorted(cache_rows)
             ],
         }
-        receipt["cache_sha256"] = _json_sha256(receipt)
-        return receipt
 
     trials_attempted = previous_phase_a.get("trials_attempted")
     if not isinstance(trials_attempted, int) or isinstance(trials_attempted, bool) \

@@ -74,7 +74,7 @@ def record_failure(
     """Persist one failure once and return compact fields for a trial record.
 
     ``failure_id`` intentionally uses 16 hex characters for a short filename;
-    the artifact keeps full prefixed digests and loudly rejects a collision.
+    the artifact keeps a full digest and loudly rejects a collision.
     """
     report_path = Path(report_path)
     candidate_path = Path(candidate_path)
@@ -102,7 +102,6 @@ def record_failure(
     receipt = {
         "failure_id": failure_id,
         "artifact": relative_artifact,
-        "content_sha256": content_sha256,
         "exception": exception,
         "exception_traceback_line": exception_traceback_line,
         "frames": frames,

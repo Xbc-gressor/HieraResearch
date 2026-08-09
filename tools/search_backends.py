@@ -329,13 +329,8 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
             errors.append(f"{where}.retrieved_at must be non-empty")
         if not isinstance(call.get("backend_version"), str) or not call["backend_version"]:
             errors.append(f"{where}.backend_version must be non-empty")
-        if call.get("status") == "success":
-            raw = call.get("raw_response")
-            digest = hashlib.sha256(
-                json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()
-            ).hexdigest()
-            if call.get("response_sha256") != digest:
-                errors.append(f"{where}.response_sha256 does not match raw_response")
+        if call.get("status") == "success" and "raw_response" not in call:
+            errors.append(f"{where}.raw_response must be retained")
     missing_calls = sorted(query_ids - called_queries)
     if missing_calls:
         errors.append(f"retrieval queries have no backend call records: {missing_calls}")
@@ -369,9 +364,6 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
             else:
                 if visit.get("content_chars") != len(content):
                     errors.append(f"{where}.content_chars does not match retained content")
-                digest = hashlib.sha256(content.encode()).hexdigest()
-                if visit.get("content_sha256") != digest:
-                    errors.append(f"{where}.content_sha256 does not match retained content")
         view = visit.get("view")
         section = visit.get("section")
         if view == "section" and (not isinstance(section, str) or not section.strip()):
@@ -716,7 +708,6 @@ async def dispatch_search(
             continue
         rows = response.get("items", []) if isinstance(response, dict) else []
         raw_response = response.get("raw_response") if isinstance(response, dict) else None
-        serialized = json.dumps(raw_response, sort_keys=True, ensure_ascii=False).encode()
         calls.append(
             {
                 "query_id": query["id"],
@@ -724,7 +715,6 @@ async def dispatch_search(
                 "backend_version": backend.version,
                 "status": "success",
                 "retrieved_at": retrieved_at,
-                "response_sha256": hashlib.sha256(serialized).hexdigest(),
                 "raw_response": raw_response,
                 "metadata": response.get("metadata", {}) if isinstance(response, dict) else {},
             }
@@ -1060,9 +1050,6 @@ def add_visit(
             "status": status,
             "budget_tokens": budgets[lane],
             "content_chars": len(content or ""),
-            "content_sha256": hashlib.sha256((content or "").encode()).hexdigest()
-            if content
-            else None,
             "content": content,
             "retrieved_at": datetime.now(timezone.utc).isoformat(),
             "error": error,

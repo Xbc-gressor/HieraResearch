@@ -875,6 +875,11 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         self.assertEqual(validate_parameter_transfer_binding(ledger, child), [])
 
         ledger_tools._capture_transfer_parent_snapshot(ledger, child)
+        self.assertNotIn("receipt_sha256", ledger["lineage_snapshots"][0])
+        legacy_ledger = copy.deepcopy(ledger)
+        legacy_snapshot = legacy_ledger["lineage_snapshots"][0]
+        legacy_snapshot["receipt_sha256"] = _json_sha256(legacy_snapshot)
+        self.assertEqual(validate_lineage_snapshots(legacy_ledger), [])
         old_record_hash = child["parameter_transfer"]["receipt"][
             "primary_parent"
         ]["ledger_record_sha256"]

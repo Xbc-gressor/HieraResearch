@@ -116,7 +116,7 @@ def main() -> int:
         frozen_manifest = json.loads(manifest_path.read_text())
         assert frozen_manifest["retrieval_condition"] == "frozen"
         assert frozen_manifest["backend_calls"][0]["raw_response"]
-        assert frozen_manifest["visits"][0]["content_sha256"]
+        assert frozen_manifest["visits"][0]["content"]
         assert validate_manifest(frozen_manifest) == []
 
         implicit_external = subprocess.run(

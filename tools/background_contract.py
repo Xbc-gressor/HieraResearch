@@ -16,7 +16,6 @@ and disposable, so there is no implicit migration or mixed-mode behavior.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -1643,28 +1642,21 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                 "candidate_objective_attempts",
                 "attempt_log",
                 "attempt_log_sha256",
-                "receipt_sha256",
             }
+            actual_receipt_fields = (
+                set(unevaluated_receipt)
+                if isinstance(unevaluated_receipt, dict)
+                else set()
+            )
             if (
                 not isinstance(unevaluated_receipt, dict)
-                or set(unevaluated_receipt) != receipt_fields
+                or actual_receipt_fields
+                not in (receipt_fields, receipt_fields | {"receipt_sha256"})
             ):
                 errors.append(
                     f"{where}.unevaluated_receipt has an invalid shape"
                 )
             else:
-                unhashed = dict(unevaluated_receipt)
-                receipt_hash = unhashed.pop("receipt_sha256")
-                encoded = json.dumps(
-                    unhashed,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ).encode()
-                expected_hash = (
-                    "sha256:" + hashlib.sha256(encoded).hexdigest()
-                )
                 receipt_budget = unevaluated_receipt.get("budget")
                 receipt_done = unevaluated_receipt.get("evaluations_done")
                 if (
@@ -1683,7 +1675,6 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     or not isinstance(
                         unevaluated_receipt.get("attempt_log_sha256"), str
                     )
-                    or receipt_hash != expected_hash
                 ):
                     errors.append(
                         f"{where}.unevaluated_receipt is not a valid exhausted-"

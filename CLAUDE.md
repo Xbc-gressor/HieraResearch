@@ -225,3 +225,8 @@ the project root, or quoted absolute paths, without a leading `cd`.
   `got_graph.py render --incremental` with fixed Top/Bottom anchors; never inject
   the unbounded full ledger or global DAG. Retrieve a full record, source, or log
   only when a compact view identifies a specific missing field or bottleneck.
+- Use content hashes only for cross-artifact bindings, cache/version keys, and
+  content-addressed ids. Do not store a hash beside the complete inline JSON it
+  hashes unless another artifact uses that digest as its identity; never add a
+  self-hash solely to revalidate its own container. Validate inline fields and
+  schemas directly instead.

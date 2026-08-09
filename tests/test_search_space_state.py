@@ -1477,6 +1477,7 @@ class LedgerIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(resolved["status"], "unevaluated")
             self.assertIsNone(resolved["final_best_score"])
+            self.assertNotIn("receipt_sha256", resolved["unevaluated_receipt"])
             self.assertEqual(
                 resolved["unevaluated_receipt"][
                     "candidate_objective_attempts"
