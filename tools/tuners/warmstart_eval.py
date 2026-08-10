@@ -46,12 +46,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+from dataclasses import dataclass, field
 import json
 import random
 import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))  # tools/ for apply_base_params
@@ -85,6 +87,11 @@ from tune_tools import (  # noqa: E402
 
 CRASHED = 3  # a not-yet-scored config raised; the caller diagnoses + fixes + resumes
 BUDGET_EXHAUSTED = 4  # no score_fn call was started; coordinator ends the run
+
+
+# =============================================================================
+# Candidate and warm-config contracts
+# =============================================================================
 
 
 def _params_key(params: dict) -> str:
@@ -359,7 +366,41 @@ def validate_provided_baseline_configs(
     }
 
 
-def main() -> int:
+# =============================================================================
+# Invocation setup and resumable state
+# =============================================================================
+
+
+@dataclass
+class WarmstartRun:
+    """Mutable state shared by the named stages of one Phase-A invocation."""
+
+    candidate_path: Path
+    report_path: Path
+    configs: list[dict]
+    deferred: list[dict]
+    selected_indices: list[int]
+    selection: dict
+    parameter_transfer: dict | None
+    candidate_code_revision: dict
+    search_space: dict
+    make_model: Callable[..., Any]
+    evaluate: Callable[..., float]
+    preflight_enabled: bool
+    report: dict
+    preflight_report: dict
+    cache_rows: dict[str, dict]
+    cache: dict[str, float]
+    trials_attempted: int
+    started: float
+    warm_rows: list[dict] = field(default_factory=list)
+
+    @property
+    def phase_a(self) -> dict:
+        return self.report["phase_a"]
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-path", required=True, type=Path)
     parser.add_argument("--configs-json", required=True, type=Path,
@@ -373,8 +414,152 @@ def main() -> int:
                              "(BO enqueue / grid prepend) only if this candidate is selected. "
                              "The sampled permutation is persisted for resume. Default = all "
                              "(no deferral).")
-    args = parser.parse_args()
+    return parser
 
+
+def _load_parameter_transfer(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    all_configs: list[dict],
+    control_contract: dict,
+) -> dict | None:
+    """Load and validate the mandatory primary-parent transfer, if any."""
+    if not control_contract["requires_parameter_transfer"]:
+        return None
+
+    receipt_path = args.candidate_path.parent / PARAMETER_TRANSFER_FILENAME
+    try:
+        parameter_transfer = json.loads(receipt_path.read_text())
+    except OSError as exc:
+        parser.error(
+            f"schema-4 non-fresh candidate requires {receipt_path}: {exc}"
+        )
+    except json.JSONDecodeError as exc:
+        parser.error(f"invalid parameter-transfer receipt {receipt_path}: {exc}")
+    try:
+        validate_parameter_transfer(
+            args.candidate_path,
+            all_configs,
+            parameter_transfer,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    return parameter_transfer
+
+
+def _restore_warm_score_cache(
+    *,
+    all_configs: list[dict],
+    search_space: dict,
+    previous_phase_a: dict,
+    candidate_code_revision: dict,
+    parameter_transfer: dict | None,
+) -> tuple[dict[str, dict], dict[str, float], bool]:
+    """Recover only scores bound to the current code and transfer revision."""
+    phase_revision_matches = (
+        previous_phase_a.get("candidate_code_revision")
+        == candidate_code_revision
+    )
+    current_param_keys = {
+        _params_key(cast_params_to_search_space(dict(config), search_space))
+        for config in all_configs
+    }
+    cache_rows: dict[str, dict] = {}
+
+    def admit(trial: dict) -> None:
+        if (
+            not isinstance(trial, dict)
+            or not isinstance(trial.get("params"), dict)
+            or not is_finite_score(trial.get("score"))
+        ):
+            return
+        key = _params_key(trial["params"])
+        if key not in current_param_keys:
+            return
+        cache_rows[key] = {
+            "params": trial["params"],
+            "score": trial["score"],
+        }
+
+    if phase_revision_matches:
+        previous_rows = previous_phase_a.get("warm_start_configs", [])
+        if not isinstance(previous_rows, list):
+            previous_rows = []
+        for trial in previous_rows:
+            if (
+                isinstance(trial, dict)
+                and trial.get("candidate_execution_revision_sha256")
+                == candidate_code_revision["revision_sha256"]
+            ):
+                admit(trial)
+
+    previous_cache = previous_phase_a.get("warm_score_cache")
+    if (
+        isinstance(previous_cache, dict)
+        and set(previous_cache)
+        == {"schema_version", "candidate_execution_revision", "rows"}
+        and previous_cache.get("schema_version") == 1
+        and previous_cache.get("candidate_execution_revision")
+        == candidate_code_revision
+        and isinstance(previous_cache.get("rows"), list)
+    ):
+        for trial in previous_cache["rows"]:
+            admit(trial)
+
+    previous_transfer = previous_phase_a.get("parameter_transfer")
+    if parameter_transfer is not None:
+        if (
+            not isinstance(previous_transfer, dict)
+            or previous_transfer != parameter_transfer
+        ):
+            cache_rows = {}
+    elif previous_transfer is not None:
+        cache_rows = {}
+
+    cache = {key: row["score"] for key, row in cache_rows.items()}
+    return cache_rows, cache, phase_revision_matches
+
+
+def _cache_receipt(run: WarmstartRun) -> dict:
+    return {
+        "schema_version": 1,
+        "candidate_execution_revision": run.candidate_code_revision,
+        "rows": [run.cache_rows[key] for key in sorted(run.cache_rows)],
+    }
+
+
+def _trial_receipt(run: WarmstartRun, proposed_index: int) -> dict:
+    receipt = {
+        "proposed_index": proposed_index,
+        "candidate_structure_sha256": run.candidate_code_revision[
+            "structure_sha256"
+        ],
+        "candidate_execution_revision_sha256": run.candidate_code_revision[
+            "revision_sha256"
+        ],
+    }
+    if run.parameter_transfer is not None and proposed_index == 0:
+        receipt.update(
+            {
+                "role": "inherited_control",
+                "parameter_transfer_receipt_sha256": run.parameter_transfer[
+                    "receipt_sha256"
+                ],
+                "params_sha256": run.parameter_transfer["projection"][
+                    "params_sha256"
+                ],
+            }
+        )
+    return receipt
+
+
+def _prepare_run(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> WarmstartRun:
+    """Validate inputs, materialize BASE_PARAMS, and persist running Phase A."""
+
+    # Validate every immutable input before the first candidate/report write.
     contract = lint_contract(args.candidate_path, require_base_params=False)
     if not contract["ok"]:
         parser.error(
@@ -395,25 +580,12 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    parameter_transfer = None
-    if control_contract["requires_parameter_transfer"]:
-        receipt_path = args.candidate_path.parent / PARAMETER_TRANSFER_FILENAME
-        try:
-            parameter_transfer = json.loads(receipt_path.read_text())
-        except OSError as exc:
-            parser.error(
-                f"schema-4 non-fresh candidate requires {receipt_path}: {exc}"
-            )
-        except json.JSONDecodeError as exc:
-            parser.error(f"invalid parameter-transfer receipt {receipt_path}: {exc}")
-        try:
-            validate_parameter_transfer(
-                args.candidate_path,
-                all_configs,
-                parameter_transfer,
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
+    parameter_transfer = _load_parameter_transfer(
+        args,
+        parser,
+        all_configs,
+        control_contract,
+    )
 
     # This is the mandatory data boundary. `check-search-space` remains useful
     # for proposing/expanding the space, but skipping it must never let an
@@ -433,7 +605,11 @@ def main() -> int:
     # are sampled without replacement. Persist and replay the full permutation
     # so a crash/resume never redraws the subset. k_eval=None / >=len means
     # every config is selected (no deferral).
-    k_eval = len(all_configs) if args.k_eval is None else max(1, min(args.k_eval, len(all_configs)))
+    k_eval = (
+        len(all_configs)
+        if args.k_eval is None
+        else max(1, min(args.k_eval, len(all_configs)))
+    )
     if parameter_transfer is not None and k_eval < 2:
         parser.error(
             "schema-4 non-fresh candidates require k_eval>=2: inherited "
@@ -455,9 +631,8 @@ def main() -> int:
     configs = [all_configs[index] for index in selected_indices]
     deferred = [all_configs[index] for index in deferred_indices]
 
-    # Ensure BASE_PARAMS exists (create on the first run, rewrite later) so
-    # load_candidate_modules' REQUIRED_SYMBOLS check passes; AST reads SEARCH_SPACE
-    # from the file, so this precedes the import.
+    # BASE_PARAMS must exist before importing the complete candidate contract;
+    # the AST-only validation above intentionally precedes this first write.
     apply_base_params.apply(args.candidate_path, dict(configs[0]))
 
     train_module, prepare_module = load_candidate_modules(
@@ -468,85 +643,20 @@ def main() -> int:
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
     preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
-    current_structure_sha256 = candidate_code_revision["structure_sha256"]
-    current_execution_revision_sha256 = candidate_code_revision["revision_sha256"]
 
     # Resume cache: configs already scored in a prior run, keyed by params. A
     # config the caller edited (config-invalid fix) gets new params → cache miss
     # → re-evaluated; a config that crashed has no score → re-evaluated; passed
     # configs are reused only under the same parameter-transfer/code revision.
-    prev = previous_phase_a.get("warm_start_configs", [])
-    if not isinstance(prev, list):
-        prev = []
-    previous_code_revision = previous_phase_a.get("candidate_code_revision")
-    phase_revision_matches = previous_code_revision == candidate_code_revision
-    current_param_keys = {
-        _params_key(cast_params_to_search_space(dict(config), search_space))
-        for config in all_configs
-    }
-    cache_rows: dict[str, dict] = {}
+    cache_rows, cache, phase_revision_matches = _restore_warm_score_cache(
+        all_configs=all_configs,
+        search_space=search_space,
+        previous_phase_a=previous_phase_a,
+        candidate_code_revision=candidate_code_revision,
+        parameter_transfer=parameter_transfer,
+    )
 
-    def _admit_cache_row(trial: dict) -> None:
-        if (
-            not isinstance(trial, dict)
-            or not isinstance(trial.get("params"), dict)
-            or not is_finite_score(trial.get("score"))
-        ):
-            return
-        key = _params_key(trial["params"])
-        if key not in current_param_keys:
-            return
-        cache_rows[key] = {
-            "params": trial["params"],
-            "score": trial["score"],
-        }
-
-    if phase_revision_matches:
-        for trial in prev:
-            if (
-                isinstance(trial, dict)
-                and trial.get("candidate_execution_revision_sha256")
-                == current_execution_revision_sha256
-            ):
-                _admit_cache_row(trial)
-
-    previous_cache = previous_phase_a.get("warm_score_cache")
-    if (
-        isinstance(previous_cache, dict)
-        and set(previous_cache)
-        == {"schema_version", "candidate_execution_revision", "rows"}
-        and previous_cache.get("schema_version") == 1
-        and previous_cache.get("candidate_execution_revision")
-        == candidate_code_revision
-        and isinstance(previous_cache.get("rows"), list)
-    ):
-        for trial in previous_cache["rows"]:
-            _admit_cache_row(trial)
-
-    if parameter_transfer is not None:
-        previous_transfer = previous_phase_a.get("parameter_transfer")
-        if (
-            not isinstance(previous_transfer, dict)
-            or previous_transfer != parameter_transfer
-        ):
-            cache_rows = {}
-    elif previous_phase_a.get("parameter_transfer") is not None:
-        cache_rows = {}
-    cache = {
-        key: row["score"]
-        for key, row in cache_rows.items()
-    }
-
-    def _cache_receipt() -> dict:
-        return {
-            "schema_version": 1,
-            "candidate_execution_revision": candidate_code_revision,
-            "rows": [
-                cache_rows[key]
-                for key in sorted(cache_rows)
-            ],
-        }
-
+    # Rebuild the running Phase-A view while preserving its cumulative budget.
     trials_attempted = previous_phase_a.get("trials_attempted", 0)
     if (
         not isinstance(trials_attempted, int)
@@ -574,7 +684,7 @@ def main() -> int:
     if preflight_enabled:
         preflight_report["invocations"] = len(preflight_report.get("attempts", []))
         preflight_report["status"] = "running"
-    report["phase_a"] = {
+    phase_a = {
         "warm_start_configs": [],
         "warm_config_selection": selection,
         # deferred = proposed-but-not-evaluated-now; the deep-tuner evaluates these
@@ -588,11 +698,16 @@ def main() -> int:
         # Keep every still-relevant finite row while `warm_start_configs` is
         # replayed incrementally. A kill between cached rows cannot erase the
         # untouched suffix and force duplicate objective calls on the next run.
-        "warm_score_cache": _cache_receipt(),
+        "warm_score_cache": {
+            "schema_version": 1,
+            "candidate_execution_revision": candidate_code_revision,
+            "rows": [cache_rows[key] for key in sorted(cache_rows)],
+        },
     }
+    report["phase_a"] = phase_a
     if parameter_transfer is not None:
-        report["phase_a"]["parameter_transfer"] = parameter_transfer
-        report["phase_a"]["inherited_control"] = {
+        phase_a["parameter_transfer"] = parameter_transfer
+        phase_a["inherited_control"] = {
             "warm_config_index": 0,
             "selected": 0 in selected_indices,
             "primary_parent_run_id": parameter_transfer["primary_parent"]["run_id"],
@@ -604,271 +719,370 @@ def main() -> int:
         }
     write_tune_report(args.tune_report_json, report)
 
-    started = time.time()
-    wsc: list[dict] = []
+    return WarmstartRun(
+        candidate_path=args.candidate_path,
+        report_path=args.tune_report_json,
+        configs=configs,
+        deferred=deferred,
+        selected_indices=selected_indices,
+        selection=selection,
+        parameter_transfer=parameter_transfer,
+        candidate_code_revision=candidate_code_revision,
+        search_space=search_space,
+        make_model=make_model,
+        evaluate=evaluate,
+        preflight_enabled=preflight_enabled,
+        report=report,
+        preflight_report=preflight_report,
+        cache_rows=cache_rows,
+        cache=cache,
+        trials_attempted=trials_attempted,
+        started=time.time(),
+    )
 
-    def _trial_receipt(proposed_index: int) -> dict:
-        receipt = {
-            "proposed_index": proposed_index,
-            "candidate_structure_sha256": current_structure_sha256,
-            "candidate_execution_revision_sha256": (
-                current_execution_revision_sha256
-            ),
+
+# =============================================================================
+# Sequential evaluation and terminal paths
+# =============================================================================
+
+
+def _preflight_config(
+    run: WarmstartRun,
+    *,
+    params: dict,
+    proposed_index: int,
+    evaluation_position: int,
+) -> bool:
+    """Run and persist one no-score feasibility check; false means stop."""
+    if not run.preflight_enabled:
+        return True
+    try:
+        result = timed_preflight(
+            params,
+            run.candidate_path,
+            expected_execution_revision=run.candidate_code_revision,
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        sys.stderr.write(tb)
+        failure = record_failure(
+            report_path=run.report_path,
+            candidate_path=run.candidate_path,
+            phase="preflight",
+            method="warmstart",
+            params=params,
+            error=exc,
+            traceback_text=tb,
+        )
+        run.preflight_report.setdefault("attempts", []).append(
+            {
+                "params": params,
+                "source": "warmstart",
+                "status": "failed",
+                **failure,
+            }
+        )
+        run.preflight_report["invocations"] = len(
+            run.preflight_report["attempts"]
+        )
+        run.preflight_report["status"] = "failed"
+        run.phase_a["warm_start_configs"] = run.warm_rows
+        run.phase_a["status"] = "preflight_failed"
+        write_tune_report(run.report_path, run.report)
+        write_json(
+            {
+                "phase": "preflight",
+                "status": "crashed",
+                "crash_index": proposed_index,
+                "evaluation_position": evaluation_position,
+                "crash_params": params,
+                "objective_slot_consumed": False,
+                **failure,
+            }
+        )
+        return False
+
+    run.preflight_report.setdefault("attempts", []).append(
+        {
+            "params": params,
+            "source": "warmstart",
+            "status": "ok",
+            "result": result or {"status": "ok"},
         }
-        if parameter_transfer is not None and proposed_index == 0:
-            receipt.update(
+    )
+    run.preflight_report["invocations"] = len(
+        run.preflight_report["attempts"]
+    )
+    write_tune_report(run.report_path, run.report)
+    return True
+
+
+def _finish_budget_exhausted(
+    run: WarmstartRun,
+    *,
+    current_position: int,
+    error: EvaluationBudgetExhausted,
+) -> int:
+    """Close Phase A from cached observations when no new slot is available."""
+    if run.preflight_enabled:
+        run.preflight_report["status"] = "ok"
+
+    recovered = list(run.warm_rows)
+    truly_unscored = []
+    for position in range(current_position, len(run.configs)):
+        remaining_params = cast_params_to_search_space(
+            dict(run.configs[position]),
+            run.search_space,
+        )
+        remaining_key = _params_key(remaining_params)
+        if remaining_key in run.cache:
+            recovered.append(
                 {
-                    "role": "inherited_control",
-                    "parameter_transfer_receipt_sha256": parameter_transfer[
-                        "receipt_sha256"
-                    ],
-                    "params_sha256": parameter_transfer["projection"][
-                        "params_sha256"
-                    ],
+                    "params": remaining_params,
+                    "score": run.cache[remaining_key],
+                    **_trial_receipt(
+                        run,
+                        run.selected_indices[position],
+                    ),
                 }
             )
-        return receipt
-
-    for i, raw in enumerate(configs):
-        proposed_index = selected_indices[i]
-        params = cast_params_to_search_space(dict(raw), search_space)
-        trial_receipt = _trial_receipt(proposed_index)
-        if preflight_enabled:
-            try:
-                result = timed_preflight(
-                    params,
-                    args.candidate_path,
-                    expected_execution_revision=candidate_code_revision,
-                )
-            except Exception as exc:
-                tb = traceback.format_exc()
-                sys.stderr.write(tb)
-                failure = record_failure(
-                    report_path=args.tune_report_json,
-                    candidate_path=args.candidate_path,
-                    phase="preflight",
-                    method="warmstart",
-                    params=params,
-                    error=exc,
-                    traceback_text=tb,
-                )
-                preflight_report.setdefault("attempts", []).append(
-                    {
-                        "params": params,
-                        "source": "warmstart",
-                        "status": "failed",
-                        **failure,
-                    }
-                )
-                preflight_report["invocations"] = len(preflight_report["attempts"])
-                preflight_report["status"] = "failed"
-                report["phase_a"]["warm_start_configs"] = wsc
-                report["phase_a"]["status"] = "preflight_failed"
-                write_tune_report(args.tune_report_json, report)
-                write_json(
-                    {
-                        "phase": "preflight",
-                        "status": "crashed",
-                        "crash_index": proposed_index,
-                        "evaluation_position": i,
-                        "crash_params": params,
-                        "objective_slot_consumed": False,
-                        **failure,
-                    }
-                )
-                return CRASHED
-            preflight_report.setdefault("attempts", []).append(
-                {
-                    "params": params,
-                    "source": "warmstart",
-                    "status": "ok",
-                    "result": result or {"status": "ok"},
-                }
-            )
-            preflight_report["invocations"] = len(preflight_report["attempts"])
-            write_tune_report(args.tune_report_json, report)
-
-        key = _params_key(params)
-        if key in cache:
-            wsc.append({"params": params, "score": cache[key], **trial_receipt})
         else:
-            try:
-                score = timed_eval(
-                    evaluate,
-                    make_model,
-                    params,
-                    args.candidate_path,
-                    phase="phase_a",
-                    method="warmstart",
-                )
-            except EvaluationBudgetExhausted as exc:
-                if preflight_enabled:
-                    preflight_report["status"] = "ok"
-                recovered = list(wsc)
-                truly_unscored = []
-                for remaining_position in range(i, len(configs)):
-                    remaining_params = cast_params_to_search_space(
-                        dict(configs[remaining_position]),
-                        search_space,
-                    )
-                    remaining_key = _params_key(remaining_params)
-                    if remaining_key in cache:
-                        recovered.append({
-                            "params": remaining_params,
-                            "score": cache[remaining_key],
-                            **_trial_receipt(
-                                selected_indices[remaining_position]
-                            ),
-                        })
-                    else:
-                        truly_unscored.append(configs[remaining_position])
-                unscored = truly_unscored + deferred
-                report["phase_a"]["warm_start_configs"] = recovered
-                report["phase_a"]["deferred_configs"] = [
-                    {
-                        "params": cast_params_to_search_space(
-                            dict(config),
-                            search_space,
-                        )
-                    }
-                    for config in unscored
-                ]
-                selectable = finite_warm_incumbent_rows(recovered)
-                if selectable:
-                    best_params, best_warm_score = min(
-                        (
-                            (trial["params"], trial["score"])
-                            for trial in selectable
-                        ),
-                        key=lambda item: item[1],
-                    )
-                    apply_base_params.apply(args.candidate_path, best_params)
-                    elapsed = time.time() - started
-                    report["phase_a"].update(
-                        {
-                            "best_warm_score": best_warm_score,
-                            "best_warm_params": best_params,
-                            "k_evaluated": len(recovered),
-                            "k_survived": len(recovered),
-                            "k_deferred": len(unscored),
-                            "elapsed_seconds": round(elapsed, 1),
-                            "status": "ok",
-                            "budget_exhausted": True,
-                        }
-                    )
-                    write_tune_report(args.tune_report_json, report)
-                    write_json(
-                        {
-                            "phase": "a",
-                            "status": "ok",
-                            "budget_exhausted": True,
-                            "k_evaluated": len(recovered),
-                            "trials_attempted": trials_attempted,
-                            "best_warm_score": best_warm_score,
-                            "best_warm_params": best_params,
-                            "elapsed_seconds": round(elapsed, 1),
-                        }
-                    )
-                    return 0
-                report["phase_a"]["status"] = "budget_exhausted"
-                write_tune_report(args.tune_report_json, report)
-                write_json(
-                    {
-                        "phase": "a",
-                        "status": "budget_exhausted",
-                        "reason": (
-                            f"{exc}; no finite selectable warm observation "
-                            "beyond the inherited fidelity control"
-                            if recovered
-                            else str(exc)
-                        ),
-                        "objective_slot_consumed": False,
-                    }
-                )
-                return BUDGET_EXHAUSTED
-            except Exception as exc:
-                trials_attempted += 1
-                report["phase_a"]["trials_attempted"] = trials_attempted
-                tb = traceback.format_exc()
-                sys.stderr.write(tb)
-                failure = record_failure(
-                    report_path=args.tune_report_json,
-                    candidate_path=args.candidate_path,
-                    phase="phase_a",
-                    method="warmstart",
-                    params=params,
-                    error=exc,
-                    traceback_text=tb,
-                )
-                wsc.append({
-                    "params": params,
-                    "score": None,
-                    "status": "failed",
-                    **trial_receipt,
-                    **failure,
-                })
-                report["phase_a"]["warm_start_configs"] = wsc
-                report["phase_a"]["status"] = "crashed"
-                write_tune_report(args.tune_report_json, report)
-                write_json({"phase": "a", "status": "crashed",
-                            "crash_index": proposed_index,
-                            "evaluation_position": i,
-                            "crash_params": params,
-                            **failure})
-                return CRASHED
-            trials_attempted += 1
-            report["phase_a"]["trials_attempted"] = trials_attempted
-            wsc.append({"params": params, "score": score, **trial_receipt})
-            cache[key] = score
-            cache_rows[key] = {"params": params, "score": score}
-            report["phase_a"]["warm_score_cache"] = _cache_receipt()
-        report["phase_a"]["warm_start_configs"] = wsc
-        write_tune_report(args.tune_report_json, report)
+            truly_unscored.append(run.configs[position])
 
-    # ---- every sampled config scored → best selectable row → BASE_PARAMS ----
-    selectable = finite_warm_incumbent_rows(wsc)
+    unscored = truly_unscored + run.deferred
+    run.phase_a["warm_start_configs"] = recovered
+    run.phase_a["deferred_configs"] = [
+        {
+            "params": cast_params_to_search_space(
+                dict(config),
+                run.search_space,
+            )
+        }
+        for config in unscored
+    ]
+    selectable = finite_warm_incumbent_rows(recovered)
+    if selectable:
+        best_params, best_warm_score = min(
+            (
+                (trial["params"], trial["score"])
+                for trial in selectable
+            ),
+            key=lambda item: item[1],
+        )
+        apply_base_params.apply(run.candidate_path, best_params)
+        elapsed = time.time() - run.started
+        run.phase_a.update(
+            {
+                "best_warm_score": best_warm_score,
+                "best_warm_params": best_params,
+                "k_evaluated": len(recovered),
+                "k_survived": len(recovered),
+                "k_deferred": len(unscored),
+                "elapsed_seconds": round(elapsed, 1),
+                "status": "ok",
+                "budget_exhausted": True,
+            }
+        )
+        write_tune_report(run.report_path, run.report)
+        write_json(
+            {
+                "phase": "a",
+                "status": "ok",
+                "budget_exhausted": True,
+                "k_evaluated": len(recovered),
+                "trials_attempted": run.trials_attempted,
+                "best_warm_score": best_warm_score,
+                "best_warm_params": best_params,
+                "elapsed_seconds": round(elapsed, 1),
+            }
+        )
+        return 0
+
+    run.phase_a["status"] = "budget_exhausted"
+    write_tune_report(run.report_path, run.report)
+    write_json(
+        {
+            "phase": "a",
+            "status": "budget_exhausted",
+            "reason": (
+                f"{error}; no finite selectable warm observation beyond "
+                "the inherited fidelity control"
+                if recovered
+                else str(error)
+            ),
+            "objective_slot_consumed": False,
+        }
+    )
+    return BUDGET_EXHAUSTED
+
+
+def _record_objective_failure(
+    run: WarmstartRun,
+    *,
+    params: dict,
+    proposed_index: int,
+    evaluation_position: int,
+    trial_receipt: dict,
+    error: Exception,
+) -> int:
+    run.trials_attempted += 1
+    run.phase_a["trials_attempted"] = run.trials_attempted
+    tb = traceback.format_exc()
+    sys.stderr.write(tb)
+    failure = record_failure(
+        report_path=run.report_path,
+        candidate_path=run.candidate_path,
+        phase="phase_a",
+        method="warmstart",
+        params=params,
+        error=error,
+        traceback_text=tb,
+    )
+    run.warm_rows.append(
+        {
+            "params": params,
+            "score": None,
+            "status": "failed",
+            **trial_receipt,
+            **failure,
+        }
+    )
+    run.phase_a["warm_start_configs"] = run.warm_rows
+    run.phase_a["status"] = "crashed"
+    write_tune_report(run.report_path, run.report)
+    write_json(
+        {
+            "phase": "a",
+            "status": "crashed",
+            "crash_index": proposed_index,
+            "evaluation_position": evaluation_position,
+            "crash_params": params,
+            **failure,
+        }
+    )
+    return CRASHED
+
+
+def _finish_phase_a(run: WarmstartRun) -> int:
+    """Apply the best selectable row and persist the successful Phase A."""
+    selectable = finite_warm_incumbent_rows(run.warm_rows)
     if not selectable:
         raise RuntimeError(
             "warm evaluation produced no finite selectable row beyond the "
             "inherited fidelity control"
         )
     best_params, best_warm_score = min(
-        ((t["params"], t["score"]) for t in selectable),
-        key=lambda t: t[1],
+        ((trial["params"], trial["score"]) for trial in selectable),
+        key=lambda item: item[1],
     )
-    apply_base_params.apply(args.candidate_path, best_params)
-    elapsed = time.time() - started
+    apply_base_params.apply(run.candidate_path, best_params)
+    elapsed = time.time() - run.started
 
-    report["phase_a"].update({
-        "best_warm_score": best_warm_score,
-        "best_warm_params": best_params,
-        "k_evaluated": len(configs),
-        "k_survived": len(wsc),
-        "k_deferred": len(deferred),
-        "elapsed_seconds": round(elapsed, 1),
-        "status": "ok",
-    })
-    if preflight_enabled:
-        preflight_report["status"] = "ok"
-    write_tune_report(args.tune_report_json, report)
+    run.phase_a.update(
+        {
+            "best_warm_score": best_warm_score,
+            "best_warm_params": best_params,
+            "k_evaluated": len(run.configs),
+            "k_survived": len(run.warm_rows),
+            "k_deferred": len(run.deferred),
+            "elapsed_seconds": round(elapsed, 1),
+            "status": "ok",
+        }
+    )
+    if run.preflight_enabled:
+        run.preflight_report["status"] = "ok"
+    write_tune_report(run.report_path, run.report)
 
-    write_json({
-        "phase": "a",
-        "status": "ok",
-        "k_evaluated": len(configs),
-        "k_survived": len(wsc),
-        "trials_attempted": trials_attempted,
-        "warm_config_selection": selection,
-        **(
-            {"inherited_control": report["phase_a"]["inherited_control"]}
-            if parameter_transfer is not None
-            else {}
-        ),
-        "best_warm_score": best_warm_score,
-        "best_warm_params": best_params,
-        "elapsed_seconds": round(elapsed, 1),
-    })
+    write_json(
+        {
+            "phase": "a",
+            "status": "ok",
+            "k_evaluated": len(run.configs),
+            "k_survived": len(run.warm_rows),
+            "trials_attempted": run.trials_attempted,
+            "warm_config_selection": run.selection,
+            **(
+                {"inherited_control": run.phase_a["inherited_control"]}
+                if run.parameter_transfer is not None
+                else {}
+            ),
+            "best_warm_score": best_warm_score,
+            "best_warm_params": best_params,
+            "elapsed_seconds": round(elapsed, 1),
+        }
+    )
     return 0
+
+
+def _evaluate_selected_configs(run: WarmstartRun) -> int:
+    """Evaluate selected configs sequentially, stopping at the first failure."""
+
+    for position, raw in enumerate(run.configs):
+        proposed_index = run.selected_indices[position]
+        params = cast_params_to_search_space(dict(raw), run.search_space)
+        trial_receipt = _trial_receipt(run, proposed_index)
+        if not _preflight_config(
+            run,
+            params=params,
+            proposed_index=proposed_index,
+            evaluation_position=position,
+        ):
+            return CRASHED
+
+        key = _params_key(params)
+        if key in run.cache:
+            run.warm_rows.append(
+                {
+                    "params": params,
+                    "score": run.cache[key],
+                    **trial_receipt,
+                }
+            )
+        else:
+            try:
+                score = timed_eval(
+                    run.evaluate,
+                    run.make_model,
+                    params,
+                    run.candidate_path,
+                    phase="phase_a",
+                    method="warmstart",
+                )
+            except EvaluationBudgetExhausted as exc:
+                return _finish_budget_exhausted(
+                    run,
+                    current_position=position,
+                    error=exc,
+                )
+            except Exception as exc:
+                return _record_objective_failure(
+                    run,
+                    params=params,
+                    proposed_index=proposed_index,
+                    evaluation_position=position,
+                    trial_receipt=trial_receipt,
+                    error=exc,
+                )
+            run.trials_attempted += 1
+            run.phase_a["trials_attempted"] = run.trials_attempted
+            run.warm_rows.append(
+                {"params": params, "score": score, **trial_receipt}
+            )
+            run.cache[key] = score
+            run.cache_rows[key] = {"params": params, "score": score}
+            run.phase_a["warm_score_cache"] = _cache_receipt(run)
+
+        run.phase_a["warm_start_configs"] = run.warm_rows
+        write_tune_report(run.report_path, run.report)
+
+    return _finish_phase_a(run)
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+    run = _prepare_run(args, parser)
+    return _evaluate_selected_configs(run)
 
 
 if __name__ == "__main__":
