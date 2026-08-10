@@ -234,5 +234,103 @@ class HillclimbArmTests(unittest.TestCase):
             )
 
 
+    def test_provider_echoing_summary_keys_is_repaired_by_corrective_ask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            space = SearchSpace.from_legacy({"x": ("float", -5.0, 5.0)})
+            initial = Observation(
+                observation_id="warm",
+                params={"x": 4.0},
+                score=16.0,
+                status="ok",
+                origin="warm",
+                consumes_budget=False,
+            )
+            context = BenchmarkContext(
+                checkpoint_id="hillclimb-repair",
+                regime="first",
+                space=space,
+                observations=(initial,),
+                budget=1,
+                seed=0,
+            )
+            provider = ReplayProposalProvider(
+                [
+                    {
+                        "changes": {
+                            "checkpoint_id": "hillclimb-repair",
+                            "focused_history": [],
+                            "incumbent": {"params": {"x": 4.0}},
+                            "regime": "first",
+                            "remaining_budget": 1,
+                            "search_space": [],
+                        },
+                        "reason": "echoed the summary",
+                    },
+                    {"changes": {"x": 2.0}, "reason": "reduce x"},
+                ]
+            )
+            result = BenchmarkRunner(
+                context,
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMHillclimbArm(provider))
+
+            self.assertEqual(result["evaluations_consumed"], 1)
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn("not search-space dimensions", provider.calls[1]["prompt"])
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "run" / "events.jsonl").read_text().splitlines()
+            ]
+            proposal = next(
+                event for event in events if event["kind"] == "proposal_batch"
+            )["proposals"][0]
+            self.assertEqual(proposal["params"], {"x": 2.0})
+            self.assertFalse(proposal["metadata"]["degraded"])
+
+    def test_broken_provider_degrades_to_a_random_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            space = SearchSpace.from_legacy({"x": ("float", -5.0, 5.0)})
+            initial = Observation(
+                observation_id="warm",
+                params={"x": 4.0},
+                score=16.0,
+                status="ok",
+                origin="warm",
+                consumes_budget=False,
+            )
+            context = BenchmarkContext(
+                checkpoint_id="hillclimb-degraded",
+                regime="first",
+                space=space,
+                observations=(initial,),
+                budget=1,
+                seed=0,
+            )
+            provider = ReplayProposalProvider(
+                [{"changes": {"not_a_dim": 1.0}, "reason": "bad"}] * 4
+            )
+            result = BenchmarkRunner(
+                context,
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMHillclimbArm(provider))
+
+            self.assertEqual(result["evaluations_consumed"], 1)
+            self.assertEqual(len(provider.calls), 4)
+            self.assertEqual(result["policy_snapshot"]["degraded_calls"], 1)
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "run" / "events.jsonl").read_text().splitlines()
+            ]
+            proposal = next(
+                event for event in events if event["kind"] == "proposal_batch"
+            )["proposals"][0]
+            self.assertEqual(set(proposal["params"]), {"x"})
+            self.assertNotEqual(proposal["params"], {"x": 4.0})
+            self.assertTrue(proposal["metadata"]["degraded"])
+            self.assertIn("degraded fallback", proposal["metadata"]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

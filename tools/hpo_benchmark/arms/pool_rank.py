@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -25,6 +26,7 @@ from ..core import (
 )
 from ..providers import FreshProposalProvider
 from ..summary import FocusedSummaryBuilder
+from ._repair import complete_with_repair, random_config
 
 
 POOL_SIZE = 8
@@ -98,18 +100,23 @@ class LLMPoolRankArm:
         ranker: PoolRanker,
         summary_builder: FocusedSummaryBuilder | None = None,
         min_ranker_history: int = MIN_RANKER_HISTORY,
+        corrective_attempts: int = 3,
     ):
         if min_ranker_history < 1:
             raise ValueError("min_ranker_history must be positive")
+        if corrective_attempts < 0:
+            raise ValueError("corrective_attempts must be non-negative")
         self.name = name
         self.provider = provider
         self.ranker = ranker
         self.summary_builder = summary_builder or FocusedSummaryBuilder()
         self.min_ranker_history = min_ranker_history
+        self.corrective_attempts = corrective_attempts
         self.context: BenchmarkContext | None = None
         self.observations: list[Observation] = []
         self.provider_calls = 0
         self.ranker_calls = 0
+        self.degraded_calls = 0
         self._pool: list[dict[str, Any]] | None = None
         self._order: list[int] = []
         self._selection_mode: str | None = None
@@ -117,6 +124,7 @@ class LLMPoolRankArm:
         self._raw_output: str | None = None
         self._model: str | None = None
         self._provider_metadata: dict[str, Any] = {}
+        self._repair_problems: list[str] = []
         self._last_selected_index: int | None = None
         self._rejected_indices: list[int] = []
 
@@ -125,6 +133,7 @@ class LLMPoolRankArm:
         self.observations = list(context.observations)
         self.provider_calls = 0
         self.ranker_calls = 0
+        self.degraded_calls = 0
         self._clear_pool()
 
     def _clear_pool(self) -> None:
@@ -135,8 +144,67 @@ class LLMPoolRankArm:
         self._raw_output = None
         self._model = None
         self._provider_metadata = {}
+        self._repair_problems = []
         self._last_selected_index = None
         self._rejected_indices = []
+
+    def _pool_problems(self, output: Mapping[str, Any]) -> list[str]:
+        assert self.context is not None
+        raw_pool = output.get("proposals")
+        if not isinstance(raw_pool, list):
+            return [f"proposals must be a list of exactly {POOL_SIZE} objects"]
+        if len(raw_pool) != POOL_SIZE:
+            return [
+                f"proposals must contain exactly {POOL_SIZE} configurations"
+            ]
+        problems: list[str] = []
+        for index, item in enumerate(raw_pool):
+            if not isinstance(item, Mapping):
+                problems.append(f"proposal {index + 1} is not an object")
+                continue
+            params = item.get("params")
+            reason = item.get("reason")
+            if not isinstance(params, Mapping):
+                problems.append(f"proposal {index + 1} must contain a params object")
+            else:
+                try:
+                    self.context.space.project(params)
+                except ValueError as exc:
+                    problems.append(f"proposal {index + 1} params are invalid: {exc}")
+            if not isinstance(reason, str) or not reason.strip():
+                problems.append(
+                    f"proposal {index + 1} must contain a non-empty reason"
+                )
+        return problems
+
+    def _fallback_pool(self) -> list[dict[str, Any]]:
+        assert self.context is not None
+        rng = random.Random(self.context.seed * 10007 + self.provider_calls * 31)
+        space = self.context.space
+        seen: set[str] = set()
+        pool: list[dict[str, Any]] = []
+        draws = 0
+        while len(pool) < POOL_SIZE:
+            draws += 1
+            if draws > POOL_SIZE * 256:
+                raise PolicyContractError(
+                    f"cannot build a fallback pool of {POOL_SIZE} distinct "
+                    "configurations in this search space"
+                )
+            params = random_config(space, rng)
+            key = space.canonical(params)
+            if key in seen:
+                continue
+            seen.add(key)
+            pool.append(
+                {
+                    "llm_rank": len(pool) + 1,
+                    "params": params,
+                    "reason": "degraded fallback pool",
+                    "ranker_scores": None,
+                }
+            )
+        return pool
 
     def _new_pool(self, remaining_budget: int) -> None:
         assert self.context is not None
@@ -150,41 +218,29 @@ class LLMPoolRankArm:
             "the pool, and return JSON matching the supplied schema.\n\n"
             + json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False)
         )
-        response = self.provider.complete(prompt, output_schema=OUTPUT_SCHEMA)
-        raw_pool = response.output.get("proposals")
-        if not isinstance(raw_pool, list) or len(raw_pool) != POOL_SIZE:
-            raise PolicyContractError(
-                f"pool provider must return exactly {POOL_SIZE} proposals"
-            )
-
-        pool: list[dict[str, Any]] = []
-        for index, item in enumerate(raw_pool):
-            if not isinstance(item, Mapping):
-                raise PolicyContractError(f"pool proposal {index + 1} is not an object")
-            params = item.get("params")
-            reason = item.get("reason")
-            if not isinstance(params, Mapping):
-                raise PolicyContractError(
-                    f"pool proposal {index + 1} must contain params"
+        response, problems, final_prompt = complete_with_repair(
+            self.provider,
+            prompt,
+            OUTPUT_SCHEMA,
+            validate=self._pool_problems,
+            corrective_attempts=self.corrective_attempts,
+        )
+        self.provider_calls += 1
+        if problems:
+            self.degraded_calls += 1
+            pool = self._fallback_pool()
+        else:
+            pool = []
+            for index, item in enumerate(response.output["proposals"]):
+                projected = self.context.space.project(item["params"])
+                pool.append(
+                    {
+                        "llm_rank": index + 1,
+                        "params": projected,
+                        "reason": item["reason"],
+                        "ranker_scores": None,
+                    }
                 )
-            if not isinstance(reason, str) or not reason.strip():
-                raise PolicyContractError(
-                    f"pool proposal {index + 1} must contain a non-empty reason"
-                )
-            try:
-                projected = self.context.space.project(params)
-            except ValueError as exc:
-                raise PolicyContractError(
-                    f"pool proposal {index + 1} is invalid: {exc}"
-                ) from exc
-            pool.append(
-                {
-                    "llm_rank": index + 1,
-                    "params": projected,
-                    "reason": reason,
-                    "ranker_scores": None,
-                }
-            )
 
         history = effective_observations(self.context.space, self.observations)
         if len(history) < self.min_ranker_history:
@@ -211,14 +267,14 @@ class LLMPoolRankArm:
             selection_mode = self.ranker.name
             self.ranker_calls += 1
 
-        self.provider_calls += 1
         self._pool = pool
         self._order = list(order)
         self._selection_mode = selection_mode
-        self._prompt = prompt
+        self._prompt = final_prompt
         self._raw_output = response.raw_output
         self._model = response.model
         self._provider_metadata = dict(response.metadata)
+        self._repair_problems = list(problems)
         self._rejected_indices = []
 
     def ask(self, remaining_budget: int) -> ProposalBatch:
@@ -244,6 +300,8 @@ class LLMPoolRankArm:
             ),
             "min_ranker_history": self.min_ranker_history,
             "previously_rejected_pool_indices": list(self._rejected_indices),
+            "repair_problems": list(self._repair_problems),
+            "degraded": bool(self._repair_problems),
             "prompt": self._prompt,
             "raw_output": self._raw_output,
             "model": self._model,
@@ -294,6 +352,7 @@ class LLMPoolRankArm:
             "ranker_calls": self.ranker_calls,
             "ranker": self.ranker.name,
             "min_ranker_history": self.min_ranker_history,
+            "degraded_calls": self.degraded_calls,
             "effective_history_count": len(
                 effective_observations(self.context.space, self.observations)
             ),

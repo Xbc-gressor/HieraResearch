@@ -200,7 +200,7 @@ class ActiveSetArmTests(unittest.TestCase):
             second_prompt = json.loads(provider.calls[1]["prompt"].split("\n\n", 1)[1])
             self.assertEqual(len(second_prompt["recent_rejections"]), 2)
 
-    def test_rejects_odd_budget_and_non_numeric_selection(self):
+    def test_rejects_odd_budget_and_repairs_non_numeric_selection(self):
         categorical = SearchSpace.from_legacy(
             {
                 "x": ("float", 0.0, 1.0),
@@ -226,20 +226,82 @@ class ActiveSetArmTests(unittest.TestCase):
         with self.assertRaisesRegex(PolicyContractError, "even evaluation budget"):
             LLMActiveSetArm(ReplayProposalProvider([])).initialize(odd)
 
-        even = BenchmarkContext(
-            checkpoint_id="active-set-categorical",
-            regime="first",
-            space=categorical,
-            observations=(initial,),
-            budget=2,
-            seed=0,
-        )
-        arm = LLMActiveSetArm(
-            ReplayProposalProvider([response(move("mode", 1, 0.10))])
-        )
-        arm.initialize(even)
-        with self.assertRaisesRegex(PolicyContractError, "non-numeric or fixed"):
-            arm.ask(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            even = BenchmarkContext(
+                checkpoint_id="active-set-categorical",
+                regime="first",
+                space=categorical,
+                observations=(initial,),
+                budget=2,
+                seed=0,
+            )
+            provider = ReplayProposalProvider(
+                [
+                    response(move("mode", 1, 0.10)),
+                    response(move("x", 1, 0.10)),
+                ]
+            )
+            result = BenchmarkRunner(
+                even,
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMActiveSetArm(provider))
+
+            self.assertEqual(result["evaluations_consumed"], 2)
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn("non-numeric or fixed", provider.calls[1]["prompt"])
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "run" / "events.jsonl").read_text().splitlines()
+            ]
+            first = next(event for event in events if event["kind"] == "proposal_batch")
+            self.assertEqual(
+                first["proposals"][0]["metadata"]["active_dimensions"],
+                [{"name": "x", "direction": 1, "step": 0.10}],
+            )
+
+    def test_broken_provider_degrades_to_a_default_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            space = SearchSpace.from_legacy(
+                {"x": ("float", 0.0, 1.0), "y": ("float", 0.0, 1.0)}
+            )
+            initial = Observation(
+                observation_id="warm",
+                params={"x": 0.5, "y": 0.5},
+                score=0.5,
+                status="ok",
+                origin="warm",
+                consumes_budget=False,
+            )
+            context = BenchmarkContext(
+                checkpoint_id="active-set-degraded",
+                regime="first",
+                space=space,
+                observations=(initial,),
+                budget=2,
+                seed=0,
+            )
+            garbage = response(move("mode", 1, 0.10))
+            provider = ReplayProposalProvider([garbage] * 4)
+            result = BenchmarkRunner(
+                context,
+                FunctionObjective(lambda params: params["x"] ** 2 + params["y"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMActiveSetArm(provider))
+
+            self.assertEqual(result["evaluations_consumed"], 2)
+            self.assertEqual(len(provider.calls), 4)
+            self.assertEqual(result["policy_snapshot"]["degraded_calls"], 1)
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "run" / "events.jsonl").read_text().splitlines()
+            ]
+            first = next(event for event in events if event["kind"] == "proposal_batch")
+            self.assertEqual(
+                first["proposals"][0]["metadata"]["active_dimensions"],
+                [{"name": "x", "direction": 1, "step": 0.10}],
+            )
+            self.assertTrue(first["proposals"][0]["metadata"]["degraded"])
 
 
 if __name__ == "__main__":

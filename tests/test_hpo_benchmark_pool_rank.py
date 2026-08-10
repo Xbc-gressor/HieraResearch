@@ -177,6 +177,52 @@ class PoolRankArmTests(unittest.TestCase):
             self.assertEqual(pool[3]["ranker_scores"], {"fixed_score": 3})
             self.assertEqual(batches[1]["metadata"]["selected_rank"], 2)
 
+    def test_invalid_pool_is_repaired_with_a_corrective_ask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.context(2, budget=1)
+            provider = ReplayProposalProvider(
+                [
+                    {"proposals": [{"params": {"x": 1.0}, "reason": "only one"}]},
+                    replay_pool([0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]),
+                ]
+            )
+            result = BenchmarkRunner(
+                context,
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMPoolHEBORankArm(provider))
+
+            self.assertEqual(result["evaluations_consumed"], 1)
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn("exactly 8", provider.calls[1]["prompt"])
+            self.assertEqual(result["policy_snapshot"]["degraded_calls"], 0)
+
+    def test_broken_pool_provider_degrades_to_a_fallback_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.context(2, budget=1)
+            garbage = {"proposals": [{"params": {"x": 1.0}, "reason": "x"}]}
+            provider = ReplayProposalProvider([garbage] * 4)
+            result = BenchmarkRunner(
+                context,
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMPoolHEBORankArm(provider))
+
+            self.assertEqual(result["evaluations_consumed"], 1)
+            self.assertEqual(len(provider.calls), 4)
+            self.assertEqual(result["policy_snapshot"]["degraded_calls"], 1)
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "run" / "events.jsonl").read_text().splitlines()
+            ]
+            proposal = next(
+                event for event in events if event["kind"] == "proposal_batch"
+            )["proposals"][0]
+            pool = proposal["metadata"]["pool"]
+            self.assertEqual(len(pool), 8)
+            self.assertEqual(len({item["params"]["x"] for item in pool}), 8)
+            self.assertTrue(proposal["metadata"]["degraded"])
+
     def test_hebo_pareto_fronts_and_factories_are_deterministic(self):
         self.assertEqual(
             nondominated_fronts(

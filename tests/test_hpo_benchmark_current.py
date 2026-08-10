@@ -140,6 +140,39 @@ class CurrentArmTests(unittest.TestCase):
             self.assertEqual(prompt["regime"], "continuation")
             self.assertEqual(prompt["remaining_budget"], 4)
 
+    def test_broken_rewarm_skips_to_tpe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = ReplayProposalProvider([{"proposals": "garbage"}] * 4)
+            created = []
+
+            def factory(context):
+                backend = FakeBackend(context, [{"x": 0.0}, {"x": -1.0}])
+                created.append(backend)
+                return backend
+
+            result = BenchmarkRunner(
+                checkpoint(regime="continuation", budget=2),
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(CurrentArm(provider=provider, tpe_backend_factory=factory))
+
+            self.assertEqual(result["evaluations_consumed"], 2)
+            self.assertEqual(len(provider.calls), 4)
+            self.assertIn("must be a list", provider.calls[1]["prompt"])
+            self.assertTrue(result["policy_snapshot"]["rewarm_degraded"])
+            self.assertEqual(result["policy_snapshot"]["queue_evaluated"], 0)
+            self.assertEqual(result["final_incumbent_score"], 0.0)
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "run" / "events.jsonl").read_text().splitlines()
+            ]
+            origins = [
+                event["proposals"][0]["origin"]
+                for event in events
+                if event["kind"] == "proposal_batch"
+            ]
+            self.assertEqual(origins, ["current_tpe", "current_tpe"])
+
     def test_continuation_requires_rewarm_provider(self):
         arm = CurrentArm()
         with self.assertRaisesRegex(

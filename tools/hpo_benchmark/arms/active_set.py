@@ -21,6 +21,7 @@ from ..core import (
 )
 from ..providers import FreshProposalProvider
 from ..summary import FocusedSummaryBuilder
+from ._repair import complete_with_repair
 
 
 ALLOWED_STEPS = (0.05, 0.10, 0.20, 0.40)
@@ -102,15 +103,20 @@ class LLMActiveSetArm:
         provider: FreshProposalProvider,
         *,
         summary_builder: FocusedSummaryBuilder | None = None,
+        corrective_attempts: int = 3,
     ):
+        if corrective_attempts < 0:
+            raise ValueError("corrective_attempts must be non-negative")
         self.provider = provider
         self.summary_builder = summary_builder or FocusedSummaryBuilder()
+        self.corrective_attempts = corrective_attempts
         self.context: BenchmarkContext | None = None
         self.observations: list[Observation] = []
         self.provider_calls = 0
         self.completed_rounds = 0
         self.rejected_batches = 0
         self.failed_rounds = 0
+        self.degraded_calls = 0
         self._pending_group_id: str | None = None
 
     def initialize(self, context: BenchmarkContext) -> None:
@@ -134,6 +140,7 @@ class LLMActiveSetArm:
         self.completed_rounds = 0
         self.rejected_batches = 0
         self.failed_rounds = 0
+        self.degraded_calls = 0
         self._pending_group_id = None
 
     def ask(self, remaining_budget: int) -> ProposalBatch:
@@ -171,9 +178,20 @@ class LLMActiveSetArm:
             "\n\n"
             + json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False)
         )
-        response = self.provider.complete(prompt, output_schema=OUTPUT_SCHEMA)
-        moves, reason = self._parse_output(response.output)
+        response, problems, final_prompt = complete_with_repair(
+            self.provider,
+            prompt,
+            OUTPUT_SCHEMA,
+            validate=self._problems,
+            corrective_attempts=self.corrective_attempts,
+        )
         center = dict(summary["incumbent"]["params"])
+        if problems:
+            self.degraded_calls += 1
+            moves = self._default_move(center)
+            reason = "degraded default move: " + "; ".join(problems)
+        else:
+            moves, reason = self._parse_output(response.output)
         (
             plus,
             minus,
@@ -185,7 +203,7 @@ class LLMActiveSetArm:
         self.provider_calls += 1
         group_id = f"active-set-{self.provider_calls:04d}"
         self._pending_group_id = group_id
-        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        prompt_hash = hashlib.sha256(final_prompt.encode("utf-8")).hexdigest()
         move_records = [move.record() for move in moves]
         shared = {
             "group_id": group_id,
@@ -195,7 +213,9 @@ class LLMActiveSetArm:
             "active_dimensions": move_records,
             "effective_steps": effective_steps,
             "reason": reason,
-            "prompt": prompt,
+            "repair_problems": list(problems),
+            "degraded": bool(problems),
+            "prompt": final_prompt,
             "prompt_hash": prompt_hash,
             "raw_output": response.raw_output,
             "model": response.model,
@@ -231,6 +251,25 @@ class LLMActiveSetArm:
                 "center_observation_id": summary["incumbent"]["observation_id"],
                 "active_dimensions": move_records,
             },
+        )
+
+    def _problems(self, output: Mapping[str, Any]) -> list[str]:
+        try:
+            self._parse_output(output)
+        except PolicyContractError as exc:
+            return [str(exc)]
+        return []
+
+    def _default_move(self, center: Mapping[str, Any]) -> tuple[_Move, ...]:
+        assert self.context is not None
+        for dimension in self.context.space.active_dimensions:
+            if dimension.kind not in {"float", "int"}:
+                continue
+            normalized = dimension.normalized(center[dimension.name])
+            direction = 1 if normalized <= 0.5 else -1
+            return (_Move(dimension, direction, 0.10),)
+        raise PolicyContractError(
+            "LLM active-set requires a non-fixed numeric dimension"
         )
 
     def _parse_output(
@@ -368,6 +407,7 @@ class LLMActiveSetArm:
             "completed_rounds": self.completed_rounds,
             "rejected_batches": self.rejected_batches,
             "failed_rounds": self.failed_rounds,
+            "degraded_calls": self.degraded_calls,
             "incumbent_id": incumbent.observation_id,
             "incumbent_score": incumbent.score,
         }

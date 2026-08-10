@@ -19,6 +19,7 @@ from ..core import (
 )
 from ..providers import FreshProposalProvider
 from ..summary import FocusedSummaryBuilder
+from ._repair import complete_with_repair
 
 
 REWARM_OUTPUT_SCHEMA = {
@@ -222,20 +223,25 @@ class CurrentArm:
         summary_builder: FocusedSummaryBuilder | None = None,
         max_rewarm_proposals: int = 3,
         tpe_backend_factory: BackendFactory | None = None,
+        corrective_attempts: int = 3,
     ):
         if not 0 <= max_rewarm_proposals <= 3:
             raise ValueError("max_rewarm_proposals must be between 0 and 3")
+        if corrective_attempts < 0:
+            raise ValueError("corrective_attempts must be non-negative")
         self.deferred_configs = [dict(config) for config in deferred_configs]
         self.provider = provider
         self.summary_builder = summary_builder or FocusedSummaryBuilder()
         self.max_rewarm_proposals = max_rewarm_proposals
         self.tpe_backend_factory = tpe_backend_factory or _OptunaTPEBackend
+        self.corrective_attempts = corrective_attempts
         self.context: BenchmarkContext | None = None
         self.observations: list[Observation] = []
         self._queue: list[Proposal] = []
         self._backend: ProposalBackend | None = None
         self._pending_backend = False
         self._rewarm_generated = False
+        self._rewarm_degraded = False
         self._provider_calls = 0
         self._queue_evaluated = 0
         self._skipped_queue_configs = 0
@@ -254,6 +260,7 @@ class CurrentArm:
         self._backend = None
         self._pending_backend = False
         self._rewarm_generated = False
+        self._rewarm_degraded = False
         self._provider_calls = 0
         self._queue_evaluated = 0
         self._skipped_queue_configs = 0
@@ -299,6 +306,12 @@ class CurrentArm:
             queued.append(Proposal(projected, origin=origin, metadata=metadata))
         return queued
 
+    def _rewarm_problems(self, output: Mapping[str, Any]) -> list[str]:
+        rows = output.get("proposals")
+        if not isinstance(rows, list):
+            return ["proposals must be a list of configuration objects"]
+        return []
+
     def _generate_rewarm(self, remaining_budget: int) -> None:
         assert self.context is not None and self.provider is not None
         summary = self.summary_builder.build(
@@ -311,11 +324,20 @@ class CurrentArm:
             "matching the supplied schema.\n\n"
             + json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False)
         )
-        response = self.provider.complete(prompt, output_schema=REWARM_OUTPUT_SCHEMA)
+        response, problems, final_prompt = complete_with_repair(
+            self.provider,
+            prompt,
+            REWARM_OUTPUT_SCHEMA,
+            validate=self._rewarm_problems,
+            corrective_attempts=self.corrective_attempts,
+        )
         self._provider_calls += 1
+        if problems:
+            # Degraded: skip the rewarm queue and fall through to TPE.
+            self._rewarm_degraded = True
+            self._queue = []
+            return
         rows = response.output.get("proposals")
-        if not isinstance(rows, list):
-            raise PolicyContractError("rewarm provider must return a proposals list")
         rows = rows[: self.max_rewarm_proposals]
         configs: list[Mapping[str, Any]] = []
         reasons: list[str] = []
@@ -334,11 +356,13 @@ class CurrentArm:
             origin="current_rewarm",
             reasons=reasons,
             shared_metadata={
-                "prompt": prompt,
-                "prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "prompt": final_prompt,
+                "prompt_hash": hashlib.sha256(final_prompt.encode("utf-8")).hexdigest(),
                 "raw_output": response.raw_output,
                 "model": response.model,
                 "provider_metadata": dict(response.metadata),
+                "repair_problems": list(problems),
+                "degraded": bool(problems),
             },
         )
 
@@ -409,6 +433,7 @@ class CurrentArm:
             "queue_evaluated": self._queue_evaluated,
             "queue_remaining": len(self._queue),
             "skipped_queue_configs": self._skipped_queue_configs,
+            "rewarm_degraded": self._rewarm_degraded,
             "tpe": None if self._backend is None else dict(self._backend.snapshot()),
             "incumbent_id": incumbent.observation_id,
             "incumbent_score": incumbent.score,
@@ -422,5 +447,6 @@ def create_arm(**dependencies: Any) -> CurrentArm:
         "summary_builder",
         "max_rewarm_proposals",
         "tpe_backend_factory",
+        "corrective_attempts",
     }
     return CurrentArm(**{key: value for key, value in dependencies.items() if key in allowed})
