@@ -126,25 +126,8 @@ def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
     }
 
 
-def _legacy_phase_c_per_candidate(run_dir: Path) -> dict[str, int]:
-    per_candidate: dict[str, int] = {}
-    for report_path in sorted(
-        (Path(run_dir) / "candidates").glob("*/tune_report.json")
-    ):
-        try:
-            report = json.loads(report_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(report, dict):
-            per_candidate[report_path.parent.name] = _phase_c_objective_attempts(
-                report
-            )
-    return per_candidate
-
-
 def _deep_tune_usage(
     rows: list[dict],
-    run_dir: Path,
 ) -> tuple[int, dict[str, int]]:
     logged: Counter[str] = Counter()
     for row in rows:
@@ -153,86 +136,7 @@ def _deep_tune_usage(
         run_id = row.get("run_id")
         if isinstance(run_id, str):
             logged[run_id] += 1
-    # Old reservation logs migrated only aggregate/per-candidate totals. Reports
-    # are the best phase-specific receipt for those runs. For current runs the
-    # append-only log can be ahead of a report after interruption, so take the
-    # per-candidate maximum rather than summing two views of the same calls.
-    legacy = _legacy_phase_c_per_candidate(run_dir)
-    per_candidate = {
-        run_id: max(logged.get(run_id, 0), legacy.get(run_id, 0))
-        for run_id in set(logged) | set(legacy)
-    }
-    return sum(per_candidate.values()), per_candidate
-
-
-def _phase_c_objective_attempts(report: dict) -> int:
-    return sum(
-        1
-        for stage in report.get("phase_c", {}).get("stages", [])
-        for trial in stage.get("trials", [])
-        if trial.get("status") != "preflight_rejected"
-    )
-
-
-def _report_attempts(report: dict) -> int:
-    phase_a = report.get("phase_a", {})
-    warm = phase_a.get("warm_start_configs", [])
-    attempted = phase_a.get("trials_attempted")
-    if not isinstance(attempted, int) or isinstance(attempted, bool) or attempted < 0:
-        attempted = len(warm)
-    else:
-        attempted = max(attempted, len(warm))
-    return attempted + _phase_c_objective_attempts(report)
-
-
-def _legacy_per_candidate(run_dir: Path) -> dict[str, int]:
-    """Best backward-readable totals from framework or hillclimb artifacts."""
-    per_candidate: dict[str, int] = {}
-    ledger_path = Path(run_dir) / "ledger.json"
-    try:
-        records = json.loads(ledger_path.read_text()).get("records", [])
-    except (OSError, json.JSONDecodeError, AttributeError):
-        records = []
-    for record in records if isinstance(records, list) else []:
-        run_id = record.get("run_id")
-        if not isinstance(run_id, str):
-            continue
-        value = record.get("trials_attempted")
-        if value is None:
-            value = record.get("trials_completed")
-        if value is None:
-            value = record.get("warm_start_K")
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            per_candidate[run_id] = max(0, int(value))
-
-    for report_path in sorted((Path(run_dir) / "candidates").glob("*/tune_report.json")):
-        try:
-            report = json.loads(report_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        run_id = report_path.parent.name
-        per_candidate[run_id] = max(
-            per_candidate.get(run_id, 0),
-            _report_attempts(report),
-        )
-
-    # Runs created by the deliberately-simple hillclimb have one root train.py
-    # and no candidates/ tree.  Migrate their historical one-row-per-run TSV
-    # into the strict attempt log on first reservation.
-    results_path = Path(run_dir) / "results.tsv"
-    if (
-        (Path(run_dir) / "train.py").is_file()
-        and not (Path(run_dir) / "candidates").exists()
-        and results_path.is_file()
-    ):
-        lines = [line for line in results_path.read_text().splitlines() if line.strip()]
-        if lines and lines[0].split("\t")[:3] == ["step", "score", "status"]:
-            run_id = Path(run_dir).name
-            per_candidate[run_id] = max(
-                per_candidate.get(run_id, 0),
-                len(lines) - 1,
-            )
-    return per_candidate
+    return sum(logged.values()), dict(logged)
 
 
 def _canonical_hash(value: Any) -> str:
@@ -267,6 +171,11 @@ def _read_rows(handle) -> list[dict]:
                 f"unsupported {ATTEMPT_LOG} schema on line {line_number}: "
                 f"{row.get('schema_version')!r}"
             )
+        if row.get("kind") != "score_attempt":
+            raise ValueError(
+                f"unsupported {ATTEMPT_LOG} row kind on line {line_number}: "
+                f"{row.get('kind')!r}"
+            )
         rows.append(row)
     return rows
 
@@ -275,32 +184,10 @@ def _summarize_rows(rows: list[dict]) -> tuple[int, dict[str, int]]:
     total = 0
     per_candidate: Counter[str] = Counter()
     for row in rows:
-        kind = row.get("kind")
-        if kind == "baseline":
-            baseline = row.get("per_candidate", {})
-            if isinstance(baseline, dict):
-                for run_id, value in baseline.items():
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                        per_candidate[str(run_id)] += value
-                        total += value
-        elif kind == "sync":
-            synced = row.get("per_candidate")
-            if isinstance(synced, dict):
-                for run_id, value in synced.items():
-                    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                        per_candidate[str(run_id)] += value
-                        total += value
-            else:
-                # Backward-readable fallback for early schema-1 logs that only
-                # carried an aggregate migration delta.
-                value = row.get("evaluations", 0)
-                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                    total += value
-        elif kind == "score_attempt":
-            total += 1
-            run_id = row.get("run_id")
-            if isinstance(run_id, str):
-                per_candidate[run_id] += 1
+        total += 1
+        run_id = row.get("run_id")
+        if isinstance(run_id, str):
+            per_candidate[run_id] += 1
     return total, dict(per_candidate)
 
 
@@ -308,10 +195,8 @@ def attempt_log_summary(run_dir: Path) -> dict[str, Any] | None:
     """Read the append-only attempt log without mutating it.
 
     This is the public diagnostic view over the same strict parser and
-    accounting used by budget admission.  ``baseline`` and ``sync`` rows may
-    carry more than one evaluation, so callers must use ``evaluations_done``
-    rather than count JSONL rows.  Valid but unfamiliar rows are surfaced for
-    observability instead of disappearing into a phase-only tally.
+    accounting used by budget admission. Every row is one admitted score
+    attempt, so ``evaluations_done`` is exactly the number of canonical rows.
     """
     path = Path(run_dir) / ATTEMPT_LOG
     if not path.is_file():
@@ -323,18 +208,13 @@ def attempt_log_summary(run_dir: Path) -> dict[str, Any] | None:
     phase_counts: Counter[str] = Counter()
     score_attempts = 0
     unclassified_score_attempts = 0
-    unrecognized_rows = 0
     for row in rows:
-        kind = row.get("kind")
-        if kind == "score_attempt":
-            score_attempts += 1
-            phase = row.get("phase")
-            if isinstance(phase, str) and phase:
-                phase_counts[phase] += 1
-            else:
-                unclassified_score_attempts += 1
-        elif kind not in {"baseline", "sync"}:
-            unrecognized_rows += 1
+        score_attempts += 1
+        phase = row.get("phase")
+        if isinstance(phase, str) and phase:
+            phase_counts[phase] += 1
+        else:
+            unclassified_score_attempts += 1
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -342,9 +222,7 @@ def attempt_log_summary(run_dir: Path) -> dict[str, Any] | None:
         "per_candidate": per_candidate,
         "phase_counts": dict(sorted(phase_counts.items())),
         "score_attempts": score_attempts,
-        "carried_evaluations": total - score_attempts,
         "unclassified_score_attempts": unclassified_score_attempts,
-        "unrecognized_rows": unrecognized_rows,
     }
 
 
@@ -362,42 +240,6 @@ def _locked_log(run_dir: Path):
     if fcntl is not None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     return handle
-
-
-def _initialize_or_sync(handle, run_dir: Path) -> tuple[list[dict], int, dict[str, int]]:
-    rows = _read_rows(handle)
-    legacy = _legacy_per_candidate(run_dir)
-    if not rows:
-        baseline = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "baseline",
-            "per_candidate": legacy,
-            "evaluations": sum(legacy.values()),
-        }
-        _append_row(handle, baseline)
-        rows.append(baseline)
-
-    total, per_candidate = _summarize_rows(rows)
-    missing_by_candidate = {
-        run_id: value - per_candidate.get(run_id, 0)
-        for run_id, value in legacy.items()
-        if value > per_candidate.get(run_id, 0)
-    }
-    missing_total = sum(missing_by_candidate.values())
-    if missing_total:
-        sync = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "sync",
-            "evaluations": missing_total,
-            "per_candidate": missing_by_candidate,
-            "reason": "legacy ledger/report advanced outside reservation log",
-        }
-        _append_row(handle, sync)
-        rows.append(sync)
-        total += missing_total
-        for run_id, value in missing_by_candidate.items():
-            per_candidate[run_id] = per_candidate.get(run_id, 0) + value
-    return rows, total, per_candidate
 
 
 def reserve_evaluation(
@@ -418,7 +260,8 @@ def reserve_evaluation(
     budget = _framework_budget(run_dir)
     run_id = Path(ref_path).resolve().parent.name
     with _locked_log(run_dir) as handle:
-        rows, used, _ = _initialize_or_sync(handle, run_dir)
+        rows = _read_rows(handle)
+        used, _ = _summarize_rows(rows)
         if budget is not None and used >= budget:
             raise EvaluationBudgetExhausted(
                 used=used,
@@ -427,7 +270,7 @@ def reserve_evaluation(
             )
         if str(phase) == "phase_c":
             limits = _deep_tune_limits(run_dir, budget)
-            deep_used, deep_per_candidate = _deep_tune_usage(rows, run_dir)
+            deep_used, deep_per_candidate = _deep_tune_usage(rows)
             total_cap = limits["total_cap"]
             if total_cap is not None and deep_used >= total_cap:
                 raise EvaluationBudgetExhausted(
@@ -463,26 +306,14 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
     """Return the strict objective usage view without mutating by default."""
     run_dir = Path(run_dir)
     path = run_dir / ATTEMPT_LOG
-    legacy = _legacy_per_candidate(run_dir)
     rows: list[dict] = []
-    if not path.exists() and not create:
-        total = sum(legacy.values())
-        per_candidate = legacy
-    else:
+    if path.exists() or create:
         with _locked_log(run_dir) as handle:
-            if create:
-                rows, total, per_candidate = _initialize_or_sync(handle, run_dir)
-            else:
-                rows = _read_rows(handle)
-                total, per_candidate = _summarize_rows(rows)
-                for run_id, value in legacy.items():
-                    logged = per_candidate.get(run_id, 0)
-                    if value > logged:
-                        total += value - logged
-                        per_candidate[run_id] = value
+            rows = _read_rows(handle)
+    total, per_candidate = _summarize_rows(rows)
     budget = _framework_budget(run_dir)
     limits = _deep_tune_limits(run_dir, budget)
-    deep_used, deep_per_candidate = _deep_tune_usage(rows, run_dir)
+    deep_used, deep_per_candidate = _deep_tune_usage(rows)
     deep_total_cap = limits["total_cap"]
     return {
         "schema_version": SCHEMA_VERSION,
@@ -520,7 +351,7 @@ def main() -> int:
     status_parser.add_argument(
         "--initialize",
         action="store_true",
-        help="create/synchronize the append-only attempt log",
+        help="create the append-only attempt log",
     )
     reserve_parser = subparsers.add_parser(
         "reserve",

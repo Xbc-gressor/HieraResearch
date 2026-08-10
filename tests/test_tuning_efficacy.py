@@ -23,20 +23,10 @@ class TuningEfficacyTests(unittest.TestCase):
         (run_dir / "ledger.json").write_text(json.dumps({"records": []}))
         return run_dir
 
-    def test_attempt_summary_uses_canonical_baseline_and_sync_accounting(self) -> None:
+    def test_attempt_summary_uses_canonical_score_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run_dir(Path(tmp))
             rows = [
-                {
-                    "schema_version": 1,
-                    "kind": "baseline",
-                    "per_candidate": {"000": 2},
-                },
-                {
-                    "schema_version": 1,
-                    "kind": "sync",
-                    "per_candidate": {"001": 1},
-                },
                 {
                     "schema_version": 1,
                     "kind": "score_attempt",
@@ -55,17 +45,15 @@ class TuningEfficacyTests(unittest.TestCase):
 
             summary = attempt_log_summary(run_dir)
             self.assertIsNotNone(summary)
-            self.assertEqual(summary["evaluations_done"], 5)
+            self.assertEqual(summary["evaluations_done"], 2)
             self.assertEqual(summary["phase_counts"], {"phase_a": 1})
-            self.assertEqual(summary["carried_evaluations"], 3)
             self.assertEqual(summary["unclassified_score_attempts"], 1)
 
             output = io.StringIO()
             with redirect_stdout(output):
                 result = tuning_efficacy.main(["tuning_efficacy.py", str(run_dir)])
             self.assertEqual(result, 0)
-            self.assertIn("admitted evaluations: 5", output.getvalue())
-            self.assertIn("baseline/sync=3", output.getvalue())
+            self.assertIn("admitted evaluations: 2", output.getvalue())
             self.assertIn("unclassified_score_attempts=1", output.getvalue())
 
     def test_malformed_attempt_log_fails_visibly(self) -> None:

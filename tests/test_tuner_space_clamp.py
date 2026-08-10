@@ -98,30 +98,6 @@ class ClampTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(self._probe_count(), probes_after_first)
 
-    def test_legacy_or_unverified_cache_is_reprobed(self):
-        def all_ok(params, candidate_path, **kwargs):
-            return {"status": "ok", "peak_vram_mb": 40000.0}
-
-        self._run_clamp(preflight=all_ok)
-        probes_after_first = self._probe_count()
-        report = json.loads(self.report_path.read_text())
-        legacy = report["search_space_clamp"]
-        legacy["schema_version"] = 1
-        legacy.pop("algorithm_version")
-        legacy["outcome"] = "unclamped"
-        legacy["corner_feasible"] = False
-        self.report_path.write_text(json.dumps(report))
-
-        clamped = self._run_clamp(preflight=all_ok)
-
-        self.assertEqual(clamped, SPACE)
-        self.assertGreater(self._probe_count(), probes_after_first)
-        receipt = json.loads(self.report_path.read_text())["search_space_clamp"]
-        self.assertEqual(receipt["schema_version"], 2)
-        self.assertEqual(receipt["algorithm_version"], 3)
-        self.assertEqual(receipt["outcome"], "already_feasible")
-        self.assertTrue(receipt["corner_feasible"])
-
     def test_missing_vram_telemetry_is_a_noop(self):
         (Path(self.tmp.name) / "environment_preflight.json").unlink()
         clamped = self._run_clamp()

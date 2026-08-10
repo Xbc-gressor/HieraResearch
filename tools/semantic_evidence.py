@@ -74,66 +74,21 @@ COVERAGE_KEYS = (
     "confounded_noncrash_edges",
     "crash_edges",
 )
-# Coverage shape before `direct_tuned_edges` split screening-depth direct
-# comparators out of `direct_noncrash_edges`. Legacy artifacts and decision
-# receipts carry exactly these three keys.
-LEGACY_COVERAGE_KEYS = (
-    "direct_noncrash_edges",
-    "confounded_noncrash_edges",
-    "crash_edges",
-)
-# Coverage shape before `direct_lightly_tuned_edges` split lightly-tuned
-# direct comparators into their own bucket. Schema-2 artifacts and decision
-# receipts carry exactly these four keys.
-SCHEMA_2_COVERAGE_KEYS = (
-    "direct_tuned_edges",
-    "direct_noncrash_edges",
-    "confounded_noncrash_edges",
-    "crash_edges",
-)
 
 
 def normalize_coverage(raw: Any) -> dict[str, int] | None:
-    """Read any known coverage shape, or return None if it is none of them.
-
-    Legacy maps are read forward with the newer direct-depth buckets at 0: the
-    three-key shape predates the tuned split and the four-key shape predates
-    the lightly-tuned split, so their direct edges are not known to be tuned
-    (or lightly tuned) and the conservative reading is that none were.
-    Callers must treat the result as backward-readable evidence, never as a
-    recomputed claim.
-    """
-    if not isinstance(raw, dict):
+    """Validate the current coverage receipt, or return ``None``."""
+    if not isinstance(raw, dict) or set(raw) != set(COVERAGE_KEYS):
         return None
-
-    def _counts(keys: tuple[str, ...]) -> dict[str, int] | None:
-        out: dict[str, int] = {}
-        for key in keys:
-            value = raw.get(key)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                return None
-            out[key] = value
-        return out
-
-    if set(raw) == set(COVERAGE_KEYS):
-        return _counts(COVERAGE_KEYS)
-    if set(raw) == set(SCHEMA_2_COVERAGE_KEYS):
-        counts = _counts(SCHEMA_2_COVERAGE_KEYS)
-        if counts is None:
+    counts: dict[str, int] = {}
+    for key in COVERAGE_KEYS:
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return None
-        return {
-            "direct_tuned_edges": counts["direct_tuned_edges"],
-            "direct_lightly_tuned_edges": 0,
-            "direct_noncrash_edges": counts["direct_noncrash_edges"],
-            "confounded_noncrash_edges": counts["confounded_noncrash_edges"],
-            "crash_edges": counts["crash_edges"],
-        }
-    if set(raw) == set(LEGACY_COVERAGE_KEYS):
-        counts = _counts(LEGACY_COVERAGE_KEYS)
-        if counts is None:
-            return None
-        return {"direct_tuned_edges": 0, "direct_lightly_tuned_edges": 0, **counts}
-    return None
+        counts[key] = value
+    return counts
+
+
 DIRECT_COMPARATOR_CAPABILITY_KEY = "direct_comparator_capability"
 DIRECT_COMPARATOR_CAPABILITY = {
     "schema_version": 1,
@@ -928,19 +883,13 @@ def hypothesis_carriers(
 def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     """Validate the durable inherited-control evidence on one ledger record.
 
-    New (policy-receipt schema 5+) non-fresh terminal records must carry the
-    tuner-produced transfer receipt.  Its inherited row proves parameter
-    continuity, not semantic isolation; only an additional paired semantic
-    control can qualify. Historical records remain readable but never acquire
-    direct-comparator status retroactively.
+    Non-fresh terminal records must carry the tuner-produced transfer receipt.
+    Its inherited row proves parameter continuity, not semantic isolation;
+    only an additional paired semantic control can qualify.
     """
     errors: list[str] = []
     run_id = str(record.get("run_id"))
     transfer = record.get("parameter_transfer")
-    policy = record.get("policy_receipt")
-    is_new_contract = (
-        isinstance(policy, dict) and policy.get("schema_version") in {5, 6, 7}
-    )
     nonfresh = record.get("op") in {"improve", "crossover"}
     terminal_noncrash = record.get("status") in NONCRASH_TERMINAL_STATUSES
 
@@ -951,9 +900,9 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
             )
         return errors
     if transfer is None:
-        if is_new_contract and nonfresh and terminal_noncrash:
+        if nonfresh and terminal_noncrash:
             errors.append(
-                f"record {run_id}.parameter_transfer is required for a new "
+                f"record {run_id}.parameter_transfer is required for a "
                 "non-fresh scored candidate"
             )
         return errors
@@ -1338,11 +1287,7 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
                 f"record {run_id}.parameter_transfer paired semantic control "
                 "must differ in exactly its declared parameter"
             )
-    if (
-        is_new_contract
-        and record.get("status") in NONCRASH_TERMINAL_STATUSES
-        and len(observations) != max_observations
-    ):
+    if nonfresh and terminal_noncrash and len(observations) != max_observations:
         errors.append(
             f"record {run_id}.parameter_transfer requires every mandatory "
             "control observation before a non-crash terminal result"

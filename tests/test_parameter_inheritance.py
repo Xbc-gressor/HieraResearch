@@ -468,6 +468,7 @@ class ParameterInheritanceTests(unittest.TestCase):
         report = {
             "phase_a": {
                 "status": "ok",
+                "trials_attempted": 1,
                 "best_warm_score": 0.4,
                 "best_warm_params": {"x": 3},
                 "warm_start_configs": [observation],
@@ -492,6 +493,7 @@ class ParameterInheritanceTests(unittest.TestCase):
         report = {
             "phase_a": {
                 "status": "ok",
+                "trials_attempted": 2,
                 "best_warm_score": 0.4,
                 "best_warm_params": {"x": 1},
                 "warm_start_configs": [

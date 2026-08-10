@@ -394,6 +394,7 @@ def _belief(runs: list[str], edges: list[str], **overrides) -> dict:
         "evidence_edge_ids": edges,
         "comparator_coverage": {
             "direct_tuned_edges": len(edges),
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,

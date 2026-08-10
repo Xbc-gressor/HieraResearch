@@ -319,6 +319,7 @@ class SemanticEdgePersistenceTests(unittest.TestCase):
                     {
                         "phase_a": {
                             "status": "ok",
+                            "trials_attempted": len(observations),
                             "best_warm_params": observation["params"],
                             "best_warm_score": observation["score"],
                             "warm_start_configs": observations,

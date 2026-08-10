@@ -273,35 +273,6 @@ entrypoint = "train.py"
                 brief["primary_parent"]["sha256"],
             )
 
-    def test_ledger_budget_prefers_attempts_and_reads_legacy_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger_path = Path(tmp) / "ledger.json"
-            ledger_path.write_text(json.dumps({
-                "records": [
-                    {
-                        "run_id": "001",
-                        "status": "discard",
-                        "trials_completed": 2,
-                        "trials_attempted": 5,
-                    },
-                    {
-                        "run_id": "002",
-                        "status": "keep",
-                        "trials_completed": 3,
-                    },
-                ],
-                "search_space_state": empty_search_space_state(),
-            }))
-            result = subprocess.run(
-                [sys.executable, str(ROOT / "tools" / "ledger.py"), "evaluations",
-                 "--ledger", str(ledger_path)],
-                check=True, capture_output=True, text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["evaluations_done"], 8)
-            self.assertEqual([row["evals"] for row in payload["per_candidate"]], [5, 3])
-
     def test_autoresearch_batch_schema_uses_independent_coordinates(self) -> None:
         result = subprocess.run(
             [sys.executable, str(ROOT / "tools" / "tuners" / "tune_tools.py"),
@@ -321,11 +292,27 @@ entrypoint = "train.py"
             ledger_path.write_text(json.dumps({
                 "records": [{
                     "run_id": "001", "status": "keep", "op": "fresh",
-                    "final_best_score": 0.2, "trials_attempted": 2,
-                    "trials_completed": 2,
+                    "final_best_score": 0.2,
                 }],
                 "search_space_state": empty_search_space_state(),
             }))
+            (Path(tmp) / "evaluation_attempts.jsonl").write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "kind": "score_attempt",
+                            "attempt_id": f"eval-{index:06d}",
+                            "run_id": "001",
+                            "phase": "phase_a",
+                            "method": "warmstart",
+                            "params_sha256": f"sha256:{index}",
+                        }
+                    )
+                    + "\n"
+                    for index in (1, 2)
+                )
+            )
             brief = subprocess.run(
                 [sys.executable, str(ROOT / "tools" / "ledger.py"), "brief",
                  "--ledger", str(ledger_path), "--budget", "2"],

@@ -1140,13 +1140,20 @@ class CloseExhaustedStageTest(unittest.TestCase):
                 }
             )
         )
-        rows = [{"schema_version": 1, "kind": "baseline", "evaluations": 0,
-                 "per_candidate": {}}]
+        rows = [{
+            "schema_version": 1,
+            "kind": "score_attempt",
+            "attempt_id": "eval-000001",
+            "run_id": "001",
+            "phase": "phase_a",
+            "method": "warmstart",
+            "params_sha256": "sha256:" + "0" * 64,
+        }]
         for index in range(phase_c_attempts):
             rows.append({
                 "schema_version": 1,
                 "kind": "score_attempt",
-                "attempt_id": f"eval-{index + 1:06d}",
+                "attempt_id": f"eval-{index + 2:06d}",
                 "run_id": "001",
                 "phase": "phase_c",
                 "method": "grid",
@@ -1158,6 +1165,7 @@ class CloseExhaustedStageTest(unittest.TestCase):
         report = {
             "phase_a": {
                 "status": "ok",
+                "trials_attempted": 1,
                 "candidate_code_revision": _candidate_execution_revision(candidate),
                 "search_space": {"x0": ["float", 0.0, 1.0]},
                 "warm_start_configs": [{"params": {"x0": 0.0}, "score": 1.0}],

@@ -187,8 +187,6 @@ def main(argv: list[str]) -> int:
             f"{key}={value}"
             for key, value in attempts["phase_counts"].items()
         ]
-        if attempts["carried_evaluations"]:
-            parts.append(f"baseline/sync={attempts['carried_evaluations']}")
         if attempts["unclassified_score_attempts"]:
             parts.append(
                 "unclassified_score_attempts="
@@ -198,11 +196,6 @@ def main(argv: list[str]) -> int:
             f"admitted evaluations: {attempts['evaluations_done']} "
             f"({', '.join(parts) or 'no classified rows'})"
         )
-        if attempts["unrecognized_rows"]:
-            print(
-                "warning: unrecognized attempt-log rows="
-                f"{attempts['unrecognized_rows']}"
-            )
     if flags:
         print("flags:")
         for flag in flags:

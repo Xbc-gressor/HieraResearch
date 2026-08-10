@@ -494,6 +494,7 @@ def _comparator_covered_entry() -> dict:
         "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
         "comparator_coverage": {
             "direct_tuned_edges": 2,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
@@ -538,6 +539,7 @@ def _observed_entry() -> dict:
         "evidence_edge_ids": ["sedge-000-001"],
         "comparator_coverage": {
             "direct_tuned_edges": 1,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
@@ -607,6 +609,7 @@ def _failed_entry() -> dict:
         "evidence_edge_ids": ["sedge-002-004"],
         "comparator_coverage": {
             "direct_tuned_edges": 0,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 1,
@@ -650,6 +653,7 @@ class ExperienceSchema3Tests(unittest.TestCase):
             "evidence_edge_ids": [],
             "comparator_coverage": {
                 "direct_tuned_edges": 0,
+                "direct_lightly_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -720,6 +724,7 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 "evidence_edge_ids": ["sedge-000-001"],
                 "comparator_coverage": {
                     "direct_tuned_edges": 0,
+                    "direct_lightly_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
@@ -730,6 +735,7 @@ class ExperienceSchema3Tests(unittest.TestCase):
         forged_counts = _comparator_covered_entry()
         forged_counts["comparator_coverage"] = {
             "direct_tuned_edges": 1,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
@@ -795,6 +801,7 @@ class ExperienceSchema3Tests(unittest.TestCase):
             evidence_edge_ids=[],
             comparator_coverage={
                 "direct_tuned_edges": 0,
+                "direct_lightly_tuned_edges": 0,
                 "direct_noncrash_edges": 0,
                 "confounded_noncrash_edges": 0,
                 "crash_edges": 0,
@@ -949,6 +956,7 @@ def _carrier_demote_entry() -> dict:
         "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
         "comparator_coverage": {
             "direct_tuned_edges": 0,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 2,
             "crash_edges": 0,
@@ -1003,6 +1011,7 @@ class CarrierDemotionGateTests(unittest.TestCase):
         entry["evidence_edge_ids"] = ["sedge-000-001"]
         entry["comparator_coverage"] = {
             "direct_tuned_edges": 0,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 1,
             "crash_edges": 0,

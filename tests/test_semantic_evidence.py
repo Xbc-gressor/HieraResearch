@@ -22,7 +22,6 @@ from semantic_evidence import (  # noqa: E402
     experience_cited_ids,
     hypothesis_carriers,
     mechanical_gain_direction,
-    normalize_coverage,
     render_target_evidence,
     target_evaluation_state,
     validate_parameter_transfer_binding,
@@ -410,53 +409,6 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             },
         )
 
-    def test_legacy_single_dimension_edge_is_confounded(self) -> None:
-        registry = fixture_registry()
-        baseline = complete_point(registry)
-        filtered = complete_point(
-            registry, {"dim-data-curation": "hyp-data-filtered"}
-        )
-        records: list[dict] = []
-        _append(
-            records,
-            "000",
-            [],
-            baseline,
-            status="keep",
-            score=0.40,
-            dag_revision=1,
-        )
-        child = {
-            "run_id": "001",
-            "source_run_ids": ["000"],
-            "semantic_point": filtered,
-            "status": "discard",
-            "final_best_score": 0.50,
-            "dag_revision": 2,
-        }
-        child["semantic_edges"] = build_semantic_edges(records, child)
-        records.append(child)
-        ledger = {"records": records}
-        self.assertEqual(
-            comparator_coverage(
-                ledger,
-                ["sedge-000-001"],
-                target_kind="hypothesis",
-                target_id="hyp-data-filtered",
-            ),
-            {
-                "direct_tuned_edges": 0,
-                "direct_lightly_tuned_edges": 0,
-                "direct_noncrash_edges": 0,
-                "confounded_noncrash_edges": 1,
-                "crash_edges": 0,
-            },
-        )
-        self.assertEqual(
-            edge_observation(ledger, "sedge-000-001")["score_basis"],
-            "independently_tuned_final",
-        )
-
     def test_comparator_coverage_counts_only_cited_touching_receipts(self) -> None:
         registry = fixture_registry()
         ledger = belief_ledger(registry)
@@ -627,50 +579,6 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         # Mixed tuned/lightly-tuned controls also orient in numbers.
         records[1]["evaluation_depth"] = "tuned"
         self.assertEqual(direction(edges), "positive")
-
-    def test_legacy_coverage_receipts_normalize(self) -> None:
-        # The four-key (schema-2) and three-key (schema-1) coverage shapes read
-        # forward with direct_lightly_tuned_edges at 0.
-        four_key = {
-            "direct_tuned_edges": 2,
-            "direct_noncrash_edges": 1,
-            "confounded_noncrash_edges": 1,
-            "crash_edges": 0,
-        }
-        self.assertEqual(
-            normalize_coverage(four_key),
-            {
-                "direct_tuned_edges": 2,
-                "direct_lightly_tuned_edges": 0,
-                "direct_noncrash_edges": 1,
-                "confounded_noncrash_edges": 1,
-                "crash_edges": 0,
-            },
-        )
-        three_key = {
-            "direct_noncrash_edges": 1,
-            "confounded_noncrash_edges": 1,
-            "crash_edges": 0,
-        }
-        self.assertEqual(
-            normalize_coverage(three_key),
-            {
-                "direct_tuned_edges": 0,
-                "direct_lightly_tuned_edges": 0,
-                "direct_noncrash_edges": 1,
-                "confounded_noncrash_edges": 1,
-                "crash_edges": 0,
-            },
-        )
-        five_key = {
-            "direct_tuned_edges": 1,
-            "direct_lightly_tuned_edges": 2,
-            "direct_noncrash_edges": 0,
-            "confounded_noncrash_edges": 0,
-            "crash_edges": 0,
-        }
-        self.assertEqual(normalize_coverage(five_key), five_key)
-        self.assertIsNone(normalize_coverage({"direct_tuned_edges": 1}))
 
     def test_gain_direction_uses_repeated_control_scores_not_final_tuning(self) -> None:
         registry = fixture_registry()
@@ -1012,22 +920,6 @@ class SemanticEdgeObservationTests(unittest.TestCase):
             any("incumbent_params" in error for error in errors),
             errors,
         )
-
-    def test_legacy_policy_cannot_gain_direct_comparator_status(self) -> None:
-        registry = fixture_registry()
-        for version in (4, 5):
-            with self.subTest(version=version):
-                ledger = belief_ledger(registry)
-                child = ledger["records"][1]
-                child["policy_receipt"]["schema_version"] = version
-                coverage = comparator_coverage(
-                    ledger,
-                    ["sedge-000-001"],
-                    target_kind="hypothesis",
-                    target_id="hyp-data-filtered",
-                )
-                self.assertEqual(coverage["direct_noncrash_edges"], 0)
-                self.assertEqual(coverage["confounded_noncrash_edges"], 1)
 
     def test_pending_edge_is_not_noncrash_comparator_coverage(self) -> None:
         registry = fixture_registry()

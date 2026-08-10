@@ -160,9 +160,9 @@ def select_warm_config_indices(
 
         method = previous.get("method")
         valid_methods = (
-            {"mandatory_then_uniform_without_replacement", "legacy_prefix_resume"}
+            {"mandatory_then_uniform_without_replacement"}
             if mandatory_indices
-            else {"uniform_without_replacement", "legacy_prefix_resume"}
+            else {"uniform_without_replacement"}
         )
         if method not in valid_methods:
             raise ValueError(f"unknown warm-config selection method: {method!r}")
@@ -189,57 +189,48 @@ def select_warm_config_indices(
                 raise ValueError("mandatory warm configs must lead the permutation")
 
         previous_seed = previous.get("seed")
-        if method in {
-            "uniform_without_replacement",
-            "mandatory_then_uniform_without_replacement",
-        }:
-            if (
-                not isinstance(previous_seed, int)
-                or isinstance(previous_seed, bool)
-                or previous_seed < 0
-            ):
-                raise ValueError("uniform warm-config selection requires a nonnegative seed")
-            remaining = [
-                index
-                for index in range(population_size)
-                if index not in mandatory_indices
-            ]
-            expected = list(mandatory_indices) + random.Random(
-                previous_seed
-            ).sample(remaining, len(remaining))
-            if permutation != expected:
-                raise ValueError("warm-config permutation does not match its persisted seed")
-        elif previous_seed is not None:
-            raise ValueError("legacy warm-config selection must have a null seed")
-        return dict(previous)
-
-    if previous_phase_a:
-        # Reports created before selection receipts used the first K_eval
-        # configs. Preserve that already-started experiment instead of silently
-        # changing its sampled set during an upgrade.
-        permutation = list(range(population_size))
-        method = "legacy_prefix_resume"
-        selection_seed = None
-    else:
-        if seed is None:
-            selection_seed = random.SystemRandom().randrange(1 << 63)
-        elif not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
-            raise ValueError("warm-config selection seed must be a nonnegative integer")
-        else:
-            selection_seed = seed
+        if (
+            not isinstance(previous_seed, int)
+            or isinstance(previous_seed, bool)
+            or previous_seed < 0
+        ):
+            raise ValueError("uniform warm-config selection requires a nonnegative seed")
         remaining = [
             index
             for index in range(population_size)
             if index not in mandatory_indices
         ]
-        permutation = list(mandatory_indices) + random.Random(
-            selection_seed
+        expected = list(mandatory_indices) + random.Random(
+            previous_seed
         ).sample(remaining, len(remaining))
-        method = (
-            "mandatory_then_uniform_without_replacement"
-            if mandatory_indices
-            else "uniform_without_replacement"
+        if permutation != expected:
+            raise ValueError("warm-config permutation does not match its persisted seed")
+        return dict(previous)
+
+    if previous_phase_a:
+        raise ValueError(
+            "existing phase_a is missing warm_config_selection; start a fresh run"
         )
+
+    if seed is None:
+        selection_seed = random.SystemRandom().randrange(1 << 63)
+    elif not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError("warm-config selection seed must be a nonnegative integer")
+    else:
+        selection_seed = seed
+    remaining = [
+        index
+        for index in range(population_size)
+        if index not in mandatory_indices
+    ]
+    permutation = list(mandatory_indices) + random.Random(
+        selection_seed
+    ).sample(remaining, len(remaining))
+    method = (
+        "mandatory_then_uniform_without_replacement"
+        if mandatory_indices
+        else "uniform_without_replacement"
+    )
 
     result = {
         "schema_version": 2 if mandatory_indices else 1,
@@ -556,12 +547,13 @@ def main() -> int:
             ],
         }
 
-    trials_attempted = previous_phase_a.get("trials_attempted")
-    if not isinstance(trials_attempted, int) or isinstance(trials_attempted, bool) \
-            or trials_attempted < 0:
-        # Backward-compatible recovery for reports written before the explicit
-        # attempt counter: every persisted warm row came from one score_fn call.
-        trials_attempted = len(prev)
+    trials_attempted = previous_phase_a.get("trials_attempted", 0)
+    if (
+        not isinstance(trials_attempted, int)
+        or isinstance(trials_attempted, bool)
+        or trials_attempted < 0
+    ):
+        parser.error("phase_a.trials_attempted must be a nonnegative integer")
 
     report = previous_report
     if not phase_revision_matches:

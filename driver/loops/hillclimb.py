@@ -146,8 +146,7 @@ def _setup(task, tag, run_dir, task_toml, repo_root, max_evaluations, timeout,
 
 
 def _reconcile(run_dir, cmd, repo_root, events) -> None:
-    """Helper syncs the attempt log; the DRIVER appends TSV recovery rows —
-    two separate steps (spec crash-recovery table)."""
+    """Validate the attempt log, then append any missing TSV recovery rows."""
     cmd(["python", "tools/evaluation_budget.py", "status",
          "--run-dir", run_dir, "--initialize"], repo_root)
     done = budget_status(run_dir, repo_root, cmd).get("evaluations_done", 0)

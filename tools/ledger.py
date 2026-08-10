@@ -384,10 +384,10 @@ def cmd_set_tuning(args) -> int:
         if (
             record.get("op") in {"improve", "crossover"}
             and isinstance(receipt, dict)
-            and receipt.get("schema_version") in {5, 6, 7}
+            and receipt.get("schema_version") in {6, 7}
         ):
             raise SystemExit(
-                "new non-fresh candidates require --from-report so the exact "
+                "non-fresh candidates require --from-report so the exact "
                 "parameter-transfer control is persisted"
             )
         updates = {

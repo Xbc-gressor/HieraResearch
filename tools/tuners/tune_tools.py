@@ -2576,11 +2576,15 @@ def summarize(report: dict) -> dict:
     # and never appended to a Phase-C stage, so neither count double-counts them.
     warm_trials = phase_a.get("warm_start_configs", [])
     phase_a_attempted = phase_a.get("trials_attempted")
-    if not isinstance(phase_a_attempted, int) or isinstance(phase_a_attempted, bool) \
-            or phase_a_attempted < 0:
-        phase_a_attempted = len(warm_trials)
-    else:
-        phase_a_attempted = max(phase_a_attempted, len(warm_trials))
+    if (
+        not isinstance(phase_a_attempted, int)
+        or isinstance(phase_a_attempted, bool)
+        or phase_a_attempted < len(warm_trials)
+    ):
+        raise ValueError(
+            "phase_a.trials_attempted must be a nonnegative integer covering "
+            "every persisted warm trial"
+        )
     phase_c_trials = [
         trial
         for stage in report.get("phase_c", {}).get("stages", [])

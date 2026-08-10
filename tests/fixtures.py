@@ -355,12 +355,11 @@ def policy_receipt(
     selection_index: int = 1,
     selected_lane: str = "active",
     deprioritized_interval: int = 5,
-    schema_version: int = 4,
+    schema_version: int = 6,
 ) -> dict:
     """A coverage-policy selection receipt with a consistent budget lane.
 
-    Defaults to schema 4; pass ``schema_version=6`` for the current admission
-    schema, which additionally pins the LLM weight and empty conditioning.
+    Schema 6 pins the LLM weight and an empty conditioning receipt.
     """
     scheduled_lane = (
         "deprioritized"

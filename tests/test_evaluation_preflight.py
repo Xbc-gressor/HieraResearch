@@ -68,19 +68,6 @@ class EvaluationBudgetTests(unittest.TestCase):
         )
         self.assertEqual(replayed, selection)
 
-    def test_warm_config_selection_preserves_legacy_prefix_on_resume(self) -> None:
-        selection = select_warm_config_indices(
-            5,
-            3,
-            {"status": "crashed", "warm_start_configs": []},
-            seed=17,
-        )
-
-        self.assertEqual(selection["method"], "legacy_prefix_resume")
-        self.assertIsNone(selection["seed"])
-        self.assertEqual(selection["selected_indices"], [0, 1, 2])
-        self.assertEqual(selection["deferred_indices"], [3, 4])
-
     def test_warm_config_selection_rejects_contract_changes_on_resume(self) -> None:
         selection = select_warm_config_indices(5, 3, {}, seed=17)
 
@@ -317,7 +304,7 @@ class EvaluationBudgetTests(unittest.TestCase):
             ]
             self.assertEqual(
                 [row["kind"] for row in rows],
-                ["baseline", "score_attempt", "score_attempt"],
+                ["score_attempt", "score_attempt"],
             )
 
     def test_deep_tune_total_and_per_candidate_caps_are_strict(self) -> None:
@@ -438,53 +425,6 @@ class EvaluationBudgetTests(unittest.TestCase):
                 )
             self.assertEqual(exhausted.exception.scope, "deep_tune_total")
 
-    def test_legacy_reports_seed_phase_c_allocation_before_reservation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir, candidate = _run_dir(Path(tmp), budget=10)
-            (run_dir / "framework_cfg.json").write_text(
-                json.dumps(
-                    {
-                        "max_evaluations": 10,
-                        "tuner": {
-                            "deep_tune_budget_fraction": 0.2,
-                            "deep_tune_per_candidate_cap": 5,
-                        },
-                    }
-                )
-            )
-            (candidate.parent / "tune_report.json").write_text(
-                json.dumps(
-                    {
-                        "phase_a": {"warm_start_configs": []},
-                        "phase_c": {
-                            "stages": [
-                                {
-                                    "method": "bo",
-                                    "trials": [
-                                        {"params": {"x": 1}, "score": 0.5},
-                                        {"params": {"x": 2}, "score": 0.4},
-                                    ],
-                                }
-                            ]
-                        },
-                    }
-                )
-            )
-
-            status = evaluation_budget.budget_status(run_dir)
-            self.assertEqual(status["deep_tune"]["attempts"], 2)
-            self.assertEqual(status["deep_tune"]["remaining"], 0)
-            with self.assertRaises(
-                evaluation_budget.EvaluationBudgetExhausted
-            ) as exhausted:
-                evaluation_budget.reserve_evaluation(
-                    candidate,
-                    params={"x": 3},
-                    phase="phase_c",
-                    method="bo",
-                )
-            self.assertEqual(exhausted.exception.scope, "deep_tune_total")
-
     def test_corrupt_framework_cfg_fails_fast_instead_of_lifting_guards(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir, candidate = _run_dir(Path(tmp), budget=1)
@@ -551,44 +491,6 @@ class EvaluationBudgetTests(unittest.TestCase):
                     _common.resolve_score_fn(prepare, candidate)
                 with self.assertRaisesRegex(ValueError, "expected key = value"):
                     timed_preflight({}, candidate)
-
-    def test_legacy_sync_reconciles_per_candidate_without_hiding_calls(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir, candidate = _run_dir(Path(tmp), budget=10)
-            evaluation_budget.reserve_evaluation(
-                candidate, params={"x": 1}, phase="phase_a", method="warmstart"
-            )
-            evaluation_budget.reserve_evaluation(
-                candidate, params={"x": 2}, phase="phase_a", method="warmstart"
-            )
-
-            # Candidate 001's aggregate is stale, while candidate 002 was
-            # recorded by an older caller that never wrote the reservation log.
-            (run_dir / "ledger.json").write_text(
-                json.dumps(
-                    {
-                        "records": [
-                            {"run_id": "001", "trials_attempted": 1},
-                            {"run_id": "002", "trials_attempted": 2},
-                        ]
-                    }
-                )
-            )
-            status = evaluation_budget.budget_status(run_dir, create=True)
-
-            self.assertEqual(status["evaluations_done"], 4)
-            self.assertEqual(
-                {row["run_id"]: row["evals"] for row in status["per_candidate"]},
-                {"001": 2, "002": 2},
-            )
-            sync = [
-                json.loads(line)
-                for line in (run_dir / evaluation_budget.ATTEMPT_LOG)
-                .read_text()
-                .splitlines()
-                if '"kind": "sync"' in line
-            ]
-            self.assertEqual(sync[-1]["per_candidate"], {"002": 2})
 
     def test_concurrent_reservations_cannot_overshoot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -673,35 +575,6 @@ class EvaluationBudgetTests(unittest.TestCase):
                 evaluation_budget.budget_status(run_dir)["evaluations_done"],
                 1,
             )
-
-    def test_legacy_hillclimb_tsv_migrates_before_new_reservation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp) / "runs" / "unit" / "legacy-hillclimb"
-            run_dir.mkdir(parents=True)
-            candidate = run_dir / "train.py"
-            candidate.write_text("VALUE = 1\n")
-            (run_dir / "framework_cfg.json").write_text(
-                json.dumps({"max_evaluations": 5})
-            )
-            (run_dir / "results.tsv").write_text(
-                "step\tscore\tstatus\tdescription\n"
-                "0\t1.0\tkeep\tbaseline\n"
-                "1\tinf\tcrash\tfailed edit\n"
-            )
-
-            initial = evaluation_budget.budget_status(run_dir, create=True)
-            self.assertEqual(initial["evaluations_done"], 2)
-            evaluation_budget.reserve_evaluation(
-                candidate,
-                params={"candidate_sha256": "sha256:test"},
-                phase="hillclimb",
-                method="direct",
-            )
-            self.assertEqual(
-                evaluation_budget.budget_status(run_dir)["evaluations_done"],
-                3,
-            )
-
 
 class EnvironmentPreflightTests(unittest.TestCase):
     def test_environment_hook_runs_without_score_surface_call(self) -> None:

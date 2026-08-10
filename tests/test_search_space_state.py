@@ -117,6 +117,7 @@ def decision(revision: int, target_id: str, before: str, after: str) -> dict:
         "evidence_edge_ids": ["sedge-000-001", "sedge-002-003"],
         "comparator_coverage": {
             "direct_tuned_edges": 2,
+            "direct_lightly_tuned_edges": 0,
             "direct_noncrash_edges": 0,
             "confounded_noncrash_edges": 0,
             "crash_edges": 0,
@@ -526,6 +527,7 @@ class ExperienceTransitionTests(unittest.TestCase):
                 "comparator_coverage": {
                     "direct_tuned_edges": 2
                     + len(self.additional_evidence_edge_ids),
+                    "direct_lightly_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
@@ -779,6 +781,7 @@ class ExperienceTransitionTests(unittest.TestCase):
                 "evidence_edge_ids": ["sedge-000-001"],
                 "comparator_coverage": {
                     "direct_tuned_edges": 1,
+                    "direct_lightly_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
@@ -842,6 +845,7 @@ class ExperienceTransitionTests(unittest.TestCase):
                 "evidence_edge_ids": ["sedge-002-004"],
                 "comparator_coverage": {
                     "direct_tuned_edges": 0,
+                    "direct_lightly_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 1,
@@ -933,6 +937,7 @@ class ExperienceTransitionTests(unittest.TestCase):
                 ][-5:],
                 "comparator_coverage": {
                     "direct_tuned_edges": len(existing_edges) + 1,
+                    "direct_lightly_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
@@ -1105,37 +1110,6 @@ class LedgerIntegrationTests(unittest.TestCase):
         self.assertTrue(
             any("one-based admission index 1" in error for error in errors), errors
         )
-
-    def test_historical_policy_receipts_remain_readable(self) -> None:
-        """Schema evolution is additive: older receipts still validate as-is."""
-        registry = fixture_registry()
-        baseline = complete_point(registry)
-
-        def ledger_with(entry: dict) -> dict:
-            return {
-                "search_space": space_receipt(registry),
-                "records": [entry],
-                "search_space_state": empty_search_space_state(),
-            }
-
-        schema_four = record("000", "fresh", [], baseline, score=0.5, status="keep")
-        self.assertEqual(schema_four["policy_receipt"]["schema_version"], 4)
-        self.assertEqual(validate_ledger(registry, ledger_with(schema_four)), [])
-
-        schema_two = record("000", "fresh", [], baseline, score=0.5, status="keep")
-        receipt = schema_two["policy_receipt"]
-        receipt["schema_version"] = 2
-        receipt.pop("budget")
-        receipt.pop("experience")
-        receipt["policy"]["config"].pop("deprioritized_budget_interval")
-        for field in (
-            "prior_gain",
-            "experience_gain_adjustment",
-            "prior_uncertainty",
-            "experience_uncertainty_adjustment",
-        ):
-            receipt["components"].pop(field)
-        self.assertEqual(validate_ledger(registry, ledger_with(schema_two)), [])
 
     def test_validate_ledger_requires_state_once_records_exist(self) -> None:
         registry = fixture_registry()
@@ -1434,7 +1408,6 @@ class LedgerIntegrationTests(unittest.TestCase):
             "000", "fresh", [], baseline, score=0.5, status="keep"
         )
         terminal["dag_revision"] = 1
-        terminal["trials_attempted"] = 1
         pending = record(
             "001",
             "improve",
@@ -1466,6 +1439,20 @@ class LedgerIntegrationTests(unittest.TestCase):
             replacement_path = run_dir / "experience.json"
             (run_dir / "framework_cfg.json").write_text(
                 json.dumps({"max_evaluations": 1})
+            )
+            (run_dir / "evaluation_attempts.jsonl").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": "score_attempt",
+                        "attempt_id": "eval-000001",
+                        "run_id": "000",
+                        "phase": "phase_a",
+                        "method": "warmstart",
+                        "params_sha256": "sha256:terminal",
+                    }
+                )
+                + "\n"
             )
             ledger_path.write_text(json.dumps(ledger))
             background_path.write_text(background_text(registry))
@@ -1735,6 +1722,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 "evidence_edge_ids": ["sedge-000-001"],
                 "comparator_coverage": {
                     "direct_tuned_edges": 1,
+                    "direct_lightly_tuned_edges": 0,
                     "direct_noncrash_edges": 0,
                     "confounded_noncrash_edges": 0,
                     "crash_edges": 0,
@@ -2295,9 +2283,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(written["schema_version"], 7)
         self.assertEqual(written["search_space_state_revision"], 1)
 
-    def test_schema6_llm_weight_is_auditable_and_schema5_remains_readable(
-        self,
-    ) -> None:
+    def test_llm_weight_is_auditable_and_fixed_midrun(self) -> None:
         proposals = self._proposals(
             {"records": [], "search_space_state": empty_search_space_state()}
         )
@@ -2385,36 +2371,6 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             any("must stay fixed at 44" in error for error in errors),
             errors,
         )
-
-        legacy = copy.deepcopy(ledger)
-        legacy_receipt = legacy["records"][0]["policy_receipt"]
-        legacy_receipt["schema_version"] = 5
-        legacy_receipt["policy"]["config"].pop("llm_intelligence_score")
-        for carrier_key in (
-            "carrier_pos_weight",
-            "carrier_pos_cap",
-            "carrier_neg_weight",
-            "carrier_neg_cap",
-        ):
-            legacy_receipt["policy"]["config"].pop(carrier_key)
-        legacy_receipt["components"].pop("llm_judgment_weight")
-        legacy_receipt["components"].pop("experience_prior")
-        legacy_receipt["components"].pop("carriers")
-        legacy_receipt["budget"] = {
-            "selection_index": legacy_receipt["budget"]["selection_index"],
-            "deprioritized_interval": 5,
-            "scheduled_lane": "active",
-            "selected_lane": "active",
-            "fallback": "none",
-            "base_rank": 1,
-        }
-        unweighted_model_score = 0.6 + 0.5 * 0.2
-        legacy_receipt["acquisition_score"] = round(
-            unweighted_model_score
-            + 0.1 * legacy_receipt["components"]["coverage"],
-            10,
-        )
-        self.assertEqual(validate_ledger(self.registry, legacy), [])
 
     def test_validate_ledger_replays_each_record_at_its_receipt_revision(self) -> None:
         registry = self.registry

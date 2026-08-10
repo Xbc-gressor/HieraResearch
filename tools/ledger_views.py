@@ -49,46 +49,36 @@ def candidate_dir_for(
     return (ROOT / relative).as_posix()
 
 
-def evaluations_done(data: dict, ledger_path: Path | None = None) -> dict:
-    """Return all config-to-score attempts, reconciled with strict receipts."""
+def evaluations_done(data: dict, ledger_path: Path) -> dict:
+    """Return all admitted config-to-score attempts from strict receipts."""
     records = data.get("records", [])
-    per_candidate, total = [], 0
+    strict = budget_status(Path(ledger_path).parent)
+    strict_per = {
+        row["run_id"]: row["evals"]
+        for row in strict.get("per_candidate", [])
+    }
+    per_candidate = []
     for record in records:
-        attempted = record.get("trials_attempted")
-        if attempted is None:
-            attempted = record.get("trials_completed")
-        if attempted is None:
-            attempted = record.get("warm_start_K") or 0
-        attempted = int(attempted)
-        total += attempted
+        run_id = record.get("run_id")
         per_candidate.append(
             {
-                "run_id": record.get("run_id"),
-                "evals": attempted,
+                "run_id": run_id,
+                "evals": strict_per.pop(run_id, 0),
                 "tuned": bool(record.get("tune")),
                 "status": record.get("status"),
             }
         )
-    if ledger_path is not None:
-        strict = budget_status(Path(ledger_path).parent)
-        total = max(total, strict["evaluations_done"])
-        strict_per = {
-            row["run_id"]: row["evals"]
-            for row in strict.get("per_candidate", [])
-        }
-        for row in per_candidate:
-            row["evals"] = max(row["evals"], strict_per.pop(row["run_id"], 0))
-        for run_id, attempted in sorted(strict_per.items()):
-            per_candidate.append(
-                {
-                    "run_id": run_id,
-                    "evals": attempted,
-                    "tuned": False,
-                    "status": "pending",
-                }
-            )
+    for run_id, attempted in sorted(strict_per.items()):
+        per_candidate.append(
+            {
+                "run_id": run_id,
+                "evals": attempted,
+                "tuned": False,
+                "status": "pending",
+            }
+        )
     return {
-        "evaluations_done": total,
+        "evaluations_done": strict["evaluations_done"],
         "n_candidates": len(records),
         "per_candidate": per_candidate,
     }

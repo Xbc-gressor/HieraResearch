@@ -821,27 +821,6 @@ class FailureArtifactTests(unittest.TestCase):
                 TRACEBACK,
             )
 
-    def test_legacy_inline_traceback_remains_compatible(self) -> None:
-        report = {
-            "phase_a": {
-                "warm_start_configs": [
-                    {
-                        "params": {"depth": 0},
-                        "score": None,
-                        "status": "failed",
-                        "error": "ValueError: depth must be positive",
-                        "error_traceback": TRACEBACK,
-                    },
-                    {"params": {"depth": 2}, "score": 0.4},
-                ],
-                "elapsed_seconds": 1.5,
-            }
-        }
-
-        self.assertEqual(select_best(report)["best_score"], 0.4)
-        self.assertEqual(summarize(report)["trials_completed"], 1)
-        self.assertEqual(summarize(report)["trials_attempted"], 2)
-
     def test_non_finite_scores_are_not_successful_trials(self) -> None:
         report = {
             "phase_a": {
@@ -851,6 +830,7 @@ class FailureArtifactTests(unittest.TestCase):
                     {"params": {"depth": 3}, "score": 0.4},
                 ],
                 "best_warm_score": float("inf"),
+                "trials_attempted": 3,
             },
             "phase_c": {
                 "stages": [
@@ -909,6 +889,7 @@ class FailureArtifactTests(unittest.TestCase):
                 ],
                 "best_warm_params": {"depth": 2},
                 "best_warm_score": 0.4,
+                "trials_attempted": 2,
             },
             "phase_c": {
                 "stages": [
