@@ -194,11 +194,12 @@ class ActiveSetArmTests(unittest.TestCase):
             ).run(LLMActiveSetArm(provider))
 
             self.assertEqual(result["evaluations_consumed"], 2)
-            self.assertEqual(result["proposal_batches"], 2)
-            self.assertEqual(result["policy_snapshot"]["rejected_batches"], 1)
+            self.assertEqual(result["proposal_batches"], 1)
+            self.assertEqual(result["policy_snapshot"]["rejected_batches"], 0)
             self.assertEqual(len(provider.calls), 2)
-            second_prompt = json.loads(provider.calls[1]["prompt"].split("\n\n", 1)[1])
-            self.assertEqual(len(second_prompt["recent_rejections"]), 2)
+            self.assertIn("symmetric pair collapses", provider.calls[1]["prompt"])
+            self.assertEqual(result["policy_snapshot"]["provider_attempts"], 2)
+            self.assertEqual(result["policy_snapshot"]["corrective_calls"], 1)
 
     def test_rejects_odd_budget_and_repairs_non_numeric_selection(self):
         categorical = SearchSpace.from_legacy(

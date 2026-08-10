@@ -115,6 +115,8 @@ class LLMPoolRankArm:
         self.context: BenchmarkContext | None = None
         self.observations: list[Observation] = []
         self.provider_calls = 0
+        self.provider_attempts = 0
+        self.corrective_calls = 0
         self.ranker_calls = 0
         self.degraded_calls = 0
         self._pool: list[dict[str, Any]] | None = None
@@ -132,6 +134,8 @@ class LLMPoolRankArm:
         self.context = context
         self.observations = list(context.observations)
         self.provider_calls = 0
+        self.provider_attempts = 0
+        self.corrective_calls = 0
         self.ranker_calls = 0
         self.degraded_calls = 0
         self._clear_pool()
@@ -158,6 +162,13 @@ class LLMPoolRankArm:
                 f"proposals must contain exactly {POOL_SIZE} configurations"
             ]
         problems: list[str] = []
+        names = set(self.context.space.names)
+        history = {
+            self.context.space.canonical(observation.params)
+            for observation in self.observations
+            if set(observation.params) == names
+        }
+        proposed: set[str] = set()
         for index, item in enumerate(raw_pool):
             if not isinstance(item, Mapping):
                 problems.append(f"proposal {index + 1} is not an object")
@@ -168,9 +179,20 @@ class LLMPoolRankArm:
                 problems.append(f"proposal {index + 1} must contain a params object")
             else:
                 try:
-                    self.context.space.project(params)
-                except ValueError as exc:
+                    projected = self.context.space.project(params)
+                except (TypeError, ValueError) as exc:
                     problems.append(f"proposal {index + 1} params are invalid: {exc}")
+                else:
+                    key = self.context.space.canonical(projected)
+                    if key in history:
+                        problems.append(
+                            f"proposal {index + 1} revisits a configuration in history"
+                        )
+                    if key in proposed:
+                        problems.append(
+                            f"proposal {index + 1} duplicates another proposal"
+                        )
+                    proposed.add(key)
             if not isinstance(reason, str) or not reason.strip():
                 problems.append(
                     f"proposal {index + 1} must contain a non-empty reason"
@@ -181,7 +203,12 @@ class LLMPoolRankArm:
         assert self.context is not None
         rng = random.Random(self.context.seed * 10007 + self.provider_calls * 31)
         space = self.context.space
-        seen: set[str] = set()
+        names = set(space.names)
+        seen = {
+            space.canonical(observation.params)
+            for observation in self.observations
+            if set(observation.params) == names
+        }
         pool: list[dict[str, Any]] = []
         draws = 0
         while len(pool) < POOL_SIZE:
@@ -226,6 +253,12 @@ class LLMPoolRankArm:
             corrective_attempts=self.corrective_attempts,
         )
         self.provider_calls += 1
+        self.provider_attempts += int(
+            response.metadata["repair_provider_attempts"]
+        )
+        self.corrective_calls += int(
+            response.metadata["repair_corrective_calls"]
+        )
         if problems:
             self.degraded_calls += 1
             pool = self._fallback_pool()
@@ -349,6 +382,8 @@ class LLMPoolRankArm:
         assert self.context is not None
         return {
             "provider_calls": self.provider_calls,
+            "provider_attempts": self.provider_attempts,
+            "corrective_calls": self.corrective_calls,
             "ranker_calls": self.ranker_calls,
             "ranker": self.ranker.name,
             "min_ranker_history": self.min_ranker_history,

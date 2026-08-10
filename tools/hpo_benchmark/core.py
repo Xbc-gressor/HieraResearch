@@ -25,6 +25,10 @@ class PolicyContractError(RuntimeError):
     """An arm returned a batch that the shared runner cannot execute fairly."""
 
 
+class ConfigInfeasibleError(RuntimeError):
+    """One admitted configuration failed for a known config-specific reason."""
+
+
 @dataclass(frozen=True)
 class SearchDimension:
     name: str
@@ -253,6 +257,12 @@ class Policy(Protocol):
 
 
 class Objective(Protocol):
+    """Return preflight rejections; raise unknown failures unchanged.
+
+    Evaluation may raise ``ConfigInfeasibleError`` for an admitted config whose
+    failure is known to be config-specific and safe to record as ``+inf``.
+    """
+
     def preflight(self, params: Mapping[str, Any]) -> str | None: ...
 
     def evaluate(self, params: Mapping[str, Any]) -> float: ...
@@ -315,11 +325,22 @@ class ArtifactStore:
         self.manifest_path = self.output_dir / "manifest.json"
         self.events_path = self.output_dir / "events.jsonl"
         self.result_path = self.output_dir / "result.json"
+        self.failure_path = self.output_dir / "failure.json"
         self._event_count = 0
+        self._initialized = False
 
     def initialize(self, manifest: Mapping[str, Any]) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        occupied = [path.name for path in (self.manifest_path, self.events_path, self.result_path) if path.exists()]
+        occupied = [
+            path.name
+            for path in (
+                self.manifest_path,
+                self.events_path,
+                self.result_path,
+                self.failure_path,
+            )
+            if path.exists()
+        ]
         if occupied:
             raise FileExistsError(
                 f"benchmark output already contains artifacts: {', '.join(occupied)}"
@@ -328,6 +349,7 @@ class ArtifactStore:
             json.dumps(_jsonable(manifest), indent=2, ensure_ascii=False, allow_nan=False) + "\n",
             encoding="utf-8",
         )
+        self._initialized = True
 
     def event(self, kind: str, **payload: Any) -> None:
         record = {"event_index": self._event_count, "kind": kind, **payload}
@@ -342,6 +364,13 @@ class ArtifactStore:
             json.dumps(_jsonable(result), indent=2, ensure_ascii=False, allow_nan=False) + "\n",
             encoding="utf-8",
         )
+
+    def failure(self, failure: Mapping[str, Any]) -> None:
+        self.failure_path.write_text(
+            json.dumps(_jsonable(failure), indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
 
 class BenchmarkRunner:
     """Run one checkpoint × arm × seed cell with strict admitted budget."""
@@ -366,6 +395,22 @@ class BenchmarkRunner:
             raise ValueError("max_proposal_batches cannot be smaller than evaluation budget")
 
     def run(self, policy: Policy) -> dict[str, Any]:
+        try:
+            return self._run(policy)
+        except Exception as exc:
+            if self.store._initialized:
+                self.store.failure(
+                    {
+                        "schema_version": 1,
+                        "checkpoint_id": self.context.checkpoint_id,
+                        "arm": getattr(policy, "name", None),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+            raise
+
+    def _run(self, policy: Policy) -> dict[str, Any]:
         if not isinstance(policy, Policy):
             raise TypeError("policy does not implement the benchmark arm contract")
         observations = list(self.context.observations)
@@ -435,20 +480,18 @@ class BenchmarkRunner:
                 try:
                     params = self.context.space.project(proposal.params)
                     key = self.context.space.canonical(params)
+                except (TypeError, ValueError) as exc:
+                    params = None
+                    failure = f"{type(exc).__name__}: {exc}"
+                    rejection_kind = "contract"
+                else:
                     if key in seen or key in batch_seen:
                         failure = "duplicate configuration"
                         rejection_kind = "duplicate"
                     else:
-                        try:
-                            failure = self.objective.preflight(params)
-                        except Exception as exc:
-                            failure = f"{type(exc).__name__}: {exc}"
+                        failure = self.objective.preflight(params)
                         rejection_kind = "preflight" if failure is not None else None
                     batch_seen.add(key)
-                except Exception as exc:
-                    params = None
-                    failure = f"{type(exc).__name__}: {exc}"
-                    rejection_kind = "contract"
                 prepared.append((proposal, params, failure, rejection_kind))
 
             if batch.atomic and any(
@@ -505,7 +548,7 @@ class BenchmarkRunner:
                             raise ValueError("objective returned a non-finite score")
                         status: ObservationStatus = "ok"
                         failure = None
-                    except Exception as exc:
+                    except ConfigInfeasibleError as exc:
                         score = math.inf
                         status = "crash"
                         failure = f"{type(exc).__name__}: {exc}"

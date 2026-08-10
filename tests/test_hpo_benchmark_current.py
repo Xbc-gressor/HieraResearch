@@ -173,6 +173,44 @@ class CurrentArmTests(unittest.TestCase):
             ]
             self.assertEqual(origins, ["current_tpe", "current_tpe"])
 
+    def test_rewarm_repairs_historical_and_duplicate_proposals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = ReplayProposalProvider(
+                [
+                    {
+                        "proposals": [
+                            {"params": {"x": 4.0}, "reason": "history"},
+                            {"params": {"x": 3.0}, "reason": "first"},
+                            {"params": {"x": 3.0}, "reason": "duplicate"},
+                        ]
+                    },
+                    {
+                        "proposals": [
+                            {"params": {"x": 3.0}, "reason": "fresh"}
+                        ]
+                    },
+                ]
+            )
+
+            result = BenchmarkRunner(
+                checkpoint(regime="continuation", budget=1),
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(
+                CurrentArm(
+                    provider=provider,
+                    tpe_backend_factory=lambda context: FakeBackend(context, []),
+                )
+            )
+
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn("revisits", provider.calls[1]["prompt"])
+            self.assertIn("duplicates", provider.calls[1]["prompt"])
+            self.assertEqual(result["policy_snapshot"]["provider_calls"], 1)
+            self.assertEqual(result["policy_snapshot"]["provider_attempts"], 2)
+            self.assertEqual(result["policy_snapshot"]["corrective_calls"], 1)
+            self.assertEqual(result["policy_snapshot"]["queue_evaluated"], 1)
+
     def test_continuation_requires_rewarm_provider(self):
         arm = CurrentArm()
         with self.assertRaisesRegex(

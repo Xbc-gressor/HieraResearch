@@ -113,6 +113,8 @@ class LLMActiveSetArm:
         self.context: BenchmarkContext | None = None
         self.observations: list[Observation] = []
         self.provider_calls = 0
+        self.provider_attempts = 0
+        self.corrective_calls = 0
         self.completed_rounds = 0
         self.rejected_batches = 0
         self.failed_rounds = 0
@@ -137,6 +139,8 @@ class LLMActiveSetArm:
         self.context = context
         self.observations = list(context.observations)
         self.provider_calls = 0
+        self.provider_attempts = 0
+        self.corrective_calls = 0
         self.completed_rounds = 0
         self.rejected_batches = 0
         self.failed_rounds = 0
@@ -184,6 +188,12 @@ class LLMActiveSetArm:
             OUTPUT_SCHEMA,
             validate=self._problems,
             corrective_attempts=self.corrective_attempts,
+        )
+        self.provider_attempts += int(
+            response.metadata["repair_provider_attempts"]
+        )
+        self.corrective_calls += int(
+            response.metadata["repair_corrective_calls"]
         )
         center = dict(summary["incumbent"]["params"])
         if problems:
@@ -255,8 +265,32 @@ class LLMActiveSetArm:
 
     def _problems(self, output: Mapping[str, Any]) -> list[str]:
         try:
-            self._parse_output(output)
-        except PolicyContractError as exc:
+            moves, _ = self._parse_output(output)
+            assert self.context is not None
+            center = dict(
+                _full_space_incumbent(
+                    self.context, self.observations
+                ).params
+            )
+            plus, minus, _, _, _ = self._symmetric_pair(center, moves)
+            plus_key = self.context.space.canonical(plus)
+            minus_key = self.context.space.canonical(minus)
+            if plus_key == minus_key:
+                return [
+                    "the symmetric pair collapses after projection; choose a "
+                    "dimension away from its boundary"
+                ]
+            history = {
+                self.context.space.canonical(observation.params)
+                for observation in self.observations
+                if set(observation.params) == set(self.context.space.names)
+            }
+            if plus_key in history or minus_key in history:
+                return [
+                    "the symmetric pair revisits a configuration in history; "
+                    "choose different active dimensions or steps"
+                ]
+        except (PolicyContractError, TypeError, ValueError) as exc:
             return [str(exc)]
         return []
 
@@ -267,9 +301,23 @@ class LLMActiveSetArm:
                 continue
             normalized = dimension.normalized(center[dimension.name])
             direction = 1 if normalized <= 0.5 else -1
-            return (_Move(dimension, direction, 0.10),)
+            moves = (_Move(dimension, direction, 0.10),)
+            plus, minus, _, _, _ = self._symmetric_pair(center, moves)
+            plus_key = self.context.space.canonical(plus)
+            minus_key = self.context.space.canonical(minus)
+            history = {
+                self.context.space.canonical(observation.params)
+                for observation in self.observations
+                if set(observation.params) == set(self.context.space.names)
+            }
+            if (
+                plus_key != minus_key
+                and plus_key not in history
+                and minus_key not in history
+            ):
+                return moves
         raise PolicyContractError(
-            "LLM active-set requires a non-fixed numeric dimension"
+            "LLM active-set cannot build a distinct unseen symmetric pair"
         )
 
     def _parse_output(
@@ -404,6 +452,8 @@ class LLMActiveSetArm:
         incumbent = _full_space_incumbent(self.context, self.observations)
         return {
             "provider_calls": self.provider_calls,
+            "provider_attempts": self.provider_attempts,
+            "corrective_calls": self.corrective_calls,
             "completed_rounds": self.completed_rounds,
             "rejected_batches": self.rejected_batches,
             "failed_rounds": self.failed_rounds,

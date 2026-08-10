@@ -9,6 +9,7 @@ import unittest
 from tools.hpo_benchmark.core import (
     BenchmarkContext,
     BenchmarkRunner,
+    ConfigInfeasibleError,
     EvaluationOutcome,
     FunctionObjective,
     Observation,
@@ -131,7 +132,7 @@ class BenchmarkRunnerTests(unittest.TestCase):
 
         def evaluate(params):
             if params["x"] == 3.0:
-                raise RuntimeError("synthetic crash")
+                raise ConfigInfeasibleError("synthetic config crash")
             return params["x"] ** 2
 
         result = BenchmarkRunner(
@@ -159,6 +160,40 @@ class BenchmarkRunnerTests(unittest.TestCase):
             if event["kind"] == "evaluation" and event["observation"]["status"] == "crash"
         )
         self.assertEqual(crash["observation"]["score"], "+inf")
+
+    def test_unknown_objective_errors_propagate_and_leave_failure_receipt(self):
+        history = (observation("warm", 4.0, 16.0),)
+
+        def fail_preflight(params):
+            raise RuntimeError("unknown preflight failure")
+
+        def fail_evaluation(params):
+            raise RuntimeError("unknown evaluation failure")
+
+        cases = (
+            (
+                "preflight",
+                FunctionObjective(lambda params: 1.0, preflight_fn=fail_preflight),
+            ),
+            ("evaluation", FunctionObjective(fail_evaluation)),
+        )
+        for name, objective in cases:
+            with self.subTest(name=name):
+                output = Path(self.tmp.name) / name
+                arm = ScriptedArm(
+                    [ProposalBatch((Proposal({"x": 3.0}, "scripted"),))]
+                )
+                with self.assertRaisesRegex(RuntimeError, f"unknown {name} failure"):
+                    BenchmarkRunner(
+                        self._context(history, budget=1), objective, output
+                    ).run(arm)
+
+                failure = json.loads(
+                    (output / "failure.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(failure["error_type"], "RuntimeError")
+                self.assertEqual(failure["error"], f"unknown {name} failure")
+                self.assertFalse((output / "result.json").exists())
 
     def test_atomic_batch_is_not_partially_evaluated(self):
         history = (observation("warm", 4.0, 16.0),)

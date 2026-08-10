@@ -197,6 +197,30 @@ class PoolRankArmTests(unittest.TestCase):
             self.assertIn("exactly 8", provider.calls[1]["prompt"])
             self.assertEqual(result["policy_snapshot"]["degraded_calls"], 0)
 
+    def test_pool_repairs_history_revisits_and_internal_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.context(2, budget=1)
+            provider = ReplayProposalProvider(
+                [
+                    replay_pool([0.0, 2.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+                    replay_pool([0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]),
+                ]
+            )
+
+            result = BenchmarkRunner(
+                context,
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMPoolHEBORankArm(provider))
+
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn("revisits", provider.calls[1]["prompt"])
+            self.assertIn("duplicates", provider.calls[1]["prompt"])
+            self.assertEqual(result["proposal_batches"], 1)
+            self.assertEqual(result["policy_snapshot"]["provider_calls"], 1)
+            self.assertEqual(result["policy_snapshot"]["provider_attempts"], 2)
+            self.assertEqual(result["policy_snapshot"]["corrective_calls"], 1)
+
     def test_broken_pool_provider_degrades_to_a_fallback_pool(self):
         with tempfile.TemporaryDirectory() as tmp:
             context = self.context(2, budget=1)

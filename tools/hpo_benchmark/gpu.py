@@ -26,12 +26,18 @@ TUNER_DIR = ROOT / "tools" / "tuners"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(TUNER_DIR))
 
-from _common import _communicate_with_limit, is_finite_score, timed_preflight  # noqa: E402
+from _common import (  # noqa: E402
+    _communicate_with_limit,
+    is_config_infeasible_error,
+    is_finite_score,
+    timed_preflight,
+)
 
 from tools.apply_base_params import apply as apply_base_params  # noqa: E402
 from tools.hpo_benchmark.core import (  # noqa: E402
     BenchmarkContext,
     BenchmarkRunner,
+    ConfigInfeasibleError,
     Observation,
     SearchSpace,
     load_arm,
@@ -272,34 +278,43 @@ class CandidateObjective:
         try:
             timed_preflight(dict(params), self.candidate_path)
         except Exception as exc:
+            if not is_config_infeasible_error(exc):
+                raise
             return f"{type(exc).__name__}: {exc}"
         return None
 
     def evaluate(self, params: Mapping[str, Any]) -> float:
-        eval_one = str(TUNER_DIR / "_eval_one.py")
-        out, err, returncode = _communicate_with_limit(
-            [
-                sys.executable,
-                eval_one,
-                str(self.candidate_path),
-                json.dumps(dict(params), ensure_ascii=False, allow_nan=False),
-            ],
-            limit=self.evaluation_timeout,
-            label="benchmark evaluation exceeded evaluation_timeout",
-        )
-        for line in out.splitlines():
-            if line.startswith("RESULT:"):
-                score = float(line[len("RESULT:") :])
-                if not is_finite_score(score):
-                    raise ValueError(f"evaluation returned non-finite score: {score!r}")
-                return score
-        detail = err.strip()
-        if len(detail) > 4000:
-            detail = "...[stderr truncated]...\n" + detail[-4000:]
-        raise RuntimeError(
-            f"evaluation subprocess exited with code {returncode} without a RESULT line"
-            + (f"\nchild stderr:\n{detail}" if detail else "")
-        )
+        try:
+            eval_one = str(TUNER_DIR / "_eval_one.py")
+            out, err, returncode = _communicate_with_limit(
+                [
+                    sys.executable,
+                    eval_one,
+                    str(self.candidate_path),
+                    json.dumps(dict(params), ensure_ascii=False, allow_nan=False),
+                ],
+                limit=self.evaluation_timeout,
+                label="benchmark evaluation exceeded evaluation_timeout",
+            )
+            for line in out.splitlines():
+                if line.startswith("RESULT:"):
+                    score = float(line[len("RESULT:") :])
+                    if not is_finite_score(score):
+                        raise ValueError(
+                            f"evaluation returned non-finite score: {score!r}"
+                        )
+                    return score
+            detail = err.strip()
+            if len(detail) > 4000:
+                detail = "...[stderr truncated]...\n" + detail[-4000:]
+            raise RuntimeError(
+                f"evaluation subprocess exited with code {returncode} without a RESULT line"
+                + (f"\nchild stderr:\n{detail}" if detail else "")
+            )
+        except Exception as exc:
+            if is_config_infeasible_error(exc):
+                raise ConfigInfeasibleError(str(exc)) from exc
+            raise
 
 
 def _copy_candidate(source: Path, destination: Path) -> None:
@@ -445,7 +460,7 @@ def prepare_checkpoint(args: argparse.Namespace) -> int:
             try:
                 score = objective.evaluate(params)
                 status, failure = "ok", None
-            except Exception as exc:
+            except ConfigInfeasibleError as exc:
                 score, status = "+inf", "crash"
                 failure = f"{type(exc).__name__}: {exc}"
             observation = {

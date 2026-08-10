@@ -38,15 +38,20 @@ def complete_with_repair(
     follow-up.  Returns ``(response, problems, final_prompt)`` where ``problems``
     are those of the last validation (empty on success) and ``final_prompt`` is
     the prompt of the last call.  The caller decides how to salvage a response
-    that still fails.
+    that still fails.  The returned response metadata includes aggregate fresh
+    call/CLI-attempt counts and the rejected problem history.
     """
     if corrective_attempts < 0:
         raise ValueError("corrective_attempts must be non-negative")
     response = provider.complete(prompt, output_schema=output_schema)
+    provider_calls = 1
+    provider_attempts = int(response.metadata.get("provider_attempt_count", 1))
     problems = validate(response.output)
+    problem_history: list[list[str]] = []
     for _ in range(corrective_attempts):
         if not problems:
             break
+        problem_history.append(list(problems))
         items = "\n".join(f"- {problem}" for problem in problems)
         prompt = (
             prompt
@@ -55,7 +60,25 @@ def complete_with_repair(
             + "\nReturn one corrected response that fixes every problem."
         )
         response = provider.complete(prompt, output_schema=output_schema)
+        provider_calls += 1
+        provider_attempts += int(
+            response.metadata.get("provider_attempt_count", 1)
+        )
         problems = validate(response.output)
+    if problems:
+        problem_history.append(list(problems))
+    response = ProviderResponse(
+        output=response.output,
+        raw_output=response.raw_output,
+        model=response.model,
+        metadata={
+            **dict(response.metadata),
+            "repair_provider_calls": provider_calls,
+            "repair_provider_attempts": provider_attempts,
+            "repair_corrective_calls": provider_calls - 1,
+            "repair_problem_history": problem_history,
+        },
+    )
     return response, problems, prompt
 
 

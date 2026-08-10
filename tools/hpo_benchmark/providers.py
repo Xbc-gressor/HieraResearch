@@ -61,14 +61,19 @@ class ClaudeCLIProposalProvider:
         cwd: Path,
         cli_path: str = "claude",
         max_budget_usd: float | None = None,
+        retries: int = 2,
         command_runner: CommandRunner = subprocess.run,
     ):
+        if retries < 0:
+            raise ValueError("retries must be non-negative")
         self.model = model
         self.cwd = Path(cwd)
         self.cli_path = cli_path
         self.max_budget_usd = max_budget_usd
+        self.retries = retries
         self._command_runner = command_runner
         self.calls = 0
+        self.attempts = 0
 
     def complete(
         self, prompt: str, *, output_schema: Mapping[str, Any]
@@ -90,19 +95,27 @@ class ClaudeCLIProposalProvider:
         if self.max_budget_usd is not None:
             command.extend(["--max-budget-usd", str(self.max_budget_usd)])
         command.append(prompt)
-        completed = self._command_runner(
-            command,
-            cwd=self.cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
+        attempts_this_call = 0
+        for _ in range(self.retries + 1):
+            completed = self._command_runner(
+                command,
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            attempts_this_call += 1
+            self.attempts += 1
+            if completed.returncode == 0:
+                break
+        else:
             detail = (completed.stderr or completed.stdout).strip()
             if len(detail) > 2000:
                 detail = "...[output truncated]...\n" + detail[-2000:]
             raise RuntimeError(
-                f"Claude proposal call exited with code {completed.returncode}: {detail}"
+                "Claude proposal call failed after "
+                f"{attempts_this_call} attempts; last exit code "
+                f"{completed.returncode}: {detail}"
             )
         try:
             envelope = json.loads(completed.stdout)
@@ -126,6 +139,9 @@ class ClaudeCLIProposalProvider:
             if key in envelope
         }
         metadata["provider_call_index"] = self.calls - 1
+        metadata["provider_attempt_count"] = attempts_this_call
+        metadata["provider_retry_count"] = attempts_this_call - 1
+        metadata["provider_total_attempts"] = self.attempts
         return ProviderResponse(
             output=dict(output),
             raw_output=json.dumps(output, ensure_ascii=False, allow_nan=False),

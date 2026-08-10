@@ -288,6 +288,68 @@ class HillclimbArmTests(unittest.TestCase):
             self.assertEqual(proposal["params"], {"x": 2.0})
             self.assertFalse(proposal["metadata"]["degraded"])
 
+    def test_bad_noop_and_historical_changes_are_corrected_before_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            space = SearchSpace.from_legacy({"x": ("float", -5.0, 5.0)})
+            incumbent = Observation(
+                observation_id="warm",
+                params={"x": 4.0},
+                score=16.0,
+                status="ok",
+                origin="warm",
+                consumes_budget=False,
+            )
+            historical = Observation(
+                observation_id="older",
+                params={"x": 3.0},
+                score=25.0,
+                status="ok",
+                origin="warm",
+                consumes_budget=False,
+            )
+            context = BenchmarkContext(
+                checkpoint_id="hillclimb-validation",
+                regime="first",
+                space=space,
+                observations=(incumbent, historical),
+                budget=1,
+                seed=0,
+            )
+            provider = ReplayProposalProvider(
+                [
+                    {"changes": {"x": "bad"}, "reason": "bad value"},
+                    {"changes": {"x": 4.0}, "reason": "no movement"},
+                    {"changes": {"x": 3.0}, "reason": "repeat history"},
+                    {"changes": {"x": 2.0}, "reason": "fresh step"},
+                ]
+            )
+
+            result = BenchmarkRunner(
+                context,
+                FunctionObjective(lambda params: params["x"] ** 2),
+                Path(tmp) / "run",
+            ).run(LLMHillclimbArm(provider))
+
+            self.assertEqual(result["proposal_batches"], 1)
+            self.assertEqual(result["rejection_count"], 0)
+            self.assertEqual(result["policy_snapshot"]["provider_calls"], 1)
+            self.assertEqual(result["policy_snapshot"]["provider_attempts"], 4)
+            self.assertEqual(result["policy_snapshot"]["corrective_calls"], 3)
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "run" / "events.jsonl").read_text().splitlines()
+            ]
+            proposal = next(
+                event for event in events if event["kind"] == "proposal_batch"
+            )["proposals"][0]
+            history = proposal["metadata"]["provider_metadata"][
+                "repair_problem_history"
+            ]
+            self.assertEqual(len(history), 3)
+            self.assertIn("cannot be projected", history[0][0])
+            self.assertIn("no-op", history[1][0])
+            self.assertIn("history", history[2][0])
+
     def test_broken_provider_degrades_to_a_random_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             space = SearchSpace.from_legacy({"x": ("float", -5.0, 5.0)})

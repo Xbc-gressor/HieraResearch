@@ -243,6 +243,8 @@ class CurrentArm:
         self._rewarm_generated = False
         self._rewarm_degraded = False
         self._provider_calls = 0
+        self._provider_attempts = 0
+        self._corrective_calls = 0
         self._queue_evaluated = 0
         self._skipped_queue_configs = 0
 
@@ -262,6 +264,8 @@ class CurrentArm:
         self._rewarm_generated = False
         self._rewarm_degraded = False
         self._provider_calls = 0
+        self._provider_attempts = 0
+        self._corrective_calls = 0
         self._queue_evaluated = 0
         self._skipped_queue_configs = 0
         self._queue = []
@@ -307,10 +311,53 @@ class CurrentArm:
         return queued
 
     def _rewarm_problems(self, output: Mapping[str, Any]) -> list[str]:
+        assert self.context is not None
         rows = output.get("proposals")
         if not isinstance(rows, list):
             return ["proposals must be a list of configuration objects"]
-        return []
+        if len(rows) > self.max_rewarm_proposals:
+            return [
+                "proposals must contain at most "
+                f"{self.max_rewarm_proposals} configurations"
+            ]
+        names = set(self.context.space.names)
+        history = {
+            self.context.space.canonical(observation.params)
+            for observation in self.observations
+            if set(observation.params) == names
+        }
+        proposed: set[str] = set()
+        problems: list[str] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                problems.append(f"proposal {index + 1} is not an object")
+                continue
+            params, reason = row.get("params"), row.get("reason")
+            if not isinstance(params, Mapping):
+                problems.append(f"proposal {index + 1} must contain a params object")
+            else:
+                try:
+                    projected = self.context.space.project(params)
+                except (TypeError, ValueError) as exc:
+                    problems.append(
+                        f"proposal {index + 1} params are invalid: {exc}"
+                    )
+                else:
+                    key = self.context.space.canonical(projected)
+                    if key in history:
+                        problems.append(
+                            f"proposal {index + 1} revisits a configuration in history"
+                        )
+                    if key in proposed:
+                        problems.append(
+                            f"proposal {index + 1} duplicates another proposal"
+                        )
+                    proposed.add(key)
+            if not isinstance(reason, str) or not reason.strip():
+                problems.append(
+                    f"proposal {index + 1} must contain a non-empty reason"
+                )
+        return problems
 
     def _generate_rewarm(self, remaining_budget: int) -> None:
         assert self.context is not None and self.provider is not None
@@ -332,6 +379,12 @@ class CurrentArm:
             corrective_attempts=self.corrective_attempts,
         )
         self._provider_calls += 1
+        self._provider_attempts += int(
+            response.metadata["repair_provider_attempts"]
+        )
+        self._corrective_calls += int(
+            response.metadata["repair_corrective_calls"]
+        )
         if problems:
             # Degraded: skip the rewarm queue and fall through to TPE.
             self._rewarm_degraded = True
@@ -430,6 +483,8 @@ class CurrentArm:
         return {
             "regime": None if self.context is None else self.context.regime,
             "provider_calls": self._provider_calls,
+            "provider_attempts": self._provider_attempts,
+            "corrective_calls": self._corrective_calls,
             "queue_evaluated": self._queue_evaluated,
             "queue_remaining": len(self._queue),
             "skipped_queue_configs": self._skipped_queue_configs,
