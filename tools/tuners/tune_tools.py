@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -71,7 +72,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PARAMETER_TRANSFER_FILENAME = "_parameter_transfer.json"
 
 
-# ---------- SEARCH_SPACE via AST (no candidate import) ----------
+# =============================================================================
+# Candidate contract and search-space validation
+# =============================================================================
 
 
 def _read_search_space(train_path: Path) -> dict:
@@ -197,7 +200,7 @@ def _space_schema_mismatch(schema_entry, space_entry) -> str | None:
     return None
 
 
-# ---------- method selection ----------
+# --- Deterministic method selection ---
 
 # Single source of truth for the dimensionality -> Phase C method map. Trial-cap
 # args (n_trials etc.) are NOT here — they are caller-overridable defaults owned
@@ -213,7 +216,7 @@ def select_method(n_dims: int) -> dict:
     return {"n_dims": n_dims, "method": "bo", "fallback": ["cmaes"]}
 
 
-# ---------- bounds checking ----------
+# --- Parameter bounds ---
 
 
 def _value_in_bounds(value, entry) -> bool:
@@ -273,7 +276,7 @@ def _bounds_violations(params: dict, search_space: dict) -> list[dict]:
     return violations
 
 
-# ---------- contract lint ----------
+# --- Static contract lint ---
 
 # The tuner contract's *relational* invariants — the ones that silently poison
 # downstream tuning if an LLM writes the contract slightly wrong. `_common` only
@@ -911,7 +914,9 @@ def lint_schema(train_path: Path) -> dict:
     }
 
 
-# ---------- best-trial selection ----------
+# =============================================================================
+# Trial selection and tuning lifecycle
+# =============================================================================
 
 
 def finite_warm_incumbent_rows(rows) -> list[dict]:
@@ -1001,7 +1006,7 @@ def select_best(report: dict) -> dict:
     return {"best_params": best[1], "best_score": best[2], "source": best[0]}
 
 
-# ---------- Phase-C completion / finalization guard ----------
+# --- Phase-C completion and finalization ---
 
 
 def validated_phase_a_incumbent(report: dict) -> dict:
@@ -1049,6 +1054,283 @@ _TERMINAL_STAGE_STATUSES = {
 _FINALIZABLE_STAGE_STATUSES = _TERMINAL_STAGE_STATUSES - {"rejected"}
 
 
+@dataclass(frozen=True)
+class _PhaseCFinalizationState:
+    """Validated shape and deterministic-chain facts used at finalization."""
+
+    stages: list[dict]
+    statuses: list[str | None]
+    last_bout: list[dict]
+    exhausted_rejections: bool
+    final_stage: dict
+    final_status: str | None
+    final_trials: list
+
+
+def _phase_a_finalization_evidence(
+    report: dict,
+    errors: list[str],
+) -> tuple[dict, dict | None]:
+    """Collect and cross-check the finite Phase-A incumbent."""
+    phase_a = report.get("phase_a")
+    if not isinstance(phase_a, dict) or phase_a.get("status") != "ok":
+        errors.append("phase_a.status must be 'ok'")
+        phase_a = {}
+
+    warm_rows = phase_a.get("warm_start_configs")
+    if not isinstance(warm_rows, list):
+        errors.append("phase_a.warm_start_configs must be a list")
+        warm_rows = []
+    finite_warm = finite_warm_incumbent_rows(warm_rows)
+    warm_best = (
+        min(finite_warm, key=lambda row: float(row["score"]))
+        if finite_warm
+        else None
+    )
+    if warm_best is None:
+        errors.append("phase_a has no finite selectable warm observation")
+        return phase_a, None
+
+    if phase_a.get("best_warm_params") != warm_best["params"]:
+        errors.append(
+            "phase_a.best_warm_params does not match its finite warm best"
+        )
+    if (
+        not _is_finite_score(phase_a.get("best_warm_score"))
+        or float(phase_a["best_warm_score"]) != float(warm_best["score"])
+    ):
+        errors.append(
+            "phase_a.best_warm_score does not match its finite warm best"
+        )
+    return phase_a, warm_best
+
+
+def _phase_c_finalization_state(
+    report: dict,
+    phase_a: dict,
+    errors: list[str],
+) -> _PhaseCFinalizationState:
+    """Validate stage shape, bout prefixes, and the deterministic method chain."""
+    from _common import stages_by_bout
+
+    phase_c = report.get("phase_c")
+    stages = phase_c.get("stages") if isinstance(phase_c, dict) else None
+    if not isinstance(stages, list) or not stages:
+        errors.append("phase_c.stages must be a non-empty list")
+        stages = []
+
+    statuses: list[str | None] = []
+    for index, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            errors.append(f"phase_c.stages[{index}] must be an object")
+            statuses.append(None)
+            continue
+        if stage.get("method") not in {"grid", "bo", "cmaes"}:
+            errors.append(f"phase_c.stages[{index}].method is invalid")
+        status = stage.get("status")
+        statuses.append(status if isinstance(status, str) else None)
+        if status not in _TERMINAL_STAGE_STATUSES:
+            errors.append(
+                f"phase_c.stages[{index}].status is not terminal "
+                f"(got {status!r})"
+            )
+        if status == "rejected" and stage.get("trials") not in (None, []):
+            errors.append(
+                f"phase_c.stages[{index}] is rejected but contains trial rows"
+            )
+
+    # Grouping malformed stages would crash; their shape error above is enough.
+    bouts = (
+        stages_by_bout(stages)
+        if all(isinstance(stage, dict) for stage in stages)
+        else []
+    )
+    offset = 0
+    for bout in bouts:
+        for index, stage in enumerate(bout[:-1]):
+            if stage.get("status") != "rejected":
+                errors.append(
+                    f"phase_c.stages[{offset + index}] precedes another stage "
+                    "of its bout but is not rejected"
+                )
+        offset += len(bout)
+
+    expected_methods: list[str] = []
+    search_space = phase_a.get("search_space")
+    if isinstance(search_space, dict) and search_space:
+        expected = select_method(len(search_space))
+        expected_methods = [expected["method"], *expected["fallback"]]
+        for bout in bouts:
+            bout_methods = [stage.get("method") for stage in bout]
+            if bout_methods != expected_methods[:len(bout_methods)]:
+                errors.append(
+                    f"Phase-C method chain {bout_methods!r} does not match "
+                    f"deterministic chain {expected_methods!r}"
+                )
+
+    # Only the final bout may prove that the current chain is exhausted.
+    last_bout = bouts[-1] if bouts else []
+    last_methods = [stage.get("method") for stage in last_bout]
+    last_statuses = [stage.get("status") for stage in last_bout]
+    exhausted_rejections = bool(
+        expected_methods
+        and last_methods == expected_methods
+        and last_statuses == ["rejected"] * len(expected_methods)
+    )
+    if statuses and (
+        statuses[-1] not in _FINALIZABLE_STAGE_STATUSES
+        and not exhausted_rejections
+    ):
+        errors.append(
+            "final Phase-C stage must end with status "
+            + ", ".join(repr(status) for status in sorted(_FINALIZABLE_STAGE_STATUSES))
+            + ", unless every method in the deterministic fallback chain "
+            "was rejected"
+        )
+
+    final_stage = stages[-1] if stages and isinstance(stages[-1], dict) else {}
+    final_status = statuses[-1] if statuses else None
+    final_trials = final_stage.get("trials", [])
+    if not isinstance(final_trials, list):
+        errors.append("final Phase-C stage trials must be a list")
+        final_trials = []
+
+    return _PhaseCFinalizationState(
+        stages=stages,
+        statuses=statuses,
+        last_bout=last_bout,
+        exhausted_rejections=exhausted_rejections,
+        final_stage=final_stage,
+        final_status=final_status,
+        final_trials=final_trials,
+    )
+
+
+def _phase_c_finalization_rows(
+    state: _PhaseCFinalizationState,
+    warm_best: dict | None,
+    errors: list[str],
+) -> list[tuple[str, dict]]:
+    """Validate terminal receipts and return every finite Phase-C observation."""
+    finite_rows = [
+        (str(stage.get("method")), row)
+        for stage in state.stages
+        if isinstance(stage, dict) and isinstance(stage.get("trials"), list)
+        for row in stage["trials"]
+        if isinstance(row, dict)
+        and isinstance(row.get("params"), dict)
+        and _is_finite_score(row.get("score"))
+    ]
+
+    for index, stage in enumerate(state.stages):
+        if not isinstance(stage, dict) or stage.get("status") != "ok":
+            continue
+        trials = stage.get("trials")
+        if not isinstance(trials, list) or not any(
+            isinstance(row, dict) and _is_finite_score(row.get("score"))
+            for row in trials
+        ):
+            errors.append(
+                f"phase_c.stages[{index}] is ok but must contain a finite trial"
+            )
+
+    if state.exhausted_rejections and any(
+        stage.get("trials") not in (None, [])
+        for stage in state.last_bout
+    ):
+        errors.append(
+            "an exhausted rejected method chain cannot contain trial rows"
+        )
+
+    if state.final_status == "no_search_needed":
+        stage = state.final_stage
+        effective_space = stage.get("effective_search_space", {})
+        fixed = (
+            isinstance(effective_space, dict)
+            and effective_space
+            and all(
+                valid_space_entry(entry)
+                and (
+                    (entry[0] in {"float", "int"} and entry[1] == entry[2])
+                    or (entry[0] == "categorical" and len(entry[1]) == 1)
+                )
+                for entry in effective_space.values()
+            )
+        )
+        fixed_params = stage.get("fixed_incumbent_params")
+        fixed_score = stage.get("fixed_incumbent_score")
+        if not (
+            stage.get("method") == "cmaes"
+            and stage.get("fixed_search_space") is True
+            and stage.get("early_stop_reason") == "fixed_search_space"
+            and stage.get("trials_attempted") == 0
+            and stage.get("trials_completed") == 0
+            and state.final_trials == []
+            and fixed
+            and warm_best is not None
+            and fixed_params == warm_best["params"]
+            and _is_finite_score(fixed_score)
+            and float(fixed_score) == float(warm_best["score"])
+            and not _bounds_violations(fixed_params, effective_space)
+        ):
+            errors.append(
+                "no_search_needed requires a fixed CMA-ES space bound to the "
+                "finite Phase-A incumbent"
+            )
+    return finite_rows
+
+
+def _best_finalizable_observation(
+    warm_best: dict | None,
+    phase_c_rows: list[tuple[str, dict]],
+    errors: list[str],
+) -> dict:
+    """Choose the lower-is-better incumbent across Phase A and every bout."""
+    eligible_rows: list[tuple[str, dict]] = []
+    if warm_best is not None:
+        eligible_rows.append(("warm_start", warm_best))
+    eligible_rows.extend(phase_c_rows)
+    if not eligible_rows:
+        errors.append("no finite finalizable best is available")
+        return {"best_params": None, "best_score": None, "source": None}
+
+    source, best_row = min(
+        eligible_rows,
+        key=lambda item: float(item[1]["score"]),
+    )
+    return {
+        "best_params": best_row["params"],
+        "best_score": float(best_row["score"]),
+        "source": source,
+    }
+
+
+def _validate_applied_close(
+    report: dict,
+    best: dict,
+    *,
+    require_applied: bool,
+    errors: list[str],
+) -> None:
+    """When closing fields exist, bind them to the proven global incumbent."""
+    closing_fields = {
+        "final_best_params": report.get("final_best_params"),
+        "final_best_score": report.get("final_best_score"),
+        "applied_to_base_params": report.get("applied_to_base_params"),
+    }
+    if not any(value is not None for value in closing_fields.values()) and not require_applied:
+        return
+    if closing_fields["final_best_params"] != best.get("best_params"):
+        errors.append("final_best_params does not match the report's global best")
+    if not _is_finite_score(closing_fields["final_best_score"]) or (
+        _is_finite_score(best.get("best_score"))
+        and float(closing_fields["final_best_score"]) != float(best["best_score"])
+    ):
+        errors.append("final_best_score does not match the report's global best")
+    if closing_fields["applied_to_base_params"] is not True:
+        errors.append("applied_to_base_params must be true")
+
+
 def finalizable_tuning_result(report: dict, *, require_applied: bool = False) -> dict:
     """Return the global best once Phase C reached a terminal state.
 
@@ -1080,253 +1362,36 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
     finalizable (or that bout's whole chain was rejected). The best spans all
     bouts, so a continuation close can never regress the score.
     """
-    from _common import stages_by_bout
-
     if not isinstance(report, dict):
-        raise ValueError("tuning report is not finalizable: report must be an object")
+        raise ValueError(
+            "tuning report is not finalizable: report must be an object"
+        )
+
     errors: list[str] = []
-    phase_a = report.get("phase_a")
-    if not isinstance(phase_a, dict) or phase_a.get("status") != "ok":
-        errors.append("phase_a.status must be 'ok'")
-        phase_a = {}
-
-    warm_rows = phase_a.get("warm_start_configs")
-    if not isinstance(warm_rows, list):
-        errors.append("phase_a.warm_start_configs must be a list")
-        warm_rows = []
-    finite_warm = finite_warm_incumbent_rows(warm_rows)
-    warm_best = (
-        min(finite_warm, key=lambda row: float(row["score"]))
-        if finite_warm
-        else None
+    phase_a, warm_best = _phase_a_finalization_evidence(report, errors)
+    phase_c = _phase_c_finalization_state(report, phase_a, errors)
+    phase_c_rows = _phase_c_finalization_rows(phase_c, warm_best, errors)
+    best = _best_finalizable_observation(warm_best, phase_c_rows, errors)
+    _validate_applied_close(
+        report,
+        best,
+        require_applied=require_applied,
+        errors=errors,
     )
-    if warm_best is None:
-        errors.append("phase_a has no finite selectable warm observation")
-    else:
-        if phase_a.get("best_warm_params") != warm_best["params"]:
-            errors.append(
-                "phase_a.best_warm_params does not match its finite warm best"
-            )
-        if (
-            not _is_finite_score(phase_a.get("best_warm_score"))
-            or float(phase_a["best_warm_score"]) != float(warm_best["score"])
-        ):
-            errors.append(
-                "phase_a.best_warm_score does not match its finite warm best"
-            )
-
-    phase_c = report.get("phase_c")
-    stages = phase_c.get("stages") if isinstance(phase_c, dict) else None
-    if not isinstance(stages, list) or not stages:
-        errors.append("phase_c.stages must be a non-empty list")
-        stages = []
-
-    statuses: list[str | None] = []
-    for index, stage in enumerate(stages):
-        if not isinstance(stage, dict):
-            errors.append(f"phase_c.stages[{index}] must be an object")
-            statuses.append(None)
-            continue
-        method = stage.get("method")
-        if method not in {"grid", "bo", "cmaes"}:
-            errors.append(f"phase_c.stages[{index}].method is invalid")
-        status = stage.get("status")
-        statuses.append(status if isinstance(status, str) else None)
-        if status not in _TERMINAL_STAGE_STATUSES:
-            errors.append(
-                f"phase_c.stages[{index}].status is not terminal "
-                f"(got {status!r})"
-            )
-        if (
-            status == "rejected"
-            and isinstance(stage, dict)
-            and stage.get("trials") not in (None, [])
-        ):
-            errors.append(
-                f"phase_c.stages[{index}] is rejected but contains trial rows"
-            )
-
-    # A non-dict stage already failed above; grouping it would crash here, so
-    # the per-bout checks simply yield to that collected error.
-    bouts = (
-        stages_by_bout(stages)
-        if all(isinstance(stage, dict) for stage in stages)
-        else []
-    )
-    offset = 0
-    for bout in bouts:
-        for index, stage in enumerate(bout[:-1]):
-            if stage.get("status") != "rejected":
-                errors.append(
-                    f"phase_c.stages[{offset + index}] precedes another stage "
-                    "of its bout but is not rejected"
-                )
-        offset += len(bout)
-
-    search_space = phase_a.get("search_space")
-    expected_methods: list[str] = []
-    if isinstance(search_space, dict) and search_space:
-        expected = select_method(len(search_space))
-        expected_methods = [expected["method"], *expected["fallback"]]
-        for bout in bouts:
-            bout_methods = [stage.get("method") for stage in bout]
-            if bout_methods != expected_methods[:len(bout_methods)]:
-                errors.append(
-                    f"Phase-C method chain {bout_methods!r} does not match "
-                    f"deterministic chain {expected_methods!r}"
-                )
-
-    # A chain is exhausted only when the LAST bout rejected every method —
-    # earlier bouts closed on their own finalizable stage and prove nothing
-    # about the continuation's chain.
-    last_bout = bouts[-1] if bouts else []
-    last_methods = [stage.get("method") for stage in last_bout]
-    last_statuses = [stage.get("status") for stage in last_bout]
-    exhausted_rejections = bool(
-        expected_methods
-        and last_methods == expected_methods
-        and last_statuses == ["rejected"] * len(expected_methods)
-    )
-    if statuses and (
-        statuses[-1] not in _FINALIZABLE_STAGE_STATUSES
-        and not exhausted_rejections
-    ):
-        errors.append(
-            "final Phase-C stage must end with status "
-            + ", ".join(repr(s) for s in sorted(_FINALIZABLE_STAGE_STATUSES))
-            + ", unless every method in the deterministic fallback chain "
-            "was rejected"
-        )
-
-    # The "final stage" the terminal-status receipt checks below bind to is the
-    # final stage of the LAST bout — the same object as stages[-1].
-    final_stage = stages[-1] if stages else {}
-    final_status = statuses[-1] if statuses else None
-    final_trials = (
-        final_stage.get("trials", [])
-        if isinstance(final_stage, dict)
-        else []
-    )
-    if not isinstance(final_trials, list):
-        errors.append("final Phase-C stage trials must be a list")
-        final_trials = []
-    finite_phase_c_rows = [
-        (str(stage.get("method")), row)
-        for stage in stages
-        if isinstance(stage, dict) and isinstance(stage.get("trials"), list)
-        for row in stage["trials"]
-        if isinstance(row, dict)
-        and isinstance(row.get("params"), dict)
-        and _is_finite_score(row.get("score"))
-    ]
-
-    for index, stage in enumerate(stages):
-        if not isinstance(stage, dict) or stage.get("status") != "ok":
-            continue
-        ok_trials = stage.get("trials")
-        if not isinstance(ok_trials, list) or not any(
-            isinstance(row, dict) and _is_finite_score(row.get("score"))
-            for row in ok_trials
-        ):
-            errors.append(
-                f"phase_c.stages[{index}] is ok but must contain a finite trial"
-            )
-    if exhausted_rejections and any(
-        stage.get("trials") not in (None, [])
-        for stage in last_bout
-    ):
-        errors.append(
-            "an exhausted rejected method chain cannot contain trial rows"
-        )
-    if final_status == "no_search_needed":
-        effective_space = final_stage.get("effective_search_space", {})
-        fixed = (
-            isinstance(effective_space, dict)
-            and effective_space
-            and all(
-                valid_space_entry(entry)
-                and (
-                    (entry[0] in {"float", "int"} and entry[1] == entry[2])
-                    or (
-                        entry[0] == "categorical"
-                        and len(entry[1]) == 1
-                    )
-                )
-                for entry in effective_space.values()
-            )
-        )
-        fixed_params = final_stage.get("fixed_incumbent_params")
-        fixed_score = final_stage.get("fixed_incumbent_score")
-        if not (
-            final_stage.get("method") == "cmaes"
-            and final_stage.get("fixed_search_space") is True
-            and final_stage.get("early_stop_reason") == "fixed_search_space"
-            and final_stage.get("trials_attempted") == 0
-            and final_stage.get("trials_completed") == 0
-            and final_trials == []
-            and fixed
-            and warm_best is not None
-            and fixed_params == warm_best["params"]
-            and _is_finite_score(fixed_score)
-            and float(fixed_score) == float(warm_best["score"])
-            and not _bounds_violations(fixed_params, effective_space)
-        ):
-            errors.append(
-                "no_search_needed requires a fixed CMA-ES space bound to the "
-                "finite Phase-A incumbent"
-            )
-
-    eligible_rows = []
-    if warm_best is not None:
-        eligible_rows.append(("warm_start", warm_best))
-    # Every finite Phase-C row across ALL bouts competes with the Phase-A
-    # incumbent, whatever terminal status its stage carries (see the docstring
-    # for why those rows are already proven). A later bout is not trusted to
-    # beat earlier ones, so the argmin spans the whole history. No status
-    # filter is needed here: `rejected` stages are validated above to carry no
-    # trial rows, so they contribute nothing.
-    eligible_rows.extend(finite_phase_c_rows)
-    if eligible_rows:
-        source, best_row = min(
-            eligible_rows, key=lambda item: float(item[1]["score"])
-        )
-        best = {
-            "best_params": best_row["params"],
-            "best_score": float(best_row["score"]),
-            "source": source,
-        }
-    else:
-        best = {"best_params": None, "best_score": None, "source": None}
-        errors.append("no finite finalizable best is available")
-
-    closing_fields = {
-        "final_best_params": report.get("final_best_params"),
-        "final_best_score": report.get("final_best_score"),
-        "applied_to_base_params": report.get("applied_to_base_params"),
-    }
-    closing_present = any(value is not None for value in closing_fields.values())
-    if closing_present or require_applied:
-        if closing_fields["final_best_params"] != best.get("best_params"):
-            errors.append("final_best_params does not match the report's global best")
-        if not _is_finite_score(closing_fields["final_best_score"]) or (
-            _is_finite_score(best.get("best_score"))
-            and float(closing_fields["final_best_score"]) != float(best["best_score"])
-        ):
-            errors.append("final_best_score does not match the report's global best")
-        if closing_fields["applied_to_base_params"] is not True:
-            errors.append("applied_to_base_params must be true")
 
     if errors:
-        raise ValueError("tuning report is not finalizable: " + "; ".join(errors))
+        raise ValueError(
+            "tuning report is not finalizable: " + "; ".join(errors)
+        )
 
     return {
         **best,
-        # The applied observation's own provenance, not the stage's status: a
-        # Phase-C row that wins carries its method however the stage ended.
+        # The winning observation carries its method even when its stage ended
+        # with a non-ok terminal status.
         "phase_c_method": (
             None if best.get("source") in (None, "warm_start") else best["source"]
         ),
-        "stage_statuses": statuses,
+        "stage_statuses": phase_c.statuses,
     }
 
 
@@ -1611,7 +1676,9 @@ def close_exhausted_stage(candidate_path: Path, report_path: Path) -> dict:
     }
 
 
-# ---------- primary-parent parameter inheritance ----------
+# =============================================================================
+# Candidate provenance and primary-parent inheritance
+# =============================================================================
 
 
 def _canonical_json(value) -> bytes:
@@ -2519,7 +2586,9 @@ def validate_parameter_transfer(
     return receipt
 
 
-# ---------- tuning summary ----------
+# =============================================================================
+# Tuning summaries and ledger records
+# =============================================================================
 
 
 def summarize(report: dict) -> dict:
@@ -2769,7 +2838,9 @@ def finalized_tuning_record(
     }
 
 
-# ---------- search-space induction (check + expand) ----------
+# =============================================================================
+# Search-space induction and proposal validation
+# =============================================================================
 
 # When a survived config sits outside the inducer's proposed range, extend past
 # it by this fraction of the gap so the value lands *interior*, not on the new
@@ -3067,7 +3138,9 @@ def validate_proposals(
     }
 
 
-# ---------- lineage evidence (parent candidates -> hyperparam->performance) ----------
+# =============================================================================
+# Lineage evidence
+# =============================================================================
 
 # How many whole configs to surface per parent: the best TOP_K by score plus
 # DIVERSE_K farthest-point picks. Whole configs (not per-key marginals) so the
@@ -3165,7 +3238,9 @@ def lineage_evidence(run_dir: Path, source_run_ids: list) -> dict:
     return {"per_parent": per_parent}
 
 
-# ---------- candidate selection (decoupled tuning, design §15) ----------
+# =============================================================================
+# Candidate selection (decoupled tuning, design §15)
+# =============================================================================
 
 # step-2 is decoupled from idea proposal: every idea stops at step 0+1, and the
 # tuner picks ONE candidate from the whole population to deep-tune per round.
@@ -3232,6 +3307,404 @@ def _last_bout_was_first(run_dir: Path, ledger: dict) -> bool | None:
     return int(record.get("tuning_bouts") or 1) <= 1
 
 
+@dataclass(frozen=True)
+class _CandidateBudgetState:
+    """Budget facts needed by one deterministic candidate-selection pass."""
+
+    receipt: dict | None
+    attempts_by_run: dict[str, int]
+    per_candidate_cap: object
+    stop_result: dict | None
+
+
+@dataclass(frozen=True)
+class _CandidatePools:
+    """Like-for-like candidate groups used by the progressive policy."""
+
+    candidates: list[dict]
+    fresh: list[dict]
+    continuations: list[dict]
+    non_responders: list[dict]
+    incumbent_retry: dict | None
+    all_at_cap: bool
+
+
+@dataclass(frozen=True)
+class _CandidateChoice:
+    """Policy decision before its public receipt is assembled."""
+
+    selected: dict | None
+    is_continuation: bool = False
+    percentile: float | None = None
+    alternation: bool = False
+    incumbent_retry: bool = False
+
+
+def _validate_candidate_selection_args(
+    n_min: int,
+    top_percentile: float,
+    bout_trials: int | None,
+) -> None:
+    if not isinstance(n_min, int) or isinstance(n_min, bool) or n_min <= 0:
+        raise ValueError("n_min must be a positive integer")
+    if (
+        not isinstance(top_percentile, (int, float))
+        or isinstance(top_percentile, bool)
+        or not math.isfinite(float(top_percentile))
+        or not 0 <= float(top_percentile) < 100
+    ):
+        raise ValueError("top_percentile must be finite and in [0, 100)")
+    if bout_trials is not None and (
+        not isinstance(bout_trials, int)
+        or isinstance(bout_trials, bool)
+        or bout_trials <= 0
+    ):
+        raise ValueError("bout_trials must be a positive integer or None")
+
+
+def _candidate_budget_state(
+    budget_allocation: dict | None,
+    n_candidates: int,
+) -> _CandidateBudgetState:
+    if budget_allocation is None:
+        return _CandidateBudgetState(None, {}, None, None)
+
+    global_remaining = budget_allocation.get("remaining")
+    deep = budget_allocation.get("deep_tune", {})
+    deep_remaining = deep.get("remaining") if isinstance(deep, dict) else None
+    per_candidate_cap = (
+        deep.get("per_candidate_cap") if isinstance(deep, dict) else None
+    )
+    attempts_by_run = (
+        {
+            str(row.get("run_id")): int(row.get("evals", 0))
+            for row in deep.get("per_candidate", [])
+            if isinstance(row, dict)
+            and isinstance(row.get("run_id"), str)
+            and isinstance(row.get("evals"), int)
+        }
+        if isinstance(deep, dict)
+        else {}
+    )
+    receipt = {
+        "global_remaining": global_remaining,
+        "deep_tune_remaining": deep_remaining,
+        "deep_tune_total_cap": (
+            deep.get("total_cap") if isinstance(deep, dict) else None
+        ),
+        "deep_tune_per_candidate_cap": per_candidate_cap,
+        "deep_tune_time_limit_seconds": (
+            deep.get("time_limit_seconds") if isinstance(deep, dict) else None
+        ),
+    }
+    stop_result = None
+    if isinstance(global_remaining, int) and global_remaining <= 0:
+        stop_result = {
+            "run_id": None,
+            "n_candidates": n_candidates,
+            "reason": "evaluation_budget_reached",
+            "budget_allocation": receipt,
+        }
+    elif isinstance(deep_remaining, int) and deep_remaining <= 0:
+        stop_result = {
+            "run_id": None,
+            "n_candidates": n_candidates,
+            "reason": "deep_tune_budget_exhausted",
+            "budget_allocation": receipt,
+        }
+    return _CandidateBudgetState(
+        receipt,
+        attempts_by_run,
+        per_candidate_cap,
+        stop_result,
+    )
+
+
+def _candidate_cap_allows(
+    record: dict,
+    budget: _CandidateBudgetState,
+) -> bool:
+    return (
+        not isinstance(budget.per_candidate_cap, int)
+        or budget.attempts_by_run.get(str(record.get("run_id")), 0)
+        < budget.per_candidate_cap
+    )
+
+
+def _incumbent_retry_candidate(
+    candidates: list[dict],
+    non_responders: list[dict],
+) -> dict | None:
+    """Return the one-bout run-best non-responder eligible for confirmation."""
+    if not non_responders:
+        return None
+    finals = [
+        float(record["final_best_score"])
+        for record in candidates
+        if _is_finite_score(record.get("final_best_score"))
+    ]
+    if not finals:
+        return None
+    best_final = min(finals)
+    return next(
+        (
+            record
+            for record in non_responders
+            if int(record.get("tuning_bouts") or 1) == 1
+            and _is_finite_score(record.get("final_best_score"))
+            and float(record["final_best_score"]) == best_final
+        ),
+        None,
+    )
+
+
+def _partition_candidates(
+    ledger: dict,
+    candidates: list[dict],
+    budget: _CandidateBudgetState,
+) -> _CandidatePools:
+    def eligible(record: dict) -> bool:
+        return _candidate_cap_allows(
+            record,
+            budget,
+        ) and not _has_unresolved_primary_descendant(
+            ledger,
+            str(record.get("run_id")),
+        )
+
+    fresh = [
+        record
+        for record in candidates
+        if not record.get("tune") and eligible(record)
+    ]
+    continuations = [
+        record
+        for record in candidates
+        if record.get("tune")
+        and record.get("last_bout_improved") is not False
+        and _is_finite_score(record.get("final_best_score"))
+        and eligible(record)
+    ]
+    non_responders = [
+        record
+        for record in candidates
+        if record.get("tune")
+        and record.get("last_bout_improved") is False
+        and eligible(record)
+    ]
+    cap_flags = [
+        _candidate_cap_allows(record, budget)
+        for record in candidates
+    ]
+    return _CandidatePools(
+        candidates=candidates,
+        fresh=fresh,
+        continuations=continuations,
+        non_responders=non_responders,
+        incumbent_retry=_incumbent_retry_candidate(
+            candidates,
+            non_responders,
+        ),
+        all_at_cap=bool(cap_flags) and not any(cap_flags),
+    )
+
+
+def _continuation_rank(record: dict) -> tuple[int, float]:
+    return (
+        int(record.get("tuning_bouts") or 1),
+        float(record["final_best_score"]),
+    )
+
+
+def _choose_candidate(
+    pools: _CandidatePools,
+    *,
+    top_percentile: float,
+    last_bout_was_first: bool | None,
+) -> _CandidateChoice:
+    """Apply alternation, first-bout gate, continuation, then retry priority."""
+    if last_bout_was_first and pools.continuations:
+        return _CandidateChoice(
+            selected=min(pools.continuations, key=_continuation_rank),
+            is_continuation=True,
+            alternation=True,
+        )
+    if last_bout_was_first and pools.incumbent_retry is not None:
+        return _CandidateChoice(
+            selected=pools.incumbent_retry,
+            is_continuation=True,
+            alternation=True,
+            incumbent_retry=True,
+        )
+
+    percentile = None
+    if pools.fresh:
+        best_fresh = min(
+            pools.fresh,
+            key=lambda record: record["best_warm_score"],
+        )
+        value = best_fresh["best_warm_score"]
+        worse = sum(
+            1
+            for record in pools.candidates
+            if record is not best_fresh
+            and record["best_warm_score"] > value
+        )
+        count = len(pools.candidates)
+        percentile = 100.0 * worse / (count - 1) if count > 1 else 100.0
+        if percentile >= top_percentile:
+            return _CandidateChoice(
+                selected=best_fresh,
+                percentile=percentile,
+            )
+
+    if pools.continuations:
+        return _CandidateChoice(
+            selected=min(pools.continuations, key=_continuation_rank),
+            is_continuation=True,
+            percentile=percentile,
+        )
+    if pools.incumbent_retry is not None:
+        return _CandidateChoice(
+            selected=pools.incumbent_retry,
+            is_continuation=True,
+            percentile=percentile,
+            incumbent_retry=True,
+        )
+    return _CandidateChoice(selected=None, percentile=percentile)
+
+
+def _unselected_candidate_result(
+    pools: _CandidatePools,
+    choice: _CandidateChoice,
+    budget: _CandidateBudgetState,
+    *,
+    top_percentile: float,
+) -> dict:
+    percentile = choice.percentile
+    if (
+        pools.fresh
+        and percentile is not None
+        and pools.non_responders
+        and not pools.continuations
+    ):
+        reason = (
+            f"best untuned percentile {percentile:.0f} < "
+            f"{top_percentile:.0f} and all tuned candidates are "
+            "non-responders (last bout improved nothing)"
+        )
+    elif pools.fresh and percentile is not None:
+        reason = (
+            f"best untuned percentile {percentile:.0f} < "
+            f"{top_percentile:.0f} "
+            f"(top {100 - top_percentile:.0f}% already tuned)"
+        )
+    elif pools.non_responders and not pools.continuations:
+        reason = (
+            "all tuned candidates are non-responders (last bout improved "
+            "nothing); no first-bout candidate available"
+        )
+    elif pools.all_at_cap:
+        reason = "all candidates reached deep-tune per-candidate cap"
+    elif pools.candidates:
+        reason = "all candidates have unresolved primary descendants"
+    else:
+        reason = "no candidates"
+
+    result = {
+        "run_id": None,
+        "n_candidates": len(pools.candidates),
+        "reason": reason,
+    }
+    if percentile is not None:
+        result["percentile"] = round(percentile)
+    if budget.receipt is not None:
+        result["budget_allocation"] = budget.receipt
+    return result
+
+
+def _selected_candidate_result(
+    choice: _CandidateChoice,
+    pools: _CandidatePools,
+    budget: _CandidateBudgetState,
+    *,
+    top_percentile: float,
+    bout_trials: int | None,
+) -> dict:
+    selected = choice.selected
+    assert selected is not None
+    tuning_bouts = int(
+        selected.get("tuning_bouts")
+        or (1 if selected.get("tune") else 0)
+    )
+    if choice.is_continuation:
+        reason = (
+            f"continuation: responder with fewest bouts ({tuning_bouts}) "
+            "and best tuned score"
+        )
+        if choice.incumbent_retry:
+            reason = (
+                "incumbent retry: run-best candidate's first bout improved "
+                "nothing; one confirmation bout"
+            )
+        if choice.alternation:
+            reason = (
+                "alternation: responder follows last round's first bout; "
+                + reason
+            )
+    else:
+        reason = (
+            f"best untuned in top {100 - top_percentile:.0f}% "
+            f"(percentile {choice.percentile:.0f} >= "
+            f"{top_percentile:.0f})"
+        )
+
+    result = {
+        "run_id": selected.get("run_id"),
+        "reason": reason,
+        "is_continuation": choice.is_continuation,
+        "bout_index": tuning_bouts,
+        "tuning_bouts": tuning_bouts,
+        "last_bout_improved": selected.get("last_bout_improved"),
+        "best_warm_score": selected.get("best_warm_score"),
+        "final_best_score": selected.get("final_best_score"),
+        "percentile": (
+            round(choice.percentile)
+            if choice.percentile is not None
+            else None
+        ),
+        "n_candidates": len(pools.candidates),
+    }
+    if budget.receipt is None:
+        return result
+
+    candidate_used = budget.attempts_by_run.get(
+        str(selected.get("run_id")),
+        0,
+    )
+    caps = [
+        value
+        for value in (
+            budget.receipt["global_remaining"],
+            budget.receipt["deep_tune_remaining"],
+            (
+                budget.per_candidate_cap - candidate_used
+                if isinstance(budget.per_candidate_cap, int)
+                else None
+            ),
+            bout_trials,
+        )
+        if isinstance(value, int)
+    ]
+    result["budget_allocation"] = {
+        **budget.receipt,
+        "candidate_attempts": candidate_used,
+        "bout_trials": bout_trials,
+        "trial_cap": min(caps) if caps else None,
+    }
+    return result
+
+
 def select_candidate(
     ledger: dict,
     *,
@@ -3263,265 +3736,58 @@ def select_candidate(
     score. Warm and tuned scores are never compared against each other.
     Returns {run_id|None, reason, bout_index, is_continuation, ...}.
     """
-    if (
-        not isinstance(n_min, int)
-        or isinstance(n_min, bool)
-        or n_min <= 0
-    ):
-        raise ValueError("n_min must be a positive integer")
-    if (
-        not isinstance(top_percentile, (int, float))
-        or isinstance(top_percentile, bool)
-        or not math.isfinite(float(top_percentile))
-        or not 0 <= float(top_percentile) < 100
-    ):
-        raise ValueError("top_percentile must be finite and in [0, 100)")
-    if bout_trials is not None and (
-        not isinstance(bout_trials, int)
-        or isinstance(bout_trials, bool)
-        or bout_trials <= 0
-    ):
-        raise ValueError("bout_trials must be a positive integer or None")
-
-    cands = [r for r in ledger.get("records", [])
-             if r.get("status") != "crash" and _is_finite_score(r.get("best_warm_score"))]
-    n = len(cands)
-    allocation_receipt = None
-    per_candidate_deep: dict[str, int] = {}
-    per_candidate_cap = None
-    if budget_allocation is not None:
-        global_remaining = budget_allocation.get("remaining")
-        deep = budget_allocation.get("deep_tune", {})
-        deep_remaining = deep.get("remaining") if isinstance(deep, dict) else None
-        per_candidate_cap = (
-            deep.get("per_candidate_cap") if isinstance(deep, dict) else None
-        )
-        if isinstance(deep, dict):
-            per_candidate_deep = {
-                str(row.get("run_id")): int(row.get("evals", 0))
-                for row in deep.get("per_candidate", [])
-                if isinstance(row, dict)
-                and isinstance(row.get("run_id"), str)
-                and isinstance(row.get("evals"), int)
-            }
-        allocation_receipt = {
-            "global_remaining": global_remaining,
-            "deep_tune_remaining": deep_remaining,
-            "deep_tune_total_cap": (
-                deep.get("total_cap") if isinstance(deep, dict) else None
-            ),
-            "deep_tune_per_candidate_cap": per_candidate_cap,
-            "deep_tune_time_limit_seconds": (
-                deep.get("time_limit_seconds") if isinstance(deep, dict) else None
-            ),
-        }
-        if isinstance(global_remaining, int) and global_remaining <= 0:
-            return {
-                "run_id": None,
-                "n_candidates": n,
-                "reason": "evaluation_budget_reached",
-                "budget_allocation": allocation_receipt,
-            }
-        if isinstance(deep_remaining, int) and deep_remaining <= 0:
-            return {
-                "run_id": None,
-                "n_candidates": n,
-                "reason": "deep_tune_budget_exhausted",
-                "budget_allocation": allocation_receipt,
-            }
-
-    if n < n_min:
-        return {"run_id": None, "n_candidates": n,
-                "reason": f"population {n} < n_min {n_min} (breadth first)"}
-
-    def cap_ok(record: dict) -> bool:
-        return (
-            not isinstance(per_candidate_cap, int)
-            or per_candidate_deep.get(str(record.get("run_id")), 0)
-            < per_candidate_cap
-        )
-
-    def eligible(record: dict) -> bool:
-        return cap_ok(record) and not _has_unresolved_primary_descendant(
-            ledger, str(record.get("run_id"))
-        )
-
-    fresh = [r for r in cands if not r.get("tune") and eligible(r)]
-    continuations = [
-        r
-        for r in cands
-        if r.get("tune")
-        and r.get("last_bout_improved") is not False
-        and _is_finite_score(r.get("final_best_score"))
-        and eligible(r)
-    ]
-    non_responders = [
-        r
-        for r in cands
-        if r.get("tune") and r.get("last_bout_improved") is False and eligible(r)
-    ]
-
-    # Incumbent retry: exactly one failed bout + the run's best final score
-    # earns one confirmation bout. A first bout is mostly TPE startup, so a
-    # single non-response is weak evidence — but only the incumbent's ceiling
-    # justifies the extra trials. tuning_bouts >= 2 means the retry is spent.
-    retry = None
-    if non_responders:
-        finals = [
-            float(r["final_best_score"])
-            for r in cands
-            if _is_finite_score(r.get("final_best_score"))
-        ]
-        if finals:
-            best_final = min(finals)
-            for r in non_responders:
-                if (
-                    int(r.get("tuning_bouts") or 1) == 1
-                    and _is_finite_score(r.get("final_best_score"))
-                    and float(r["final_best_score"]) == best_final
-                ):
-                    retry = r
-                    break
-
-    selected = None
-    is_continuation = False
-    pct = None
-    alternation = False
-    incumbent_retry = False
-    if last_bout_was_first and continuations:
-        # Alternation: a completed first bout guarantees a waiting responder
-        # the next bout before any new first bout starts.
-        selected = min(
-            continuations,
-            key=lambda r: (
-                int(r.get("tuning_bouts") or 1),
-                float(r["final_best_score"]),
-            ),
-        )
-        is_continuation = True
-        alternation = True
-    if selected is None and last_bout_was_first and retry is not None:
-        selected = retry
-        is_continuation = True
-        alternation = True
-        incumbent_retry = True
-    if selected is None and fresh:
-        best_fresh = min(fresh, key=lambda r: r["best_warm_score"])
-        value = best_fresh["best_warm_score"]
-        # percentile = fraction of OTHER candidates strictly worse (higher
-        # score); high percentile = among the best (warm-vs-warm, including
-        # tuned candidates' historical warm scores, as before).
-        worse = sum(1 for r in cands if r is not best_fresh and r["best_warm_score"] > value)
-        pct = 100.0 * worse / (n - 1) if n > 1 else 100.0
-        if pct >= top_percentile:
-            selected = best_fresh
-    if selected is None and continuations:
-        selected = min(
-            continuations,
-            key=lambda r: (
-                int(r.get("tuning_bouts") or 1),
-                float(r["final_best_score"]),
-            ),
-        )
-        is_continuation = True
-    if selected is None and retry is not None:
-        selected = retry
-        is_continuation = True
-        incumbent_retry = True
-
-    if selected is None:
-        if fresh and pct is not None and non_responders and not continuations:
-            reason = (
-                f"best untuned percentile {pct:.0f} < {top_percentile:.0f} and "
-                "all tuned candidates are non-responders (last bout improved "
-                "nothing)"
-            )
-        elif fresh and pct is not None:
-            reason = (
-                f"best untuned percentile {pct:.0f} < {top_percentile:.0f} "
-                f"(top {100 - top_percentile:.0f}% already tuned)"
-            )
-        elif non_responders and not continuations:
-            reason = (
-                "all tuned candidates are non-responders (last bout improved "
-                "nothing); no first-bout candidate available"
-            )
-        elif any(not cap_ok(r) for r in cands) and not any(
-            cap_ok(r) for r in cands
-        ):
-            reason = "all candidates reached deep-tune per-candidate cap"
-        elif cands:
-            reason = "all candidates have unresolved primary descendants"
-        else:
-            reason = "no candidates"
-        result = {"run_id": None, "n_candidates": n, "reason": reason}
-        if pct is not None:
-            result["percentile"] = round(pct)
-        if allocation_receipt is not None:
-            result["budget_allocation"] = allocation_receipt
-        return result
-
-    tuning_bouts = int(
-        selected.get("tuning_bouts") or (1 if selected.get("tune") else 0)
+    _validate_candidate_selection_args(
+        n_min,
+        top_percentile,
+        bout_trials,
     )
-    if is_continuation:
-        reason = (
-            f"continuation: responder with fewest bouts ({tuning_bouts}) and "
-            "best tuned score"
-        )
-        if incumbent_retry:
-            reason = (
-                "incumbent retry: run-best candidate's first bout improved "
-                "nothing; one confirmation bout"
-            )
-        if alternation:
-            reason = (
-                "alternation: responder follows last round's first bout; "
-                + reason
-            )
-    else:
-        reason = (
-            f"best untuned in top {100 - top_percentile:.0f}% "
-            f"(percentile {pct:.0f} >= {top_percentile:.0f})"
-        )
-    result = {
-        "run_id": selected.get("run_id"),
-        "reason": reason,
-        "is_continuation": is_continuation,
-        "bout_index": tuning_bouts,
-        "tuning_bouts": tuning_bouts,
-        "last_bout_improved": selected.get("last_bout_improved"),
-        "best_warm_score": selected.get("best_warm_score"),
-        "final_best_score": selected.get("final_best_score"),
-        "percentile": round(pct) if pct is not None else None,
-        "n_candidates": n,
-    }
-    if allocation_receipt is not None:
-        candidate_used = per_candidate_deep.get(str(selected.get("run_id")), 0)
-        caps = [
-            value
-            for value in (
-                allocation_receipt["global_remaining"],
-                allocation_receipt["deep_tune_remaining"],
-                (
-                    per_candidate_cap - candidate_used
-                    if isinstance(per_candidate_cap, int)
-                    else None
-                ),
-                bout_trials,
-            )
-            if isinstance(value, int)
-        ]
-        result["budget_allocation"] = {
-            **allocation_receipt,
-            "candidate_attempts": candidate_used,
-            "bout_trials": bout_trials,
-            "trial_cap": min(caps) if caps else None,
+    candidates = [
+        record
+        for record in ledger.get("records", [])
+        if record.get("status") != "crash"
+        and _is_finite_score(record.get("best_warm_score"))
+    ]
+    n_candidates = len(candidates)
+    budget = _candidate_budget_state(
+        budget_allocation,
+        n_candidates,
+    )
+    if budget.stop_result is not None:
+        return budget.stop_result
+    if n_candidates < n_min:
+        return {
+            "run_id": None,
+            "n_candidates": n_candidates,
+            "reason": (
+                f"population {n_candidates} < n_min {n_min} (breadth first)"
+            ),
         }
-    return result
+
+    pools = _partition_candidates(ledger, candidates, budget)
+    choice = _choose_candidate(
+        pools,
+        top_percentile=top_percentile,
+        last_bout_was_first=last_bout_was_first,
+    )
+    if choice.selected is None:
+        return _unselected_candidate_result(
+            pools,
+            choice,
+            budget,
+            top_percentile=top_percentile,
+        )
+    return _selected_candidate_result(
+        choice,
+        pools,
+        budget,
+        top_percentile=top_percentile,
+        bout_trials=bout_trials,
+    )
 
 
-# ---------- CLI ----------
+# =============================================================================
+# CLI adapters and parser
+# =============================================================================
 
 
 def cmd_lint_contract(args) -> int:
