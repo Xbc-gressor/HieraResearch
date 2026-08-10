@@ -1010,12 +1010,7 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         "param_schema",
         "defaults",
     }
-    candidate_legacy_fields = {"param_schema_sha256", "defaults_sha256"}
-    if (
-        not isinstance(candidate, dict)
-        or not candidate_fields <= set(candidate)
-        or set(candidate) - candidate_fields - candidate_legacy_fields
-    ):
+    if not isinstance(candidate, dict) or set(candidate) != candidate_fields:
         errors.append(
             f"record {run_id}.parameter_transfer.receipt.candidate has an invalid shape"
         )
@@ -1050,12 +1045,7 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         "incumbent_params",
         "param_schema",
     }
-    primary_legacy_fields = {"incumbent_params_sha256", "param_schema_sha256"}
-    if (
-        not isinstance(primary, dict)
-        or not primary_fields <= set(primary)
-        or set(primary) - primary_fields - primary_legacy_fields
-    ):
+    if not isinstance(primary, dict) or set(primary) != primary_fields:
         errors.append(
             f"record {run_id}.parameter_transfer.receipt.primary_parent has an invalid shape"
         )
@@ -1422,10 +1412,8 @@ def validate_parameter_transfer_binding(
             "applied_incumbent",
             "captured_by_run_id",
         }
-        extra_revision_fields = set(revision) - revision_fields
         if (
-            not revision_fields <= set(revision)
-            or extra_revision_fields not in (set(), {"receipt_sha256"})
+            set(revision) != revision_fields
             or revision.get("schema_version") != 1
             or revision.get("kind") != "parameter_transfer_parent_snapshot"
         ):
@@ -1445,12 +1433,7 @@ def validate_parameter_transfer_binding(
         "entrypoint_sha256",
         "tune_report_sha256",
     }
-    snapshot_legacy_fields = {"params_sha256", "param_schema_sha256"}
-    if (
-        not isinstance(snapshot, dict)
-        or not snapshot_fields <= set(snapshot)
-        or set(snapshot) - snapshot_fields - snapshot_legacy_fields
-    ):
+    if not isinstance(snapshot, dict) or set(snapshot) != snapshot_fields:
         errors.append(
             f"record {run_id}.parameter_transfer parent has no exact applied "
             "incumbent snapshot"
@@ -1564,11 +1547,7 @@ def validate_lineage_snapshots(ledger: dict[str, Any]) -> list[str]:
         if not isinstance(item, dict):
             errors.append(f"{where} has an invalid shape")
             continue
-        extra_fields = set(item) - fields
-        if (
-            not fields <= set(item)
-            or extra_fields not in (set(), {"receipt_sha256"})
-        ):
+        if set(item) != fields:
             errors.append(f"{where} has an invalid shape")
             continue
         key = (

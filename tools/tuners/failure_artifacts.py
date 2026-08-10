@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (.+)$')
 
 

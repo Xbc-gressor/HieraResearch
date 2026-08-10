@@ -54,9 +54,7 @@ def _applied_snapshot(
         "source": source,
         "score": score,
         "params": params,
-        "params_sha256": _json_sha256(params),
         "param_schema": schema,
-        "param_schema_sha256": _json_sha256(schema),
         "entrypoint_sha256": _sha256(parent),
         "tune_report_sha256": _sha256(report_path),
     }

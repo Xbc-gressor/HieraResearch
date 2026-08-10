@@ -457,9 +457,7 @@ def attach_matched_transfer(
         "source": "applied_phase_a",
         "score": parent_score,
         "params": parent_params,
-        "params_sha256": json_sha256(parent_params),
         "param_schema": parent_schema,
-        "param_schema_sha256": json_sha256(parent_schema),
         "entrypoint_sha256": "sha256:" + "3" * 64,
         "tune_report_sha256": "sha256:" + "4" * 64,
     }
@@ -483,9 +481,7 @@ def attach_matched_transfer(
             "brief_sha256": "sha256:" + "1" * 64,
             "structure_sha256": "sha256:" + "2" * 64,
             "param_schema": child_schema,
-            "param_schema_sha256": json_sha256(child_schema),
             "defaults": child_defaults,
-            "defaults_sha256": json_sha256(child_defaults),
         },
         "primary_parent": {
             "run_id": parent["run_id"],
@@ -498,9 +494,7 @@ def attach_matched_transfer(
             "incumbent_source": "applied_phase_a",
             "incumbent_score": parent_score,
             "incumbent_params": parent_params,
-            "incumbent_params_sha256": json_sha256(parent_params),
             "param_schema": parent_schema,
-            "param_schema_sha256": json_sha256(parent_schema),
         },
         "projection": {
             "params": projected,

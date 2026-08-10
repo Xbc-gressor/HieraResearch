@@ -112,11 +112,9 @@ def evaluate_config(make_model, params):
                 "cache_sha256",
                 first_report["phase_a"]["warm_score_cache"],
             )
-            self.assertEqual(first_revision["schema_version"], 3)
+            self.assertEqual(first_revision["schema_version"], 4)
             self.assertTrue(first_revision["structure_sha256"].startswith("sha256:"))
-            self.assertTrue(
-                first_revision["search_space_sha256"].startswith("sha256:")
-            )
+            self.assertNotIn("search_space_sha256", first_revision)
             self.assertTrue(first_revision["prepare_sha256"].startswith("sha256:"))
             self.assertTrue(first_revision["revision_sha256"].startswith("sha256:"))
             self.assertEqual(
@@ -134,12 +132,6 @@ def evaluate_config(make_model, params):
                 {first_revision["revision_sha256"]},
             )
 
-            # Reports produced before the simplification remain resumable; the
-            # now-redundant field is tolerated and omitted on the next write.
-            first_report["phase_a"]["warm_score_cache"]["cache_sha256"] = (
-                "sha256:legacy"
-            )
-            report_path.write_text(json.dumps(first_report))
             resumed_eval = self._run(candidate, configs_path, report_path)
             resumed_eval.assert_not_called()
             resumed_report = json.loads(report_path.read_text())
@@ -283,8 +275,8 @@ def evaluate_config(make_model, params):
                 first_revision["structure_sha256"],
             )
             self.assertNotEqual(
-                second_revision["search_space_sha256"],
-                first_revision["search_space_sha256"],
+                second_revision["search_space"],
+                first_revision["search_space"],
             )
             self.assertNotEqual(
                 second_revision["revision_sha256"],

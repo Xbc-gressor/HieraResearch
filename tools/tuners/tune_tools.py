@@ -1794,14 +1794,13 @@ def _candidate_execution_revision(candidate_path: Path) -> dict:
             }
 
     revision = {
-        "schema_version": 3,
+        "schema_version": 4,
         "structure_sha256": _candidate_structure_sha256(candidate_path),
         "search_space": _json_native(search_space),
         # Mapping order drives deterministic grid/CMA encodings. Dict equality
         # and canonical JSON hashes intentionally ignore it, so carry the key
         # sequence as an explicit part of the execution revision.
         "search_space_keys": list(search_space),
-        "search_space_sha256": _json_sha256(search_space),
         "prepare_sha256": _file_sha256(prepare_path),
         "evaluation_contract": evaluation_contract,
     }
@@ -2246,16 +2245,7 @@ def authoritative_parent_incumbent(
         "entrypoint_sha256": _file_sha256(parent_train),
         "tune_report_sha256": pinned_report_hash,
     }
-    normalized_applied_snapshot = (
-        {
-            key: value
-            for key, value in applied_snapshot.items()
-            if key not in {"params_sha256", "param_schema_sha256"}
-        }
-        if isinstance(applied_snapshot, dict)
-        else applied_snapshot
-    )
-    if normalized_applied_snapshot != expected_snapshot:
+    if applied_snapshot != expected_snapshot:
         raise ValueError(
             f"primary parent {parent_run_id} ledger applied-incumbent snapshot "
             "does not match its files and report"
@@ -2292,20 +2282,6 @@ def _valid_self_hashed_receipt(receipt: dict) -> bool:
     except (OverflowError, TypeError, ValueError):
         return False
     return receipt["receipt_sha256"] == expected
-
-
-def _normalized_transfer_payload(receipt: dict) -> dict:
-    """Normalize legacy redundant hashes before semantic comparison."""
-    payload = _receipt_without_self_hash(receipt)
-    candidate = payload.get("candidate")
-    if isinstance(candidate, dict):
-        candidate.pop("param_schema_sha256", None)
-        candidate.pop("defaults_sha256", None)
-    parent = payload.get("primary_parent")
-    if isinstance(parent, dict):
-        parent.pop("incumbent_params_sha256", None)
-        parent.pop("param_schema_sha256", None)
-    return payload
 
 
 def build_parameter_transfer(
@@ -2560,9 +2536,7 @@ def validate_parameter_transfer(
     ):
         raise ValueError("parameter-transfer receipt lacks child defaults")
     expected = build_parameter_transfer(candidate_path, candidate["defaults"])
-    if _normalized_transfer_payload(receipt) != _normalized_transfer_payload(
-        expected
-    ):
+    if receipt != expected:
         raise ValueError(
             "parameter-transfer receipt is stale relative to parent or child"
         )

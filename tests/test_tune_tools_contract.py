@@ -342,7 +342,7 @@ def make_model(params):
         after = _candidate_execution_revision(path)
 
         self.assertEqual(before["structure_sha256"], after["structure_sha256"])
-        self.assertEqual(before["search_space_sha256"], after["search_space_sha256"])
+        self.assertEqual(before["search_space"], after["search_space"])
         self.assertNotEqual(before["search_space_keys"], after["search_space_keys"])
         self.assertNotEqual(before["revision_sha256"], after["revision_sha256"])
 

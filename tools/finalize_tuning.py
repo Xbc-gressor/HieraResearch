@@ -90,8 +90,7 @@ def _ledger_committed_final_state(
     record = records[0]
     return (
         record.get("tune") is True
-        and ledger.normalize_applied_incumbent(record.get("applied_incumbent"))
-        == expected
+        and record.get("applied_incumbent") == expected
         and record.get("final_best_score") == expected["score"]
     )
 

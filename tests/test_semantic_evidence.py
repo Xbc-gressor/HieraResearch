@@ -876,10 +876,12 @@ class SemanticEdgeObservationTests(unittest.TestCase):
 
         ledger_tools._capture_transfer_parent_snapshot(ledger, child)
         self.assertNotIn("receipt_sha256", ledger["lineage_snapshots"][0])
-        legacy_ledger = copy.deepcopy(ledger)
-        legacy_snapshot = legacy_ledger["lineage_snapshots"][0]
-        legacy_snapshot["receipt_sha256"] = _json_sha256(legacy_snapshot)
-        self.assertEqual(validate_lineage_snapshots(legacy_ledger), [])
+        wrong_shape = copy.deepcopy(ledger)
+        wrong_shape["lineage_snapshots"][0]["receipt_sha256"] = "sha256:obsolete"
+        self.assertIn(
+            "ledger.lineage_snapshots[0] has an invalid shape",
+            validate_lineage_snapshots(wrong_shape),
+        )
         old_record_hash = child["parameter_transfer"]["receipt"][
             "primary_parent"
         ]["ledger_record_sha256"]
@@ -978,9 +980,6 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         projection = receipt["projection"]
         semantic_control = receipt["semantic_control"]
         primary["incumbent_params"] = {"shared": 999.0}
-        primary["incumbent_params_sha256"] = _json_sha256(
-            primary["incumbent_params"]
-        )
         projection["params"] = {"shared": 999.0}
         projection["params_sha256"] = _json_sha256(projection["params"])
         projection["copied"] = [{"key": "shared", "value": 999.0}]

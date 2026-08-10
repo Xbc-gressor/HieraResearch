@@ -1277,39 +1277,5 @@ class LedgerProgressiveFieldsTest(unittest.TestCase):
         self.assertEqual(record["tuning_bouts"], 0)
         self.assertIsNone(record["last_bout_improved"])
 
-    def test_legacy_records_normalize_on_load(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger_path = Path(tmp) / "ledger.json"
-            legacy = {
-                "run_id": "001",
-                "semantic_point": {},
-                "policy_receipt": {},
-                "status": "keep",
-                "tune": True,
-                "final_best_score": 0.9,
-            }
-            fresh = {
-                "run_id": "002",
-                "semantic_point": {},
-                "policy_receipt": {},
-                "status": "keep",
-                "tune": False,
-                "final_best_score": 1.1,
-            }
-            ledger_path.write_text(json.dumps({
-                "task": "autoresearch-baseline",
-                "tag": "test",
-                "metric": "val_bpb",
-                "search_space_state": empty_search_space_state(),
-                "records": [legacy, fresh],
-            }))
-            data = ledger._load_ledger(ledger_path)
-            by_id = {r["run_id"]: r for r in data["records"]}
-            self.assertEqual(by_id["001"]["tuning_bouts"], 1)
-            self.assertIsNone(by_id["001"]["last_bout_improved"])
-            self.assertEqual(by_id["002"]["tuning_bouts"], 0)
-            self.assertIsNone(by_id["002"]["last_bout_improved"])
-
-
 if __name__ == "__main__":
     unittest.main()

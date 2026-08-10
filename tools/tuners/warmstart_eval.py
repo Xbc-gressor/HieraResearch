@@ -522,6 +522,8 @@ def main() -> int:
     previous_cache = previous_phase_a.get("warm_score_cache")
     if (
         isinstance(previous_cache, dict)
+        and set(previous_cache)
+        == {"schema_version", "candidate_execution_revision", "rows"}
         and previous_cache.get("schema_version") == 1
         and previous_cache.get("candidate_execution_revision")
         == candidate_code_revision
