@@ -42,7 +42,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 import sys
 
 import numpy as np
@@ -70,14 +70,6 @@ PHASE_C_LOCK_FILENAME = ".phase_c.lock"
 
 class DeepTuneStageAdmissionError(RuntimeError):
     """The requested Phase-C method is not the next legal stage."""
-
-
-class DeepTuneTimeExhausted(RuntimeError):
-    """The candidate-level cumulative Phase-C wall-clock cap is exhausted."""
-
-    def __init__(self, message: str, *, attempt_reserved: bool = False):
-        super().__init__(message)
-        self.attempt_reserved = attempt_reserved
 
 
 class _PhaseCLock:
@@ -435,14 +427,14 @@ def deep_tune_time_budget(
 
     This is the first boundary every search script calls, before importing an
     optimizer or candidate, probing preflight, or constructing a study/grid. It
-    validates the deterministic method/fallback chain, recovers wall time from
+    validates the deterministic method/fallback chain, recovers elapsed time from
     an interrupted ``running`` invocation, and persists the new invocation's
     epoch start before any expensive work begins.
 
     Normal invocations use ``time.monotonic`` for precise accounting. The epoch
     start is solely a crash-recovery journal: if the process disappears before
-    terminal metadata is written, the next invocation charges the abandoned
-    interval before granting any remaining time.
+    terminal metadata is written, the next invocation records the abandoned
+    interval in its elapsed-time receipt.
     """
     lock_handle = _acquire_phase_c_lock(ref_path)
     try:
@@ -465,15 +457,8 @@ def _deep_tune_time_budget_locked(
     """Locked implementation for :func:`deep_tune_time_budget`."""
     started_monotonic = time.monotonic()
     started_epoch = time.time()
-    # Phase C has no wall-clock limit. The budget is trial-denominated:
-    # patience, n_trials, the per-candidate objective cap, and the run share.
-    # A seconds cap sized below the sampler's startup regime silently degraded
-    # every stage to random fallback draws (run 0730-ds-ex100-1: 3600 s at
-    # ~450 s/eval never reached TPE's 10-trial startup, in every stage). The
-    # legacy `tuner.deep_tune_time_limit_seconds` key still parses but is
-    # ignored. Elapsed accounting below is kept for receipts and crash
-    # recovery, not for enforcement.
-    limit = math.inf
+    # Phase C is trial-denominated. Elapsed accounting is retained for receipts
+    # and crash recovery, not enforcement.
     report = read_tune_report(report_path)
     phase_c = report.get("phase_c")
     if phase_c is None:
@@ -601,9 +586,10 @@ def _deep_tune_time_budget_locked(
                     f"within its bout (status={stage.get('status')!r})"
                 )
 
-    # Recover every abandoned invocation conservatively before calculating the
-    # candidate-level total. A legal report has at most the active method here,
-    # but stale timestamps must never disappear even in a malformed report.
+    # Recover every abandoned invocation conservatively so elapsed receipts
+    # retain time from interrupted processes. A legal report has at most the
+    # active method here, but stale timestamps must never disappear even in a
+    # malformed report.
     for item in stages:
         invocation_started = item.pop(DEEP_TUNE_INVOCATION_STARTED_AT, None)
         if (
@@ -631,7 +617,6 @@ def _deep_tune_time_budget_locked(
             )
             item["recovered_interrupted_invocations"] = recovered + 1
 
-    total_used = 0.0
     stage_used = 0.0
     for item in stages:
         elapsed = item.get("elapsed_seconds")
@@ -641,14 +626,8 @@ def _deep_tune_time_budget_locked(
             and math.isfinite(float(elapsed))
             and float(elapsed) > 0
         ):
-            total_used += float(elapsed)
             if item.get("method") == method:
                 stage_used += float(elapsed)
-    remaining = max(0.0, limit - total_used)
-    # Persist the journal even at zero remaining. The caller normally closes it
-    # immediately as time_exhausted, but a kill in that tiny window must leave a
-    # resumable active stage rather than an unstatused, permanently inadmissible
-    # record.
     stage.update(
         {
             "status": "running",
@@ -657,14 +636,10 @@ def _deep_tune_time_budget_locked(
     )
     write_tune_report(report_path, report)
     return {
-        # Receipts serialize this as null: no wall-clock limit exists anymore.
-        # Internal arithmetic uses remaining_seconds (always +inf).
+        # Keep the current receipt shape explicit: no Phase-C wall limit exists.
         "limit_seconds": None,
-        "used_seconds": total_used,
         "stage_used_seconds": stage_used,
-        "remaining_seconds": remaining,
         "started_monotonic": started_monotonic,
-        "started_epoch": started_epoch,
         "candidate_execution_revision": candidate_execution_revision,
         "bout_index": bout_index,
     }
@@ -675,26 +650,6 @@ def deep_tune_stage_elapsed(time_budget: dict) -> float:
     return float(time_budget["stage_used_seconds"]) + max(
         0.0, time.monotonic() - float(time_budget["started_monotonic"])
     )
-
-
-def deep_tune_time_remaining(time_budget: dict) -> float:
-    """Remaining Phase-C seconds: always +inf since the wall clock was removed.
-
-    Kept so callers (optuna ``timeout=``, ``phase_time_limit_seconds=``
-    suppliers) keep working unchanged; +inf maps to "no limit" downstream.
-    """
-    invocation_elapsed = max(
-        0.0, time.monotonic() - float(time_budget["started_monotonic"])
-    )
-    return max(0.0, float(time_budget["remaining_seconds"]) - invocation_elapsed)
-
-
-def ensure_deep_tune_time_remaining(time_budget: dict) -> None:
-    """No-op retained for call-site compatibility: no wall cap exists."""
-    if deep_tune_time_remaining(time_budget) <= 0:
-        raise DeepTuneTimeExhausted(
-            "candidate deep-tune wall-clock allocation exhausted"
-        )
 
 
 def read_runtime_limit(ref_path: Any) -> float | None:
@@ -768,30 +723,6 @@ def _communicate_with_limit(
     return out, err, int(proc.returncode)
 
 
-def _resolve_phase_time_limit(
-    value: float | Callable[[], float] | None,
-) -> float | None:
-    """Resolve a live Phase-C remaining-time supplier into a strict limit."""
-    if callable(value):
-        value = value()
-    if value is None:
-        return None
-    try:
-        limit = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "phase_time_limit_seconds must be a finite positive number"
-        ) from None
-    if limit == math.inf:
-        # No Phase-C wall clock exists (removed); only per_runtime_limit binds.
-        return None
-    if not math.isfinite(limit) or limit <= 0:
-        raise DeepTuneTimeExhausted(
-            "candidate deep-tune wall-clock allocation exhausted"
-        )
-    return limit
-
-
 def timed_eval(
     evaluate,
     make_model,
@@ -800,78 +731,43 @@ def timed_eval(
     *,
     phase: str = "unknown",
     method: str = "unknown",
-    phase_time_limit_seconds: float | Callable[[], float] | None = None,
     expected_execution_revision: dict | None = None,
 ) -> float:
-    """Run ONE config eval under task and Phase-C hard wall-clock limits.
+    """Run one config evaluation under the task's per-evaluation limit.
 
     Outside Phase C, no task limit keeps the historical in-process fast path.
-    Whenever either ``per_runtime_limit`` or a Phase-C remaining allocation is
-    supplied, run in a fresh subprocess and hard-kill its process group at the
-    smaller limit. The objective reservation happens first, so a subprocess
-    timeout remains an admitted/charged evaluation attempt.
+    When ``per_runtime_limit`` is configured, run in a fresh subprocess and
+    hard-kill its process group at that limit. The objective reservation happens
+    first, so a subprocess timeout remains an admitted/charged attempt.
 
     Timeouts, child-process errors, missing results, and non-finite scores raise
     so callers record an auditable failed trial instead of caching ``+inf`` as
     if it were a successful score.
     """
-    # Fail before reservation when the caller already knows no Phase-C time
-    # remains. A live supplier is resolved again after atomic reservation so
-    # lock contention/I/O cannot grant the child a stale, overly large timeout.
-    phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
     reserve_evaluation(
         candidate_path,
         params=params,
         phase=phase,
         method=method,
     )
-    try:
-        phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
-    except DeepTuneTimeExhausted as exc:
-        raise DeepTuneTimeExhausted(
-            str(exc),
-            attempt_reserved=True,
-        ) from None
     runtime_limit = read_runtime_limit(candidate_path)
-    if runtime_limit is None and phase_limit is None:
+    if runtime_limit is None:
         score = float(evaluate(make_model, params))
         if not is_finite_score(score):
             raise ValueError(f"evaluation returned non-finite score: {score!r}")
         return score
-    phase_binds = (
-        phase_limit is not None
-        and (runtime_limit is None or phase_limit <= runtime_limit)
-    )
-    if runtime_limit is None:
-        limit = float(phase_limit)
-    elif phase_limit is None:
-        limit = runtime_limit
-    else:
-        limit = min(runtime_limit, phase_limit)
     eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
-    try:
-        out, err, returncode = _communicate_with_limit(
-            [
-                sys.executable,
-                eval_one,
-                str(candidate_path),
-                json.dumps(params),
-                json.dumps(expected_execution_revision),
-            ],
-            limit=limit,
-            label=(
-                "evaluation exceeded Phase-C remaining wall time"
-                if phase_binds
-                else "evaluation exceeded per_runtime_limit"
-            ),
-        )
-    except TimeoutError as exc:
-        if phase_binds:
-            raise DeepTuneTimeExhausted(
-                str(exc),
-                attempt_reserved=True,
-            ) from None
-        raise
+    out, err, returncode = _communicate_with_limit(
+        [
+            sys.executable,
+            eval_one,
+            str(candidate_path),
+            json.dumps(params),
+            json.dumps(expected_execution_revision),
+        ],
+        limit=runtime_limit,
+        label="evaluation exceeded per_runtime_limit",
+    )
     for line in out.splitlines():
         if line.startswith("RESULT:"):
             try:
@@ -900,7 +796,6 @@ def timed_preflight(
     params: dict,
     candidate_path: Any,
     *,
-    phase_time_limit_seconds: float | Callable[[], float] | None = None,
     expected_execution_revision: dict | None = None,
     probe_mode: str = "preflight",
 ) -> dict | None:
@@ -925,37 +820,18 @@ def timed_preflight(
     if configured is None:
         return None
     preflight_one = str(Path(__file__).resolve().parent / "_preflight_one.py")
-    phase_limit = _resolve_phase_time_limit(phase_time_limit_seconds)
-    configured_limit = read_preflight_limit(candidate_path)
-    phase_binds = (
-        phase_limit is not None and phase_limit <= configured_limit
+    out, err, returncode = _communicate_with_limit(
+        [
+            sys.executable,
+            preflight_one,
+            str(candidate_path),
+            json.dumps(params),
+            json.dumps(expected_execution_revision),
+            probe_mode,
+        ],
+        limit=read_preflight_limit(candidate_path),
+        label="preflight exceeded preflight_runtime_limit",
     )
-    limit = (
-        configured_limit
-        if phase_limit is None
-        else min(configured_limit, phase_limit)
-    )
-    try:
-        out, err, returncode = _communicate_with_limit(
-            [
-                sys.executable,
-                preflight_one,
-                str(candidate_path),
-                json.dumps(params),
-                json.dumps(expected_execution_revision),
-                probe_mode,
-            ],
-            limit=limit,
-            label=(
-                "preflight exceeded Phase-C remaining wall time"
-                if phase_binds
-                else "preflight exceeded preflight_runtime_limit"
-            ),
-        )
-    except TimeoutError as exc:
-        if phase_binds:
-            raise DeepTuneTimeExhausted(str(exc)) from None
-        raise
     for line in out.splitlines():
         if not line.startswith("PREFLIGHT:"):
             continue
@@ -1037,7 +913,7 @@ def write_tune_report(report_path: Path, report: dict) -> None:
 
 
 def stage_bout_index(stage: dict) -> int:
-    """0-based bout a Phase-C stage belongs to (legacy unstamped stages: 0)."""
+    """0-based bout a Phase-C stage belongs to (unstamped first bout: 0)."""
     value = stage.get("bout_index", 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
@@ -1363,17 +1239,6 @@ class PatienceMonitor:
         return self.since >= self.patience
 
 
-def prior_best_score(prior_trials: list[dict]) -> float | None:
-    """Return the best (minimum) score among prior_trials, or None if the list
-    is empty or no scores are numeric."""
-    scores = [
-        t["score"]
-        for t in prior_trials
-        if is_finite_score(t.get("score"))
-    ]
-    return min(scores) if scores else None
-
-
 def prior_patience_state(
     report_path: Path,
     bout_index: int | None = None,
@@ -1527,8 +1392,6 @@ def clamp_search_space_to_preflight(
     report_path: Path,
     *,
     headroom: float = SPACE_CLAMP_HEADROOM,
-    admission_check: Callable[[], None] | None = None,
-    phase_time_limit_seconds: float | Callable[[], float] | None = None,
     expected_execution_revision: dict | None = None,
 ) -> dict:
     """Shrink numeric SEARCH_SPACE upper bounds until the box's upper corner is
@@ -1639,28 +1502,15 @@ def clamp_search_space_to_preflight(
         """
         if not essential and len(probes) >= SPACE_CLAMP_MAX_PROBES:
             raise _ClampProbeBudgetExceeded
-        if admission_check is not None:
-            admission_check()
         started = time.time()
         elapsed = lambda: round(time.time() - started, 1)  # noqa: E731
         try:
-            preflight_kwargs = {}
-            if phase_time_limit_seconds is not None:
-                preflight_kwargs["phase_time_limit_seconds"] = (
-                    phase_time_limit_seconds
-                )
-            if expected_execution_revision is not None:
-                preflight_kwargs["expected_execution_revision"] = (
-                    expected_execution_revision
-                )
             result = timed_preflight(
                 params,
                 candidate_path,
                 probe_mode=probe_mode,
-                **preflight_kwargs,
+                expected_execution_revision=expected_execution_revision,
             )
-        except DeepTuneTimeExhausted:
-            raise
         except Exception as exc:
             append_preflight_attempt(
                 report_path,
@@ -1672,8 +1522,6 @@ def clamp_search_space_to_preflight(
             probes.append(
                 {"label": label, "feasible": False, "elapsed_seconds": elapsed()}
             )
-            if admission_check is not None:
-                admission_check()
             return False, None
         append_preflight_attempt(
             report_path,
@@ -1702,8 +1550,6 @@ def clamp_search_space_to_preflight(
             "probe_seq_len": (result or {}).get("probe_seq_len"),
             "elapsed_seconds": elapsed(),
         })
-        if admission_check is not None:
-            admission_check()
         return feasible, (float(peak) if peak is not None else None)
 
     def at(dim_values: dict) -> dict:

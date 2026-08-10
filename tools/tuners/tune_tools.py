@@ -312,15 +312,6 @@ def _module_bindings(tree: ast.Module) -> dict[str, list[ast.AST]]:
     return out
 
 
-def _module_symbols(tree: ast.Module) -> dict[str, ast.AST]:
-    """Runtime-effective module-level bindings (the final binding wins).
-
-    Contract readers must additionally require exactly one binding; this helper
-    exists for diagnostics that need to keep inspecting a malformed module.
-    """
-    return {name: nodes[-1] for name, nodes in _module_bindings(tree).items()}
-
-
 def _duplicate_binding_errors(
     bindings: dict[str, list[ast.AST]],
     names: tuple[str, ...] = CONTRACT_SYMBOLS,
@@ -1050,7 +1041,6 @@ _TERMINAL_STAGE_STATUSES = {
     "rejected",
     "budget_exhausted",
     "no_search_needed",
-    "time_exhausted",
 }
 # Every terminal status except `rejected` can close a candidate.  A rejected
 # stage is a method the deterministic chain never ran, so it carries no
@@ -1248,27 +1238,6 @@ def finalizable_tuning_result(report: dict, *, require_applied: bool = False) ->
         errors.append(
             "an exhausted rejected method chain cannot contain trial rows"
         )
-    if final_status == "time_exhausted":
-        time_limit = final_stage.get("time_limit_seconds")
-        elapsed_rows = [
-            stage.get("elapsed_seconds")
-            for stage in stages
-            if isinstance(stage, dict)
-            and _is_finite_score(stage.get("elapsed_seconds"))
-            and float(stage["elapsed_seconds"]) >= 0
-        ]
-        candidate_elapsed = sum(float(value) for value in elapsed_rows)
-        if not (
-            final_stage.get("early_stop_reason") == "time_budget"
-            and _is_finite_score(final_stage.get("elapsed_seconds"))
-            and float(final_stage["elapsed_seconds"]) >= 0
-            and _is_finite_score(time_limit)
-            and float(time_limit) > 0
-            and candidate_elapsed >= float(time_limit) - 0.1
-        ):
-            errors.append(
-                "time_exhausted requires a cumulative elapsed/time-limit receipt"
-            )
     if final_status == "no_search_needed":
         effective_space = final_stage.get("effective_search_space", {})
         fixed = (

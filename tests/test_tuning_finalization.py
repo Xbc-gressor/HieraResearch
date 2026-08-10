@@ -601,50 +601,6 @@ class TuningFinalizationTests(unittest.TestCase):
         self.assertEqual(result["best_score"], 0.5)
         self.assertIsNone(result["phase_c_method"])
 
-    def test_time_exhausted_is_a_proven_terminal_boundary(self) -> None:
-        report = _report(stage_status="time_exhausted")
-        stage = report["phase_c"]["stages"][0]
-        stage.update(
-            {
-                "early_stop_reason": "time_budget",
-                "elapsed_seconds": 10.0,
-                "time_limit_seconds": 10.0,
-            }
-        )
-
-        result = finalize_tuning.finalizable_tuning_result(report)
-
-        self.assertEqual(result["best_score"], 0.8)
-        self.assertEqual(result["phase_c_method"], "grid")
-
-        stage["elapsed_seconds"] = 1.0
-        with self.assertRaisesRegex(ValueError, "cumulative elapsed"):
-            finalize_tuning.finalizable_tuning_result(report)
-
-    def test_time_exhaustion_counts_elapsed_across_fallback_stages(self) -> None:
-        report = _report(stage_status="rejected")
-        report["phase_c"]["stages"] = [
-            {
-                "method": "grid",
-                "status": "rejected",
-                "trials": [],
-                "elapsed_seconds": 9.5,
-            },
-            {
-                "method": "bo",
-                "status": "time_exhausted",
-                "trials": [],
-                "elapsed_seconds": 0.5,
-                "early_stop_reason": "time_budget",
-                "time_limit_seconds": 10.0,
-            },
-        ]
-
-        result = finalize_tuning.finalizable_tuning_result(report)
-
-        self.assertEqual(result["best_score"], 1.0)
-        self.assertIsNone(result["phase_c_method"])
-
     def test_terminal_stage_closes_once_and_reconciles_strict_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             candidate_path, report_path, ledger_path = self._fixture(

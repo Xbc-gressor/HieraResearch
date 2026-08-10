@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 import subprocess
 import sys
@@ -17,15 +16,11 @@ import _common  # noqa: E402
 from _common import (  # noqa: E402
     DEEP_TUNE_INVOCATION_STARTED_AT,
     DeepTuneStageAdmissionError,
-    DeepTuneTimeExhausted,
     deduplicate_configs,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
-    ensure_deep_tune_time_remaining,
     read_pending_proposals,
     set_stage_meta,
-    timed_eval,
-    timed_preflight,
 )
 from grid_search import main as grid_main  # noqa: E402
 from tune_tools import (  # noqa: E402
@@ -37,10 +32,6 @@ from tune_tools import (  # noqa: E402
     select_candidate,
     validate_proposals,
 )
-
-
-def _plain_make_model(params):
-    return params
 
 
 class DeepTuneGovernanceTest(unittest.TestCase):
@@ -121,10 +112,7 @@ class DeepTuneGovernanceTest(unittest.TestCase):
                 resumed = deep_tune_time_budget(candidate, report_path, "grid")
 
             self.assertEqual(resumed["stage_used_seconds"], 4.0)
-            # No wall-clock limit exists (the fixture's legacy
-            # deep_tune_time_limit_seconds key must parse but be ignored):
-            # remaining is unbounded and the receipt value is null.
-            self.assertEqual(resumed["remaining_seconds"], math.inf)
+            # No wall-clock limit exists; the receipt value remains null.
             self.assertIsNone(resumed["limit_seconds"])
             stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
             self.assertEqual(stage["recovered_interrupted_invocations"], 1)
@@ -142,13 +130,12 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             ), mock.patch.object(_common.time, "time", return_value=100.0):
                 budget = deep_tune_time_budget(candidate, report_path, "grid")
                 self.assertAlmostEqual(deep_tune_stage_elapsed(budget), 0.037)
-                ensure_deep_tune_time_remaining(budget)
 
             budget["_phase_c_lock_handle"].close()
             set_stage_meta(
                 report_path,
                 "grid",
-                status="time_exhausted",
+                status="failed",
                 elapsed_seconds=0.037,
             )
             stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
@@ -434,7 +421,6 @@ class DeepTuneGovernanceTest(unittest.TestCase):
 
             # Past any legacy cap, admission and journaling must be unaffected.
             first = deep_tune_time_budget(candidate, report_path, "grid")
-            self.assertEqual(first["remaining_seconds"], math.inf)
             stage = json.loads(report_path.read_text())["phase_c"]["stages"][0]
             self.assertEqual(stage["status"], "running")
             self.assertIn(DEEP_TUNE_INVOCATION_STARTED_AT, stage)
@@ -443,7 +429,6 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             # journal remains. The next invocation must be admissible and recover it.
             first["_phase_c_lock_handle"].close()
             resumed = deep_tune_time_budget(candidate, report_path, "grid")
-            self.assertEqual(resumed["remaining_seconds"], math.inf)
             resumed["_phase_c_lock_handle"].close()
 
     def test_candidate_phase_c_lock_rejects_concurrent_tuner(self):
@@ -458,74 +443,6 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             first["_phase_c_lock_handle"].close()
             resumed = deep_tune_time_budget(candidate, report_path, "grid")
             resumed["_phase_c_lock_handle"].close()
-
-    def test_eval_uses_live_minimum_phase_timeout_and_charges_reservation(self):
-        remaining = mock.Mock(side_effect=[5.0, 3.0])
-        with mock.patch.object(
-            _common, "reserve_evaluation"
-        ) as reserve, mock.patch.object(
-            _common, "read_runtime_limit", return_value=10.0
-        ), mock.patch.object(
-            _common,
-            "_communicate_with_limit",
-            return_value=("RESULT:0.25\n", "", 0),
-        ) as communicate:
-            score = timed_eval(
-                object(),
-                _plain_make_model,
-                {"x": 1},
-                Path("/tmp/candidate.py"),
-                phase="phase_c",
-                method="grid",
-                phase_time_limit_seconds=remaining,
-            )
-
-        self.assertEqual(score, 0.25)
-        reserve.assert_called_once()
-        self.assertEqual(communicate.call_args.kwargs["limit"], 3.0)
-
-    def test_phase_bound_eval_timeout_reports_reserved_attempt(self):
-        with mock.patch.object(
-            _common, "reserve_evaluation"
-        ) as reserve, mock.patch.object(
-            _common, "read_runtime_limit", return_value=None
-        ), mock.patch.object(
-            _common,
-            "_communicate_with_limit",
-            side_effect=TimeoutError("phase timeout"),
-        ):
-            with self.assertRaises(DeepTuneTimeExhausted) as caught:
-                timed_eval(
-                    object(),
-                    _plain_make_model,
-                    {},
-                    Path("/tmp/candidate.py"),
-                    phase="phase_c",
-                    method="bo",
-                    phase_time_limit_seconds=2.0,
-                )
-
-        reserve.assert_called_once()
-        self.assertTrue(caught.exception.attempt_reserved)
-
-    def test_preflight_uses_minimum_of_task_and_phase_time(self):
-        with mock.patch.object(
-            _common, "_configured_preflight_name", return_value="preflight"
-        ), mock.patch.object(
-            _common, "read_preflight_limit", return_value=10.0
-        ), mock.patch.object(
-            _common,
-            "_communicate_with_limit",
-            return_value=('PREFLIGHT:{"status":"ok"}\n', "", 0),
-        ) as communicate:
-            result = timed_preflight(
-                {},
-                Path("/tmp/candidate.py"),
-                phase_time_limit_seconds=3.0,
-            )
-
-        self.assertEqual(result, {"status": "ok"})
-        self.assertEqual(communicate.call_args.kwargs["limit"], 3.0)
 
     def test_search_space_change_is_rejected_before_stage_admission(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -642,71 +559,6 @@ class DeepTuneGovernanceTest(unittest.TestCase):
             self.assertEqual(result["best_params"], {"mode": "b"})
             self.assertEqual(result["deferred_skipped_already_seen"], 2)
             self.assertEqual(result["grid_skipped_already_seen"], 2)
-
-    def test_grid_rechecks_time_after_preflight_before_objective_reservation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            candidate, report_path = self._fixture(root)
-            train_module = mock.Mock(
-                SEARCH_SPACE={"x0": ("float", 0.0, 1.0)},
-                BASE_PARAMS={"x0": 0.0},
-                make_model=object(),
-            )
-            time_checks = [None] * 6 + [
-                DeepTuneTimeExhausted("expired after preflight")
-            ]
-
-            with mock.patch(
-                "grid_search.load_candidate_modules",
-                return_value=(train_module, object()),
-            ), mock.patch(
-                "grid_search.resolve_score_fn", return_value=object()
-            ), mock.patch(
-                "grid_search.resolve_preflight_fn", return_value=object()
-            ), mock.patch(
-                "grid_search.clamp_search_space_to_preflight",
-                return_value=train_module.SEARCH_SPACE,
-            ) as clamp_mock, mock.patch(
-                "grid_search.ensure_deep_tune_time_remaining",
-                side_effect=time_checks,
-            ), mock.patch(
-                "grid_search.timed_preflight", return_value={"status": "ok"}
-            ) as preflight_mock, mock.patch(
-                "grid_search.timed_eval"
-            ) as timed_eval_mock, mock.patch(
-                "grid_search.write_json"
-            ) as write_result, mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "grid_search.py",
-                    "--candidate-path",
-                    str(candidate),
-                    "--tune-report-json",
-                    str(report_path),
-                ],
-            ):
-                self.assertEqual(grid_main(), 0)
-
-            preflight_mock.assert_called_once()
-            self.assertTrue(
-                callable(
-                    clamp_mock.call_args.kwargs["phase_time_limit_seconds"]
-                )
-            )
-            self.assertTrue(
-                callable(
-                    preflight_mock.call_args.kwargs[
-                        "phase_time_limit_seconds"
-                    ]
-                )
-            )
-            timed_eval_mock.assert_not_called()
-            self.assertEqual(
-                write_result.call_args.args[0]["status"],
-                "time_exhausted",
-            )
-
 
 class BoutAdmissionTest(unittest.TestCase):
     def _fixture(self, root: Path):

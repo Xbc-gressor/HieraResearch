@@ -33,7 +33,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
     EvaluationBudgetExhausted,
-    DeepTuneTimeExhausted,
     resolve_score_fn,
     resolve_preflight_fn,
     timed_eval,
@@ -47,8 +46,6 @@ from _common import (  # noqa: E402
     deduplicate_configs,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
-    deep_tune_time_remaining,
-    ensure_deep_tune_time_remaining,
     is_config_infeasible_error,
     load_candidate_modules,
     prior_patience_state,
@@ -96,43 +93,6 @@ def main() -> int:
         "grid",
     )
 
-    def close_time_exhausted(
-        *,
-        trials_completed: int = 0,
-        trials_attempted: int = 0,
-        preflight_rejections: int = 0,
-    ) -> int:
-        elapsed_seconds = deep_tune_stage_elapsed(time_budget)
-        set_stage_meta(
-            args.tune_report_json,
-            "grid",
-            bout_index=time_budget["bout_index"],
-            status="time_exhausted",
-            elapsed_seconds=elapsed_seconds,
-            early_stopped=True,
-            early_stop_reason="time_budget",
-            preflight_rejections=preflight_rejections,
-            time_limit_seconds=time_budget["limit_seconds"],
-        )
-        write_json({
-            "method": "grid",
-            "status": "time_exhausted",
-            "reason": "candidate deep-tune wall-clock allocation exhausted",
-            "trials_completed": trials_completed,
-            "trials_attempted": trials_attempted,
-            "preflight_rejections": preflight_rejections,
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "time_limit_seconds": time_budget["limit_seconds"],
-        })
-        return 0
-
-    if time_budget["remaining_seconds"] <= 0:
-        return close_time_exhausted()
-
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     train_module, prepare_module = load_candidate_modules(
         args.candidate_path,
         expected_execution_revision=time_budget[
@@ -146,29 +106,15 @@ def main() -> int:
     if preflight_enabled:
         # Clamp the box to the preflight-feasible region before searching.
         # Anything residual that still fails is rejected by preflight.
-        try:
-            search_space = clamp_search_space_to_preflight(
-                search_space,
-                getattr(train_module, "BASE_PARAMS", None),
-                args.candidate_path,
-                args.tune_report_json,
-                admission_check=lambda: ensure_deep_tune_time_remaining(
-                    time_budget
-                ),
-                phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                    time_budget
-                ),
-                expected_execution_revision=time_budget[
-                    "candidate_execution_revision"
-                ],
-            )
-        except DeepTuneTimeExhausted:
-            return close_time_exhausted()
-
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
+        search_space = clamp_search_space_to_preflight(
+            search_space,
+            getattr(train_module, "BASE_PARAMS", None),
+            args.candidate_path,
+            args.tune_report_json,
+            expected_execution_revision=time_budget[
+                "candidate_execution_revision"
+            ],
+        )
     keys = list(search_space.keys())
     grids = [expand_entry(search_space[k], args.resolution) for k in keys]
     total = 1
@@ -183,13 +129,9 @@ def main() -> int:
         if isinstance(trial, dict)
     ]
 
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     # A fresh oversized grid rejects into the deterministic fallback. A resumed
     # grid already passed that admission once; continue from its unseen points
-    # and let the atomic remaining allocation stop it exactly.
+    # and let the atomic remaining objective allocation stop it exactly.
     if total > args.max_trials and not existing_grid_trials:
         set_stage_meta(args.tune_report_json, "grid", status="rejected",
                        bout_index=time_budget["bout_index"])
@@ -206,10 +148,6 @@ def main() -> int:
         })
         return 0
 
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     combos = list(itertools.product(*grids))
     rng = random.Random(args.seed)
     rng.shuffle(combos)
@@ -305,7 +243,6 @@ def main() -> int:
     early_stop_reason = "none"
     budget_exhausted = False
     budget_exhausted_scope = None
-    time_exhausted = False
     preflight_rejections = 0
     failure_refs = []
 
@@ -320,30 +257,15 @@ def main() -> int:
             early_stopped = True
             early_stop_reason = "max_trials"
             break
-        try:
-            ensure_deep_tune_time_remaining(time_budget)
-        except DeepTuneTimeExhausted:
-            time_exhausted = True
-            early_stopped = True
-            early_stop_reason = "time_budget"
-            break
         if preflight_enabled:
             try:
                 preflight_result = timed_preflight(
                     params,
                     args.candidate_path,
-                    phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                        time_budget
-                    ),
                     expected_execution_revision=time_budget[
                         "candidate_execution_revision"
                     ],
                 )
-            except DeepTuneTimeExhausted:
-                time_exhausted = True
-                early_stopped = True
-                early_stop_reason = "time_budget"
-                break
             except Exception as exc:
                 failure = record_failure(
                     report_path=args.tune_report_json,
@@ -372,13 +294,6 @@ def main() -> int:
                     },
                 )
                 preflight_rejections += 1
-                try:
-                    ensure_deep_tune_time_remaining(time_budget)
-                except DeepTuneTimeExhausted:
-                    time_exhausted = True
-                    early_stopped = True
-                    early_stop_reason = "time_budget"
-                    break
                 # A scoreless trial is a non-improvement: count it toward
                 # patience so failure streaks cannot sidestep early stopping.
                 if monitor.update_failed():
@@ -393,15 +308,7 @@ def main() -> int:
                 status="ok",
                 result=preflight_result or {"status": "ok"},
             )
-            try:
-                ensure_deep_tune_time_remaining(time_budget)
-            except DeepTuneTimeExhausted:
-                time_exhausted = True
-                early_stopped = True
-                early_stop_reason = "time_budget"
-                break
         try:
-            ensure_deep_tune_time_remaining(time_budget)
             score = timed_eval(
                 evaluate,
                 make_model,
@@ -409,40 +316,7 @@ def main() -> int:
                 args.candidate_path,
                 phase="phase_c",
                 method="grid",
-                phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                    time_budget
-                ),
             )
-        except DeepTuneTimeExhausted as exc:
-            if exc.attempt_reserved:
-                trials_attempted += 1
-                failure = record_failure(
-                    report_path=args.tune_report_json,
-                    candidate_path=args.candidate_path,
-                    phase="phase_c",
-                    method="grid",
-                    params=params,
-                    error=exc,
-                    traceback_text=traceback.format_exc(),
-                )
-                append_trial(
-                    args.tune_report_json,
-                    "grid",
-                    {
-                        "params": params,
-                        "score": None,
-                        "status": "failed",
-                        "time_exhausted": True,
-                        "config_infeasible": False,
-                        **failure,
-                    },
-                )
-                if failure["failure_ref"] not in failure_refs:
-                    failure_refs.append(failure["failure_ref"])
-            time_exhausted = True
-            early_stopped = True
-            early_stop_reason = "time_budget"
-            break
         except EvaluationBudgetExhausted as exc:
             budget_exhausted = True
             budget_exhausted_scope = exc.scope
@@ -507,13 +381,6 @@ def main() -> int:
             "elapsed_seconds": round(stage_elapsed, 1),
         })
         return 0
-
-    if best_params is None and time_exhausted:
-        return close_time_exhausted(
-            trials_completed=trials_done,
-            trials_attempted=trials_attempted,
-            preflight_rejections=preflight_rejections,
-        )
 
     if best_params is None:
         # Every combo errored — surface a failed stage instead of "ok" with a null best.

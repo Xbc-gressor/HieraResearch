@@ -32,7 +32,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
     EvaluationBudgetExhausted,
-    DeepTuneTimeExhausted,
     resolve_score_fn,
     resolve_preflight_fn,
     timed_eval,
@@ -46,8 +45,6 @@ from _common import (  # noqa: E402
     deduplicate_configs,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
-    deep_tune_time_remaining,
-    ensure_deep_tune_time_remaining,
     is_config_infeasible_error,
     is_finite_score,
     load_candidate_modules,
@@ -220,45 +217,8 @@ def main() -> int:
         "cmaes",
     )
 
-    def close_time_exhausted(
-        *,
-        trials_completed: int = 0,
-        trials_attempted: int = 0,
-        preflight_rejections: int = 0,
-    ) -> int:
-        elapsed_seconds = deep_tune_stage_elapsed(time_budget)
-        set_stage_meta(
-            args.tune_report_json,
-            "cmaes",
-            bout_index=time_budget["bout_index"],
-            status="time_exhausted",
-            elapsed_seconds=elapsed_seconds,
-            early_stopped=True,
-            early_stop_reason="time_budget",
-            preflight_rejections=preflight_rejections,
-            time_limit_seconds=time_budget["limit_seconds"],
-        )
-        write_json({
-            "method": "cmaes",
-            "status": "time_exhausted",
-            "reason": "candidate deep-tune wall-clock allocation exhausted",
-            "trials_completed": trials_completed,
-            "trials_attempted": trials_attempted,
-            "preflight_rejections": preflight_rejections,
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "time_limit_seconds": time_budget["limit_seconds"],
-        })
-        return 0
-
-    if time_budget["remaining_seconds"] <= 0:
-        return close_time_exhausted()
-
     try:
-        ensure_deep_tune_time_remaining(time_budget)
         import cma
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     except ImportError:
         set_stage_meta(
             args.tune_report_json,
@@ -274,10 +234,6 @@ def main() -> int:
         })
         return 0
 
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     train_module, prepare_module = load_candidate_modules(
         args.candidate_path,
         expected_execution_revision=time_budget[
@@ -292,29 +248,15 @@ def main() -> int:
     if preflight_enabled:
         # Clamp the box to the preflight-feasible region before searching.
         # Anything residual that still fails is rejected by preflight.
-        try:
-            search_space = clamp_search_space_to_preflight(
-                search_space,
-                base_params,
-                args.candidate_path,
-                args.tune_report_json,
-                admission_check=lambda: ensure_deep_tune_time_remaining(
-                    time_budget
-                ),
-                phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                    time_budget
-                ),
-                expected_execution_revision=time_budget[
-                    "candidate_execution_revision"
-                ],
-            )
-        except DeepTuneTimeExhausted:
-            return close_time_exhausted()
-
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
+        search_space = clamp_search_space_to_preflight(
+            search_space,
+            base_params,
+            args.candidate_path,
+            args.tune_report_json,
+            expected_execution_revision=time_budget[
+                "candidate_execution_revision"
+            ],
+        )
     prior_trials = read_prior_trials(args.tune_report_json)
     best_prior = None
     if prior_trials:
@@ -399,10 +341,6 @@ def main() -> int:
     # stage deterministically from the best compatible prior. If that invariant
     # is broken, fail closed instead of fabricating a successful CMA trial.
     if not keys:
-        try:
-            ensure_deep_tune_time_remaining(time_budget)
-        except DeepTuneTimeExhausted:
-            return close_time_exhausted()
         terminal_elapsed = deep_tune_stage_elapsed(time_budget)
         phase_a_trials = [
             trial
@@ -517,10 +455,6 @@ def main() -> int:
         rewarm_skipped_already_seen=proposals_skipped_seen,
     )
 
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     es = cma.CMAEvolutionStrategy(
         x0,
         args.sigma0,
@@ -532,11 +466,6 @@ def main() -> int:
             "verb_disp": 0,
         },
     )
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
-
     best_params = dict(seed_params)
     best_score = math.inf
     evals = 0
@@ -547,7 +476,6 @@ def main() -> int:
     early_stop_reason = "none"
     budget_exhausted = False
     budget_exhausted_scope = None
-    time_exhausted = False
     preflight_rejections = 0
     duplicates_skipped = 0
     duplicate_scores_reused = 0
@@ -564,22 +492,16 @@ def main() -> int:
 
     def preflight_passes(params: dict) -> bool:
         nonlocal preflight_rejections
-        ensure_deep_tune_time_remaining(time_budget)
         if not preflight_enabled:
             return True
         try:
             result = timed_preflight(
                 params,
                 args.candidate_path,
-                phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                    time_budget
-                ),
                 expected_execution_revision=time_budget[
                     "candidate_execution_revision"
                 ],
             )
-        except DeepTuneTimeExhausted:
-            raise
         except Exception as exc:
             failure = record_failure(
                 report_path=args.tune_report_json,
@@ -608,7 +530,6 @@ def main() -> int:
                 },
             )
             preflight_rejections += 1
-            ensure_deep_tune_time_remaining(time_budget)
             return False
         append_preflight_attempt(
             args.tune_report_json,
@@ -617,7 +538,6 @@ def main() -> int:
             status="ok",
             result=result or {"status": "ok"},
         )
-        ensure_deep_tune_time_remaining(time_budget)
         return True
 
     # Validated LLM re-warm proposals first, then the deferred warm configs
@@ -638,21 +558,8 @@ def main() -> int:
             # Proposals displace the evals budget; once it is spent the
             # remaining proposals are dropped (deferred extras still run).
             continue
-        try:
-            ensure_deep_tune_time_remaining(time_budget)
-        except DeepTuneTimeExhausted:
-            time_exhausted = True
-            early_stopped = True
-            early_stop_reason = "time_budget"
-            break
         params = cast_params_to_search_space(dict(d_params), search_space)
-        try:
-            preflight_ok = preflight_passes(params)
-        except DeepTuneTimeExhausted:
-            time_exhausted = True
-            early_stopped = True
-            early_stop_reason = "time_budget"
-            break
+        preflight_ok = preflight_passes(params)
         if not preflight_ok:
             # No budget charge, for either kind: preflight reserves no slot in
             # evaluation_attempts.jsonl and never reaches score_fn, so a
@@ -670,7 +577,6 @@ def main() -> int:
                 break
             continue
         try:
-            ensure_deep_tune_time_remaining(time_budget)
             score = timed_eval(
                 evaluate,
                 make_model,
@@ -678,41 +584,7 @@ def main() -> int:
                 args.candidate_path,
                 phase="phase_c",
                 method="cmaes",
-                phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                    time_budget
-                ),
             )
-        except DeepTuneTimeExhausted as exc:
-            if exc.attempt_reserved:
-                trials_attempted += 1
-                attempted_identities.add(params_identity(params))
-                failure = record_failure(
-                    report_path=args.tune_report_json,
-                    candidate_path=args.candidate_path,
-                    phase="phase_c",
-                    method="cmaes",
-                    params=params,
-                    error=exc,
-                    traceback_text=traceback.format_exc(),
-                )
-                append_trial(
-                    args.tune_report_json,
-                    "cmaes",
-                    {
-                        "params": params,
-                        "score": None,
-                        "status": "failed",
-                        "time_exhausted": True,
-                        "config_infeasible": False,
-                        **failure,
-                    },
-                )
-                if failure["failure_ref"] not in failure_refs:
-                    failure_refs.append(failure["failure_ref"])
-            time_exhausted = True
-            early_stopped = True
-            early_stop_reason = "time_budget"
-            break
         except EvaluationBudgetExhausted as exc:
             budget_exhausted = True
             budget_exhausted_scope = exc.scope
@@ -761,13 +633,6 @@ def main() -> int:
             best_score, best_params = score, params
 
     while evals < args.max_evals and not budget_exhausted and not early_stopped:
-        try:
-            ensure_deep_tune_time_remaining(time_budget)
-        except DeepTuneTimeExhausted:
-            time_exhausted = True
-            early_stopped = True
-            early_stop_reason = "time_budget"
-            break
         if es.stop():
             early_stopped = True
             early_stop_reason = "cma_internal"
@@ -776,14 +641,6 @@ def main() -> int:
         results = []  # [(x, fitness_or_None)] — None marks a failed evaluation
         stop_now = False
         for x in xs:
-            try:
-                ensure_deep_tune_time_remaining(time_budget)
-            except DeepTuneTimeExhausted:
-                time_exhausted = True
-                early_stopped = True
-                early_stop_reason = "time_budget"
-                stop_now = True
-                break
             if evals >= args.max_evals:
                 break
             params = decode(np.asarray(x))
@@ -810,14 +667,7 @@ def main() -> int:
                     stop_now = True
                     break
                 continue
-            try:
-                preflight_ok = preflight_passes(params)
-            except DeepTuneTimeExhausted:
-                time_exhausted = True
-                early_stopped = True
-                early_stop_reason = "time_budget"
-                stop_now = True
-                break
+            preflight_ok = preflight_passes(params)
             if not preflight_ok:
                 results.append((x, None))
                 evals += 1
@@ -832,7 +682,6 @@ def main() -> int:
                     break
                 continue
             try:
-                ensure_deep_tune_time_remaining(time_budget)
                 score = timed_eval(
                     evaluate,
                     make_model,
@@ -840,42 +689,7 @@ def main() -> int:
                     args.candidate_path,
                     phase="phase_c",
                     method="cmaes",
-                    phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                        time_budget
-                    ),
                 )
-            except DeepTuneTimeExhausted as exc:
-                if exc.attempt_reserved:
-                    trials_attempted += 1
-                    attempted_identities.add(identity)
-                    failure = record_failure(
-                        report_path=args.tune_report_json,
-                        candidate_path=args.candidate_path,
-                        phase="phase_c",
-                        method="cmaes",
-                        params=params,
-                        error=exc,
-                        traceback_text=traceback.format_exc(),
-                    )
-                    append_trial(
-                        args.tune_report_json,
-                        "cmaes",
-                        {
-                            "params": params,
-                            "score": None,
-                            "status": "failed",
-                            "time_exhausted": True,
-                            "config_infeasible": False,
-                            **failure,
-                        },
-                    )
-                    if failure["failure_ref"] not in failure_refs:
-                        failure_refs.append(failure["failure_ref"])
-                time_exhausted = True
-                early_stopped = True
-                early_stop_reason = "time_budget"
-                stop_now = True
-                break
             except EvaluationBudgetExhausted as exc:
                 budget_exhausted = True
                 budget_exhausted_scope = exc.scope
@@ -972,13 +786,6 @@ def main() -> int:
             "elapsed_seconds": round(stage_elapsed, 1),
         })
         return 0
-
-    if not any_success and time_exhausted:
-        return close_time_exhausted(
-            trials_completed=trials_completed,
-            trials_attempted=trials_attempted,
-            preflight_rejections=preflight_rejections,
-        )
 
     if (
         not any_success

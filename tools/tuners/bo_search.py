@@ -24,7 +24,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from _common import (  # noqa: E402
     EvaluationBudgetExhausted,
-    DeepTuneTimeExhausted,
     resolve_score_fn,
     resolve_preflight_fn,
     timed_eval,
@@ -37,8 +36,6 @@ from _common import (  # noqa: E402
     clamp_search_space_to_preflight,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
-    deep_tune_time_remaining,
-    ensure_deep_tune_time_remaining,
     is_config_infeasible_error,
     load_candidate_modules,
     params_identity,
@@ -322,39 +319,6 @@ def main() -> int:
         "bo",
     )
 
-    def close_time_exhausted(
-        *,
-        trials_completed: int = 0,
-        trials_attempted: int = 0,
-        preflight_rejections: int = 0,
-    ) -> int:
-        elapsed_seconds = deep_tune_stage_elapsed(time_budget)
-        set_stage_meta(
-            args.tune_report_json,
-            "bo",
-            bout_index=time_budget["bout_index"],
-            status="time_exhausted",
-            elapsed_seconds=elapsed_seconds,
-            early_stopped=True,
-            early_stop_reason="time_budget",
-            preflight_rejections=preflight_rejections,
-            time_limit_seconds=time_budget["limit_seconds"],
-        )
-        write_json({
-            "method": "bo",
-            "status": "time_exhausted",
-            "reason": "candidate deep-tune wall-clock allocation exhausted",
-            "trials_completed": trials_completed,
-            "trials_attempted": trials_attempted,
-            "preflight_rejections": preflight_rejections,
-            "elapsed_seconds": round(elapsed_seconds, 1),
-            "time_limit_seconds": time_budget["limit_seconds"],
-        })
-        return 0
-
-    if time_budget["remaining_seconds"] <= 0:
-        return close_time_exhausted()
-
     # per-run framework overrides (Phase-3 OFAT): <run_dir>/framework_cfg.json tuner.*
     # explicit flag wins; else framework_cfg.json; else the historical defaults.
     _rc = load_run_cfg(args.candidate_path, "tuner")
@@ -368,11 +332,7 @@ def main() -> int:
     patience_override = args.patience if args.patience is not None else _rc.get("bo_patience")
 
     try:
-        ensure_deep_tune_time_remaining(time_budget)
         import optuna
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     except ImportError:
         set_stage_meta(
             args.tune_report_json,
@@ -390,10 +350,6 @@ def main() -> int:
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
     train_module, prepare_module = load_candidate_modules(
         args.candidate_path,
         expected_execution_revision=time_budget[
@@ -407,29 +363,15 @@ def main() -> int:
     if preflight_enabled:
         # Clamp the box to the preflight-feasible region before searching.
         # Anything residual that still fails is fed to TPE as a constraint.
-        try:
-            search_space = clamp_search_space_to_preflight(
-                search_space,
-                getattr(train_module, "BASE_PARAMS", None),
-                args.candidate_path,
-                args.tune_report_json,
-                admission_check=lambda: ensure_deep_tune_time_remaining(
-                    time_budget
-                ),
-                phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                    time_budget
-                ),
-                expected_execution_revision=time_budget[
-                    "candidate_execution_revision"
-                ],
-            )
-        except DeepTuneTimeExhausted:
-            return close_time_exhausted()
-
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted()
+        search_space = clamp_search_space_to_preflight(
+            search_space,
+            getattr(train_module, "BASE_PARAMS", None),
+            args.candidate_path,
+            args.tune_report_json,
+            expected_execution_revision=time_budget[
+                "candidate_execution_revision"
+            ],
+        )
     n_dims = len(search_space)
     if patience_override is not None:
         patience = int(patience_override)
@@ -608,7 +550,6 @@ def main() -> int:
         "duplicates_skipped": 0,
         "budget_exhausted": False,
         "budget_exhausted_scope": None,
-        "time_exhausted": False,
     }
     failure_refs = []
     known_scores: dict[str, float] = {}
@@ -642,20 +583,9 @@ def main() -> int:
         known_infeasible.add(params_identity(normalized))
     known_infeasible.difference_update(known_scores)
 
-    def admit_timed_work() -> None:
-        try:
-            ensure_deep_tune_time_remaining(time_budget)
-        except DeepTuneTimeExhausted:
-            counters["time_exhausted"] = True
-            early_stopped["flag"] = True
-            early_stopped["reason"] = "time_budget"
-            study.stop()
-            raise
-
     def objective(trial):
         params = {k: suggest(trial, k, search_space[k]) for k in search_space}
         params = cast_params_to_search_space(params, search_space)
-        admit_timed_work()
         identity = params_identity(params)
         if identity in known_scores:
             counters["duplicates_skipped"] += 1
@@ -670,19 +600,10 @@ def main() -> int:
                 preflight_result = timed_preflight(
                     params,
                     args.candidate_path,
-                    phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                        time_budget
-                    ),
                     expected_execution_revision=time_budget[
                         "candidate_execution_revision"
                     ],
                 )
-            except DeepTuneTimeExhausted:
-                counters["time_exhausted"] = True
-                early_stopped["flag"] = True
-                early_stopped["reason"] = "time_budget"
-                study.stop()
-                raise
             except Exception as exc:
                 _set_feasibility(trial, feasible=False)
                 failure = record_failure(
@@ -713,7 +634,6 @@ def main() -> int:
                 )
                 counters["preflight_rejections"] += 1
                 known_infeasible.add(identity)
-                admit_timed_work()
                 # Complete this Optuna trial as constrained-infeasible instead of
                 # FAILED: built-in samplers ignore failed trials, while constrained
                 # TPE can use this receipt to avoid nearby infeasible proposals.
@@ -726,9 +646,7 @@ def main() -> int:
                 status="ok",
                 result=preflight_result or {"status": "ok"},
             )
-            admit_timed_work()
         try:
-            admit_timed_work()
             score = timed_eval(
                 evaluate,
                 make_model,
@@ -736,41 +654,7 @@ def main() -> int:
                 args.candidate_path,
                 phase="phase_c",
                 method="bo",
-                phase_time_limit_seconds=lambda: deep_tune_time_remaining(
-                    time_budget
-                ),
             )
-        except DeepTuneTimeExhausted as exc:
-            if exc.attempt_reserved:
-                counters["objective_attempts"] += 1
-                failure = record_failure(
-                    report_path=args.tune_report_json,
-                    candidate_path=args.candidate_path,
-                    phase="phase_c",
-                    method="bo",
-                    params=params,
-                    error=exc,
-                    traceback_text=traceback.format_exc(),
-                )
-                append_trial(
-                    args.tune_report_json,
-                    "bo",
-                    {
-                        "params": params,
-                        "score": None,
-                        "status": "failed",
-                        "time_exhausted": True,
-                        "config_infeasible": False,
-                        **failure,
-                    },
-                )
-                if failure["failure_ref"] not in failure_refs:
-                    failure_refs.append(failure["failure_ref"])
-            counters["time_exhausted"] = True
-            early_stopped["flag"] = True
-            early_stopped["reason"] = "time_budget"
-            study.stop()
-            raise
         except EvaluationBudgetExhausted as exc:
             counters["budget_exhausted"] = True
             counters["budget_exhausted_scope"] = exc.scope
@@ -837,34 +721,16 @@ def main() -> int:
             early_stopped["reason"] = "patience"
             study.stop()
 
-    try:
-        ensure_deep_tune_time_remaining(time_budget)
-    except DeepTuneTimeExhausted:
-        return close_time_exhausted(
-            trials_completed=counters["objective_completed"],
-            trials_attempted=counters["objective_attempts"],
-            preflight_rejections=counters["preflight_rejections"],
-        )
     study.optimize(
         objective,
         n_trials=n_trials,
-        timeout=deep_tune_time_remaining(time_budget),
+        timeout=None,
         show_progress_bar=False,
         callbacks=[patience_callback],
         catch=(Exception,),
     )
 
     stage_elapsed = deep_tune_stage_elapsed(time_budget)
-    hit_time_limit = (
-        (
-            counters["time_exhausted"]
-            or deep_tune_time_remaining(time_budget) <= 0
-        )
-        and not counters["budget_exhausted"]
-    )
-    if hit_time_limit:
-        early_stopped["flag"] = True
-        early_stopped["reason"] = "time_budget"
 
     # TPE startup accounting. Optuna's sampler silently falls back to random
     # draws until the study holds n_startup_trials COMPLETE/PRUNED trials, so a
@@ -915,13 +781,6 @@ def main() -> int:
             "elapsed_seconds": round(stage_elapsed, 1),
         })
         return 0
-
-    if counters["objective_completed"] == 0 and hit_time_limit:
-        return close_time_exhausted(
-            trials_completed=0,
-            trials_attempted=counters["objective_attempts"],
-            preflight_rejections=counters["preflight_rejections"],
-        )
 
     if (
         counters["objective_completed"] == 0

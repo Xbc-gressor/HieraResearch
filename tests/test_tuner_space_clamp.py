@@ -163,26 +163,6 @@ class ClampTest(unittest.TestCase):
         for entry in receipt["probes"]:
             self.assertIn("elapsed_seconds", entry)
 
-    def test_admission_guard_runs_before_and_after_each_probe(self):
-        checks = []
-
-        def all_ok(params, candidate_path, **kwargs):
-            checks.append("preflight")
-            return {"status": "ok", "peak_vram_mb": 40000.0}
-
-        with mock.patch.object(
-            _common, "_configured_preflight_name", return_value="preflight_config"
-        ), mock.patch.object(_common, "timed_preflight", side_effect=all_ok):
-            clamp_search_space_to_preflight(
-                SPACE,
-                BASE,
-                self.candidate_path,
-                self.report_path,
-                admission_check=lambda: checks.append("guard"),
-            )
-
-        self.assertEqual(checks, ["guard", "preflight", "guard"])
-
     def test_sub_maximal_envelope_cannot_certify_feasibility(self):
         """A probe that admits it measured the wrong shape is not evidence.
 
