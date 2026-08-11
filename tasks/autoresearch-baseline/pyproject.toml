@@ -6,7 +6,6 @@ readme = "TASK.md"
 requires-python = ">=3.10"
 dependencies = [
     "cma>=3.3.0",
-    "gpytorch>=1.14",
     "kernels>=0.11.7",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
@@ -15,8 +14,6 @@ dependencies = [
     "pyarrow>=21.0.0",
     "requests>=2.32.0",
     "rustbpe>=0.1.0",
-    "scikit-learn>=1.5.0",
-    "smac>=2.0",
     "tiktoken>=0.11.0",
     "torch==2.9.1",
 ]
