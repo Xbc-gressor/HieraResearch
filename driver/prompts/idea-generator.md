@@ -113,6 +113,11 @@ Read `framework_cfg.json.semantic_search`. If absent, use
   bonus), computed from ledger edges; no LLM scores;
 - `coverage`: no LLM scores; select by under-covered hypotheses and point
   novelty;
+- `coverage_attempt`: coverage plus the policy-conditioned attempt downside —
+  how candidates previously built at this exact `(point_id, op)` turned out
+  under the current writer/route/evaluation policy. It only ever subtracts;
+- `coverage_carrier_attempt`: both deterministic channels, for checking
+  whether they double-count;
 - `gain`: predicted gain minus cost, with a small deterministic coverage term;
 - `gain_uncertainty`: predicted gain plus a separate uncertainty exploration
   bonus, minus cost, plus coverage;
@@ -126,9 +131,9 @@ pre-scale them. The deterministic selector maps the score to
 `llm_judgment_weight = score / 100` and applies it to the complete LLM-authored
 gain/uncertainty/cost term while leaving deterministic coverage unscaled.
 This is not a calibrated probability or a leaderboard-relative percentile.
-The `coverage` and `coverage_experience` policies ignore it.
+The four coverage-family policies ignore it.
 
-For `coverage` or `coverage_experience`, select directly:
+For any coverage-family policy, select directly:
 
 ```bash
 python tools/semantic_search.py select \
@@ -252,6 +257,14 @@ the prior and per-hypothesis carrier counts under `components` plus the
 selection index in `budget`; the legacy lane fields are null with
 `fallback: lanes_removed`.
 
+Under an attempt arm the receipt additionally records `attempt_prior` (always
+`<= 0`) and the `attempts` statistic: the full outcome partition
+(`crash` / `screen_success` / `screen_fail` / `screen_neutral` / `unpaired`),
+the leave-one-point-out base rate, and the contributing run ids. That signal is
+an empirical risk of re-selecting this point under the current policy — it is
+not causal evidence against the mechanism the point encodes, and it never
+blacklists a point or triggers a semantic prune.
+
 `select` also checks that the proposal set's `search_space_state_revision`
 equals the ledger's current overlay revision. A stale set is a protocol
 violation: re-run `propose` against the current overlay before selecting; never
@@ -263,7 +276,31 @@ missing scores.
 
 ## Step 4 — IDEATE a complete candidate at the selected point
 
-Read `point.json` and the relevant hypothesis claims. Produce:
+Read `point.json` and the relevant hypothesis claims. First obtain the route
+arm this run is configured for:
+
+```bash
+python tools/semantic_routes.py memory \
+  --ledger <run_dir>/ledger.json --point <...>/point.json --op <op> \
+  --output <...>/route-memory.json
+```
+
+The helper reports `n_route_sketches`, whether `route_memory` is on, and — when
+it is — a bounded relevance-ordered list of previously **planned** routes at
+this exact point first, then same-op semantic neighbors, nearer and newer
+first. Each row carries a route summary and that attempt's outcome. A row with
+`route_available: false` predates route provenance: it has no route to read, and
+you must not invent one for it. Neighbor rows are transfer context for
+generation only — never treat them as evidence about the target point itself,
+and never let any row veto the point the policy already selected.
+
+When `n_route_sketches` is 1, plan one explicit implementation route to the
+selected point and record it. When it is greater than 1, sketch that many
+genuinely distinct routes to the same point, rank them, and pick one — all
+inside this invocation. Do not spawn anything and do not make an extra model
+call for it. When it is 0 there is no planning step and no route record.
+
+Produce:
 
 - `idea`: a standalone, implementation-ready description of the resulting
   candidate. Explain the task-relevant components, their interactions, and how
@@ -303,8 +340,37 @@ python tools/ledger.py add-record \
   --background <run_dir>/background.md \
   --semantic-point <...>/point.json --policy-receipt <...>/policy.json \
   --idea '<complete solution>' --change '<parent-relative delta>' \
-  --candidate-name-hint '<name>' --description '<short summary>'
+  --candidate-name-hint '<name>' --description '<short summary>' \
+  [--route-provenance <...>/route-provenance.json]
 ```
+
+`--route-provenance` is required whenever the route arm is active
+(`n_route_sketches >= 1`, including the single-route planning baseline) and
+rejected content fails admission rather than degrading to the no-planning arm.
+Write it as:
+
+```json
+{
+  "schema_version": 1,
+  "point_id": "<copy from route-memory.json>",
+  "op": "<copy from route-memory.json>",
+  "n_route_sketches": 3,
+  "route_memory": true,
+  "memory_rows": ["<the rows array from route-memory.json, copied verbatim>"],
+  "sketches": [
+    {"sketch_id": "r1", "route": "<concrete implementation route>"},
+    {"sketch_id": "r2", "route": "..."},
+    {"sketch_id": "r3", "route": "..."}
+  ],
+  "preference_order": ["r2", "r1", "r3"],
+  "chosen_sketch_id": "r2",
+  "chosen_route": "<verbatim copy of the chosen sketch's route>"
+}
+```
+
+This records what you **planned**, before any code exists. It is not a claim
+about the implementation the candidate writer ultimately produces, and nothing
+downstream may read it as one.
 
 Run `add-record` once per structural action, in action order, and complete
 propose → select → `add-record` for one action before starting the next; an

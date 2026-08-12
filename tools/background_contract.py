@@ -35,6 +35,10 @@ from search_space_state import (
     validate_point_eligibility,
     validate_search_space_state,
 )
+from semantic_attempts import (
+    validate_attempt_detail,
+    validate_attempt_observations,
+)
 from semantic_evidence import (
     acquisition_target_relations,
     COVERAGE_KEYS,
@@ -144,6 +148,28 @@ POLICY_CONFIG_KEYS_V7 = POLICY_CONFIG_KEYS_V6 | {
     "carrier_pos_cap",
     "carrier_neg_weight",
     "carrier_neg_cap",
+    "attempt_noise_threshold",
+    "attempt_screen_weight",
+    "attempt_crash_weight",
+    "attempt_screen_prior_strength",
+    "attempt_crash_prior_strength",
+    "attempt_cap",
+}
+# Coverage-family arms. They share the "no model components" rule and differ
+# only in which deterministic channel is added to coverage, which is what makes
+# the carrier / attempt increments separately attributable.
+COVERAGE_POLICY_NAMES = {
+    "coverage",
+    "coverage_experience",
+    "coverage_attempt",
+    "coverage_carrier_attempt",
+}
+CARRIER_POLICY_NAMES = {"coverage_experience", "coverage_carrier_attempt"}
+ATTEMPT_POLICY_NAMES = {"coverage_attempt", "coverage_carrier_attempt"}
+POLICY_NAMES = COVERAGE_POLICY_NAMES | {
+    "gain",
+    "gain_uncertainty",
+    "gain_uncertainty_nocost",
 }
 
 
@@ -891,17 +917,15 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     policy_name = policy.get("name") if isinstance(policy, dict) else None
     if not isinstance(policy, dict) or set(policy) != {"name", "config"}:
         errors.append(f"{where}.policy_receipt.policy must contain only name and config")
-    elif policy_name not in {
-        "coverage",
-        "coverage_experience",
-        "gain",
-        "gain_uncertainty",
-        "gain_uncertainty_nocost",
-    }:
+    elif policy_name not in POLICY_NAMES:
         errors.append(
-            f"{where}.policy_receipt.policy.name must be coverage, "
-            "coverage_experience, gain, gain_uncertainty, or "
-            "gain_uncertainty_nocost"
+            f"{where}.policy_receipt.policy.name must be one of "
+            f"{sorted(POLICY_NAMES)}"
+        )
+    elif policy_name in ATTEMPT_POLICY_NAMES and receipt_schema != 7:
+        errors.append(
+            f"{where}.policy_receipt.policy.name {policy_name} requires "
+            "receipt schema 7"
         )
     config = policy.get("config") if isinstance(policy, dict) else None
     config_valid = True
@@ -980,7 +1004,12 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         "llm_judgment_weight",
     }
     if receipt_schema == 7:
-        required_components |= {"experience_prior", "carriers"}
+        required_components |= {
+            "experience_prior",
+            "carriers",
+            "attempt_prior",
+            "attempts",
+        }
     if not isinstance(components, dict) or set(components) != required_components:
         errors.append(
             f"{where}.policy_receipt.components must keep {sorted(required_components)} separate"
@@ -1006,7 +1035,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             components.get("experience_uncertainty_adjustment"),
         ]
         llm_judgment_weight = components.get("llm_judgment_weight")
-        if policy_name in {"coverage", "coverage_experience"}:
+        if policy_name in COVERAGE_POLICY_NAMES:
             model_components_valid = (
                 all(value is None for value in model_components)
                 and all(value is None for value in conditioned_components)
@@ -1042,10 +1071,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     f"{where}.policy_receipt gain policies require separate finite "
                     "predicted_gain, uncertainty, and cost values in [0, 1]"
                 )
-        if policy_name not in {
-            "coverage",
-            "coverage_experience",
-        }:
+        if policy_name not in COVERAGE_POLICY_NAMES:
             prior_values = (
                 components.get("prior_gain"),
                 components.get("prior_uncertainty"),
@@ -1109,10 +1135,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                         f"{where}.policy_receipt {label} must equal its prior "
                         "plus experience adjustment"
                     )
-        if policy_name not in {
-            "coverage",
-            "coverage_experience",
-        }:
+        if policy_name not in COVERAGE_POLICY_NAMES:
             expected_llm_weight = (
                 float(config["llm_intelligence_score"]) / 100.0
                 if config_valid
@@ -1143,14 +1166,14 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         if receipt_schema == 7:
             carrier_prior = components.get("experience_prior")
             carrier_detail = components.get("carriers")
-            if policy_name == "coverage_experience":
+            if policy_name in CARRIER_POLICY_NAMES:
                 if not (
                     isinstance(carrier_prior, (int, float))
                     and not isinstance(carrier_prior, bool)
                     and math.isfinite(float(carrier_prior))
                 ):
                     errors.append(
-                        f"{where}.policy_receipt coverage_experience requires a "
+                        f"{where}.policy_receipt {policy_name} requires a "
                         "finite components.experience_prior"
                     )
                 if not isinstance(carrier_detail, dict) or not all(
@@ -1164,7 +1187,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     for detail in carrier_detail.values()
                 ):
                     errors.append(
-                        f"{where}.policy_receipt coverage_experience components."
+                        f"{where}.policy_receipt {policy_name} components."
                         "carriers must map hypothesis ids to non-negative "
                         "integer counts"
                     )
@@ -1172,6 +1195,30 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 errors.append(
                     f"{where}.policy_receipt {policy_name} must not invent "
                     "carrier components"
+                )
+            attempt_prior = components.get("attempt_prior")
+            attempt_detail = components.get("attempts")
+            if policy_name in ATTEMPT_POLICY_NAMES:
+                # The attempt channel is a downside only: an observed success
+                # dilutes an existing penalty but never buys a bonus.
+                if not (
+                    isinstance(attempt_prior, (int, float))
+                    and not isinstance(attempt_prior, bool)
+                    and math.isfinite(float(attempt_prior))
+                    and float(attempt_prior) <= 0.0
+                ):
+                    errors.append(
+                        f"{where}.policy_receipt {policy_name} requires a finite "
+                        "non-positive components.attempt_prior"
+                    )
+                errors.extend(
+                    f"{where}.policy_receipt.components.{error}"
+                    for error in validate_attempt_detail(attempt_detail)
+                )
+            elif attempt_prior is not None or attempt_detail is not None:
+                errors.append(
+                    f"{where}.policy_receipt {policy_name} must not invent "
+                    "attempt components"
                 )
     evidence = receipt.get("evidence")
     if (
@@ -1183,7 +1230,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
             f"{where}.policy_receipt.evidence must contain at most five short strings"
         )
         evidence = []
-    if policy_name in {"coverage", "coverage_experience"} and evidence:
+    if policy_name in COVERAGE_POLICY_NAMES and evidence:
         errors.append(f"{where}.policy_receipt coverage policy evidence must be empty")
     if policy_name in {"gain", "gain_uncertainty", "gain_uncertainty_nocost"} and not evidence:
         errors.append(f"{where}.policy_receipt gain policies require selection evidence")
@@ -1259,7 +1306,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                     f"{where}.policy_receipt.experience.rationale must be "
                     "non-empty and at most 240 characters"
                 )
-            if policy_name in {"coverage", "coverage_experience"}:
+            if policy_name in COVERAGE_POLICY_NAMES:
                 if run_ids or edge_ids or experience_receipt.get("conditioning") != []:
                     errors.append(
                         f"{where}.policy_receipt coverage policy must not cite "
@@ -1437,13 +1484,23 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
         and config_valid
         and coverage_valid
         and model_components_valid
-        and policy_name in {"coverage", "coverage_experience", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
+        and policy_name in POLICY_NAMES
     ):
         coverage = float(components["coverage"])
-        if policy_name == "coverage":
-            expected_score = coverage
-        elif policy_name == "coverage_experience":
-            expected_score = coverage + float(components["experience_prior"])
+        if policy_name in COVERAGE_POLICY_NAMES:
+            channels = []
+            if policy_name in CARRIER_POLICY_NAMES:
+                channels.append(components.get("experience_prior"))
+            if policy_name in ATTEMPT_POLICY_NAMES:
+                channels.append(components.get("attempt_prior"))
+            if all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in channels
+            ):
+                expected_score = coverage + sum(float(value) for value in channels)
+            else:
+                # A malformed channel already produced its own error above.
+                expected_score = None
         elif policy_name == "gain_uncertainty_nocost":
             model_score = (
                 float(components["predicted_gain"])
@@ -1514,6 +1571,7 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
 def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     errors.extend(validate_lineage_snapshots(ledger))
+    errors.extend(validate_attempt_observations(ledger))
     records = ledger.get("records")
     if not isinstance(records, list):
         return ["ledger.records must be a list"]

@@ -1603,6 +1603,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 change="attempt to improve a missing parent",
                 candidate_name_hint="fixture_missing_parent",
                 description=None,
+                route_provenance=None,
             )
             with self.assertRaises(SystemExit) as raised:
                 cmd_add_record(args)
@@ -1672,6 +1673,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 change="from scratch after an unprocessed terminal delta",
                 candidate_name_hint="fixture_stale_dag",
                 description=None,
+                route_provenance=None,
             )
 
             with self.assertRaisesRegex(
@@ -1884,6 +1886,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 change="from scratch at a stale belief revision",
                 candidate_name_hint="fixture_stale_experience",
                 description=None,
+                route_provenance=None,
             )
             with self.assertRaises(SystemExit) as raised:
                 cmd_add_record(args)
@@ -1999,6 +2002,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 change="from scratch without usable experience evidence",
                 candidate_name_hint="fixture_empty_experience",
                 description=None,
+                route_provenance=None,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cmd_add_record(args), 0)
@@ -2118,6 +2122,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
                 change="from scratch at the pruned point",
                 candidate_name_hint="fixture_stale",
                 description=None,
+                route_provenance=None,
             )
             with self.assertRaises(SystemExit) as raised:
                 cmd_add_record(args)

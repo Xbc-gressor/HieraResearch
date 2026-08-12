@@ -79,6 +79,9 @@ from run_cfg import RunConfigError
 from search_space_state import (
     append_experience_transitions,
 )
+from semantic_attempts import (
+    capture_attempt_observation as _capture_attempt_observation,
+)
 from semantic_evidence import (
     DIRECT_COMPARATOR_CAPABILITY,
     DIRECT_COMPARATOR_CAPABILITY_KEY,
@@ -206,6 +209,10 @@ def cmd_add_record(args) -> int:
                 policy_receipt_path=Path(args.policy_receipt),
                 candidate_name_hint=args.candidate_name_hint,
                 description=args.description,
+                route_provenance_path=(
+                    Path(args.route_provenance) if args.route_provenance else None
+                ),
+                task_config=config,
             ),
         )
     except AdmissionError as exc:
@@ -484,6 +491,11 @@ def record_run(
     if transfer_errors:
         raise ValueError("; ".join(transfer_errors))
     _capture_transfer_parent_snapshot(data, record)
+    # The screening observation is frozen HERE, where final_best_score still
+    # equals the step 0+1 warm score. A repair may replace a provisional crash
+    # with this finite result; a later Phase-C close uses a different path and
+    # cannot rewrite the observation.
+    _capture_attempt_observation(data, record)
     after_graph_value = (record.get("status"), record.get("final_best_score"))
     if after_graph_value != before_graph_value:
         _touch_dag_record(data, record)
@@ -914,6 +926,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="semantic acquisition receipt JSON kept separate from observations")
     add.add_argument("--candidate-name-hint", required=True)
     add.add_argument("--description")
+    add.add_argument("--route-provenance", type=Path,
+                     help="planned route sketches, preference order, and chosen route; "
+                          "required when the run's route arm is enabled")
     add.set_defaults(func=cmd_add_record)
 
     tune = sub.add_parser("set-tuning", parents=[common])

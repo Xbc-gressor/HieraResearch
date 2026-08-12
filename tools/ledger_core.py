@@ -46,6 +46,7 @@ class LedgerData(TypedDict, total=False):
     run_state: dict[str, Any]
     search_space_state: dict[str, Any]
     lineage_snapshots: list[dict[str, Any]]
+    attempt_observations: list[dict[str, Any]]
 
 
 # Field order is the on-disk record layout. Keep stable; do not rename keys.
@@ -59,6 +60,7 @@ RECORD_FIELDS = (
     "semantic_point",
     "semantic_edges",
     "policy_receipt",
+    "route_provenance",
     "parameter_transfer",
     "applied_incumbent",
     "candidate_name",

@@ -461,6 +461,20 @@ def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
          "--point-output", semantic / "point.json",
          "--receipt-output", semantic / "policy.json"], repo_root)
     entrypoint = seed.get("entrypoint", "train.py")
+    # Nobody planned this candidate: it is the task's own file, copied in. The
+    # route arm records that explicitly rather than inventing a planned route.
+    route_provenance = semantic / "route-provenance.json"
+    route_provenance.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "not_applicable",
+                "reason": f"task-provided baseline entrypoint {entrypoint}",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     cmd(["python", "tools/ledger.py", "add-record",
          "--ledger", run_dir / "ledger.json", "--task", task,
          "--run-id", "000", "--kind", "optimization", "--op", "fresh",
@@ -471,6 +485,7 @@ def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
          "--semantic-point", semantic / "point.json",
          "--policy-receipt", semantic / "policy.json",
          "--candidate-name-hint", "provided_baseline",
+         "--route-provenance", route_provenance,
          "--description", f"Task-provided baseline: {entrypoint}"], repo_root)
     cmd(["python", "tools/new_candidate.py", task, tag, "000",
          "--provided-baseline"], repo_root)

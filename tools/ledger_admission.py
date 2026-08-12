@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from background_contract import (
+    ATTEMPT_POLICY_NAMES,
     load_registry,
     validate_background_markdown,
     validate_registry,
@@ -21,7 +22,13 @@ from ledger_core import (
     get_record,
     new_record,
 )
+from run_cfg import load_run_cfg
 from search_space_state import empty_search_space_state
+from semantic_attempts import (
+    DEFAULT_ATTEMPT_CONFIG,
+    attempt_adjustment,
+    classify_attempts,
+)
 from semantic_evidence import (
     SemanticEvidenceError,
     acquisition_conditioning,
@@ -31,9 +38,18 @@ from semantic_evidence import (
     validate_conditioned_adjustment,
     validate_conditioning_against_ledger,
 )
+from semantic_routes import (
+    RouteError,
+    build_route_memory,
+    is_not_applicable,
+    route_arm_active,
+    route_config,
+    validate_route_provenance,
+)
 from semantic_space import (
     SemanticSpaceError,
     digest,
+    point_id,
     resolve_dimension_catalog,
     resolve_dimension_strategy,
     space_receipt,
@@ -58,6 +74,8 @@ class AdmissionRequest:
     policy_receipt_path: Path
     candidate_name_hint: str
     description: str | None = None
+    route_provenance_path: Path | None = None
+    task_config: dict | None = None
 
 
 def _resolve_space(request: AdmissionRequest, data: dict) -> tuple[dict, dict, str]:
@@ -204,6 +222,88 @@ def _validate_experience_binding(
         raise AdmissionError("invalid policy receipt: " + "; ".join(errors))
 
 
+def _validate_route_provenance(
+    data: dict, request: AdmissionRequest, semantic_point: dict
+) -> dict | None:
+    """Resolve the route arm and validate the candidate's planned provenance.
+
+    When the arm is on, a missing or inconsistent route record is an admission
+    failure rather than a silent fall back to the no-memory arm — otherwise a
+    route experiment could report the wrong arm for part of its own run.
+    """
+    try:
+        cfg = route_config(load_run_cfg(request.background_path, "semantic_search"))
+    except RouteError as exc:
+        raise AdmissionError(str(exc)) from None
+    active = route_arm_active(cfg)
+    if request.route_provenance_path is None:
+        if active:
+            raise AdmissionError(
+                "the configured route arm requires --route-provenance "
+                f"(n_route_sketches={cfg['n_route_sketches']}, "
+                f"route_memory={cfg['route_memory']})"
+            )
+        return None
+    provenance = json.loads(request.route_provenance_path.read_text())
+    if is_not_applicable(provenance):
+        # Only a candidate nobody generated may opt out, and only a task that
+        # actually ships a baseline entrypoint has one.
+        seed = (request.task_config or {}).get("seed")
+        provided = seed.get("provided") if isinstance(seed, dict) else None
+        if not provided or data.get("records") or request.op != "fresh":
+            raise AdmissionError(
+                "route provenance may be marked not_applicable only for a "
+                "task-provided baseline admitted as the run's first record"
+            )
+    memory = build_route_memory(data, semantic_point, request.op, cfg)
+    errors = validate_route_provenance(provenance, memory=memory)
+    if errors:
+        raise AdmissionError("invalid route provenance: " + "; ".join(errors))
+    return provenance
+
+
+def _validate_attempt_binding(data: dict, record: dict, policy_receipt: dict) -> None:
+    """Rebind the receipt's attempt channel to the pre-admission ledger.
+
+    The receipt's shape is already validated upstream; what is not otherwise
+    checkable is whether the numbers describe *this* ledger.  Recomputing the
+    selected point's adjustment here makes a hand-edited counts / run_ids /
+    screen / crash statistic an admission failure instead of a persisted claim.
+    """
+    policy = policy_receipt.get("policy")
+    if not isinstance(policy, dict) or policy.get("name") not in ATTEMPT_POLICY_NAMES:
+        return
+    config = policy.get("config")
+    if not isinstance(config, dict) or not set(DEFAULT_ATTEMPT_CONFIG) <= set(config):
+        raise AdmissionError(
+            "invalid policy receipt: an attempt policy must record the attempt "
+            "configuration it scored with"
+        )
+    components = policy_receipt.get("components")
+    if not isinstance(components, dict):
+        raise AdmissionError("invalid policy receipt: components must be an object")
+    rows = classify_attempts(
+        data, noise_threshold=float(config["attempt_noise_threshold"])
+    )
+    expected_prior, expected_detail = attempt_adjustment(
+        rows,
+        point_id=point_id(record["semantic_point"]),
+        op=record["op"],
+        cfg=config,
+    )
+    if components.get("attempts") != expected_detail:
+        raise AdmissionError(
+            "invalid policy receipt: components.attempts does not equal the "
+            "attempt statistic recomputed from the ledger's own observations"
+        )
+    if components.get("attempt_prior") != expected_prior:
+        raise AdmissionError(
+            "invalid policy receipt: components.attempt_prior "
+            f"{components.get('attempt_prior')!r} does not equal the recomputed "
+            f"adjustment {expected_prior!r}"
+        )
+
+
 def admit_record(data: dict, request: AdmissionRequest) -> dict:
     """Validate and append one candidate, returning the new record."""
     try:
@@ -233,6 +333,9 @@ def admit_record(data: dict, request: AdmissionRequest) -> dict:
         semantic_point=semantic_point,
         semantic_edges=[],
         policy_receipt=policy_receipt,
+        # Recomputed against the pre-admission ledger, so the memory the
+        # generator was shown is exactly the memory validated here.
+        route_provenance=_validate_route_provenance(data, request, semantic_point),
         candidate_name=request.candidate_name_hint,
         description=request.description or request.idea,
         metric=data["metric"],
@@ -261,6 +364,7 @@ def admit_record(data: dict, request: AdmissionRequest) -> dict:
             "LLM-judgment reliability prior"
         )
     _validate_experience_binding(data, record, policy_receipt, parent_ids)
+    _validate_attempt_binding(data, record, policy_receipt)
 
     budget = policy_receipt.get("budget")
     expected_selection_index = len(data["records"]) + 1

@@ -49,6 +49,10 @@ from search_space_state import (
     replay_search_space_state,
     validate_point_eligibility,
 )
+from semantic_attempts import (
+    DEFAULT_ATTEMPT_CONFIG,
+    attempt_priors,
+)
 from semantic_evidence import (
     acquisition_conditioning,
     conditioning_cited_ids,
@@ -56,6 +60,7 @@ from semantic_evidence import (
     mechanical_gain_directions,
     validate_conditioned_adjustment,
 )
+from semantic_routes import DEFAULT_ROUTE_CONFIG
 from semantic_space import (
     SemanticSpaceError,
     complete_point,
@@ -77,7 +82,26 @@ PREDICTION_SCHEMA_VERSION = 3
 CONDITIONED_PREDICTION_SCHEMA_VERSION = 2
 LEGACY_PREDICTION_SCHEMA_VERSION = 1
 POLICY_RECEIPT_SCHEMA_VERSION = 7
-POLICIES = {"coverage", "coverage_experience", "gain", "gain_uncertainty", "gain_uncertainty_nocost"}
+POLICIES = {
+    "coverage",
+    "coverage_experience",
+    "coverage_attempt",
+    "coverage_carrier_attempt",
+    "gain",
+    "gain_uncertainty",
+    "gain_uncertainty_nocost",
+}
+# Coverage-family policies: no model prediction, no cost, no LLM judgment
+# weight. The four arms differ only in which deterministic channels are added
+# to coverage, so an experiment can attribute the increment.
+COVERAGE_POLICIES = {
+    "coverage",
+    "coverage_experience",
+    "coverage_attempt",
+    "coverage_carrier_attempt",
+}
+CARRIER_POLICIES = {"coverage_experience", "coverage_carrier_attempt"}
+ATTEMPT_POLICIES = {"coverage_attempt", "coverage_carrier_attempt"}
 DEFAULT_POLICY_CONFIG = {
     "coverage_weight": 0.10,
     "cost_weight": 0.20,
@@ -88,6 +112,7 @@ DEFAULT_POLICY_CONFIG = {
     "carrier_pos_cap": 2,
     "carrier_neg_weight": 0.20,
     "carrier_neg_cap": 3,
+    **DEFAULT_ATTEMPT_CONFIG,
 }
 MAX_PROPOSALS = 128
 MAX_EXPERIENCE_RUN_IDS = 5
@@ -1288,7 +1313,7 @@ def select_proposal(
             cfg[key] = float(value)
 
     prediction_by_id: dict[str, dict[str, Any]] = {}
-    if policy not in {"coverage", "coverage_experience"}:
+    if policy not in COVERAGE_POLICIES:
         prediction_by_id, prediction_errors = _prediction_map(
             predictions,
             proposal_set,
@@ -1300,10 +1325,15 @@ def select_proposal(
             raise ContractError("invalid policy predictions: " + "; ".join(prediction_errors))
 
     carrier_priors: dict[str, tuple[float, dict[str, dict[str, int]]]] = {}
-    if policy == "coverage_experience":
+    if policy in CARRIER_POLICIES:
         if not isinstance(ledger, dict):
-            raise ContractError("coverage_experience selection requires the ledger")
+            raise ContractError(f"{policy} selection requires the ledger")
         carrier_priors = _carrier_priors(proposal_set, ledger, cfg)
+    attempt_adjustments: dict[str, tuple[float, dict[str, Any]]] = {}
+    if policy in ATTEMPT_POLICIES:
+        if not isinstance(ledger, dict):
+            raise ContractError(f"{policy} selection requires the ledger")
+        attempt_adjustments = attempt_priors(proposal_set, ledger, cfg)
 
     ranked: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
     llm_judgment_weight = float(cfg["llm_intelligence_score"]) / 100.0
@@ -1318,10 +1348,16 @@ def select_proposal(
             if prediction is None or "cost" not in prediction
             else float(prediction["cost"])
         )
-        if policy == "coverage":
-            score = coverage
-        elif policy == "coverage_experience":
-            score = coverage + carrier_priors[point_id_value][0]
+        carrier_prior = (
+            None if policy not in CARRIER_POLICIES else carrier_priors[point_id_value][0]
+        )
+        attempt_prior = (
+            None
+            if policy not in ATTEMPT_POLICIES
+            else attempt_adjustments[point_id_value][0]
+        )
+        if policy in COVERAGE_POLICIES:
+            score = coverage + (carrier_prior or 0.0) + (attempt_prior or 0.0)
         elif policy == "gain":
             score = (
                 llm_judgment_weight
@@ -1371,15 +1407,17 @@ def select_proposal(
             ),
             "uncertainty": uncertainty,
             "cost": cost,
-            "experience_prior": (
-                None
-                if policy != "coverage_experience"
-                else carrier_priors[point_id_value][0]
-            ),
+            "experience_prior": carrier_prior,
             "carriers": (
                 None
-                if policy != "coverage_experience"
+                if policy not in CARRIER_POLICIES
                 else carrier_priors[point_id_value][1]
+            ),
+            "attempt_prior": attempt_prior,
+            "attempts": (
+                None
+                if policy not in ATTEMPT_POLICIES
+                else attempt_adjustments[point_id_value][1]
             ),
         }
         ranked.append((round(score, 10), point_id_value, proposal, components))
@@ -1397,10 +1435,14 @@ def select_proposal(
     snapshot = _experience_snapshot_receipt(experience)
     if prediction is not None:
         rationale = prediction["experience_rationale"]
-    elif policy == "coverage_experience":
+    elif policy in COVERAGE_POLICIES and policy != "coverage":
+        channels = []
+        if policy in CARRIER_POLICIES:
+            channels.append("carrier prior over recorded edges")
+        if policy in ATTEMPT_POLICIES:
+            channels.append("policy-conditioned attempt downside")
         rationale = (
-            "deterministic carrier prior over recorded edges; "
-            "no model-scored experience"
+            "deterministic " + " plus ".join(channels) + "; no model-scored experience"
         )
     else:
         rationale = "coverage policy does not use model-scored experience"
@@ -1459,7 +1501,12 @@ def _framework_policy_config(
     section = root.get("semantic_search", {})
     if not isinstance(section, dict):
         raise ContractError(f"{path}: semantic_search must be an object")
-    unknown = sorted(set(section) - ({"policy"} | set(DEFAULT_POLICY_CONFIG)))
+    # Route-arm keys configure idea generation, not acquisition; they are
+    # legal in this section but never enter the receipt's policy config.
+    unknown = sorted(
+        set(section)
+        - ({"policy"} | set(DEFAULT_POLICY_CONFIG) | set(DEFAULT_ROUTE_CONFIG))
+    )
     if unknown:
         raise ContractError(f"{path}: unknown semantic_search keys {unknown}")
     policy = section.get("policy")

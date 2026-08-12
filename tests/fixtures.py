@@ -531,7 +531,9 @@ def attach_matched_transfer(
     child["op"] = child.get("op") or "improve"
     policy = child.setdefault("policy_receipt", {"schema_version": 6})
     if isinstance(policy, dict):
-        policy["schema_version"] = 6
+        # Fill in what a schema-6 receipt needs, but never downgrade a real one:
+        # an attempt-family policy is only valid at schema 7.
+        policy.setdefault("schema_version", 6)
         config = policy.get("policy", {}).get("config")
         if isinstance(config, dict):
             config.setdefault("llm_intelligence_score", 100.0)
