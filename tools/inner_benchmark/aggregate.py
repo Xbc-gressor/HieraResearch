@@ -25,7 +25,7 @@ stale checkpoint silently relabel a cell's stratum.
 
 Usage:
     uv run python tools/inner_benchmark/aggregate.py \
-        --cells <cells-root> --checkpoints <checkpoints-root> \
+        --cells <cells-root> --checkpoints <ckpts-root-machineA> [<ckpts-root-machineB> ...] \
         [--out report.json] [--md report.md]
 """
 
@@ -76,37 +76,42 @@ def load_cells(cells_root) -> list[dict]:
     return cells
 
 
-def attach_checkpoint_info(cells: list[dict], checkpoints_root) -> None:
+def attach_checkpoint_info(cells: list[dict], checkpoints_roots) -> None:
     """Attach regime/stratum from the frozen checkpoint, hash-verified.
 
-    Adds ``regime`` / ``stratum`` / ``checkpoint_ok`` to each cell dict;
-    cells whose checkpoint is missing or hash-mismatched keep
-    ``checkpoint_ok=False`` and stratum "unknown" (they still appear in
-    the report's per-cell listing, never in a stratum they don't own).
+    ``checkpoints_roots`` is a list of roots (one per execution machine's
+    remeasured copy). Adds ``regime`` / ``stratum`` / ``checkpoint_ok`` to
+    each cell dict; cells whose checkpoint is missing or hash-mismatched
+    keep ``checkpoint_ok=False`` and stratum "unknown" (they still appear
+    in the report's per-cell listing, never in a stratum they don't own).
     """
-    index: dict[str, Path] = {}
-    for path in sorted(Path(checkpoints_root).rglob(checkpoint_mod.CHECKPOINT_FILENAME)):
-        data = json.loads(path.read_text())
-        checkpoint_id = data.get("checkpoint_id")
-        if checkpoint_id:
-            index[checkpoint_id] = path.parent
+    # Multiple roots: every execution machine remeasures its OWN checkpoint
+    # copy (PLAN §七/§八 same-machine scores), so the same checkpoint_id
+    # legitimately carries a different hash per machine. A cell verifies when
+    # its manifest hash matches ANY root's copy.
+    index: dict[str, list[Path]] = {}
+    for checkpoints_root in checkpoints_roots:
+        for path in sorted(Path(checkpoints_root).rglob(checkpoint_mod.CHECKPOINT_FILENAME)):
+            data = json.loads(path.read_text())
+            checkpoint_id = data.get("checkpoint_id")
+            if checkpoint_id:
+                index.setdefault(checkpoint_id, []).append(path.parent)
     for cell in cells:
         manifest = cell["manifest"]
         cell["checkpoint_ok"] = False
         cell["regime"] = "unknown"
         cell["stratum"] = "unknown"
-        checkpoint_dir = index.get(manifest.get("checkpoint_id"))
-        if checkpoint_dir is None:
-            continue
-        digest = hashlib.sha256(
-            (checkpoint_dir / checkpoint_mod.CHECKPOINT_FILENAME).read_bytes()
-        ).hexdigest()
-        if digest != manifest.get("checkpoint_hash"):
-            continue  # stale checkpoint vs the cell's manifest: miswired
-        frozen = checkpoint_mod.load_checkpoint(checkpoint_dir)
-        cell["checkpoint_ok"] = True
-        cell["regime"] = frozen.regime
-        cell["stratum"] = frozen.stratum
+        for checkpoint_dir in index.get(manifest.get("checkpoint_id"), []):
+            digest = hashlib.sha256(
+                (checkpoint_dir / checkpoint_mod.CHECKPOINT_FILENAME).read_bytes()
+            ).hexdigest()
+            if digest != manifest.get("checkpoint_hash"):
+                continue  # not the copy this cell ran against
+            frozen = checkpoint_mod.load_checkpoint(checkpoint_dir)
+            cell["checkpoint_ok"] = True
+            cell["regime"] = frozen.regime
+            cell["stratum"] = frozen.stratum
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +447,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoints",
         required=True,
-        help="frozen checkpoints root (stratum attachment + hash verify)",
+        nargs="+",
+        help="frozen checkpoints roots — one per execution machine's "
+        "remeasured copy (stratum attachment + hash verify against ANY root)",
     )
     parser.add_argument("--out", default=None, help="write the JSON report here")
     parser.add_argument("--md", default=None, help="write the markdown summary here")

@@ -118,7 +118,7 @@ def corpus(tmp_path):
 
 def build(corpus):
     cells = aggregate.load_cells(corpus["cells"])
-    aggregate.attach_checkpoint_info(cells, corpus["ckpts"])
+    aggregate.attach_checkpoint_info(cells, [corpus["ckpts"]])
     return aggregate.summarize(cells)
 
 
@@ -205,3 +205,41 @@ def test_cli_writes_reports(corpus, tmp_path) -> None:
     report = json.loads(out.read_text())
     assert set(report["by_stratum"]) >= {"first", "cont_improved", "unknown"}
     assert "stratum: first" in md.read_text()
+
+
+def test_multiple_checkpoint_roots_per_machine_remeasure(corpus, tmp_path) -> None:
+    """Two machines remeasure their own copies: same checkpoint_id, different
+    hash. A cell verifies against whichever root carries its machine's copy."""
+    import shutil
+
+    # Machine B's copy of checkpoint A: remeasure rewrote scores -> new hash.
+    ckpt_a = corpus["ckpts"] / "A"
+    ckpt_b_copy = tmp_path / "machineB" / "A"
+    shutil.copytree(ckpt_a, ckpt_b_copy)
+    data = json.loads((ckpt_b_copy / "checkpoint.json").read_text())
+    data["incumbent"]["score"] = 9.5  # remeasured on machine B
+    (ckpt_b_copy / "checkpoint.json").write_text(json.dumps(data))
+
+    cells = aggregate.load_cells(corpus["cells"])
+    aggregate.attach_checkpoint_info(cells, [corpus["ckpts"], tmp_path / "machineB"])
+    by_id = {
+        (row["arm"], row["seed"]): row
+        for row in aggregate.summarize(cells)["cells"]
+    }
+    # Cells fabricated against the original copy verify via the first root.
+    assert by_id[("current", 1)]["checkpoint_ok"] is True
+    # A cell run against machine B's copy verifies via the second root.
+    b_cell = write_cell(
+        corpus["cells"], "a-cur-b", ckpt_a, "current", 3,
+        auc=11.0, final=13.0, hash_override=_checkpoint_hash(ckpt_b_copy),
+    )
+    cells = aggregate.load_cells(corpus["cells"])
+    aggregate.attach_checkpoint_info(cells, [corpus["ckpts"], tmp_path / "machineB"])
+    report = aggregate.summarize(cells)
+    row = [r for r in report["cells"] if r["cell_dir"] == str(b_cell)][0]
+    assert row["checkpoint_ok"] is True
+    assert row["stratum"] == "first"
+    # ...but flagged when its machine's root is not given.
+    aggregate.attach_checkpoint_info(cells, [corpus["ckpts"]])
+    row = [r for r in aggregate.summarize(cells)["cells"] if r["cell_dir"] == str(b_cell)][0]
+    assert row["checkpoint_ok"] is False
