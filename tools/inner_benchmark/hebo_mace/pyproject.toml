@@ -1,0 +1,32 @@
+[project]
+name = "inner-benchmark-hebo-mace"
+version = "0.1.0"
+description = "Isolated official-HEBO MACE ranker for the inner-tuner benchmark (PLAN §6.4)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # Official HEBO codebase, pinned commit (PLAN §6.4: 使用官方 HEBO codebase
+    # 并 pin commit/version). install_requires comes from HEBO/requirements.txt
+    # at that commit: numpy>=1.16,<1.25 (caps the env at CPython 3.11 — numpy
+    # 1.24 has no cp312 wheels), torch>=1.9, pymoo==0.6.0, gpytorch>=1.4,
+    # GPy>=1.9.9, catboost, scikit-learn, pandas, disjoint-set.
+    "hebo",
+    # Unpinned, the resolver falls back to gpy 1.9.9 (2019, sdist-only, fails
+    # to compile on CPython 3.11): gpy 1.14.x needs numpy>=2 (HEBO caps
+    # numpy<1.25) and gpy 1.13.2 caps scipy<=1.12.0 (newest scikit-learn
+    # pulls a newer scipy), so both get excluded. Pinning 1.13.2 (has cp311
+    # manylinux wheels) forces the consistent older generation. GPy itself is
+    # never imported on our code path (only hebo/models/gp/gpy_wgp.py and
+    # gpy_mlp.py import it, and nothing imports those).
+    "gpy==1.13.2",
+]
+
+[tool.uv.sources]
+hebo = { git = "https://github.com/huawei-noah/HEBO", rev = "ee6112d39d1a9e9703fecaf9057193e1ec9dae72", subdirectory = "HEBO" }
+torch = { index = "pytorch-cpu" }
+
+# CPU-only torch wheels: the default PyPI torch wheel pulls multi-GB CUDA
+# libraries; this env only ever runs CPU surrogate fitting.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

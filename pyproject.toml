@@ -4,7 +4,15 @@ version = "0.1.0"
 description = "Claude Agent SDK-driven multi-task autoresearch harness"
 readme = "README_ZH.md"
 requires-python = ">=3.11"
-dependencies = ["claude-agent-sdk"]
+dependencies = [
+    "claude-agent-sdk",
+    # Inner-tuner benchmark cells run in this env (review §E): optimizer libs
+    # for the numerical arms. Evaluation subprocesses run in the task project
+    # env instead (objective.python_cmd_for_project).
+    "cma>=3.3.0",
+    "optuna>=3.6.0",
+    "scikit-learn>=1.5",
+]
 
 [dependency-groups]
 dev = ["pytest", "numpy"]

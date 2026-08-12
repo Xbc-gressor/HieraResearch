@@ -1,0 +1,35 @@
+"""Benchmark arms (PLAN §六) — lazy registry.
+
+Importing an arm module pays for that arm's optimizer deps (optuna / sklearn /
+the isolated HEBO env), so the registry never imports arms itself: a cell
+driver loads exactly the one arm it runs. Every arm module defines a
+module-level ``ARM`` singleton (arm_api protocol; per-cell state lives in the
+``run(ctx)`` generator's locals, never on the object).
+"""
+
+from __future__ import annotations
+
+import importlib
+
+ARM_MODULES = {
+    "current": "arms.current",
+    "llm_hillclimb": "arms.llm_hillclimb",
+    "active_set": "arms.active_set",
+    "local_tr": "arms.local_tr",
+    "spsa": "arms.spsa",
+    "llm_pool_self_rank": "arms.llm_pool_self_rank",
+    "pool_gp_ei": "arms.pool_gp_ei",
+    "pool_tpe": "arms.pool_tpe",
+    "pool_hebo_mace": "arms.pool_hebo_mace",
+}
+
+
+def load_arm(name: str):
+    """Import the named arm module and return its ARM singleton."""
+    if name not in ARM_MODULES:
+        raise KeyError(f"unknown arm {name!r}; registered: {sorted(ARM_MODULES)}")
+    module = importlib.import_module(ARM_MODULES[name])
+    return module.ARM
+
+
+__all__ = ["ARM_MODULES", "load_arm"]
