@@ -19,13 +19,6 @@ from driver.roles import InvocationContext  # noqa: E402
 from driver.session import FakeSessionRunner  # noqa: E402
 from ib_support import cfg, write_checkpoint  # noqa: E402
 
-TOY_TASK = {
-    "score_fn": "evaluate_config",
-    "preflight_fn": "preflight_config",
-    "per_runtime_limit": 900,
-    "project": "tasks/toy-task",
-}
-
 
 def pool_receipt(step):
     """A valid POOL=5 receipt; lr offsets keep every step's members distinct."""
@@ -45,7 +38,11 @@ def pool_receipt(step):
 
 
 def test_execute_cell_end_to_end_with_fake_sessions(tmp_path) -> None:
-    ckpt = write_checkpoint(tmp_path, task=TOY_TASK)
+    # Default task (project None): the eval/preflight subprocesses use the
+    # root interpreter. Pointing task.project at a real second project env is
+    # NOT this test's job — the partition is pinned by the runner/objective
+    # tests, and uv's nonexistent-project fallback differs across uv releases.
+    ckpt = write_checkpoint(tmp_path)
     out = tmp_path / "out"
     fake = FakeSessionRunner([{"receipt": pool_receipt(step)} for step in range(3)])
 
@@ -71,9 +68,10 @@ def test_execute_cell_end_to_end_with_fake_sessions(tmp_path) -> None:
     assert manifest["extra"]["machine"]["label"] == "testbox"
     assert manifest["extra"]["machine"]["hostname"]
     assert manifest["arm"] == "llm_pool_self_rank"
-    # Invocation context: task name from task.project, cell-identifying tag.
+    # Invocation context: task name falls back to "unknown" (no project),
+    # tag identifies the cell.
     _, ctx = fake.calls[0]
-    assert ctx.task == "toy-task"
+    assert ctx.task == "unknown"
     assert ctx.tag == "ckpt--llm_pool_self_rank--s11"
     # One run_dir per cell (D16): driver artifacts gather under <out>/llm.
     assert ctx.run_dir == out / "llm"
