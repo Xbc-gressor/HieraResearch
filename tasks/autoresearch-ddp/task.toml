@@ -1,0 +1,51 @@
+name = "autoresearch-ddp"
+description = "Multi-GPU (DDP) variant of the autoresearch pretraining task. Default world size 4."
+
+[env]
+type = "uv"
+project = "tasks/autoresearch-ddp"
+
+[run]
+working_dir = "tasks/autoresearch-ddp"
+prepare_command = "uv run python prepare.py"
+# Higher than the single-GPU baseline's 900s: N ranks each pay torch.compile
+# and FA3 kernel load at startup (excluded from the 300s training budget but
+# counted in wall-clock).
+timeout_seconds = 1500
+
+[seed]
+target_count = 1
+# Both experiment protocols admit this exact entrypoint as their observed
+# starting control.
+provided = ["train.py"]
+entrypoint = "train.py"
+
+# The single config->score evaluation function. Semantics + hard rules live in
+# TASK.md's `## Evaluation Contract`. score_fn(make_model, params) -> float,
+# lower-is-better; it is the ONE surface (warm-start eval + Phase C tuning) for
+# the experiment loop. The standalone `python train.py` run (manual/hillclimb)
+# still prints the summary parsed via [result].
+#
+# Multi-GPU: world size is a fixed task constant (prepare.WORLD_SIZE, default
+# 4, overridable only via AUTORESEARCH_DDP_WORLD_SIZE for single-GPU
+# regression). When world size > 1 the score/preflight/probe functions
+# internally launch a torchrun process group; their signatures and budget
+# accounting are identical to the single-GPU task.
+[evaluation]
+score_fn = "evaluate_config"
+environment_preflight_fn = "preflight_environment"
+preflight_fn = "preflight_config"
+# Optional no-score resource oracle for the search-space clamp: same contract as
+# preflight_fn, but pinned to the worst-case training shape (T = MAX_SEQ_LEN).
+resource_probe_fn = "resource_probe_config"
+
+[result]
+metric = "val_bpb"
+parser = "tools/parse_result.py"
+required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
+results_file = "ledger.json"
+
+[constraints]
+editable_files = ["train.py"]
+readonly_files = ["prepare.py"]
+allow_dependencies = false

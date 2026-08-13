@@ -441,6 +441,57 @@ class ExperimentTests(unittest.TestCase):
         self.assertTrue((run_dir / "background.md").exists())
         self.assertTrue((run_dir / "run_metadata.json").exists())
 
+    def test_preseeded_background_skips_researcher(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, True]
+        cmd.run_dir.mkdir(parents=True, exist_ok=True)
+        (cmd.run_dir / "background.md").write_text("# frozen\n")
+        (cmd.run_dir / "background_retrieval.json").write_text("{}")
+        runner = FakeSessionRunner([
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep",
+                         "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        roles = [name for name, _ in runner.calls]
+        self.assertEqual(roles, ["idea-generator", "candidate-writer",
+                                 "tunable-contract-extractor",
+                                 "tuner-orchestrator"])
+        # the frozen artifacts are validated once and left untouched
+        self.assertEqual(
+            sum("background_contract.py validate" in call
+                for call in cmd.calls),
+            1)
+        self.assertEqual((cmd.run_dir / "background.md").read_text(),
+                         "# frozen\n")
+
+    def test_invalid_preseeded_background_blocks_without_repair(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.run_dir.mkdir(parents=True, exist_ok=True)
+        (cmd.run_dir / "background.md").write_text("# frozen\n")
+        (cmd.run_dir / "background_retrieval.json").write_text("{}")
+        cmd.fail_next = {"background_contract.py validate"}
+        runner = FakeSessionRunner([])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(runner.calls, [])
+        self.assertEqual((cmd.run_dir / "background.md").read_text(),
+                         "# frozen\n")
+
     def test_prepare_runs_in_task_working_dir(self) -> None:
         write_task(self.repo)
         cmd = ExperimentCmd(self.repo)

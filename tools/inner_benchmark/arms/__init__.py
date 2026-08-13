@@ -13,6 +13,7 @@ import importlib
 
 ARM_MODULES = {
     "current": "arms.current",
+    "random_search": "arms.random_search",
     "llm_hillclimb": "arms.llm_hillclimb",
     "active_set": "arms.active_set",
     "local_tr": "arms.local_tr",

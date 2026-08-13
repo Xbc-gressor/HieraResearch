@@ -346,15 +346,30 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     common.preflight_env(task, run_dir, repo_root, cmd)
     write_metadata(run_dir, model, cli_path)
 
-    # background-researcher runs ONCE, never in the loop
+    # background-researcher runs ONCE, never in the loop. A run dir pre-seeded
+    # with a frozen background (background.md + retrieval manifest) skips
+    # generation entirely; the same deterministic validators gate it, and a
+    # failure blocks rather than letting the researcher rewrite the frozen
+    # artifacts.
     strategy = _dimension_strategy(run_dir)
-    try:
-        _invoke(runner, store, "background-researcher", task, tag, run_dir)
-    except InvocationFailed as exc:
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"background-researcher failed: {exc.problems}")
-    _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
-                         events, strategy)
+    preseeded = (
+        (run_dir / "background.md").exists()
+        and (run_dir / "background_retrieval.json").exists()
+    )
+    if preseeded:
+        errors = _background_validation_errors(run_dir, repo_root, cmd,
+                                               strategy)
+        if errors:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"pre-seeded background validation failed: {errors}")
+    else:
+        try:
+            _invoke(runner, store, "background-researcher", task, tag, run_dir)
+        except InvocationFailed as exc:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"background-researcher failed: {exc.problems}")
+        _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
+                             events, strategy)
 
 
 def _background_validation_errors(run_dir, repo_root, cmd,
