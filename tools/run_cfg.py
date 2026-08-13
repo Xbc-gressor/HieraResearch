@@ -129,6 +129,19 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
                 "in [0, 100)"
             )
 
+    if "scheduler_policy" in tuner:
+        # Scheduler v3.2 is an isolated policy arm; anything else is the
+        # legacy percentile/alternation gate. A typo here must fail loudly
+        # rather than silently run the arm the experiment is comparing against.
+        value = tuner["scheduler_policy"]
+        if value not in ("legacy", "v3_2"):
+            raise RunConfigError(
+                f"{path}: tuner.scheduler_policy must be 'legacy' or 'v3_2'"
+            )
+
+    for key in ("scheduler_scenarios", "max_bouts_per_candidate"):
+        _validate_positive_int_override(tuner, key, path, label=f"tuner.{key}")
+
     if tuner.get("deep_tune_budget_fraction") is not None:
         # null (or the key omitted) = no run-level Phase-C share, the default.
         value = tuner["deep_tune_budget_fraction"]
@@ -160,6 +173,55 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             )
 
 
+def _validate_scheduler_v3_2(config: dict, tuner: dict, path: Path) -> None:
+    """Reject configs whose real admission layer cannot execute a v3.2 decision.
+
+    v3.2's whole resource contract is "a bout is admitted at full `B` or not
+    at all", and the scheduler decides against a `remaining_budget` it reads
+    from the same attempt log `reserve_evaluation` enforces. Three ways a
+    run config can break that agreement, all silently:
+
+    * **no `max_evaluations`.** The scheduler allocates a finite budget
+      between TUNE and DEFER. With no cap there is nothing to allocate and
+      `load_state` cannot even build a state.
+    * **an explicit `deep_tune_budget_fraction`.** It is a second, invisible
+      ceiling on Phase C that the scheduler does not model: decisions keep
+      returning full TUNE while `reserve_evaluation` starts refusing the
+      reservations, so a chosen bout dies partway and the realized
+      transition stops matching the simulated one.
+    * **`deep_tune_per_candidate_cap` below `B * MAX_BOUTS`.** The legacy
+      per-candidate attempt cap is what v3.2's bout cap replaces. Left
+      smaller, it truncates a bout the scheduler admitted at full `B`.
+
+    Rejecting here rather than at decide time is deliberate: the failure is
+    a property of the run's configuration, so it should stop the run before
+    it spends its first evaluation.
+    """
+    if config.get("max_evaluations") is None:
+        raise RunConfigError(
+            f"{path}: tuner.scheduler_policy 'v3_2' requires max_evaluations "
+            "(the scheduler allocates a bounded budget between TUNE and DEFER)"
+        )
+    if tuner.get("deep_tune_budget_fraction") is not None:
+        raise RunConfigError(
+            f"{path}: tuner.deep_tune_budget_fraction is incompatible with "
+            "tuner.scheduler_policy 'v3_2' — the bout contract "
+            "(B x MAX_BOUTS_PER_CANDIDATE) is the only Phase-C ceiling under "
+            "v3.2; set it to null"
+        )
+    bout_trials = int(tuner.get("bout_trials", 10))
+    max_bouts = int(tuner.get("max_bouts_per_candidate", 4))
+    per_candidate_cap = int(tuner.get("deep_tune_per_candidate_cap", 40))
+    required = bout_trials * max_bouts
+    if per_candidate_cap < required:
+        raise RunConfigError(
+            f"{path}: tuner.deep_tune_per_candidate_cap ({per_candidate_cap}) "
+            f"is below the v3.2 bout contract ({bout_trials} trials x "
+            f"{max_bouts} bouts = {required}); it would truncate a bout the "
+            "scheduler admitted at full B"
+        )
+
+
 def _validate_framework_cfg(config: dict, path: Path) -> None:
     """Validate the hard-limit fields shared by deterministic consumers."""
     _validate_optional_positive_int(config, "max_evaluations", path)
@@ -172,6 +234,8 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
     if not isinstance(tuner, dict):
         raise RunConfigError(f"{path}: tuner must be an object")
     _validate_tuner_config(tuner, path)
+    if tuner.get("scheduler_policy") == "v3_2":
+        _validate_scheduler_v3_2(config, tuner, path)
 
 
 def read_framework_cfg(path: Any) -> dict:

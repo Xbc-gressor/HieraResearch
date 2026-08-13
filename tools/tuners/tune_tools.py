@@ -3958,10 +3958,64 @@ def _run_cfg(ledger_path: Path, section: str) -> dict:
     return {}
 
 
+def _v3_2_selection(ledger_path: Path, scenarios: int | None) -> dict:
+    """Delegate the choice to the scheduler v3.2 policy arm.
+
+    The switch is per-run (`tuner.scheduler_policy`), so a scheduler
+    experiment changes one isolated layer while the inner tuner and the
+    semantic generation policy stay fixed — the attribution requirement in
+    the project's research plan.
+
+    The result is translated into this command's existing receipt shape so
+    the orchestrator's call site does not change: `run_id: null` still means
+    "no bout this round". Under v3.2 that covers DEFER (a timing decision
+    with a live next round) as well as a terminal state, which the extra
+    `scheduler` block distinguishes.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    from tools.scheduler.session import decide_for_run  # noqa: PLC0415
+
+    view = decide_for_run(ledger_path, scenarios=scenarios)
+    state = view["state"]
+    selected = view["action"] == "TUNE"
+    candidate = next(
+        (c for c in state.candidates if c.run_id == view["run_id"]), None
+    )
+    return {
+        "run_id": view["run_id"] if selected else None,
+        "reason": view["reason"],
+        "is_continuation": bool(candidate and candidate.bouts_used > 0),
+        "bout_index": candidate.bouts_used if candidate else 0,
+        "tuning_bouts": candidate.bouts_used if candidate else 0,
+        "n_candidates": len(state.candidates),
+        "scheduler": {
+            "policy_version": view["policy_version"],
+            "decision_id": view["decision_id"],
+            "state_snapshot_id": view["state_snapshot_id"],
+            "action": view["action"],
+            "defer_available": view["defer_available"],
+            "coverage_spent": view["coverage_spent"],
+            "evidence_mode": view["evidence_mode"],
+            "reused_open_decision": view["reused_open_decision"],
+            "reconciled": view["reconciled"],
+        },
+        "budget_allocation": {
+            "global_remaining": state.remaining_budget,
+            # v3.2 admits a bout at full B or not at all: there is no
+            # truncated bout to allocate a smaller cap for.
+            "trial_cap": state.contract.bout_trials if selected else None,
+            "bout_trials": state.contract.bout_trials,
+        },
+    }
+
+
 def cmd_select_candidate(args) -> int:
     led = Path(args.ledger)
     ledger = json.loads(led.read_text())
     rc = _run_cfg(led, "tuner")  # explicit flag wins; else framework_cfg.json; else module default
+    if str(rc.get("scheduler_policy", "legacy")) == "v3_2":
+        print(json.dumps(_v3_2_selection(led, rc.get("scheduler_scenarios")), indent=2))
+        return 0
     top_p = args.top_percentile if args.top_percentile is not None else float(rc.get("top_percentile", DEFAULT_TOP_PERCENTILE))
     # n_min DERIVES from top_percentile: the smallest population for which the
     # top-(100-P)% gate can contain >=1 candidate, i.e. ceil(100/(100-P))

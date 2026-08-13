@@ -73,6 +73,30 @@ against each other. A candidate with an unresolved primary descendant is
 temporarily ineligible. `budget_allocation.trial_cap` is
 `min(tuner.bout_trials, per-candidate cap remaining, budget remaining)`.
 
+**When `tuner.scheduler_policy` is `v3_2`** the same command answers from the
+scheduler v3.2 policy instead, and the receipt carries an extra `scheduler`
+block. Read it, do not re-derive it:
+
+- `scheduler.action` is `TUNE`, `DEFER`, or `STOP`. `run_id` is non-null only
+  for `TUNE`, and it names the **exact** candidate — the scheduler already
+  compared the whole action set, so never re-select, re-rank, or override it.
+- `DEFER` means "spend nothing on tuning this round, take another generation
+  round first". `STOP` means no action is admissible at all. Both print
+  `run_id: null` and both are handled the same way you already handle a null
+  `run_id`: sweep for stranded work, then submit the no-op receipt.
+- A bout runs at the full `budget_allocation.bout_trials` or not at all —
+  v3.2 admits no truncated bout, so `trial_cap` is the full bout for a
+  `TUNE` and `null` otherwise. The gate is budget and bout-cap
+  (`tuner.max_bouts_per_candidate`, default 4), not the percentile /
+  alternation / responder rules above; those do not apply under this policy.
+- The decision is already recorded under `<run_dir>/.scheduler/`. The
+  scheduler derives both its evidence and the decision→execution binding from
+  the ledger and each candidate's `tune_report.json`, so you report nothing
+  back to it. A decision stays open until those artifacts show it ran, and
+  asking again before anything has run returns the same open decision
+  (`scheduler.reused_open_decision` is true) rather than a new one — a
+  corrective follow-up therefore never manufactures a second decision.
+
 - **`run_id` is `null`** → no candidate is eligible this round (below
   `N_min`; the top tier is tuned and no continuation responded; every tuned
   candidate is a non-responder; or cap/budget exhaustion). No new bout runs.
