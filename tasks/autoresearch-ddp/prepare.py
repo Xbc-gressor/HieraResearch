@@ -48,7 +48,12 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+# Training time budget in seconds. This variant is the wall-clock compression
+# of the single-GPU task's 300 s run: with per-rank batch aligned so the
+# total batch and per-step semantics match single-GPU, 4 ranks reproduce that
+# run's step count and trajectory in ~1/4 the wall-clock. 75 s assumes ideal
+# scaling; calibrate against the target machine (85% efficiency -> ~88 s).
+TIME_BUDGET = 75
 EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
 # Fixed task constant: one evaluation trains across this many GPUs with DDP.
@@ -380,7 +385,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000, rank=0, world_size
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, rank=0, world_size=1):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -388,12 +393,18 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
 
-    Runs on the calling rank only. In a DDP run the candidate calls this on
-    rank 0 with the unwrapped model and broadcasts the result.
+    Multi-GPU: with world_size > 1 every rank evaluates its deterministic
+    disjoint shard of the pinned validation set (same stride rule as the
+    training dataloader), and the two sums are all-reduced before the
+    division — the metric definition is unchanged, the full validation set
+    is covered exactly once, and every rank returns the same value. The
+    candidate must therefore call this on ALL ranks with the unwrapped
+    model (a DDP forward here would double-synchronize).
     """
     token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val",
+                                 rank=rank, world_size=world_size)
+    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN * world_size)
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
@@ -404,6 +415,13 @@ def evaluate_bpb(model, tokenizer, batch_size):
         mask = nbytes > 0
         total_nats += (loss_flat * mask).sum().item()
         total_bytes += nbytes.sum().item()
+    if world_size > 1:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            sums = torch.tensor([total_nats, float(total_bytes)],
+                                dtype=torch.float64, device="cuda")
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+            total_nats, total_bytes = float(sums[0].item()), float(sums[1].item())
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
@@ -422,14 +440,14 @@ class PretrainEnv:
     Multi-GPU: `rank`/`world_size` identify this process's DDP rank. The bound
     `make_dataloader` automatically serves this rank's deterministic disjoint
     shard of the training stream, so candidate code calls it exactly as in the
-    single-GPU task. `evaluate_bpb` is rank-agnostic: the candidate calls it
-    on rank 0 only and broadcasts the scalar."""
+    single-GPU task. The bound `evaluate_bpb` likewise evaluates this rank's
+    validation shard and all-reduces the two metric sums; the candidate calls
+    it on every rank and gets the full-set value back on each."""
 
     def __init__(self, rank: int = 0, world_size: int = 1):
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.tokenizer = Tokenizer.from_directory()
-        self.evaluate_bpb = evaluate_bpb
         self.max_seq_len = MAX_SEQ_LEN
         self.train_budget_seconds = TIME_BUDGET
         self.vocab_size = self.tokenizer.get_vocab_size()
@@ -442,7 +460,14 @@ class PretrainEnv:
                 rank=self.rank, world_size=self.world_size, **kwargs,
             )
 
+        def sharded_evaluate_bpb(model, tokenizer, batch_size):
+            return evaluate_bpb(
+                model, tokenizer, batch_size,
+                rank=self.rank, world_size=self.world_size,
+            )
+
         self.make_dataloader = sharded_dataloader
+        self.evaluate_bpb = sharded_evaluate_bpb
 
 
 class PreflightEnv(PretrainEnv):

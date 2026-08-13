@@ -4,18 +4,22 @@ This is the multi-GPU (DDP) variant of `autoresearch-baseline`. It gives an
 agent a small LLM pretraining setup and asks it to improve validation bits per
 byte by editing `train.py` while keeping `prepare.py` and the evaluation metric
 fixed. One evaluation trains across **`prepare.WORLD_SIZE` GPUs (default 4)**
-with PyTorch DDP inside the same fixed 5-minute training budget.
+with PyTorch DDP inside a fixed **75 s** training budget.
 
-Scores are comparable only at equal world size: `val_bpb` after 300 s of
-training on 4 GPUs is a different compute envelope than the single-GPU task,
-so this task's scores must never be ranked against `autoresearch-baseline`
-scores. The world size is a fixed task constant, not a tunable coordinate.
+This variant is the **wall-clock compression** of the single-GPU task: the
+seed's per-rank batch aligns the total batch (and hence per-step gradient
+semantics and step count) with the single-GPU 300 s run, so 4 ranks reproduce
+that run's trajectory in ~1/4 the wall-clock (75 s assumes ideal scaling;
+calibrate the constant against the target machine). Scores are comparable
+only at equal world size and equal budget; do not rank them against
+single-GPU scores without a measured scaling anchor. The world size and the
+budget are fixed task constants, not tunable coordinates.
 
 ## Goal
 
 Minimize `val_bpb`. Lower is better.
 
-The training script runs for a fixed 5-minute training budget (wall-clock,
+The training script runs for a fixed 75-second training budget (wall-clock,
 synchronized across ranks), excluding startup and compilation. VRAM is a soft
 constraint per device: some increase is acceptable for a meaningful `val_bpb`
 gain, but it should not blow up dramatically.
@@ -47,8 +51,11 @@ size, and a non-zero worker-group exit is recorded as a crash.
   configured **trainer object** with a `run() -> float` method, plus the tuner
   contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) written by
   `tunable-contract-extractor`. The provided task-root `train.py` already
-  carries `make_model` + `PARAM_SCHEMA`, and its `DEFAULT_PARAMS` are the
-  original hyperparameter values. The trainer also exposes
+  carries `make_model` + `PARAM_SCHEMA`, and its `DEFAULT_PARAMS` hold the
+  original hyperparameter values with the micro-batch re-based for the DDP
+  envelope (`device_batch_size=64, grad_accum_steps=1`, total batch aligned
+  with the single-GPU baseline's 524288 tokens/step). The trainer also
+  exposes
   **`preflight() -> dict`**, which constructs the real model/optimizer and runs
   exactly one real-shape training step, but never invokes validation or returns
   an objective score.
@@ -59,7 +66,7 @@ size, and a non-zero worker-group exit is recorded as a crash.
   every rank, so ranks construct identical weights.
 - **Train**: `env` is the task-defined `prepare.PretrainEnv`. The trainer
   trains only via `env.make_dataloader(tokenizer, B, T, "train")`, for at most
-  `env.train_budget_seconds` (300 s) of training time — counted after warmup
+  `env.train_budget_seconds` (75 s) of training time — counted after warmup
   steps, excluding startup and compilation, exactly as the original script
   accounted for it. The bound dataloader automatically serves each rank a
   deterministic disjoint shard of the document stream (document-batch index ≡
@@ -72,11 +79,14 @@ size, and a non-zero worker-group exit is recorded as a crash.
 - **Score**: `evaluation.score_fn`
   (`prepare.evaluate_config(make_model, params)`) is the ONE evaluation
   surface — it runs one full budgeted DDP training run and returns the
-  post-training `val_bpb`. The fixed `env.evaluate_bpb` metric runs **on rank 0
-  only**, over the full pinned validation set on the unwrapped model (a DDP
-  forward on a single rank would hang); the scalar is broadcast so every rank
-  returns the same value. Rank 0's value **is** the candidate's
-  `final_best_score`.
+  post-training `val_bpb`. The fixed `env.evaluate_bpb` metric runs **on every
+  rank** with the unwrapped model (a DDP forward here would add pointless
+  synchronization): each rank scores its deterministic disjoint shard of the
+  pinned validation set, the fixed surface all-reduces the two metric sums
+  (total nats, total bytes) before the division, and every rank returns the
+  same full-set value. The metric definition — summed nats over summed bytes
+  across the full pinned validation set — is unchanged; that value **is** the
+  candidate's `final_best_score`.
 - **Preflight**: before each proposed config may enter `evaluate_config`, the
   framework tuner or standalone hillclimb runner calls the fixed
   `prepare.preflight_config(make_model, params)`. Under DDP it runs as a
@@ -120,14 +130,14 @@ Rules:
   changes remain in the code reached by `make_model`, where both paths see them.
 - One candidate strategy per `train.py`; do not enumerate competing candidates.
 
-Evaluation cost: one config eval is one full budgeted training run (~300 s of
-training plus startup/compilation and the final eval) across all ranks.
-Startup grows with world size (each rank pays its own torch.compile and
-kernel load, largely in parallel); this task's 1500 s `run.timeout_seconds`
-becomes the per-config `per_runtime_limit`. `init_run.py --timeout` may
-override it. Consider lowering `tuner.K` / `tuner.K_eval` in
-`framework_cfg.json` — the defaults cost 3 full training runs per candidate at
-step 0+1.
+Evaluation cost: one config eval is one full budgeted training run (~75 s of
+training plus startup/compilation and the sharded final eval) across all
+ranks. Startup grows with world size (each rank pays its own torch.compile
+and kernel load, largely in parallel); this task's 600 s
+`run.timeout_seconds` becomes the per-config `per_runtime_limit`.
+`init_run.py --timeout` may override it. Consider lowering `tuner.K` /
+`tuner.K_eval` in `framework_cfg.json` — the defaults cost 3 full training
+runs per candidate at step 0+1.
 
 The run-level `tools/preflight_env.py` check and candidate preflight calls do
 not consume `max_evaluations` because they never enter `score_fn`. Their
@@ -203,10 +213,10 @@ runs/autoresearch-ddp/<tag>/
 ```text
 ---
 val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
+training_seconds: 75.1
+total_seconds:    201.9
+peak_vram_mb:     12400.5
+mfu_percent:      38.20
 total_tokens_M:   499.6
 num_steps:        953
 num_params_M:     50.3

@@ -8,10 +8,10 @@ project = "tasks/autoresearch-ddp"
 [run]
 working_dir = "tasks/autoresearch-ddp"
 prepare_command = "uv run python prepare.py"
-# Higher than the single-GPU baseline's 900s: N ranks each pay torch.compile
-# and FA3 kernel load at startup (excluded from the 300s training budget but
-# counted in wall-clock).
-timeout_seconds = 1500
+# 75s training budget + startup: N ranks each pay torch.compile and FA3
+# kernel load (excluded from the training budget but counted in wall-clock),
+# plus the sharded final eval (roughly the single-GPU eval time / N).
+timeout_seconds = 600
 
 [seed]
 target_count = 1

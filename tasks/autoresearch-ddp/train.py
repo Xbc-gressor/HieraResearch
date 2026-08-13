@@ -14,9 +14,10 @@ Multi-GPU: `env.rank`/`env.world_size` identify this process's DDP rank
 (world_size > 1 means a torchrun worker; 1 means ordinary single-process).
 `env.make_dataloader` already serves this rank's deterministic disjoint shard
 of the training stream. The trainer below initializes NCCL, DDP-wraps the
-model, synchronizes the time-budget stop across ranks, evaluates on rank 0
-with the unwrapped model, and broadcasts the final val_bpb so every rank
-returns the same score.
+model, synchronizes the time-budget stop across ranks, then every rank
+evaluates its validation shard with the unwrapped model — the env-bound
+`env.evaluate_bpb` all-reduces the metric sums, so every rank returns the
+same score.
 """
 
 import os
@@ -59,8 +60,12 @@ PARAM_SCHEMA = {
 
 DEFAULT_PARAMS = {
     "depth": 8,                 # number of transformer layers
-    "device_batch_size": 128,   # per-device batch size (reduce if OOM)
-    "grad_accum_steps": 2,      # effective batch = device batch * sequence length * accumulation
+    # Per-rank micro-batch, chosen so the TOTAL batch matches the single-GPU
+    # baseline (128 * 2048 * 2 = 524288 tokens/step) at world size 4:
+    # 64 * 2048 * 1 * 4 = 524288. Keeps per-step gradient semantics aligned
+    # with the single-GPU experiments this variant wall-clock-compresses.
+    "device_batch_size": 64,    # per-device batch size (reduce if OOM)
+    "grad_accum_steps": 1,      # effective batch = device batch * sequence length * accumulation * world size
     "embedding_lr": 0.6,        # learning rate for token embeddings (Adam)
     "unembedding_lr": 0.004,    # learning rate for lm_head (Adam)
     "matrix_lr": 0.04,          # learning rate for matrix parameters (Muon)
@@ -784,19 +789,14 @@ class Trainer:
 
         total_tokens = step * total_batch_size
 
-        # Final eval: rank 0 runs the fixed metric on the unwrapped model
-        # (a DDP forward on one rank only would hang on its sync hooks),
-        # then the scalar is broadcast so every rank returns the same score.
+        # Final eval: every rank runs the fixed metric on its validation
+        # shard with the unwrapped model (a DDP forward here would add
+        # pointless sync); the env-bound evaluate_bpb all-reduces the two
+        # metric sums, so every rank returns the same full-set value.
         model.eval()
-        val_bpb = 0.0
-        if is_root:
-            eval_model = _unwrap_model(model) if ddp_active else model
-            with autocast_ctx:
-                val_bpb = env.evaluate_bpb(eval_model, tokenizer, device_batch_size)
-        if ddp_active:
-            val_t = torch.tensor([val_bpb], dtype=torch.float64, device=device)
-            dist.broadcast(val_t, src=0)
-            val_bpb = float(val_t.item())
+        eval_model = _unwrap_model(model) if ddp_active else model
+        with autocast_ctx:
+            val_bpb = env.evaluate_bpb(eval_model, tokenizer, device_batch_size)
 
         # Final summary
         t_end = time.time()
