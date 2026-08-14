@@ -174,7 +174,9 @@ class ExperimentTests(unittest.TestCase):
                          "ledger_updated": False}},
         ])
         status = run_experiment("fake-task", "t1", runner=runner, model="m",
-                                repo_root=self.repo, cmd=cmd)
+                                repo_root=self.repo, cmd=cmd,
+                                semantic_policy="coverage_attempt",
+                                scheduler_policy="v3_2")
         self.assertEqual(cmd._ledger().get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["background-researcher", "idea-generator",
@@ -184,6 +186,9 @@ class ExperimentTests(unittest.TestCase):
             sum("background_contract.py validate" in call for call in cmd.calls),
             1,
         )
+        init_call = next(call for call in cmd.calls if "init_run.py" in call)
+        self.assertIn("--semantic-policy coverage_attempt", init_call)
+        self.assertIn("--scheduler-policy v3_2", init_call)
 
     def test_tuner_contradiction_corrected_in_same_session(self) -> None:
         write_task(self.repo)
@@ -207,7 +212,61 @@ class ExperimentTests(unittest.TestCase):
             # contradiction: claims tuned 000 but the ledger has no tune flag
             {"receipt": {"tuned_run_id": "000", "tuned": True,
                          "ledger_updated": True}},
-            # same-session corrective follow-up: truthful no-op
+            # same-session corrective follow-up still needs one driver job
+            {"receipt": {"tuned_run_id": "000", "tuned": False,
+                         "ledger_updated": False,
+                         "driver_job": {"kind": "phase_c", "run_id": "000",
+                                        "method": "bo", "trial_cap": 10}}},
+            {"receipt": {"tuned_run_id": "000", "tuned": True,
+                         "ledger_updated": True}},
+        ])
+        jobs = []
+
+        def job_runner(role, ctx, request, *, repo_root):
+            jobs.append(request)
+            ledger = cmd._ledger()
+            ledger["records"][0]["tune"] = True
+            cmd._save_ledger(ledger)
+            return {"kind": "phase_c", "run_id": "000", "returncode": 0}
+
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd, job_runner=job_runner)
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(len(jobs), 1)
+        tuner_calls = [ctx for name, ctx in runner.calls
+                       if name == "tuner-orchestrator"]
+        self.assertEqual(len(tuner_calls), 3)
+        self.assertNotIn("reconcile_note", tuner_calls[0].extra)
+        self.assertIn("reconcile_note", tuner_calls[1].extra)
+        self.assertIn("driver_job_result", tuner_calls[2].extra)
+        self.assertEqual(
+            tuner_calls[1].resume_session_id,
+            f"fake-sess-{tuner_calls[0].invocation_id:04d}")
+        self.assertEqual(
+            tuner_calls[2].resume_session_id,
+            f"fake-sess-{tuner_calls[1].invocation_id:04d}")
+
+    def test_tuner_contradiction_can_correct_to_truthful_noop(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, True]
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: (
+                 (ctx.run_dir / "background.md").write_text("# bg\n"),
+                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"receipt": {"tuned_run_id": "000", "tuned": True,
+                         "ledger_updated": True}},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
@@ -216,11 +275,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(cmd._ledger().get("phase"), "completed")
         tuner_calls = [ctx for name, ctx in runner.calls
                        if name == "tuner-orchestrator"]
-        # in-session follow-up only; no fresh reconciliation session
         self.assertEqual(len(tuner_calls), 2)
-        self.assertNotIn("reconcile_note", tuner_calls[0].extra)
-        self.assertIn("reconcile_note", tuner_calls[1].extra)
-        # corrective follow-up RESUMES the first tuner session, not a fresh one
         self.assertEqual(
             tuner_calls[1].resume_session_id,
             f"fake-sess-{tuner_calls[0].invocation_id:04d}")
@@ -294,6 +349,51 @@ class ExperimentTests(unittest.TestCase):
                                 repo_root=self.repo, cmd=cmd)
         self.assertTrue(any("resolve-unevaluated" in c for c in cmd.calls))
         self.assertNotEqual(cmd._ledger().get("phase"), "blocked")
+
+    def test_extractor_failure_with_evidence_resumes_failed_session(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, False, True]
+
+        def failed_extractor(ctx):
+            report = ctx.run_dir / "candidates" / str(ctx.run_id) / "tune_report.json"
+            report.write_text(json.dumps({"phase_a": {"status": "failed"}}))
+
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: (
+                 (ctx.run_dir / "background.md").write_text("# bg\n"),
+                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"fail": ["warm evaluation failed"],
+             "side_effects": failed_extractor},
+            {"receipt": {"verdict": "code_incompatible", "summary": "repair",
+                         "evidence": ["tune_report.json"]}},
+            {"receipt": {"run_id": "000", "status": "keep",
+                         "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+
+        extractor_calls = [ctx for name, ctx in runner.calls
+                           if name == "tunable-contract-extractor"]
+        self.assertEqual(len(extractor_calls), 2)
+        self.assertEqual(
+            extractor_calls[1].resume_session_id,
+            f"fake-sess-{extractor_calls[0].invocation_id:04d}",
+        )
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
 
     def _seed_resumed_run(self, records: list[dict]) -> None:
         """A run killed after setup: cfg/background exist, no metadata."""

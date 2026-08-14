@@ -5,6 +5,9 @@ description = "Multi-GPU (DDP) variant of the autoresearch pretraining task. Def
 type = "uv"
 project = "tasks/autoresearch-ddp"
 
+[resources]
+accelerator = "cuda"
+
 [run]
 working_dir = "tasks/autoresearch-ddp"
 prepare_command = "uv run python prepare.py"

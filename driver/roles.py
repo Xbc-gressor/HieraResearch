@@ -69,6 +69,39 @@ class RoleDefinition:
     # When non-empty, Bash calls must start with one of these prefixes
     # (enforced by the PreToolUse hook in session.py).
     bash_patterns: tuple[str, ...] = ()
+    # Long objective commands are driver-owned. These substrings keep an agent
+    # from bypassing the typed job handoff and orphaning a GPU process.
+    forbidden_bash_substrings: tuple[str, ...] = ()
+
+
+def driver_job_handoff_problem(role_name: str, receipt: dict) -> str | None:
+    """Validate the XOR between an intermediate job handoff and a terminal receipt."""
+    job = receipt.get("driver_job")
+    if not isinstance(job, dict):
+        return None
+    if role_name == "tunable-contract-extractor":
+        if (
+            receipt.get("status") == "driver_job"
+            and receipt.get("ledger_updated") is False
+            and job.get("kind") == "warmstart"
+        ):
+            return None
+        return (
+            "extractor driver_job requires status='driver_job', "
+            "ledger_updated=false, and kind='warmstart'"
+        )
+    if role_name == "tuner-orchestrator":
+        if (
+            receipt.get("tuned") is False
+            and receipt.get("ledger_updated") is False
+            and job.get("kind") == "phase_c"
+        ):
+            return None
+        return (
+            "tuner driver_job requires tuned=false, ledger_updated=false, "
+            "and kind='phase_c'"
+        )
+    return f"role {role_name} may not submit driver_job"
 
 
 # --- helpers shared by postconditions -------------------------------------
@@ -194,10 +227,13 @@ ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "run_id": "str",
-            "status": ("enum", "keep", "discard", "crash", "unevaluated"),
+            "status": ("enum", "keep", "discard", "crash", "unevaluated",
+                       "driver_job"),
             "ledger_updated": "bool",
+            "driver_job": "?dict",
         },
         postconditions=(record_is_terminal,),
+        forbidden_bash_substrings=("warmstart_eval.py", "nohup "),
     ),
     "tuner-orchestrator": RoleDefinition(
         name="tuner-orchestrator",
@@ -208,7 +244,14 @@ ROLES: dict[str, RoleDefinition] = {
             "tuned_run_id": "str",
             "tuned": "bool",
             "ledger_updated": "bool",
+            "driver_job": "?dict",
         },
+        forbidden_bash_substrings=(
+            "tools/tuners/grid_search.py",
+            "tools/tuners/bo_search.py",
+            "tools/tuners/cmaes_search.py",
+            "nohup ",
+        ),
     ),
     "experience-extractor": RoleDefinition(
         name="experience-extractor",

@@ -121,6 +121,15 @@ def validate_task(task_dir: Path) -> list[str]:
         if env.get("type") != "uv":
             errors.append(f"{task_toml}: env.type must be 'uv'")
 
+    resources = data.get("resources")
+    if resources is not None:
+        if not isinstance(resources, dict):
+            errors.append(f"{task_toml}: [resources] must be a table")
+        elif resources.get("accelerator") not in (None, "cuda"):
+            errors.append(
+                f"{task_toml}: resources.accelerator must be 'cuda' when set"
+            )
+
     run = data.get("run", {})
     if isinstance(run, dict):
         working_dir = run.get("working_dir")

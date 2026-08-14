@@ -5,6 +5,9 @@ description = "Pipeline smoke fixture: autoresearch-baseline shrunk to a ~2-3 mi
 type = "uv"
 project = "tasks/autoresearch-smoke"
 
+[resources]
+accelerator = "cuda"
+
 [run]
 working_dir = "tasks/autoresearch-smoke"
 prepare_command = "uv run python prepare.py"

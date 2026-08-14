@@ -104,10 +104,11 @@ attribution, not a full program specification.
 
 ## Step 3 — Apply the configured semantic policy
 
-Read `framework_cfg.json.semantic_search`. If absent, use
-`coverage_experience`. Supported policies are:
+Read `framework_cfg.json.semantic_search`. New runs persist
+`coverage_attempt`; if the key is absent in a historical/unconfigured run,
+use the compatibility fallback `coverage_experience`. Supported policies are:
 
-- `coverage_experience` (default): deterministic coverage plus the carrier
+- `coverage_experience`: deterministic coverage plus the carrier
   prior — per-hypothesis counts of independent contexts where adding the
   hypothesis made its parent strictly worse (penalty) or better (smaller
   bonus), computed from ledger edges; no LLM scores;

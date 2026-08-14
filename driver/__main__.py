@@ -6,6 +6,17 @@ import argparse
 import sys
 
 
+SEMANTIC_POLICIES = (
+    "coverage",
+    "coverage_experience",
+    "coverage_attempt",
+    "coverage_carrier_attempt",
+    "gain",
+    "gain_uncertainty",
+    "gain_uncertainty_nocost",
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="driver")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -21,6 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
                           "init_run.py --per-runtime-limit, NOT a session watchdog")
     run.add_argument("--dimension-strategy", choices=["catalog_subset", "llm_induced"])
     run.add_argument("--llm-intelligence-score", type=float)
+    run.add_argument(
+        "--semantic-policy",
+        choices=SEMANTIC_POLICIES,
+        help="semantic acquisition policy; new runs default to coverage_attempt",
+    )
+    run.add_argument(
+        "--scheduler-policy",
+        choices=["legacy", "v3_2"],
+        help="tuner scheduler policy; new runs default to v3_2",
+    )
     run.add_argument("--cli-path", help="system claude CLI path; default is the "
                                         "SDK-bundled CLI (pinned via uv.lock)")
     return parser
@@ -63,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
             max_evaluations=args.max_evaluations, timeout=args.timeout,
             dimension_strategy=args.dimension_strategy,
             llm_intelligence_score=args.llm_intelligence_score,
+            semantic_policy=args.semantic_policy,
+            scheduler_policy=args.scheduler_policy,
             cli_path=args.cli_path,
         )
         print(json.dumps(status, indent=2, sort_keys=True))

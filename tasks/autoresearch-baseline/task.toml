@@ -5,6 +5,9 @@ description = "Original torch-based autoresearch pretraining task."
 type = "uv"
 project = "tasks/autoresearch-baseline"
 
+[resources]
+accelerator = "cuda"
+
 [run]
 working_dir = "tasks/autoresearch-baseline"
 prepare_command = "uv run python prepare.py"

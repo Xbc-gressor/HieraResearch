@@ -9,6 +9,8 @@ Usage:
     python tools/init_run.py <task_name> <tag>
       [--dimension-strategy <strategy>]
       [--llm-intelligence-score <score>]
+      [--semantic-policy <policy>]
+      [--scheduler-policy <policy>]
       [--max-evaluations <count>]
       [--timeout <seconds>]
 
@@ -34,6 +36,23 @@ from run_cfg import read_framework_cfg
 
 
 SEMANTIC_ARTIFACTS = ("dimension_catalog.json", "background.md", "ledger.json")
+SEMANTIC_POLICIES = (
+    "coverage",
+    "coverage_experience",
+    "coverage_attempt",
+    "coverage_carrier_attempt",
+    "gain",
+    "gain_uncertainty",
+    "gain_uncertainty_nocost",
+)
+SCHEDULER_POLICIES = ("legacy", "v3_2")
+
+# Defaults for newly initialized experiment runs. Existing runs that omit
+# these keys keep their historical runtime fallbacks; init_run never rewrites
+# an existing run merely because the defaults changed.
+DEFAULT_SEMANTIC_POLICY = "coverage_attempt"
+DEFAULT_SCHEDULER_POLICY = "v3_2"
+DEFAULT_MAX_EVALUATIONS = 200
 
 
 def _read_framework_config(path: Path) -> dict:
@@ -73,6 +92,8 @@ def initialize_run(
     *,
     dimension_strategy: str | None = None,
     llm_intelligence_score: float | None = None,
+    semantic_policy: str | None = None,
+    scheduler_policy: str | None = None,
     max_evaluations: int | None = None,
     per_runtime_limit: float | None = None,
 ) -> Path:
@@ -101,6 +122,16 @@ def initialize_run(
         )
         print("  → Framework will use code defaults.")
 
+    # Make the active policies explicit in every new run artifact. This keeps
+    # the normal launch path useful without sacrificing A/B provenance: old
+    # arms remain selectable through CLI flags and the resolved values are
+    # persisted in framework_cfg.json.
+    if not target_existed:
+        if semantic_policy is None:
+            semantic_policy = DEFAULT_SEMANTIC_POLICY
+        if scheduler_policy is None:
+            scheduler_policy = DEFAULT_SCHEDULER_POLICY
+
     # New runs inherit a task-appropriate limit instead of blindly retaining
     # the generic template's 60 seconds. Existing run-local choices remain
     # untouched, and an explicit --timeout still wins.
@@ -126,6 +157,14 @@ def initialize_run(
         raise ValueError(
             "llm intelligence score must be a finite number in [0, 100]"
         )
+    if semantic_policy is not None and semantic_policy not in SEMANTIC_POLICIES:
+        raise ValueError(
+            f"semantic policy must be one of {list(SEMANTIC_POLICIES)}"
+        )
+    if scheduler_policy is not None and scheduler_policy not in SCHEDULER_POLICIES:
+        raise ValueError(
+            f"scheduler policy must be one of {list(SCHEDULER_POLICIES)}"
+        )
     if (
         max_evaluations is not None
         and (
@@ -149,6 +188,8 @@ def initialize_run(
     if (
         dimension_strategy is None
         and llm_intelligence_score is None
+        and semantic_policy is None
+        and scheduler_policy is None
         and max_evaluations is None
         and per_runtime_limit is None
     ):
@@ -156,6 +197,16 @@ def initialize_run(
 
     config = _read_framework_config(target) if target.exists() else {}
     updates: list[str] = []
+
+    # v3.2 allocates a finite run-global budget and is invalid without one.
+    # The maintained template already carries 200; keep initialization valid
+    # even when a deployment intentionally omits the template.
+    if (
+        scheduler_policy == "v3_2"
+        and max_evaluations is None
+        and config.get("max_evaluations") is None
+    ):
+        max_evaluations = DEFAULT_MAX_EVALUATIONS
 
     if dimension_strategy is not None:
         section = config.get("space_initialization", {})
@@ -229,6 +280,50 @@ def initialize_run(
                 f"{normalized_score}."
             )
 
+    if semantic_policy is not None:
+        section = config.get("semantic_search", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: semantic_search must be an object")
+        current = section.get("policy")
+        existing_artifacts = [
+            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
+        ]
+        if current != semantic_policy and existing_artifacts:
+            raise ValueError(
+                "cannot change semantic policy after semantic artifacts exist: "
+                + ", ".join(existing_artifacts)
+            )
+        if current != semantic_policy:
+            config["semantic_search"] = {
+                **section,
+                "policy": semantic_policy,
+            }
+            updates.append(f"semantic_policy={semantic_policy}")
+        else:
+            print(f"Semantic policy already set to {semantic_policy}.")
+
+    if scheduler_policy is not None:
+        section = config.get("tuner", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: tuner must be an object")
+        current = section.get("scheduler_policy")
+        existing_artifacts = [
+            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
+        ]
+        if current != scheduler_policy and existing_artifacts:
+            raise ValueError(
+                "cannot change scheduler policy after run artifacts exist: "
+                + ", ".join(existing_artifacts)
+            )
+        if current != scheduler_policy:
+            config["tuner"] = {
+                **section,
+                "scheduler_policy": scheduler_policy,
+            }
+            updates.append(f"scheduler_policy={scheduler_policy}")
+        else:
+            print(f"Scheduler policy already set to {scheduler_policy}.")
+
     if max_evaluations is not None:
         config["max_evaluations"] = max_evaluations
         updates.append(f"max_evaluations={max_evaluations}")
@@ -273,6 +368,22 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--semantic-policy",
+        choices=SEMANTIC_POLICIES,
+        help=(
+            "semantic acquisition policy; new runs default to "
+            f"{DEFAULT_SEMANTIC_POLICY}"
+        ),
+    )
+    parser.add_argument(
+        "--scheduler-policy",
+        choices=SCHEDULER_POLICIES,
+        help=(
+            "tuner scheduler policy; new runs default to "
+            f"{DEFAULT_SCHEDULER_POLICY}"
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         "--per-runtime-limit",
         dest="per_runtime_limit",
@@ -288,6 +399,8 @@ def main() -> int:
             args.tag,
             dimension_strategy=args.dimension_strategy,
             llm_intelligence_score=args.llm_intelligence_score,
+            semantic_policy=args.semantic_policy,
+            scheduler_policy=args.scheduler_policy,
             max_evaluations=args.max_evaluations,
             per_runtime_limit=args.per_runtime_limit,
         )

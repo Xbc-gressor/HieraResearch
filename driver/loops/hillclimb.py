@@ -13,6 +13,7 @@ from pathlib import Path
 from ..events import EventsLog
 from ..metadata import warn_on_mismatch, write_metadata
 from ..receipts import ReceiptStore
+from ..resources import task_resource_lease
 from ..roles import REPO_ROOT, ROLES, InvocationContext
 from ..session import InvocationFailed
 from ..status import budget_status
@@ -75,11 +76,13 @@ def _revert(run_dir: Path) -> None:
 # --- evaluation plumbing ------------------------------------------------------
 
 
-def _preflight(task, run_dir, repo_root, cmd):
-    return cmd(["uv", "--project", f"tasks/{task}", "run", "python",
-                repo_root / "tools" / "preflight_candidate.py",
-                "--candidate-path", run_dir / "train.py"],
-               repo_root, check=False)
+def _preflight(task, run_dir, repo_root, cmd, task_toml=None):
+    owner = {"task": task, "run_dir": str(run_dir), "kind": "candidate_preflight"}
+    with task_resource_lease(task_toml or {}, owner=owner):
+        return cmd(["uv", "--project", f"tasks/{task}", "run", "python",
+                    repo_root / "tools" / "preflight_candidate.py",
+                    "--candidate-path", run_dir / "train.py"],
+                   repo_root, check=False)
 
 
 def _reserve(run_dir, repo_root, cmd) -> bool:
@@ -90,7 +93,8 @@ def _reserve(run_dir, repo_root, cmd) -> bool:
     return result.returncode == 0
 
 
-def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd) -> tuple[Path, int]:
+def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd,
+                    task_toml=None) -> tuple[Path, int]:
     log_path = run_dir / "run.log"
     entrypoint = run_dir / "train.py"
     if per_runtime_limit:
@@ -99,8 +103,10 @@ def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd) -> tuple[P
                 "python", entrypoint]
     else:
         argv = ["uv", "--project", f"tasks/{task}", "run", "python", entrypoint]
-    with log_path.open("w", encoding="utf-8") as fh:
-        result = cmd(argv, repo_root, check=False, capture=False, stdout=fh)
+    lease_owner = {"task": task, "run_dir": str(run_dir), "kind": "hillclimb"}
+    with task_resource_lease(task_toml or {}, owner=lease_owner):
+        with log_path.open("w", encoding="utf-8") as fh:
+            result = cmd(argv, repo_root, check=False, capture=False, stdout=fh)
     return log_path, result.returncode
 
 
@@ -261,7 +267,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
     if not _tsv_rows(run_dir):
         if _reserve(run_dir, repo_root, cmd):
             log, rc = _run_entrypoint(task, run_dir, per_runtime_limit,
-                                      repo_root, cmd)
+                                      repo_root, cmd, task_toml)
             score = _evaluate_outcome(log, rc, metric, required_patterns)
             if math.isfinite(score):
                 _record_keep(run_dir, 0, score, "baseline")
@@ -288,7 +294,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 break
         needs_editor = True  # a fresh idea next round starts from best.py
 
-        if _preflight(task, run_dir, repo_root, cmd).returncode != 0:
+        if _preflight(task, run_dir, repo_root, cmd, task_toml).returncode != 0:
             # Preflight failures consume no slot; one diagnosis cycle, else
             # abandon the idea (restore best) and move on.
             evidence = "candidate preflight failed after editor session"
@@ -306,14 +312,14 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 stop_condition = f"editor repair failed: {exc.problems}"
                 events.emit("blocked", reason=stop_condition)
                 break
-            if _preflight(task, run_dir, repo_root, cmd).returncode != 0:
+            if _preflight(task, run_dir, repo_root, cmd, task_toml).returncode != 0:
                 _revert(run_dir)
                 continue
 
         if not _reserve(run_dir, repo_root, cmd):
             break  # normal budget completion (exit 4), never a crash
         log, rc = _run_entrypoint(task, run_dir, per_runtime_limit,
-                                  repo_root, cmd)
+                                  repo_root, cmd, task_toml)
         score = _evaluate_outcome(log, rc, metric, required_patterns)
         step = len(_tsv_rows(run_dir))
         if not math.isfinite(score):
@@ -333,7 +339,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                         resume_from=last_editor)
                 except InvocationFailed:
                     break
-                if _preflight(task, run_dir, repo_root, cmd).returncode == 0:
+                if _preflight(task, run_dir, repo_root, cmd, task_toml).returncode == 0:
                     repaired = True
                     break
             if not repaired:

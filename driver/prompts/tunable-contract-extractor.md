@@ -248,35 +248,36 @@ disables deferral. For a provided entrypoint, pass `--k-eval 1`; its only warm
 trial is the exact supplied default. The finalized `SEARCH_SPACE` remains
 available if the decoupled tuner later promotes this semantic point.
 
-### 3a. Run the evaluator (sequential, resumable)
+### 3a. Request the evaluator (driver-owned, sequential, resumable)
 
-```bash
-uv --project <env.project> run python tools/tuners/warmstart_eval.py \
-  --candidate-path <train_py> \
-  --configs-json <candidate_dir>/_warm_configs.json \
-  --tune-report-json <candidate_dir>/tune_report.json \
-  --k-eval <tuner.K_eval or 2>
+Do not launch `warmstart_eval.py` with Bash, `nohup`, or a background task.
+Hand the long objective job to the deterministic driver by submitting this
+intermediate receipt:
+
+```json
+{
+  "run_id": "<run_id>",
+  "status": "driver_job",
+  "ledger_updated": false,
+  "driver_job": {
+    "kind": "warmstart",
+    "run_id": "<run_id>",
+    "k_eval": 2
+  }
+}
 ```
 
-Use `--project`, not `--directory`: it selects the task env without changing the
-working directory, so repo-relative paths (`tools/...`, `runs/...`) keep
-resolving. Under `--directory` uv chdirs into the task dir first and those
-relative paths break.
+Use the configured `K_eval`; use 1 for a provided entrypoint as specified
+above. The driver validates all paths, launches the evaluator in the task uv
+environment, waits synchronously with no outer timeout, and resumes this same
+session with `driver_job_result`. No candidate generation, tuning bout, or
+other driver work runs while the evaluator owns the process. CUDA tasks also
+hold the host-local objective lease for the entire job.
 
-Launch it **detached**, not in the foreground and not via
-`run_in_background: true`: K_eval evaluations × `per_runtime_limit` can
-exceed both the harness's short foreground timeout and its background-task
-lifetime cap (run 0803-sonnet-ex125-1: background tasks killed exactly
-3600s after backgrounding). A kill mid-evaluation permanently burns the
-reserved objective slot with no trial row. Use
-`nohup <cmd> > <candidate_dir>/_warmstart.log 2>&1 & echo $!` — the log goes
-in the candidate directory, not `/tmp`, because run ids repeat across
-concurrent runs and a shared `/tmp` name would let two runs overwrite each
-other's only record. Keep the echoed PID and poll `tune_report.json` / the log
-with short commands (`tail`, `ps -p <pid>`). While that PID is alive the
-evaluator is still working, however long it takes — do not relaunch it. The
-evaluator is resumable — after any interruption (PID gone, no terminal JSON in
-the log), re-run the same command and it reuses already-scored configs.
+On resume, read `driver_job_result`: its `returncode`, durable `log`, and
+`log_tail` are the evaluator result. The evaluator is resumable, so after a
+diagnosed repair request the same typed job again; already-scored configs are
+reused. Never poll a PID and never start an objective process yourself.
 
 It creates `BASE_PARAMS`, pins schema-4 config 0, samples the remaining slots
 uniformly without replacement, and persists the mandatory indices, seed,
@@ -382,8 +383,8 @@ evaluation budget. Report `status: crash`; the driver skips this candidate.
 - **Segment ① is behavior-preserving**; **segment ③ code fixes are minimal +
   additive** — they make a crashing config run **without** changing what
   already-working configs do or the candidate's strategy.
-- **You run the candidate only in segment ③** (via `warmstart_eval.py` in the uv
-  env). Segments ①② never import or run it.
+- **The driver runs the candidate only in segment ③** through the typed
+  `warmstart` job. Segments ①② never import or run it.
 - **You write `BASE_PARAMS`** — but only via `warmstart_eval.py` (which AST-writes
   the best selectable warm row and excludes an inherited fidelity control).
   Never hand-edit `BASE_PARAMS` or `SEARCH_SPACE`.
@@ -416,6 +417,9 @@ complete, call the tool `mcp__receipts__submit_receipt` exactly once with a
   the lifecycle resolution).
 - `ledger_updated` — bool — whether you wrote this candidate's final ledger
   state via `tools/ledger.py` (`set-tuning` / `record-run`).
+- `driver_job` — object, intermediate only — request the driver-owned
+  warmstart job as described in 3a. Use `status: "driver_job"`; this receipt
+  is not the terminal role result, and the driver resumes the same session.
 
 If your receipt is rejected, the tool returns the validation problems; fix
 them and call again. If the driver finds your postconditions unmet after you

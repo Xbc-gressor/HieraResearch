@@ -16,15 +16,22 @@ from typing import Callable, Protocol
 
 from .events import EventsLog
 from .receipts import ReceiptStore, build_receipt_server
-from .roles import PROMPT_DIR, REPO_ROOT, InvocationContext, RoleDefinition
+from .roles import (
+    PROMPT_DIR,
+    REPO_ROOT,
+    InvocationContext,
+    RoleDefinition,
+    driver_job_handoff_problem,
+)
 
 RECEIPT_TOOL = "mcp__receipts__submit_receipt"
 
 
 class InvocationFailed(Exception):
-    def __init__(self, role: str, problems: list[str]):
+    def __init__(self, role: str, problems: list[str], *, invocation_id: int | None = None):
         self.role = role
         self.problems = problems
+        self.invocation_id = invocation_id
         super().__init__(f"{role}: " + "; ".join(problems))
 
 
@@ -85,6 +92,17 @@ class SDKSessionRunner:
                     return deny(
                         f"role {role.name} may only run Bash commands starting "
                         f"with: {', '.join(role.bash_patterns)}")
+            if name == "Bash" and role.forbidden_bash_substrings:
+                command = (input_data.get("tool_input") or {}).get("command", "")
+                forbidden = next(
+                    (part for part in role.forbidden_bash_substrings if part in command),
+                    None,
+                )
+                if forbidden is not None:
+                    return deny(
+                        f"role {role.name} may not launch long objective work via "
+                        f"Bash ({forbidden!r}); submit a driver_job receipt"
+                    )
             return {}
 
         return hook
@@ -203,6 +221,14 @@ class SDKSessionRunner:
     def _problems(self, role: RoleDefinition, ctx: InvocationContext,
                   receipt: dict | None) -> list[str]:
         problems = [] if receipt is not None else ["no accepted receipt"]
+        # A typed long-job request is an intermediate handoff, not a completed
+        # role invocation. The driver executes it synchronously and resumes the
+        # same session; terminal postconditions are checked on that later turn.
+        if receipt is not None and isinstance(receipt.get("driver_job"), dict):
+            handoff_problem = driver_job_handoff_problem(role.name, receipt)
+            if handoff_problem:
+                problems.append(handoff_problem)
+            return problems
         for check in role.postconditions:
             error = check(ctx)
             if error:

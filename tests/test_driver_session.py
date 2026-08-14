@@ -87,6 +87,58 @@ class BashPatternTests(unittest.TestCase):
             None, {}))
         self.assertEqual(verdict, {})
 
+    def test_tuner_cannot_bypass_driver_owned_job_with_nohup(self) -> None:
+        hook = self._hook(ROLES["tuner-orchestrator"])
+        verdict = asyncio.run(hook(
+            {"tool_name": "Bash", "tool_input": {
+                "command": "nohup uv run python tools/tuners/bo_search.py &"
+            }},
+            None, {}))
+        decision = verdict["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("driver_job", decision["permissionDecisionReason"])
+
+
+class DriverJobHandoffTests(unittest.TestCase):
+    def test_intermediate_job_skips_terminal_postconditions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = SDKSessionRunner(model="m", events=EventsLog(run_dir))
+            ctx = InvocationContext(
+                task="t", tag="tag", run_dir=run_dir,
+                invocation_id=1, run_id="007",
+            )
+            receipt = {
+                "run_id": "007",
+                "status": "driver_job",
+                "ledger_updated": False,
+                "driver_job": {"kind": "warmstart", "run_id": "007", "k_eval": 2},
+            }
+            self.assertEqual(
+                runner._problems(ROLES["tunable-contract-extractor"], ctx, receipt),
+                [],
+            )
+
+    def test_terminal_fields_cannot_smuggle_an_extra_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = SDKSessionRunner(model="m", events=EventsLog(run_dir))
+            ctx = InvocationContext(
+                task="t", tag="tag", run_dir=run_dir,
+                invocation_id=1, run_id="007",
+            )
+            receipt = {
+                "run_id": "007",
+                "status": "keep",
+                "ledger_updated": True,
+                "driver_job": {"kind": "warmstart", "run_id": "007", "k_eval": 2},
+            }
+            problems = runner._problems(
+                ROLES["tunable-contract-extractor"], ctx, receipt
+            )
+            self.assertEqual(len(problems), 1)
+            self.assertIn("status='driver_job'", problems[0])
+
 
 class FakeSystemMessage:
     def __init__(self, session_id: str):

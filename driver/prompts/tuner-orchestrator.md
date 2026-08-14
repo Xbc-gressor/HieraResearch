@@ -103,7 +103,7 @@ block. Read it, do not re-derive it:
   Before emitting the no-op, sweep for stranded work: for every ledger
   candidate whose `tune_report.json` has a nonterminal (`running`) final
   Phase-C stage, run `phase-c-action` on it and obey the result — `action:
-  run` (`resume_interrupted_stage`) relaunches that search detached (Phase C
+  run` (`resume_interrupted_stage`) requests that driver-owned search (Phase C
   step 3) and, when it finishes, Finalize that candidate;
   `close_exhausted_stage` closes the stage and finalizes. Spent trials must
   not sit uncommitted just because the gate moved on.
@@ -200,7 +200,7 @@ never get proposals — they consume the deferred-config supply from step 0+1.
    All three stop early via the shared `PatienceMonitor`. Grid shuffles combos
    with `--seed`; CMA-ES also keeps its `es.stop()` σ-convergence. No direction
    to pass — all minimize.
-3. Run the corresponding script (it reads the step-1 **evaluated** warm trials from
+3. Request the corresponding driver-owned script (it reads the step-1 **evaluated** warm trials from
    `tune_report.json` as priors — BO as completed Optuna trials, CMA-ES as the
    initial mean — AND the **deferred** warm configs (`phase_a.deferred_configs`,
    proposed but not evaluated at step 0+1), which it evaluates FIRST — BO enqueues
@@ -212,63 +212,40 @@ never get proposals — they consume the deferred-config supply from step 0+1.
    deferred configs outside the clamped box are skipped — never attempted, no
    budget, no patience effect — and accounted via
    `deferred_skipped_outside_space` in the stage receipt):
-   ```
-   uv --directory <env.project> run python \
-     <repo_root>/tools/tuners/<method>_search.py \
-     --candidate-path <candidate_path> \
-     --tune-report-json <candidate_dir>/tune_report.json \
-     [method-specific args]
-   ```
-   `<env.project>` is `task.toml`'s `env.project` (repo-root-relative, e.g.
-   `tasks/tabular-model-search`) used as-is; script and `--candidate-path` /
-   `--tune-report-json` paths stay absolute.
+   Do not invoke a search script with Bash, `nohup`, or a background task.
+   Submit an intermediate receipt and let the deterministic driver own the
+   process:
 
-   **Never wrap this call in an external timeout.** No `timeout N ...`, no
-   shell watchdog, no shortened tool timeout. A deep-tune stage legitimately
-   runs for hours, and each evaluation reserves its budget slot *before*
-   `score_fn` — so a kill mid-evaluation permanently spends that slot and
-   persists no trial. Run 0802-sonnet-ex125-1 lost 6 of 50 Phase-C slots this
-   way: one API error, one self-imposed `timeout` wrapper, and three
-   foreground calls hitting the Bash tool's 2-minute default. Run
-   0803-sonnet-ex125-1 lost 2 more to the harness's own background-task
-   lifecycle: tasks launched with `run_in_background: true` were killed
-   exactly 3600s after entering background state, twice, mid-evaluation.
-   **Launch the search detached** so the harness task exits immediately and
-   the search process is reparented, escaping both the foreground timeout
-   and the background-task cap:
+   ```json
+   {
+     "tuned_run_id": "<run_id>",
+     "tuned": false,
+     "ledger_updated": false,
+     "driver_job": {
+       "kind": "phase_c",
+       "run_id": "<run_id>",
+       "method": "<method from phase-c-action>",
+       "trial_cap": 10
+     }
+   }
    ```
-   nohup uv --directory <env.project> run python \
-     <repo_root>/tools/tuners/<method>_search.py \
-     --candidate-path <candidate_path> \
-     --tune-report-json <candidate_dir>/tune_report.json \
-     [method-specific args] > <candidate_dir>/_phase_c_<method>.log 2>&1 &
-     echo $!
-   ```
-   The log lives in the candidate directory, not `/tmp`: run ids repeat
-   across concurrent runs (`013` exists in every tag), so a shared `/tmp`
-   name would let two runs overwrite each other's only record of the
-   search. Keep the echoed PID — it is what distinguishes "still running"
-   from "died without finishing".
 
-   Poll by reading `tune_report.json` and that log with short commands
-   (`tail`, `ps -p <pid>`) — never with a long foreground `sleep` wrapper
-   around the search itself — and let the script's own `per_runtime_limit`
-   bound each single evaluation. That is the only duration guard that
-   exists, and it is already correct.
+   `trial_cap` is the exact positive cap from Phase S. The driver re-runs
+   `phase-c-action` to validate the requested method, derives all paths and
+   method arguments, launches the child in the foreground, and waits with no
+   outer timeout. It resumes this same session with `driver_job_result` only
+   after the child exits. No next round or other candidate runs concurrently.
+   CUDA tasks hold the host-local objective lease for the entire job.
+
+   On resume, `driver_job_result` carries `returncode`, the durable log path,
+   and a bounded `log_tail`. Let the script's own `per_runtime_limit` bound
+   each evaluation; there is no bout-level wall-clock limit.
    For a task declaring `evaluation.preflight_fn`, every proposed config first
    passes that isolated no-score hook. Rejections are recorded as feasibility
    evidence but do not reserve an objective slot. Immediately before `score_fn`,
    the tuner atomically reserves from the strict run cap; it cannot overshoot
    the configured budget.
-4. Wait for the detached search to exit, then parse the terminal JSON **from
-   its log** — the backgrounding `&` means the launch command's own stdout is
-   empty by design, so an empty stdout proves nothing. The search is done when
-   `ps -p <pid>` reports no such process. While that PID is alive the search is
-   **not** interrupted, however long it takes: do not relaunch it, do not run
-   `phase-c-action` against its half-written report, and do not report
-   `phase_c_interrupted`. Keep polling.
-
-   Once the PID is gone, `tail` the log and classify:
+4. After the driver resumes you, classify the completed job:
    - **no terminal JSON object** (crash, kill, or truncated log) — the
      search did not prove completion. Its already-written trials are partial
      evidence only. Do not select or apply them and do not update the ledger.
@@ -276,7 +253,7 @@ never get proposals — they consume the deferred-config supply from step 0+1.
      gate may never re-select this candidate, and its already-charged
      trials would stay uncommitted. Run `phase-c-action` again against the
      persisted report now and obey its result: `action: run`
-     (`resume_interrupted_stage`) relaunches the same search detached
+     (`resume_interrupted_stage`) requests the same driver-owned search again
      (step 3), **once**; `action: close_exhausted_stage` runs the
      deterministic close (below) and then Finalize; `action: finalize`
      proceeds to Finalize. Only if that single immediate resume also
@@ -385,6 +362,9 @@ hand-edit the report or the ledger to make the story agree.
   `tune_report.json` while they run; you do not write to it during their
   execution. Only `finalize_tuning.py` writes the closing fields after a
   terminal result. Never have two processes write at once.
+- **No objective launch through Bash.** Long search processes are owned and
+  synchronously awaited by the driver through `driver_job`; never use `nohup`,
+  `&`, `run_in_background`, PID polling, or a direct `*_search.py` Bash call.
 - **Cleanup.** `_warm_configs.json` / `_search_space.json` belong to step 0/1 —
   leave them. `tune_report.json` is durable output and stays.
 - **Compact return.** Never paste trials, configs, reports, tracebacks, source,
@@ -407,6 +387,9 @@ complete, call the tool `mcp__receipts__submit_receipt` exactly once with a
   (`finalize_tuning.py` wrote `tune: true` for `tuned_run_id`).
 - `ledger_updated` — bool — whether the ledger was written (only ever via
   `tools/finalize_tuning.py`).
+- `driver_job` — object, intermediate only — request one driver-owned Phase-C
+  search as described above. The driver resumes this same session after it
+  exits; omit this field from the terminal receipt.
 
 If your receipt is rejected, the tool returns the validation problems; fix
 them and call again. If the driver finds your postconditions unmet after you

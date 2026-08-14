@@ -40,6 +40,53 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(self._strategy(run_dir), "catalog_subset")
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["per_runtime_limit"], 60)
+            self.assertEqual(
+                config["semantic_search"]["policy"],
+                "coverage_attempt",
+            )
+            self.assertEqual(config["tuner"]["scheduler_policy"], "v3_2")
+
+    def test_policy_comparison_arms_are_persisted_from_explicit_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+
+            run_dir = initialize_run(
+                repo_root,
+                "toy",
+                "comparison",
+                semantic_policy="coverage",
+                scheduler_policy="legacy",
+            )
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(config["semantic_search"]["policy"], "coverage")
+            self.assertEqual(config["tuner"]["scheduler_policy"], "legacy")
+
+    def test_existing_run_is_not_rewritten_to_new_policy_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+            run_dir = repo_root / "runs" / "toy" / "historical"
+            run_dir.mkdir(parents=True)
+            original = {"max_evaluations": 17}
+            config_path = run_dir / "framework_cfg.json"
+            config_path.write_text(json.dumps(original))
+
+            initialize_run(repo_root, "toy", "historical")
+
+            self.assertEqual(json.loads(config_path.read_text()), original)
+
+    def test_new_scheduler_default_has_budget_without_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "tasks").mkdir()
+
+            run_dir = initialize_run(repo_root, "toy", "no-template")
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(config["max_evaluations"], 200)
+            self.assertEqual(config["tuner"]["scheduler_policy"], "v3_2")
 
     def test_explicit_induced_strategy_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,7 +216,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(semantic_search["llm_intelligence_score"], 72.5)
             self.assertEqual(
                 semantic_search["policy"],
-                "coverage_experience",
+                "coverage_attempt",
             )
             self.assertEqual(semantic_search["uncertainty_weight"], 0.5)
 

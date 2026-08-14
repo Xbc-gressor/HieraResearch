@@ -29,9 +29,15 @@ import subprocess
 from pathlib import Path
 
 from ..events import EventsLog
+from ..jobs import DriverJobError, execute_driver_job
 from ..metadata import warn_on_mismatch, write_metadata
 from ..receipts import ReceiptStore
-from ..roles import REPO_ROOT, ROLES, InvocationContext
+from ..roles import (
+    REPO_ROOT,
+    ROLES,
+    InvocationContext,
+    driver_job_handoff_problem,
+)
 from ..session import InvocationFailed
 from ..status import budget_status, compact_status
 from . import common
@@ -80,9 +86,98 @@ def _invoke(runner, store, role_name, task, tag, run_dir, *,
                             invocation_id=inv_id, run_id=run_id,
                             round_no=round_no, extra=extra or {},
                             resume_session_id=resume)
-    runner.run(ROLES[role_name], ctx)
+    try:
+        runner.run(ROLES[role_name], ctx)
+    except InvocationFailed as exc:
+        # The failed invocation may still have a valid persisted SDK session.
+        # Callers that own a repair path need its identity even though no
+        # terminal receipt was accepted.
+        if exc.invocation_id is None:
+            exc.invocation_id = inv_id
+        raise
     receipt_path = store.receipt_path(role_name, inv_id)
     return json.loads(receipt_path.read_text(encoding="utf-8")), inv_id
+
+
+def _invoke_with_driver_jobs(
+    runner,
+    store,
+    role_name,
+    task,
+    tag,
+    run_dir,
+    *,
+    run_id=None,
+    round_no=None,
+    extra=None,
+    resume_from=None,
+    repo_root=REPO_ROOT,
+    job_runner=execute_driver_job,
+) -> tuple[dict, int]:
+    """Run a role, synchronously executing each typed objective-job handoff."""
+    receipt, inv_id = _invoke(
+        runner,
+        store,
+        role_name,
+        task,
+        tag,
+        run_dir,
+        run_id=run_id,
+        round_no=round_no,
+        extra=extra,
+        resume_from=resume_from,
+    )
+    jobs_run = 0
+    while isinstance(receipt.get("driver_job"), dict):
+        jobs_run += 1
+        if jobs_run > 12:
+            raise InvocationFailed(
+                role_name,
+                ["driver job handoff exceeded 12 requests without a terminal receipt"],
+                invocation_id=inv_id,
+            )
+        ctx = InvocationContext(
+            task=task,
+            tag=tag,
+            run_dir=run_dir,
+            invocation_id=inv_id,
+            run_id=run_id,
+            round_no=round_no,
+            extra=extra or {},
+        )
+        handoff_problem = driver_job_handoff_problem(role_name, receipt)
+        try:
+            if handoff_problem:
+                raise DriverJobError(handoff_problem)
+            result = job_runner(
+                role_name,
+                ctx,
+                receipt["driver_job"],
+                repo_root=repo_root,
+            )
+        except (DriverJobError, OSError, subprocess.SubprocessError) as exc:
+            result = {
+                "kind": receipt["driver_job"].get("kind"),
+                "accepted": False,
+                "error": str(exc),
+            }
+        receipt, next_inv_id = _invoke(
+            runner,
+            store,
+            role_name,
+            task,
+            tag,
+            run_dir,
+            run_id=run_id,
+            round_no=round_no,
+            extra={
+                **(extra or {}),
+                "driver_job_result": json.dumps(result, sort_keys=True),
+            },
+            resume_from=inv_id,
+        )
+        inv_id = next_inv_id
+    return receipt, inv_id
 
 
 # =============================================================================
@@ -196,7 +291,7 @@ def _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd) -> None:
 
 
 def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
-                         cmd, events) -> None:
+                         cmd, events, job_runner=execute_driver_job) -> None:
     """candidate-writer + extractor with evidence-branched escalation."""
     candidate_dir = run_dir / "candidates" / run_id
     try:
@@ -213,12 +308,14 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             _or_block(run_dir, repo_root, cmd, events,
                       f"candidate-writer failed for {run_id}: {exc.problems}")
     try:
-        _, extractor_inv = _invoke(
+        _, extractor_inv = _invoke_with_driver_jobs(
             runner, store, "tunable-contract-extractor", task, tag, run_dir,
-            run_id=run_id, extra={"candidate_dir": str(candidate_dir)})
+            run_id=run_id, extra={"candidate_dir": str(candidate_dir)},
+            repo_root=repo_root, job_runner=job_runner)
         return
     except InvocationFailed as exc:
         problems = exc.problems
+        extractor_inv = exc.invocation_id
 
     # Branch on durable evidence (spec Error handling):
     # 1. budget exhausted + zero attempts → resolve-unevaluated (call+catch)
@@ -234,20 +331,24 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             _record_crash(run_dir, run_id, repo_root, cmd)
             return
         try:  # fix verdicts go back to the repair-capable extractor session
-            _invoke(runner, store, "tunable-contract-extractor", task, tag,
-                    run_dir, run_id=run_id,
-                    extra={"candidate_dir": str(candidate_dir),
-                           "diagnosis_verdict": verdict},
-                    resume_from=extractor_inv)
+            _invoke_with_driver_jobs(
+                runner, store, "tunable-contract-extractor", task, tag,
+                run_dir, run_id=run_id,
+                extra={"candidate_dir": str(candidate_dir),
+                       "diagnosis_verdict": verdict},
+                resume_from=extractor_inv, repo_root=repo_root,
+                job_runner=job_runner)
             return
         except InvocationFailed as exc2:
             _or_block(run_dir, repo_root, cmd, events,
                       f"extractor repair failed for {run_id}: {exc2.problems}")
     # 3. no evidence → one fresh retry, then block
     try:
-        _invoke(runner, store, "tunable-contract-extractor", task, tag,
-                run_dir, run_id=run_id,
-                extra={"candidate_dir": str(candidate_dir)})
+        _invoke_with_driver_jobs(
+            runner, store, "tunable-contract-extractor", task, tag,
+            run_dir, run_id=run_id,
+            extra={"candidate_dir": str(candidate_dir)}, repo_root=repo_root,
+            job_runner=job_runner)
     except InvocationFailed as exc3:
         _or_block(run_dir, repo_root, cmd, events,
                   f"extractor failed for {run_id}: {exc3.problems}")
@@ -258,28 +359,33 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
 # =============================================================================
 
 
-def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str):
-    receipt, _ = _invoke(
+def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str,
+                     repo_root=REPO_ROOT, job_runner=execute_driver_job):
+    receipt, _ = _invoke_with_driver_jobs(
         runner, store, "tuner-orchestrator", task, tag, run_dir,
         round_no=round_no,
-        extra={"reconcile_note": reason + _RECONCILE_GUIDANCE})
+        extra={"reconcile_note": reason + _RECONCILE_GUIDANCE},
+        repo_root=repo_root, job_runner=job_runner)
     return receipt
 
 
 def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
-          events) -> dict:
+          events, job_runner=execute_driver_job) -> dict:
     """Run the decoupled tuning step; return the effective tuner receipt."""
     tuner_inv = None  # set only on a successful first invocation
     try:
-        receipt, tuner_inv = _invoke(runner, store, "tuner-orchestrator",
-                                     task, tag, run_dir, round_no=round_no)
-    except InvocationFailed:
+        receipt, tuner_inv = _invoke_with_driver_jobs(
+            runner, store, "tuner-orchestrator", task, tag, run_dir,
+            round_no=round_no, repo_root=repo_root, job_runner=job_runner)
+    except (InvocationFailed, DriverJobError):
         try:
             receipt = _tuner_reconcile(runner, store, task, tag, run_dir,
-                                       round_no, "tuner session failed.")
-        except InvocationFailed as exc:
+                                       round_no, "tuner session failed.",
+                                       repo_root, job_runner)
+        except (InvocationFailed, DriverJobError) as exc:
+            problems = getattr(exc, "problems", [str(exc)])
             _or_block(run_dir, repo_root, cmd, events,
-                      f"tuner reconciliation failed: {exc.problems}")
+                      f"tuner reconciliation failed: {problems}")
     # contradiction: receipt claims applied but the ledger disagrees
     tuned_id = receipt.get("tuned_run_id", "none")
     if receipt.get("tuned") and tuned_id != "none" and \
@@ -288,21 +394,24 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
         # spec: corrective follow-up in the SAME tuner session first
         corrected = None
         try:
-            corrected, _ = _invoke(
+            corrected, _ = _invoke_with_driver_jobs(
                 runner, store, "tuner-orchestrator", task, tag, run_dir,
                 round_no=round_no, resume_from=tuner_inv,
-                extra={"reconcile_note": note + _RECONCILE_GUIDANCE})
+                extra={"reconcile_note": note + _RECONCILE_GUIDANCE},
+                repo_root=repo_root, job_runner=job_runner)
         except InvocationFailed:
             corrected = None
         if corrected is None or (corrected.get("tuned") and not _tune_flag(
                 run_dir, corrected.get("tuned_run_id", "none"))):
             try:
                 corrected = _tuner_reconcile(
-                    runner, store, task, tag, run_dir, round_no, note)
-            except InvocationFailed as exc:
+                    runner, store, task, tag, run_dir, round_no, note,
+                    repo_root, job_runner)
+            except (InvocationFailed, DriverJobError) as exc:
+                problems = getattr(exc, "problems", [str(exc)])
                 _or_block(run_dir, repo_root, cmd, events,
-                          f"tuner receipt/ledger contradiction unresolved: "
-                          f"{exc.problems}")
+                      f"tuner receipt/ledger contradiction unresolved: "
+                          f"{problems}")
         if corrected.get("tuned") and \
                 not _tune_flag(run_dir, corrected.get("tuned_run_id", "none")):
             _or_block(run_dir, repo_root, cmd, events,
@@ -324,14 +433,30 @@ def _dimension_strategy(run_dir: Path) -> str | None:
         "dimension_strategy")
 
 
-def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
-           events, max_evaluations, timeout, dimension_strategy,
-           llm_intelligence_score, model, cli_path) -> None:
+def _init_run_extra(dimension_strategy, llm_intelligence_score,
+                    semantic_policy, scheduler_policy) -> list[str]:
     extra = []
     if dimension_strategy:
         extra += ["--dimension-strategy", dimension_strategy]
     if llm_intelligence_score is not None:
         extra += ["--llm-intelligence-score", str(llm_intelligence_score)]
+    if semantic_policy is not None:
+        extra += ["--semantic-policy", semantic_policy]
+    if scheduler_policy is not None:
+        extra += ["--scheduler-policy", scheduler_policy]
+    return extra
+
+
+def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
+           events, max_evaluations, timeout, dimension_strategy,
+           llm_intelligence_score, semantic_policy, scheduler_policy,
+           model, cli_path) -> None:
+    extra = _init_run_extra(
+        dimension_strategy,
+        llm_intelligence_score,
+        semantic_policy,
+        scheduler_policy,
+    )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
     cmd(["uv", "--directory", f"tasks/{task}", "sync"], repo_root)
@@ -461,7 +586,7 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
 
 
 def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
-                       events, seed) -> None:
+                       events, seed, job_runner=execute_driver_job) -> None:
     semantic = run_dir / ".semantic" / "000"
     semantic.mkdir(parents=True, exist_ok=True)
     cmd(["python", "tools/semantic_search.py", "propose",
@@ -517,18 +642,22 @@ def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
         _or_block(run_dir, repo_root, cmd, events,
                   f"provided-baseline writer failed: {exc.problems}")
     _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
-                                        "000", repo_root, cmd, events)
+                                        "000", repo_root, cmd, events,
+                                        job_runner)
 
 
 def _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
-                                        run_id, repo_root, cmd, events) -> None:
+                                        run_id, repo_root, cmd, events,
+                                        job_runner=execute_driver_job) -> None:
     """Provided baseline: extractor step 0+1 only; a crash BLOCKS the run
     (the protocol forbids searching on without the control)."""
     candidate_dir = run_dir / "candidates" / run_id
     try:
-        _invoke(runner, store, "tunable-contract-extractor", task, tag,
-                run_dir, run_id=run_id,
-                extra={"candidate_dir": str(candidate_dir)})
+        _invoke_with_driver_jobs(
+            runner, store, "tunable-contract-extractor", task, tag,
+            run_dir, run_id=run_id,
+            extra={"candidate_dir": str(candidate_dir)}, repo_root=repo_root,
+            job_runner=job_runner)
         return
     except InvocationFailed:
         evidence = _failure_evidence(candidate_dir)
@@ -537,10 +666,12 @@ def _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
                 runner, store, task, tag, run_dir, evidence)["verdict"]
             if verdict != "abandon":
                 try:
-                    _invoke(runner, store, "tunable-contract-extractor", task,
-                            tag, run_dir, run_id=run_id,
-                            extra={"candidate_dir": str(candidate_dir),
-                                   "diagnosis_verdict": verdict})
+                    _invoke_with_driver_jobs(
+                        runner, store, "tunable-contract-extractor", task,
+                        tag, run_dir, run_id=run_id,
+                        extra={"candidate_dir": str(candidate_dir),
+                               "diagnosis_verdict": verdict},
+                        repo_root=repo_root, job_runner=job_runner)
                     return
                 except InvocationFailed:
                     pass
@@ -550,7 +681,8 @@ def _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
 
 
 def _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
-                              repo_root, cmd, events) -> None:
+                              repo_root, cmd, events,
+                              job_runner=execute_driver_job) -> None:
     """Install or reconcile the task-provided control before ideation."""
     seed = task_toml.get("seed", {})
     if not seed.get("provided"):
@@ -559,7 +691,7 @@ def _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
     records = _ledger_records(run_dir)
     if not records:
         _provided_baseline(runner, store, task, tag, run_dir,
-                           repo_root, cmd, events, seed)
+                           repo_root, cmd, events, seed, job_runner)
         return
 
     if all(record.get("run_id") != "000" for record in records):
@@ -577,8 +709,9 @@ def _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
 
 
 def _resume_pending_candidates(runner, store, task, tag, run_dir, brief,
-                               repo_root, cmd, events) -> tuple[dict | None,
-                                                               list[str]]:
+                               repo_root, cmd, events,
+                               job_runner=execute_driver_job) -> tuple[
+                                   dict | None, list[str]]:
     """Resume admitted-but-unimplemented candidates before new ideation."""
     pending_ids = (brief or {}).get("pending_run_ids") or []
     if not pending_ids:
@@ -589,13 +722,14 @@ def _resume_pending_candidates(runner, store, task, tag, run_dir, brief,
             break
         _materialize_candidate(task, tag, run_dir, pending_id, repo_root, cmd)
         _implement_candidate(runner, store, task, tag, run_dir, pending_id,
-                             repo_root, cmd, events)
+                             repo_root, cmd, events, job_runner)
 
     return _brief(run_dir, repo_root, cmd), pending_ids
 
 
 def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
-                         repo_root, cmd, events) -> list[dict]:
+                         repo_root, cmd, events,
+                         job_runner=execute_driver_job) -> list[dict]:
     """Generate one bounded action batch and take each action through step 0+1."""
     actions = _ideate(runner, store, task, tag, run_dir, round_no,
                       repo_root, cmd, events)
@@ -605,7 +739,7 @@ def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
         run_id = str(action["run_id"])
         _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
         _implement_candidate(runner, store, task, tag, run_dir, run_id,
-                             repo_root, cmd, events)
+                             repo_root, cmd, events, job_runner)
     return actions
 
 
@@ -616,8 +750,9 @@ def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
 
 def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    max_evaluations=None, timeout=None, dimension_strategy=None,
-                   llm_intelligence_score=None, cli_path=None,
-                   cmd=common.run_cmd) -> dict:
+                   llm_intelligence_score=None, semantic_policy=None,
+                   scheduler_policy=None, cli_path=None,
+                   cmd=common.run_cmd, job_runner=execute_driver_job) -> dict:
     """Set up or resume a run, then advance it until blocked or complete."""
     run_dir = repo_root / "runs" / task / tag
     events = EventsLog(run_dir)
@@ -628,15 +763,36 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
         if not (run_dir / "framework_cfg.json").exists():
             _setup(runner, store, task, tag, run_dir, task_toml, repo_root,
                    cmd, events, max_evaluations, timeout, dimension_strategy,
-                   llm_intelligence_score, model, cli_path)
+                   llm_intelligence_score, semantic_policy, scheduler_policy,
+                   model, cli_path)
         else:
+            # Explicit CLI overrides must never disappear merely because the
+            # run directory already exists. init_run applies mutable limits,
+            # accepts idempotent frozen values, and rejects policy/space
+            # changes once their artifacts exist.
+            extra = _init_run_extra(
+                dimension_strategy,
+                llm_intelligence_score,
+                semantic_policy,
+                scheduler_policy,
+            )
+            if max_evaluations is not None or timeout is not None or extra:
+                common.init_run(
+                    task,
+                    tag,
+                    repo_root,
+                    cmd,
+                    max_evaluations,
+                    timeout,
+                    extra=extra,
+                )
             _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd,
                           events, model, cli_path)
 
         # Applies to both fresh setup and resume. A kill between init_run and
         # add-record must not let a provided control silently become seedless.
         _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
-                                  repo_root, cmd, events)
+                                  repo_root, cmd, events, job_runner)
 
         round_no = 0
         zero_progress_rounds = 0
@@ -649,7 +805,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             brief = _brief(run_dir, repo_root, cmd) if ledger_exists else None
             brief, pending_ids = _resume_pending_candidates(
                 runner, store, task, tag, run_dir, brief,
-                repo_root, cmd, events,
+                repo_root, cmd, events, job_runner,
             )
 
             if brief is not None and budget_status(
@@ -677,7 +833,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # -----------------------------------------------------------------
             actions = _evaluate_generation(
                 runner, store, task, tag, run_dir, round_no,
-                repo_root, cmd, events,
+                repo_root, cmd, events, job_runner,
             )
 
             # -----------------------------------------------------------------
@@ -686,7 +842,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             tuner_progressed = False
             if not budget_status(run_dir, repo_root, cmd).get("reached"):
                 tuner_receipt = _tune(runner, store, task, tag, run_dir,
-                                      round_no, repo_root, cmd, events)
+                                      round_no, repo_root, cmd, events,
+                                      job_runner)
                 tuner_progressed = bool(tuner_receipt.get("tuned"))
 
             # -----------------------------------------------------------------

@@ -41,12 +41,20 @@
 
 ```bash
 uv run python -m driver run tabular-model-search <tag> \
-  --loop experiment --model <model-id> [--max-evaluations N] [--timeout SECONDS]
+  --loop experiment --model <model-id> [--max-evaluations N] [--timeout SECONDS] \
+  [--semantic-policy POLICY] [--scheduler-policy POLICY]
 ```
 
-`--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations` 与 `--timeout` 经 `tools/init_run.py` 持久化为 `framework_cfg.json` 中的 `max_evaluations` 与 `per_runtime_limit`；`--timeout` 是单次评估时限的别名，不是会话看门狗。
+新 experiment run 默认启用 `coverage_attempt` 语义策略和 scheduler `v3_2`；无需预建目录或手改 JSON。要跑旧对照臂，显式传 `--semantic-policy coverage`（或 `coverage_experience`）和/或 `--scheduler-policy legacy`。所有解析后的选择都会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
+
+`--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations`、`--timeout`、`--semantic-policy` 与 `--scheduler-policy` 经 `tools/init_run.py` 持久化到 `framework_cfg.json`；`--timeout` 是单次评估时限的别名，不是会话看门狗。scheduler `v3_2` 需要有限的 `max_evaluations`；新 run 模板默认提供 200。
 
 对于并行实验，使用不同的 `tag` 值启动多个进程。
+CPU task 可以真正并行。声明 `[resources].accelerator = "cuda"` 的 task
+会在 warm screening、Phase-C bout 和 hillclimb objective 的整个执行期间
+持有同一个 host-local CUDA 独占租约；多个本地 driver 进程会排队而不是
+争抢 GPU。长 objective 由 driver 前台持有并同步等待，Agent 不再通过
+`nohup`、后台 task 或 PID 轮询启动训练。
 
 ## 4. 框架工作原理
 
@@ -124,7 +132,7 @@ step 0+1: tunable-contract-extractor
 - 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：`coverage_experience` 是默认策略（确定性 coverage 加上按账本边统计的 carrier 先验，无需 LLM 打分）；`coverage` 是仅用覆盖度的确定性基线；`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。`llm_intelligence_score` 是运行前固定的 `[0,100]` 启发式可信度先验：以 `score/100` 缩放完整的 LLM 判断项，不缩放确定性的 coverage，也不改写原始预测；它不是校准概率。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：新 run 默认使用 `coverage_attempt`（确定性 coverage 加上同一 `(point, op)` 历史尝试的 policy-conditioned downside）；`coverage` 是仅用覆盖度的确定性基线，`coverage_experience` 加入按账本边统计的 carrier 先验。`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。`llm_intelligence_score` 是运行前固定的 `[0,100]` 启发式可信度先验：以 `score/100` 缩放完整的 LLM 判断项，不缩放确定性的 coverage，也不改写原始预测；它不是校准概率。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
@@ -187,7 +195,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 外层搜索的 LLM 着陆点，通过三步产生下一代：
 
 - **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
-- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；根据配置应用 `coverage_experience`（默认：确定性 coverage 加上按账本边计算的 carrier 先验——每个假设在独立上下文中变差的次数惩罚、变好的次数小额奖励）/ `coverage` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。后三者用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的门控 adjustment 得到最终 predicted gain / uncertainty；自由文本经验不会进入 acquisition。schema-7 `policy_receipt` 固定 experience revision、目标与 proposal relation、比较覆盖、证据 id、机械 gain direction、配置的 LLM intelligence score 及实际权重（coverage_experience 下另记 carrier 先验与分假设计数）；零调整始终合法，非零 gain 必须来自至少两个方向一致、同一份子代代码内只改变语义开关的 control/treatment 配对。仅继承父代超参数的 config 0 不足以隔离代码语义变化，只能增加 uncertainty，不能制造 signed gain。
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；新 run 默认应用 `coverage_attempt`，也可显式选择 `coverage` / `coverage_experience` / `coverage_carrier_attempt` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。gain 系列用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的门控 adjustment 得到最终 predicted gain / uncertainty；自由文本经验不会进入 acquisition。schema-7 `policy_receipt` 固定 experience revision、目标与 proposal relation、比较覆盖、证据 id、机械 gain direction、配置的 LLM intelligence score 及实际权重；零调整始终合法，非零 gain 必须来自至少两个方向一致、同一份子代代码内只改变语义开关的 control/treatment 配对。仅继承父代超参数的 config 0 不足以隔离代码语义变化，只能增加 uncertainty，不能制造 signed gain。
 - **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。
@@ -495,12 +503,13 @@ runs/<task>/<tag>/framework_cfg.json
 - 任务特定的预算约束（例如，最大评估次数、单次评估时间限制）
 - 调整探索与利用的权衡
 
-**使用方法**：从 `tasks/framework_cfg.example.json` 复制，**仅保留**你想覆盖的键。删除其余部分——任何省略的键使用代码默认值。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --llm-intelligence-score 61 --max-evaluations 200 --timeout 60` 直接持久化维度策略、LLM 判断可信度先验、总评估预算和单次评估超时；恢复已有运行时可更新预算和超时，但语义产物生成后不能改变维度策略或 intelligence score。
+**使用方法**：正常情况下直接用 `driver run` 的 CLI 标志，不需要手改该文件。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --llm-intelligence-score 61 --semantic-policy coverage_attempt --scheduler-policy v3_2 --max-evaluations 200 --timeout 60` 单独初始化；恢复已有运行时可更新预算和超时，但策略、维度来源和 intelligence score 在相关产物生成后被冻结。配置文件仍可用于没有 CLI 暴露的研究参数。
 
 主要配置包括：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
-- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；默认使用纯 `coverage`（确定性选择，不调用 LLM 打分）。`gain`、`gain_uncertainty` 和 `gain_uncertainty_nocost` 保留为显式配置；使用这些策略时，`llm_intelligence_score` 以固定 `score/100` 缩放 LLM 判断项（默认 100 保持其原始行为，0 只保留已配置的 coverage 项，但仍收集原始预测）
+- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；新 run 默认使用 `coverage_attempt`。`coverage`、`coverage_experience` 等对照臂可通过 `--semantic-policy` 显式选择
+- **`tuner.scheduler_policy`**：新 run 默认 `v3_2`；旧 percentile/alternation 调度器通过 `--scheduler-policy legacy` 显式选择
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

@@ -1,9 +1,10 @@
 """Scheduler v3.2: budget allocation between TUNE(i) and DEFER.
 
-The package is an isolated policy arm. Nothing here runs unless a run's
-``framework_cfg.json`` sets ``tuner.scheduler_policy = "v3_2"``; the legacy
-percentile/alternation gate in ``tools/tuners/tune_tools.py`` stays the
-default so scheduler experiments compare against an unchanged baseline.
+The package is an isolated policy arm. New runs persist
+``tuner.scheduler_policy = "v3_2"`` during initialization; ``legacy`` remains
+an explicit CLI-selectable comparison arm. Historical runs that omit the key
+retain the legacy percentile/alternation fallback in
+``tools/tuners/tune_tools.py`` rather than changing behavior on resume.
 
 Layering follows the design's central principle — *mechanical state exact,
 statistical model coarse*:
