@@ -101,19 +101,32 @@ Decide what to do from the file system, in this order:
    semantic delta. This existing file is expected, not an upstream collision.
    For crossover, consult secondary parents as references without replacing the
    primary snapshot wholesale.
-3. **No parents → write from scratch.** This is a `fresh` candidate: implement
-   the complete idea at its selected semantic point directly against the APIs
-   exposed by `prepare.py`. Keep it runnable and within constraints; do not
-   silently replace a selected mechanism with a simpler point.
+3. **No parents → inspect baseline as reference, then write from scratch.**
+   This is a `fresh` candidate: there is still no parent and no parent-relative
+   delta. Before writing, look for a task-provided baseline implementation.
+   Read `task.toml` `[seed]`; if `provided` names the candidate entrypoint
+   (usually `train.py`) and that file exists under `task_dir`, read it. Treat
+   it strictly as a reference for the evaluation surface, file conventions, and
+   how a working candidate talks to `prepare.py`. It is not a parent, not a
+   snapshot to edit, and not a semantic default. Do not copy it, do not
+   preserve its strategy when the idea or selected point requires something
+   else, and do not silently reproduce the all-baselines program. Then
+   implement the complete idea at its selected semantic point as a new
+   `train.py` against the APIs exposed by `prepare.py`. Keep it runnable and
+   within constraints; do not silently replace a selected mechanism with a
+   simpler point. If no provided baseline exists, write from `prepare.py` and
+   the task contract alone.
 
 ## What You Do
 
 1. Read your candidate brief (above), then `TASK.md` (its `## Evaluation
    Contract`) and `task.toml` `[constraints]`, then resolve the write mode. Read
-   the candidate dir's `prepare.py` for context only.
+   the candidate dir's `prepare.py` for context only. In write-mode 3, also
+   read any provided baseline as reference only (see above) before writing.
 2. Write the candidate dir's `train.py` per the resolved mode. Keep the
    implementation minimal and faithful to the idea — no opportunistic refactors,
-   no side-quests.
+   no side-quests. A provided baseline, when present, is a reference, not a
+   starting file to patch.
 3. For generated candidates, set `CANDIDATE_NAME` in the file to a
    lowercase_with_underscores identifier that describes the experiment. Prefer
    the record's `candidate_name`; deviate only if it is unclear or already used.
@@ -144,7 +157,8 @@ Decide what to do from the file system, in this order:
    - If the parents use the tuner contract (`PARAM_SCHEMA`, `SEARCH_SPACE`,
      `BASE_PARAMS`, `make_model`), keep that structure intact rather than
      dismantling it — but do not design or redesign it yourself; the contract
-     extractor owns it.
+     extractor owns it. A provided baseline is not a parent: do not copy its
+     tuner contract into a fresh `train.py`.
 5. Submit the receipt described below. The driver can inspect the file;
    do not copy code or a diff back into the driver's context.
 

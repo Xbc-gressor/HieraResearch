@@ -218,12 +218,13 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 将账本记录的想法实现到候选目录的 `train.py` 中。**输入仅是候选目录**——它通过 `ledger.py show` 读取自己的账本记录以获取 `idea` + `source_run_ids`，派生父 `train.py` 引用，编写行为取决于文件系统状态，适应三种情况：
 
 - 目标目录已有 `train.py`（提供的基线）：不写；按原样保留；返回 `wrote: false`
-- `source_run_ids` 为空（`fresh`）：按记录的完整语义点从头编写，不得偷偷换成另一个更简单的点
+- `source_run_ids` 为空（`fresh`）：若任务声明了 provided baseline，先阅读它作为评估表面与文件约定的参考（不是父代、不是可编辑快照），再按记录的完整语义点从头编写；不得复制 baseline，也不得偷偷换成另一个更简单的点
 - `source_run_ids` 是数字父 run ids（`improve`/`crossover`）：使用父代代码实现想法，同时保持与 `semantic_point` 一致
 
 职责：
 - 通过 `ledger.py show` 读取 idea + 数字父代 + semantic_point + policy_receipt
 - 读取从 source_run_ids 派生的父 `train.py`
+- `fresh` 时，若任务声明了 provided baseline，先阅读任务根上的该实现作为参考，再从头编写
 - 读取只读 `prepare.py` 以理解评估 API
 - 仅写目标候选的 `train.py`
 
