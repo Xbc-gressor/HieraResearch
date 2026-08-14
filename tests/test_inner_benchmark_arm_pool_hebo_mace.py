@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -89,6 +90,23 @@ def scripted_rank_fn(script, calls=None):
         return script.pop(0)
 
     return rank_fn
+
+
+def test_default_ranker_uses_root_uv_interpreter() -> None:
+    completed = mock.Mock(returncode=0, stdout='{"values": [[1.0]]}', stderr="")
+    with mock.patch.object(pool_hebo_mace.subprocess, "run", return_value=completed) as run:
+        values = pool_hebo_mace._subprocess_rank_fn(
+            search_space={"x": ["float", 0.0, 1.0]},
+            history=[{"params": {"x": 0.5}, "score": 1.0}],
+            pool=[{"x": 0.25}],
+            seed=7,
+        )
+
+    assert values == [[1.0]]
+    assert run.call_args.args[0] == [
+        sys.executable,
+        str(pool_hebo_mace.HEBO_PROJECT_DIR / "rank.py"),
+    ]
 
 
 def run(ckpt, out, *, seed=1, budget=1, receipts, values_script, eval_outcomes=None, calls=None):

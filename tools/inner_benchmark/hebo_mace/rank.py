@@ -1,9 +1,9 @@
 """Official-HEBO MACE ranker for the inner-tuner benchmark (PLAN §6.4).
 
-Runs inside the isolated ``hebo_mace`` uv env (see pyproject.toml); invoked by
+Runs in a fresh subprocess of the repository-root uv environment; invoked by
 ``arms/pool_hebo_mace.py`` as::
 
-    uv --project tools/inner_benchmark/hebo_mace run --no-sync python rank.py
+    <root .venv python> tools/inner_benchmark/hebo_mace/rank.py
 
 stdin (one JSON object)::
 

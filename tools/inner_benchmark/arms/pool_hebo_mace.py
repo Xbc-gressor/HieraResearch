@@ -3,10 +3,9 @@
 Each step the proposer generates POOL=5 configs in proposer rank order
 (arms/pool.py driver); this arm ranks the duplicate-filtered pool with the
 OFFICIAL HEBO MACE acquisition (pinned commit; MACE itself is never
-reimplemented in this repo — the ranker lives in the isolated
-``tools/inner_benchmark/hebo_mace`` env, invoked per step as
-``uv --project <hebo_mace> run --no-sync python rank.py``) and executes ONE
-config:
+reimplemented in this repo — the ranker is installed by the root
+``uv sync`` and invoked in a fresh subprocess with that environment) and
+executes ONE config:
 
 - WARMUP gate (§6.4 step 4): when the LIVE count
   ``ctx.state.finite_unique_history()`` (checkpoint history + this cell's own
@@ -24,8 +23,8 @@ config:
   unique first-Pareto-front member, or a ``ctx.np_rng``-uniform choice among
   a tied front (PLAN: "按该 cell 的固定 RNG seed 在 front 内均匀选择 1 个").
 
-ranker failure (env not synced, nonzero subprocess exit, ``{"error": ...}``
-payload, malformed values, or a raising seam) raises ``ArmError`` —
+ranker failure (nonzero subprocess exit, ``{"error": ...}`` payload,
+malformed values, or a raising seam) raises ``ArmError`` —
 fail-fast per PLAN §6.4, never an invented "approximate HEBO".
 """
 
@@ -108,20 +107,12 @@ class PoolHeboMace:
 
 
 def _subprocess_rank_fn(*, search_space, history, pool, seed):
-    """Default rank_fn: the isolated-env rank.py over JSON stdin/stdout."""
+    """Default rank_fn: root-env rank.py over JSON stdin/stdout."""
     payload = json.dumps(
         {"search_space": search_space, "history": history, "pool": pool, "seed": seed}
     )
     proc = subprocess.run(
-        [
-            "uv",
-            "--project",
-            str(HEBO_PROJECT_DIR),
-            "run",
-            "--no-sync",
-            "python",
-            str(HEBO_PROJECT_DIR / "rank.py"),
-        ],
+        [sys.executable, str(HEBO_PROJECT_DIR / "rank.py")],
         input=payload,
         capture_output=True,
         text=True,
@@ -129,7 +120,7 @@ def _subprocess_rank_fn(*, search_space, history, pool, seed):
     if proc.returncode != 0:
         raise arm_api.ArmError(
             "hebo mace ranker subprocess failed "
-            f"(exit {proc.returncode}; env not synced?): "
+            f"(exit {proc.returncode}): "
             f"stderr: {proc.stderr.strip()[-400:]!r} "
             f"stdout: {proc.stdout.strip()[-200:]!r}"
         )

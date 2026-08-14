@@ -3,16 +3,41 @@ name = "autoresearch-automl"
 version = "0.1.0"
 description = "Claude Agent SDK-driven multi-task autoresearch harness"
 readme = "README_ZH.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "claude-agent-sdk",
     # Inner-tuner benchmark cells run in this env (review §E): optimizer libs
     # for the numerical arms. Evaluation subprocesses run in the task project
     # env instead (objective.python_cmd_for_project).
     "cma>=3.3.0",
+    # The production CONTINUE policy uses official HEBO MACE. Keep it in the
+    # root runtime environment so one root `uv sync` installs every driver and
+    # inner-tuner dependency. HEBO requires numpy<1.25, which in turn pins the
+    # root runtime to CPython 3.11.
+    "gpy==1.13.2",
+    "hebo",
     "optuna>=3.6.0",
     "scikit-learn>=1.5",
+    "torch",
 ]
 
 [dependency-groups]
 dev = ["pytest", "numpy"]
+
+[tool.uv.sources]
+hebo = { git = "https://github.com/huawei-noah/HEBO", rev = "ee6112d39d1a9e9703fecaf9057193e1ec9dae72", subdirectory = "HEBO" }
+torch = { index = "pytorch-cpu" }
+
+[tool.uv]
+# pymoo==0.6.0 pins cma==3.2.2 for its optional CMA algorithm. Our HEBO path
+# only evaluates MACE on an external pool and never enters pymoo's CMA code;
+# preserve the repository's existing CMA arm contract instead of downgrading
+# it as a side effect of installing HEBO.
+override-dependencies = ["cma>=3.3.0"]
+
+# The HEBO ranker is CPU-only. Avoid pulling the multi-GB CUDA torch wheels
+# into the driver environment.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
