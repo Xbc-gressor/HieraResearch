@@ -4,6 +4,11 @@ The loop: run the session → check the accepted receipt + postconditions →
 corrective follow-up in the SAME session with concrete diagnostics → repeat
 up to role.corrective_attempts → InvocationFailed. Escalation beyond that
 is the loops' job (role-specific, see spec Error handling).
+
+A drain is interrupted as soon as a schema-valid receipt is accepted: the
+receipt is the role's final artifact, so post-acceptance turns can only be
+waste (observed: models rambling or resubmitting for 10-30 extra turns).
+Corrective follow-ups may still resubmit (latest wins, see receipts.py).
 """
 
 from __future__ import annotations
@@ -152,9 +157,14 @@ class SDKSessionRunner:
         )
 
     async def _drain(self, client, role: RoleDefinition, ctx: InvocationContext,
-                     store: ReceiptStore) -> None:
+                     store: ReceiptStore, accepted: list[dict]) -> None:
         from claude_agent_sdk import ResultMessage, SystemMessage
 
+        interrupted = False
+        # Receipts accepted by EARLIER drains (e.g. the one whose postcondition
+        # failure triggered this corrective turn) must not interrupt this
+        # drain — only a NEW acceptance ends this turn's useful work.
+        accepted_baseline = len(accepted)
         async for msg in client.receive_response():
             if isinstance(msg, SystemMessage) and msg.subtype == "init":
                 session_id = msg.data.get("session_id")
@@ -200,6 +210,23 @@ class SDKSessionRunner:
                     result_excerpt=(getattr(msg, "result", None) or "")[:500]
                                    or None,
                 )
+            # A schema-valid receipt ends the invocation's useful work — the
+            # receipt protocol defines it as the role's FINAL artifact
+            # ("Call after ALL on-disk work is complete"). Without an
+            # interrupt the model keeps going after "receipt accepted":
+            # observed up to 31 extra turns and ~$5 per invocation in
+            # degenerate repetition loops. Keep draining after the interrupt
+            # so the ResultMessage (usage accounting) still lands.
+            if len(accepted) > accepted_baseline and not interrupted:
+                interrupted = True
+                interrupt = getattr(client, "interrupt", None)
+                if interrupt is not None:
+                    try:
+                        await interrupt()
+                    except Exception:
+                        # The receipt is already persisted; a failed
+                        # interrupt must not fail the invocation.
+                        pass
 
     @staticmethod
     def _latest_receipt(store: ReceiptStore, role: RoleDefinition,
@@ -256,7 +283,7 @@ class SDKSessionRunner:
                          resume=bool(ctx.resume_session_id))
         async with factory(options) as client:
             await client.query(ctx.user_message())
-            await self._drain(client, role, ctx, store)
+            await self._drain(client, role, ctx, store, accepted)
             receipt = self._latest_receipt(store, role, ctx, accepted)
             problems = self._problems(role, ctx, receipt)
             attempts = 0
@@ -266,7 +293,7 @@ class SDKSessionRunner:
                                  invocation_id=ctx.invocation_id,
                                  attempt=attempts, problems=problems)
                 await client.query(self._corrective_message(problems))
-                await self._drain(client, role, ctx, store)
+                await self._drain(client, role, ctx, store, accepted)
                 receipt = self._latest_receipt(store, role, ctx, accepted)
                 problems = self._problems(role, ctx, receipt)
         if problems:

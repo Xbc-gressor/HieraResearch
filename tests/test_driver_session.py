@@ -155,6 +155,101 @@ class FakeResultMessage:
         self.usage = {"input_tokens": 10}
 
 
+class EarlyInterruptTests(unittest.TestCase):
+    """Once the receipts MCP tool accepts a payload mid-stream, _drain must
+    interrupt the client (post-acceptance turns are pure waste) yet keep
+    draining so the ResultMessage's usage accounting is still emitted."""
+
+    class InterruptibleFakeClient:
+        def __init__(self, accepted: list):
+            self.accepted = accepted
+            self.interrupt_calls = 0
+
+        async def receive_response(self):
+            yield FakeSystemMessage("sess-fake")
+            # The in-process MCP tool runs between streamed messages.
+            self.accepted.append({"edited": True, "summary": "ok"})
+            yield object()  # post-acceptance assistant message: pure waste
+            yield FakeResultMessage()
+
+        async def interrupt(self):
+            self.interrupt_calls += 1
+
+    def test_interrupts_once_and_still_emits_session_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            events = EventsLog(run_dir)
+            runner = SDKSessionRunner(model="m", events=events)
+            accepted: list[dict] = []
+            client = self.InterruptibleFakeClient(accepted)
+            asyncio.run(runner._drain(client, SIMPLE_ROLE, make_ctx(run_dir),
+                                      ReceiptStore(run_dir), accepted))
+            self.assertEqual(client.interrupt_calls, 1)
+            rows = [json.loads(line)
+                    for line in (run_dir / "driver_events.jsonl")
+                    .read_text().splitlines()]
+            ends = [r for r in rows if r.get("kind") == "session_end"]
+            self.assertEqual(len(ends), 1)
+            self.assertEqual(ends[0]["usage"], {"input_tokens": 10})
+
+    def test_no_acceptance_no_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = SDKSessionRunner(model="m", events=EventsLog(run_dir))
+            client = self.InterruptibleFakeClient([])
+            asyncio.run(runner._drain(client, SIMPLE_ROLE, make_ctx(run_dir),
+                                      ReceiptStore(run_dir), []))
+            self.assertEqual(client.interrupt_calls, 0)
+
+    class CorrectiveFakeClient:
+        """Two drains share one accepted list — the corrective-turn shape:
+        drain 1 accepts a receipt, then a postcondition failure sends the
+        session into a corrective drain (drain 2)."""
+
+        def __init__(self, accepted: list, *, resubmit: bool):
+            self.accepted = accepted
+            self.resubmit = resubmit
+            self.interrupt_calls = 0
+            self.drains = 0
+
+        def receive_response(self):
+            self.drains += 1
+            drain_no = self.drains
+
+            async def stream():
+                yield FakeSystemMessage("sess-fake")
+                if drain_no == 1 or self.resubmit:
+                    self.accepted.append({"edited": True, "summary": "ok"})
+                yield object()  # assistant work (e.g. fixing files)
+                yield FakeResultMessage()
+
+            return stream()
+
+        async def interrupt(self):
+            self.interrupt_calls += 1
+
+    def _two_drains(self, run_dir: Path, *, resubmit: bool):
+        runner = SDKSessionRunner(model="m", events=EventsLog(run_dir))
+        accepted: list[dict] = []
+        client = self.CorrectiveFakeClient(accepted, resubmit=resubmit)
+        for _ in range(2):
+            asyncio.run(runner._drain(client, SIMPLE_ROLE, make_ctx(run_dir),
+                                      ReceiptStore(run_dir), accepted))
+        return client
+
+    def test_stale_receipt_does_not_interrupt_corrective_turn(self) -> None:
+        # Receipt accepted, then postcondition failed: the corrective turn
+        # must get to work — only a NEW acceptance may interrupt a drain.
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self._two_drains(Path(tmp), resubmit=False)
+            self.assertEqual(client.interrupt_calls, 1)
+
+    def test_corrective_resubmission_interrupts_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self._two_drains(Path(tmp), resubmit=True)
+            self.assertEqual(client.interrupt_calls, 2)
+
+
 class FakeClient:
     """Scripted stand-in for ClaudeSDKClient.
 
