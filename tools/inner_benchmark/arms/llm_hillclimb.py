@@ -97,7 +97,11 @@ HILLCLIMB_PROTOCOL = (
     "becomes the new base) or DISCARD (no improvement, or a crash — "
     "reverted). A crash scores +inf, the worst outcome, and is dropped. "
     "Scores are always lower-is-better. You keep editing one change at a "
-    "time until the evaluation budget is exhausted."
+    "time until the evaluation budget is exhausted. When the history shows "
+    "the incumbent's neighborhood is converged (repeated sub-noise moves "
+    "with no direction), do NOT keep refining within the noise band — "
+    "spend remaining evaluations on larger steps into regions far from the "
+    "incumbent; your step size is unrestricted."
 )
 
 

@@ -44,7 +44,10 @@ POOL_PROTOCOL = (
     "your own judgment (order[0] is the config you most want executed). A "
     "deterministic selector then executes exactly ONE config from the pool "
     "and appends its authoritative outcome. Unexecuted pool members are not "
-    "outcome evidence; every step asks for a fresh pool."
+    "outcome evidence; every step asks for a fresh pool. If recent evidence "
+    "shows the incumbent region is converged, build the pool to cover "
+    "genuinely different regions rather than near-duplicates of the "
+    "incumbent — five near-identical configs waste the selector's choice."
 )
 
 _EXECUTED = ("ok", "crash")

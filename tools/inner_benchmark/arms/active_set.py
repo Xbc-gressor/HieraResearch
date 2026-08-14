@@ -87,7 +87,10 @@ ACTIVE_SET_PROTOCOL = (
     "only after BOTH sides complete; even if x+ already improved, x- still "
     "runs from the same anchor. The new incumbent is the best of {anchor, "
     "x+, x-} and anchors the next poll. Categorical parameters are frozen "
-    "in this arm. The poll loop repeats until the budget is exhausted."
+    "in this arm. The poll loop repeats until the budget is exhausted. "
+    "Prefer axes not yet probed or with real (above-noise) signal; do not "
+    "spend a poll refining an axis whose past effects were within the "
+    "noise band (~0.005)."
 )
 
 _EXECUTED = ("ok", "crash")

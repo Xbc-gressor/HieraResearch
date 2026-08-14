@@ -20,8 +20,10 @@ Read and Edit, plus the receipt tool.
   score improves it. The working copy starts every invocation already
   synced to the incumbent's parameter values — what you Read IS the
   best-so-far config.
-- `history` — the structured bout history: one line per executed trial
-  (index, origin, params, score or CRASH, improvement-vs-incumbent-at-the-time).
+- `history` — the candidate's full executed history (frozen production
+  rows first; this bout's outcomes arrive as `outcome` blocks): one line
+  per executed trial (index, origin, params, score or CRASH,
+  improvement-vs-incumbent-at-the-time).
 - `protocol` — the arm's own protocol description. Follow it exactly.
 - `budget` — remaining objective evaluations for this bout.
 - `evidence` (optional) — extra read-only text blocks.

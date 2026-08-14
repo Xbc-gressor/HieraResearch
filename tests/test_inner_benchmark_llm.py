@@ -448,7 +448,7 @@ def test_first_message_blocks_cover_the_checklist(tmp_path) -> None:
 
     assert "3.0" in blocks["incumbent"] and "depth" in blocks["incumbent"]
 
-    history_lines = blocks["history"].splitlines()
+    history_lines = blocks["history"].removeprefix(llm.HISTORY_READING_NOTES).splitlines()
     assert len(history_lines) == 2
     assert "score=5.0" in history_lines[0]
     assert "CRASH" in history_lines[1]
@@ -469,7 +469,7 @@ def test_first_message_blocks_trials_override(tmp_path) -> None:
     blocks = llm.first_message_blocks(
         make_checkpoint(tmp_path), make_contract(), protocol="p",
         budget_remaining=7, trials=[])
-    assert blocks["history"] == "(no executed trials yet)"
+    assert blocks["history"] == llm.HISTORY_READING_NOTES + "(no executed trials yet)"
 
 
 def test_first_message_blocks_candidate_kind(tmp_path) -> None:
@@ -544,7 +544,7 @@ def test_first_message_blocks_history_replays_from_trajectory_start(tmp_path) ->
 
     blocks = llm.first_message_blocks(
         ckpt, make_contract(), protocol="p", budget_remaining=1)
-    lines = blocks["history"].splitlines()
+    lines = blocks["history"].removeprefix(llm.HISTORY_READING_NOTES).splitlines()
     # 5.0 seeded the best-so-far, 3.0 tightened it, 4.0 did not beat it —
     # with the final incumbent (3.0) as reference all three would read
     # "no improvement".

@@ -20,8 +20,10 @@ First call of a bout:
   inherited-control flag.
 - `incumbent` — the config to beat: params + score. Only a strictly LOWER
   score improves it. The poll anchor is always the current incumbent.
-- `history` — one line per executed trial: index, origin, params, score
-  (or CRASH), improvement-vs-incumbent-at-the-time.
+- `history` — the candidate's full executed history (frozen production
+  rows first; this bout's outcomes arrive as `outcome` blocks): one line
+  per executed trial: index, origin, params, score (or CRASH),
+  improvement-vs-incumbent-at-the-time.
 - `protocol` — the arm's own protocol description. Follow it exactly.
 - `budget` — remaining objective evaluations for this bout. Each poll you
   select costs TWO of them: the controller evaluates both x+ and x-.

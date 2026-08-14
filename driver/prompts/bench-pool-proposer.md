@@ -16,8 +16,10 @@ in this message, and the receipt tool is your only action.
   stratum, candidate kind, inherited-control flag.
 - `incumbent` — the config to beat: params + score. Only a strictly LOWER
   score improves it.
-- `history` — one line per executed trial: index, origin, params, score
-  (or CRASH), and whether it improved the incumbent at the time.
+- `history` — the candidate's full executed history (frozen production
+  rows first; this bout's outcomes arrive as `outcome` blocks): one line
+  per executed trial: index, origin, params, score (or CRASH), and whether
+  it improved the incumbent at the time.
 - `protocol` — the arm's own protocol description. Follow it exactly.
 - `budget` — remaining objective evaluations for this bout.
 - `evidence` (optional) — extra read-only text blocks.

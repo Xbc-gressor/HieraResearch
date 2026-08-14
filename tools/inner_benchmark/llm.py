@@ -432,6 +432,18 @@ def _row_origin(row) -> str:
     return origin
 
 
+# Prepended to the first message's history block (prompt-v2, failure-mode
+# M1/M3): the noise scale (remeasure spread of the same config is ~0.003)
+# and the confounded-attribution warning. Facts only; no protocol change.
+HISTORY_READING_NOTES = (
+    "Reading this history: adjacent rows usually change MANY parameters at "
+    "once — never attribute a row-to-row score difference to a single axis. "
+    "Scores are noisy: re-evaluating the SAME config can differ by ~0.003; "
+    "differences below ~0.005 carry no directional information. Treat "
+    "sub-noise \"improvements\" as ties, not as gradients to follow.\n"
+)
+
+
 def format_history(
     trials: Iterable,
     *,
@@ -531,7 +543,8 @@ def first_message_blocks(
         "search_space": format_search_space(contract),
         "candidate": candidate,
         "incumbent": incumbent,
-        "history": format_history(
+        "history": HISTORY_READING_NOTES
+        + format_history(
             checkpoint.history if trials is None else trials,
             # Replay from the trajectory's own start: the recorded history
             # begins at the candidate's own tuning start, so a +inf
