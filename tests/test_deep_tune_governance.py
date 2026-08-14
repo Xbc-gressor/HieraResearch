@@ -63,10 +63,15 @@ class DeepTuneGovernanceTest(unittest.TestCase):
         )
         (root / "framework_cfg.json").write_text(
             json.dumps(
-                {"tuner": {"deep_tune_time_limit_seconds": limit}}
+                {"tuner": {"deep_tune_time_limit_seconds": limit,
+                           # Stage-mechanics tests predate the regime-
+                           # conditioned inner policy: keep the legacy
+                           # uniform chains (grid primary at <=2 dims).
+                           "inner_policy": "legacy"}}
             )
         )
         report = {
+            "inner_policy": "legacy",
             "phase_a": {
                 "status": "ok",
                 "candidate_code_revision": _candidate_execution_revision(candidate),
@@ -577,8 +582,14 @@ class BoutAdmissionTest(unittest.TestCase):
             "def evaluate_config(make_model, params):\n"
             "    return float(params['x'])\n"
         )
+        # Admission-mechanics tests predate the regime-conditioned inner
+        # policy: keep the legacy uniform chains (grid primary at <=2 dims).
+        (run_dir / "framework_cfg.json").write_text(
+            json.dumps({"tuner": {"inner_policy": "legacy"}})
+        )
         report_path = candidate_dir / "tune_report.json"
         report = {
+            "inner_policy": "legacy",
             "phase_a": {
                 "status": "ok",
                 "warm_start_configs": [{"params": {"x": 1.0}, "score": 1.0}],
@@ -988,6 +999,7 @@ class CloseExhaustedStageTest(unittest.TestCase):
                     "tuner": {
                         "deep_tune_budget_fraction": 0.4,
                         "deep_tune_per_candidate_cap": 2,
+                        "inner_policy": "legacy",
                     },
                 }
             )
@@ -1015,6 +1027,7 @@ class CloseExhaustedStageTest(unittest.TestCase):
             "".join(json.dumps(row) + "\n" for row in rows)
         )
         report = {
+            "inner_policy": "legacy",
             "phase_a": {
                 "status": "ok",
                 "trials_attempted": 1,

@@ -3,7 +3,7 @@
 
 The data-driven sibling of `apply_base_params.py`: where that writes BASE_PARAMS,
 this writes SEARCH_SPACE. Used after the inducer proposes a space and
-`tune_tools.py check-search-space` validates + expands it — the finalized space
+`tune_tools.py check-search-space` validates it — the finalized space
 lands here, never by a fuzzy string edit. AST-locates the module-level
 `SEARCH_SPACE = {...}` assignment and replaces ONLY its value node, so
 BASE_PARAMS / make_model / imports cannot be clobbered.

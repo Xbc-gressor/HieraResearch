@@ -10,10 +10,10 @@ only then decide and commit.
 orchestrator can reach this code more than once for the same round (a
 corrective follow-up, a retried tool call, a crash between the call and the
 bout), and a scheduler that answers every one of those with a fresh
-committed decision inflates the coverage charge and fills the decision log
-with choices nobody executed. The policy is a pure function of
-`(state snapshot, evidence cursor)`, so an identical pair means the same
-round: the open decision is returned unchanged.
+committed decision fills the decision log with choices nobody executed.
+The policy is a pure function of `(state snapshot, evidence cursor)`, so
+an identical pair means the same round: the open decision is returned
+unchanged.
 """
 
 from __future__ import annotations
@@ -59,12 +59,19 @@ def contract_for(ledger_path: Path) -> ResourceContract:
     from run_cfg import load_run_cfg
 
     tuner = load_run_cfg(Path(ledger_path).parent, "tuner")
+    bout_trials = int(tuner.get("bout_trials", ResourceContract.bout_trials))
+    # Under the legacy inner policy every bout costs bout_trials; the frozen
+    # regime-conditioned policy charges B_FIRST for first bouts (design §2).
+    legacy_inner = str(tuner.get("inner_policy", "")) == "legacy"
     return ResourceContract(
-        bout_trials=int(tuner.get("bout_trials", ResourceContract.bout_trials)),
+        bout_trials=bout_trials,
         max_bouts=int(
             tuner.get("max_bouts_per_candidate", ResourceContract.max_bouts)
         ),
         k_eval=max(2, int(tuner.get("K_eval", ResourceContract.k_eval))),
+        first_bout_trials=(
+            bout_trials if legacy_inner else ResourceContract.first_bout_trials
+        ),
     )
 
 
@@ -143,6 +150,7 @@ def _view(
         "reason": receipt.get("reason"),
         "state_snapshot_id": receipt.get("state_snapshot_id"),
         "policy_version": receipt.get("policy_version", POLICY_VERSION),
+        "prior_id": receipt.get("prior_id"),
         "evidence_mode": receipt.get("evidence_mode", {}),
         "coverage_spent": receipt.get("coverage_spent", 0),
         "reused_open_decision": reused,

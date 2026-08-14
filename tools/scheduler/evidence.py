@@ -1,26 +1,23 @@
-"""Current-run empirical evidence and the plug-in models over it (§4, §5, §6).
+"""Predictive models: frozen design prior, then current-run exact class.
 
 Two deliberately coarse models:
 
 **Tuning transitions.** `P(Z, D | q)` for `q in {FIRST, LATER}` — nothing
-finer. With two historical runs of ~12 bouts each and cross-run pooling off,
-conditioning further (progress × headroom × previous-gain bucket × generator
-kind × stall × ...) leaves most cells with 0–2 records. That is not a more
-faithful model; it is recording single accidents as conditional
-distributions. The minimal-sufficient-predictive-state rule (§4.3) admits a
-new conditioning variable only after it demonstrates stable out-of-sample
-predictive value.
+finer. Mechanical regime is still FIRST / CONTINUE / DEEP (cost, method,
+eligibility); the predictive split is two-way because DEEP has no own
+sample. Conditioning further (progress × headroom × previous-gain × ...)
+leaves most cells with 0–2 records.
 
 **Arrivals.** An exchangeable marginal over whole ordered generation
-episodes (§5). Real arrivals certainly depend on generator kind, stall
-regime, and DAG state; the current run does not carry enough episodes to
-estimate that dependence, so v1 resamples episodes whole and keeps the
-diagnostics for calibration instead.
+episodes (§5). Real arrivals depend on generator kind and stall; one run
+does not carry enough episodes to estimate that, so v1 resamples episodes
+whole.
 
-Both are plug-in empirical distributions over `EVIDENCE_SCOPE =
-current_run` (§6). Other runs inform offline design, never the online model:
-sharing live evidence across arms would make replicates start from different
-states and make any E2E difference unattributable.
+Each class starts from the versioned table in `prior.py` and switches to
+current-run exact support once that class has `min_support` of its own
+records. That is a frozen design prior, not live cross-run transfer:
+every run begins from the same table, and concurrent arms do not share
+online observations. FIRST is never pooled into LATER.
 """
 
 from __future__ import annotations
@@ -31,8 +28,11 @@ import math
 from pathlib import Path
 from typing import Any, Sequence
 
-EVIDENCE_SCOPE = "current_run"
+from .prior import ARRIVAL_GAPS, FIRST_GAINS, LATER_GAINS, PRIOR_ID
+
+EVIDENCE_SCOPE = "current_run+frozen_design_prior"
 EVIDENCE_FILENAME = "evidence.jsonl"
+PRIOR_ID = PRIOR_ID
 
 FIRST = "FIRST"
 LATER = "LATER"
@@ -187,22 +187,62 @@ class EvidenceLog:
 # =============================================================================
 
 
+def frozen_tuning_records() -> tuple[TuningRecord, ...]:
+    """The versioned FIRST/LATER design prior as typed records."""
+    first = tuple(
+        TuningRecord(
+            bout_class=FIRST,
+            status=VALID,
+            gain=gain,
+            cost=8,
+            diagnostics={"source": source, "prior_id": PRIOR_ID},
+        )
+        for gain, source in FIRST_GAINS
+    )
+    later = tuple(
+        TuningRecord(
+            bout_class=LATER,
+            status=VALID,
+            gain=gain,
+            cost=10,
+            diagnostics={"source": source, "prior_id": PRIOR_ID},
+        )
+        for gain, source in LATER_GAINS
+    )
+    return first + later
+
+
+def frozen_arrival_records() -> tuple[ArrivalRecord, ...]:
+    """The versioned arrival-episode design prior as typed records."""
+    from .contract import DEFAULT_K_EVAL
+
+    return tuple(
+        ArrivalRecord(
+            warm_gaps=gaps,
+            planned_count=len(gaps),
+            per_candidate_cost=DEFAULT_K_EVAL,
+            diagnostics={"prior_id": PRIOR_ID},
+        )
+        for gaps in ARRIVAL_GAPS
+    )
+
+
 @dataclass(frozen=True)
 class TuningModel:
-    """Empirical `P(Z, D | q)` with a frozen fallback for thin classes.
+    """Empirical `P(Z, D | q)` with a frozen prior for thin classes.
 
-    `min_support` is the smallest number of same-class records the model
-    will estimate from. Below it, the class falls back to the pooled
-    FIRST+LATER records — a coarser but non-degenerate estimate — and below
-    the pooled threshold the model reports itself unsupported so the policy
-    can take its coverage or fallback path (§6) instead of sampling from a
-    distribution that does not exist.
+    `min_support` is the smallest number of same-class *current-run*
+    records the model will estimate from. Below it, the class draws from
+    the frozen design prior for that class — never from the other class.
+    Pooling FIRST into LATER would erase the difference the split exists
+    to represent.
     """
 
     first: tuple[TuningRecord, ...]
     later: tuple[TuningRecord, ...]
+    prior_first: tuple[TuningRecord, ...] = ()
+    prior_later: tuple[TuningRecord, ...] = ()
     min_support: int = 3
-    pooled_min_support: int = 3
 
     @classmethod
     def from_records(
@@ -210,47 +250,42 @@ class TuningModel:
         records: Sequence[TuningRecord],
         *,
         min_support: int = 3,
-        pooled_min_support: int = 3,
+        use_prior: bool = True,
     ) -> "TuningModel":
+        prior = frozen_tuning_records() if use_prior else ()
         return cls(
             first=tuple(r for r in records if r.bout_class == FIRST),
             later=tuple(r for r in records if r.bout_class == LATER),
+            prior_first=tuple(r for r in prior if r.bout_class == FIRST),
+            prior_later=tuple(r for r in prior if r.bout_class == LATER),
             min_support=min_support,
-            pooled_min_support=pooled_min_support,
         )
+
+    def _exact(self, bout_class: str) -> tuple[TuningRecord, ...]:
+        return self.first if bout_class == FIRST else self.later
+
+    def _prior(self, bout_class: str) -> tuple[TuningRecord, ...]:
+        return self.prior_first if bout_class == FIRST else self.prior_later
 
     def support(self, bout_class: str) -> tuple[TuningRecord, ...]:
         """The record set this class actually draws from."""
-        exact = self.first if bout_class == FIRST else self.later
+        exact = self._exact(bout_class)
         if len(exact) >= self.min_support:
             return exact
-        pooled = self.first + self.later
-        if len(pooled) >= self.pooled_min_support:
-            return pooled
-        return ()
+        return self._prior(bout_class)
 
     def exact_count(self, bout_class: str) -> int:
-        return len(self.first if bout_class == FIRST else self.later)
+        return len(self._exact(bout_class))
 
     def exact_supported(self, bout_class: str) -> bool:
-        """Whether this class has enough evidence of its OWN kind.
-
-        Separate from `supported` because the two answer different
-        questions. `supported` asks whether the rollout can sample at all;
-        this asks whether it would be sampling the right distribution.
-        Pooling FIRST into LATER is a usable stopgap, but it erases exactly
-        the FIRST/LATER difference the model exists to represent, so
-        coverage keeps trying to collect the real class while its shared cap
-        lasts.
-        """
-        exact = self.first if bout_class == FIRST else self.later
-        return len(exact) >= self.min_support
+        """Whether this class has enough evidence of its OWN kind."""
+        return len(self._exact(bout_class)) >= self.min_support
 
     def usage_mode(self, bout_class: str) -> str:
-        """How this class is being estimated: exact, pooled, or unsupported."""
+        """How this class is being estimated: exact, prior, or unsupported."""
         if self.exact_supported(bout_class):
             return "exact"
-        return "pooled" if self.supported(bout_class) else "unsupported"
+        return "prior" if self._prior(bout_class) else "unsupported"
 
     def supported(self, bout_class: str) -> bool:
         return bool(self.support(bout_class))
@@ -282,9 +317,18 @@ class TuningModel:
 
         return {
             "scope": EVIDENCE_SCOPE,
+            "prior_id": PRIOR_ID,
             "min_support": self.min_support,
-            "FIRST": stats(self.first),
-            "LATER": stats(self.later),
+            "FIRST": {
+                **stats(self.first),
+                "mode": self.usage_mode(FIRST),
+                "prior": stats(self.prior_first),
+            },
+            "LATER": {
+                **stats(self.later),
+                "mode": self.usage_mode(LATER),
+                "prior": stats(self.prior_later),
+            },
         }
 
 
@@ -293,6 +337,7 @@ class ArrivalModel:
     """Exchangeable marginal over ordered generation episodes (§5)."""
 
     episodes: tuple[ArrivalRecord, ...]
+    prior_episodes: tuple[ArrivalRecord, ...] = ()
     min_support: int = 2
 
     @classmethod
@@ -301,6 +346,7 @@ class ArrivalModel:
         records: Sequence[ArrivalRecord],
         *,
         min_support: int = 2,
+        use_prior: bool = True,
     ) -> "ArrivalModel":
         # An episode with no arrivals at all carries no information — it
         # only marks which candidates reconciliation has consumed. An
@@ -308,17 +354,29 @@ class ArrivalModel:
         # generation can spend a round and return nothing), so it is kept.
         return cls(
             episodes=tuple(r for r in records if r.warm_gaps),
+            prior_episodes=frozen_arrival_records() if use_prior else (),
             min_support=min_support,
         )
 
+    def support(self) -> tuple[ArrivalRecord, ...]:
+        if len(self.episodes) >= self.min_support:
+            return self.episodes
+        return self.prior_episodes
+
     def supported(self) -> bool:
-        return len(self.episodes) >= self.min_support
+        return bool(self.support())
+
+    def usage_mode(self) -> str:
+        if len(self.episodes) >= self.min_support:
+            return "exact"
+        return "prior" if self.prior_episodes else "unsupported"
 
     def sample(self, uniform: float) -> ArrivalRecord:
-        if not self.episodes:
+        support = self.support()
+        if not support:
             raise ValueError("arrival model has no observed episodes")
-        index = min(int(uniform * len(self.episodes)), len(self.episodes) - 1)
-        return self.episodes[index]
+        index = min(int(uniform * len(support)), len(support) - 1)
+        return support[index]
 
     def summary(self) -> dict:
         counts = [len(episode.usable_gaps) for episode in self.episodes]
@@ -331,7 +389,10 @@ class ArrivalModel:
         )
         return {
             "scope": EVIDENCE_SCOPE,
+            "prior_id": PRIOR_ID,
+            "mode": self.usage_mode(),
             "episodes": len(self.episodes),
+            "prior_episodes": len(self.prior_episodes),
             "mean_admitted": (sum(counts) / len(counts)) if counts else None,
             "mean_warm_gap": (sum(gaps) / len(gaps)) if gaps else None,
             "improving_gap_fraction": (
@@ -481,6 +542,25 @@ def _records_from_report(
             for stage in bout_stages
             if isinstance(stage.get("trials"), list)
         )
+        preflight_rejected = sum(
+            1
+            for stage in bout_stages
+            for trial in stage.get("trials", [])
+            if isinstance(trial, dict) and trial.get("status") == "preflight_rejected"
+        )
+        # Cost is objective attempts, not trial rows. Trial rows are an audit
+        # of *proposed* configs: a preflight rejection appends one without
+        # reserving an objective slot (`timed_preflight` never calls
+        # `reserve_evaluation`), while every scored or failed row passed
+        # `reserve_evaluation` on the way in — the same invariant the tuners'
+        # own bout accounting uses. Counting rows would charge the rollout's
+        # fixed budget for evaluations that never ran.
+        objective_attempts = len(scores) + sum(
+            1
+            for stage in bout_stages
+            for trial in stage.get("trials", [])
+            if isinstance(trial, dict) and trial.get("status") == "failed"
+        )
         best = min(scores) if scores else None
         # D_i is the raw improvement to the candidate's OWN best (eq. 2),
         # so it stays signed: a bout that found nothing better is evidence
@@ -497,7 +577,7 @@ def _records_from_report(
                 bout_class=bout_class(index),
                 status=_bout_status(bout_stages, len(scores), attempted),
                 gain=gain,
-                cost=attempted,
+                cost=objective_attempts,
                 run_id=run_id,
                 bout_index=index,
                 # Termination shape: recorded for calibration and for the
@@ -506,12 +586,29 @@ def _records_from_report(
                 diagnostics={
                     "stage_statuses": stage_statuses,
                     "scored_trials": len(scores),
+                    "preflight_rejected_trials": preflight_rejected,
                     "terminated_on_budget": "budget_exhausted" in stage_statuses,
                     "methods": [
                         stage.get("method")
                         for stage in bout_stages
                         if isinstance(stage, dict)
                     ],
+                    # SPSA stage counters (DEEP bouts) as the stage persisted
+                    # them; absent for non-SPSA stages. Summed per bout.
+                    **{
+                        key: sum(
+                            stage[key]
+                            for stage in bout_stages
+                            if isinstance(stage.get(key), int)
+                            and not isinstance(stage.get(key), bool)
+                        )
+                        for key in ("pairs_attempted", "updates_applied")
+                        if any(
+                            isinstance(stage.get(key), int)
+                            and not isinstance(stage.get(key), bool)
+                            for stage in bout_stages
+                        )
+                    },
                 },
             )
         )

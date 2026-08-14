@@ -50,6 +50,10 @@ from _common import (  # noqa: E402
     write_json,
 )
 from failure_artifacts import record_failure  # noqa: E402
+from inner_policy import (  # noqa: E402
+    deferred_occupy_bout_slots,
+    load_policy_id,
+)
 
 
 INFEASIBLE_ATTR = "hiera_infeasible"
@@ -312,6 +316,16 @@ def main() -> int:
     parser.add_argument("--n-trials", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sampler",
+        choices=("tpe", "random"),
+        default="tpe",
+        help=(
+            "proposal kernel: multivariate TPE (default) or explicit "
+            "RandomSampler (FIRST bouts under inner policy "
+            "deferred-random8-hebo10-spsa10-v1)"
+        ),
+    )
     args = parser.parse_args()
     time_budget = deep_tune_time_budget(
         args.candidate_path,
@@ -322,6 +336,7 @@ def main() -> int:
     # per-run framework overrides (Phase-3 OFAT): <run_dir>/framework_cfg.json tuner.*
     # explicit flag wins; else framework_cfg.json; else the historical defaults.
     _rc = load_run_cfg(args.candidate_path, "tuner")
+    policy_id = load_policy_id(args.candidate_path)
     # Defaults are data-driven (dev_plan/hpo-benchmark-report.md): patience=6 was
     # the main HPO suppressor; budget ~40.
     n_trials = args.n_trials if args.n_trials is not None else int(_rc.get("bo_n_trials", 40))
@@ -380,20 +395,31 @@ def main() -> int:
         floor = int(_rc.get("bo_patience_floor", 12))
         patience = int(min(cap, max(floor, round(1.5 * n_dims))))
 
-    # multivariate TPE ("tpe+") was the top optimizer in the benchmark — it models
-    # parameter interactions, beating plain TPE/cmaes esp. at high dims.
-    sampler_kwargs = {
-        "seed": args.seed,
-        "multivariate": True,
-        "group": True,
-        "n_startup_trials": 8,
-        # Always constrained: crashed trials (not only preflight rejections)
-        # are marked infeasible so TPE steers away from crashing regions.
-        "constraints_func": _infeasible_constraints,
-    }
-    sampler = optuna.samplers.TPESampler(
-        **sampler_kwargs,
-    )
+    if args.sampler == "random":
+        # FIRST-bout kernel of deferred-random8-hebo10-spsa10-v1: explicit
+        # RandomSampler over the production distributions (linear floats on
+        # the linear scale, log floats on the log scale, int/categorical on
+        # their own discrete distributions). Never substituted with
+        # TPESampler(n_startup_trials=N): warm/infeasible priors and deferred
+        # trials can push TPE past its startup threshold mid-bout, and the
+        # frozen policy requires model_driven_trials == 0.
+        sampler_kwargs = {"seed": args.seed}
+        sampler = optuna.samplers.RandomSampler(seed=args.seed)
+    else:
+        # multivariate TPE ("tpe+") was the top optimizer in the benchmark — it
+        # models parameter interactions, beating plain TPE/cmaes esp. at high dims.
+        sampler_kwargs = {
+            "seed": args.seed,
+            "multivariate": True,
+            "group": True,
+            "n_startup_trials": 8,
+            # Always constrained: crashed trials (not only preflight rejections)
+            # are marked infeasible so TPE steers away from crashing regions.
+            "constraints_func": _infeasible_constraints,
+        }
+        sampler = optuna.samplers.TPESampler(
+            **sampler_kwargs,
+        )
     study = optuna.create_study(direction="minimize", sampler=sampler)
 
     distributions = build_distributions(search_space)
@@ -529,10 +555,12 @@ def main() -> int:
         rewarm_proposals_enqueued=n_proposals_enqueued,
         rewarm_skipped_outside_space=len(proposals_outside),
     )
-    # Only the deferred extras enlarge the TPE budget; enqueued proposals
-    # consume the first of the existing n_trials slots.
+    # Only the legacy policy enlarges the bout budget by the deferred count;
+    # under deferred-random8-hebo10-spsa10-v1 deferred-warm configs occupy
+    # slots INSIDE the bout (design §2 rule 4), like enqueued proposals.
     n_enqueued = n_proposals_enqueued + n_deferred_enqueued
-    n_trials = n_trials + n_deferred_enqueued
+    if not deferred_occupy_bout_slots(policy_id):
+        n_trials = n_trials + n_deferred_enqueued
 
     # Seed best AND streak from the persisted trial history: a restarted study
     # continues the patience window instead of getting a fresh one.
@@ -732,30 +760,42 @@ def main() -> int:
 
     stage_elapsed = deep_tune_stage_elapsed(time_budget)
 
-    # TPE startup accounting. Optuna's sampler silently falls back to random
-    # draws until the study holds n_startup_trials COMPLETE/PRUNED trials, so a
-    # stage can report method "bo" while never engaging TPE (run 0730-ds-ex100-1:
-    # every stage ended below startup). Reconstruct the split from the trial
-    # sequence so the receipt shows it. Order in study.trials: injected score
-    # priors, injected infeasible priors, enqueued deferred, then sampler draws;
-    # injected trials are all COMPLETE (feasible with scores, infeasible with
-    # the penalty value) and count toward startup. Exact for one invocation;
-    # across a crash resume it describes the final invocation only.
-    n_startup = sampler_kwargs["n_startup_trials"]
     completes = n_priors_injected + n_infeasible_injected
-    model_driven_trials = 0
-    random_fallback_trials = 0
-    for index, run_trial in enumerate(study.trials[completes:]):
-        if index >= n_enqueued:  # enqueued proposals/deferred are not sampler draws
-            if completes >= n_startup:
-                model_driven_trials += 1
-            else:
-                random_fallback_trials += 1
-        # COMPLETE/PRUNED count toward TPE startup. Here that is exactly the
-        # finite-value trials: no pruner is configured, crashes leave value
-        # None, and infeasible completions carry the finite penalty value.
-        if run_trial.value is not None and math.isfinite(float(run_trial.value)):
-            completes += 1
+    if args.sampler == "random":
+        # An explicit RandomSampler is model-free by construction: every
+        # sampler draw is a random draw, so the TPE startup reconstruction
+        # below would be meaningless (and must report model_driven == 0).
+        n_startup = 0
+        model_driven_trials = 0
+        random_fallback_trials = sum(
+            1
+            for index, _run_trial in enumerate(study.trials[completes:])
+            if index >= n_enqueued
+        )
+    else:
+        # TPE startup accounting. Optuna's sampler silently falls back to random
+        # draws until the study holds n_startup_trials COMPLETE/PRUNED trials, so a
+        # stage can report method "bo" while never engaging TPE (run 0730-ds-ex100-1:
+        # every stage ended below startup). Reconstruct the split from the trial
+        # sequence so the receipt shows it. Order in study.trials: injected score
+        # priors, injected infeasible priors, enqueued deferred, then sampler draws;
+        # injected trials are all COMPLETE (feasible with scores, infeasible with
+        # the penalty value) and count toward startup. Exact for one invocation;
+        # across a crash resume it describes the final invocation only.
+        n_startup = sampler_kwargs["n_startup_trials"]
+        model_driven_trials = 0
+        random_fallback_trials = 0
+        for index, run_trial in enumerate(study.trials[completes:]):
+            if index >= n_enqueued:  # enqueued proposals/deferred are not sampler draws
+                if completes >= n_startup:
+                    model_driven_trials += 1
+                else:
+                    random_fallback_trials += 1
+            # COMPLETE/PRUNED count toward TPE startup. Here that is exactly the
+            # finite-value trials: no pruner is configured, crashes leave value
+            # None, and infeasible completions carry the finite penalty value.
+            if run_trial.value is not None and math.isfinite(float(run_trial.value)):
+                completes += 1
 
     if counters["objective_completed"] == 0 and counters["budget_exhausted"]:
         set_stage_meta(
@@ -861,6 +901,8 @@ def main() -> int:
         duplicates_skipped=counters["duplicates_skipped"],
         budget_exhausted=counters["budget_exhausted"],
         time_limit_seconds=time_budget["limit_seconds"],
+        sampler=args.sampler,
+        inner_policy=policy_id,
         n_startup_trials=n_startup,
         model_driven_trials=model_driven_trials,
         random_fallback_trials=random_fallback_trials,
@@ -895,6 +937,8 @@ def main() -> int:
         "deferred_skipped_outside_space": len(deferred_outside),
         "n_dims": n_dims,
         "patience": patience,
+        "sampler": args.sampler,
+        "inner_policy": policy_id,
         "n_startup_trials": n_startup,
         "model_driven_trials": model_driven_trials,
         "random_fallback_trials": random_fallback_trials,

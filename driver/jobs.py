@@ -231,7 +231,12 @@ def build_driver_job(
     tuner_cfg = framework_cfg.get("tuner", {})
     if not isinstance(tuner_cfg, dict):
         raise DriverJobError("framework_cfg tuner section must be an object")
-    bout_trials = int(tuner_cfg.get("bout_trials", 10))
+    # The bout's full size is regime-conditioned under the frozen inner policy
+    # (FIRST=8, CONTINUE/DEEP=10); phase-c-action already computed it from the
+    # candidate's bout index. The legacy inner policy keeps tuner.bout_trials.
+    bout_trials = _positive_int(
+        action.get("bout_trials"), "phase-c-action.bout_trials"
+    )
     if trial_cap > bout_trials:
         raise DriverJobError(
             f"driver_job.trial_cap {trial_cap} exceeds bout_trials {bout_trials}"
@@ -242,6 +247,24 @@ def build_driver_job(
             f"trial_cap {trial_cap} != bout_trials {bout_trials}"
         )
     script = repo_root / "tools" / "tuners" / f"{method}_search.py"
+    if method == "hebo":
+        # Repo-root env: SDK session + official HEBO ranker. Evaluations
+        # stay in the task project via timed_eval(python_cmd=...).
+        argv = [
+            "uv",
+            "--project",
+            str(repo_root),
+            "run",
+            "python",
+            str(script),
+            "--candidate-path",
+            str(candidate_path),
+            "--tune-report-json",
+            str(report_path),
+            "--n-evals",
+            str(trial_cap),
+        ]
+        return argv, candidate_path.parent / f"_phase_c_{method}.log", run_id
     argv = [
         "uv",
         "--directory",
@@ -259,6 +282,11 @@ def build_driver_job(
                  "--patience", "6"]
     elif method == "bo":
         argv += ["--n-trials", str(trial_cap)]
+        sampler = action.get("sampler")
+        if sampler:
+            argv += ["--sampler", str(sampler)]
+    elif method == "spsa":
+        argv += ["--n-evals", str(trial_cap)]
     elif method == "cmaes":
         argv += ["--popsize", "8", "--max-evals", str(min(64, trial_cap)),
                  "--patience", "20"]

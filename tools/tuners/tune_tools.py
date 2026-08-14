@@ -25,12 +25,13 @@ Subcommands:
                     final_best_score, trials_completed, trials_attempted,
                     elapsed_seconds}
 - check-search-space : proposed SEARCH_SPACE + proposed warm configs -> {ok,
-                    finalized_space, expansions, errors}; validates kinds vs the
-                    full schema and widens ranges to bracket every validated
-                    config. On ok, the
-                    proposed --space-json is overwritten in place with finalized_space
-                    (apply_search_space.py then writes it into train.py); exit 1 on a
-                    hard error.
+                    finalized_space, errors}; validate-only — kinds vs the full
+                    schema, and every warm config inside both the schema and the
+                    proposed range. The space is never widened; an out-of-range
+                    config is an error the proposer fixes. On ok, the proposed
+                    --space-json is rewritten in place in schema key order
+                    (apply_search_space.py then writes it into train.py); exit 1
+                    on a hard error.
 - lineage-evidence : run_dir + parent run_ids -> {per_parent} — per parent its
                     idea, best config+score, searched space, explored ranges, and
                     a few whole trials (top-by-score + farthest-point diverse, so
@@ -64,6 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/ for ru
 
 from failure_artifacts import render_failure
 from evaluation_budget import budget_status, find_run_dir  # noqa: E402
+import inner_policy  # noqa: E402
 from run_cfg import read_framework_cfg  # noqa: E402
 from semantic_evidence import unbound_primary_descendants  # noqa: E402
 
@@ -1125,7 +1127,7 @@ def _phase_c_finalization_state(
             errors.append(f"phase_c.stages[{index}] must be an object")
             statuses.append(None)
             continue
-        if stage.get("method") not in {"grid", "bo", "cmaes"}:
+        if stage.get("method") not in {"grid", "bo", "cmaes", "spsa", "hebo"}:
             errors.append(f"phase_c.stages[{index}].method is invalid")
         status = stage.get("status")
         statuses.append(status if isinstance(status, str) else None)
@@ -1158,14 +1160,22 @@ def _phase_c_finalization_state(
     expected_methods: list[str] = []
     search_space = phase_a.get("search_space")
     if isinstance(search_space, dict) and search_space:
-        expected = select_method(len(search_space))
-        expected_methods = [expected["method"], *expected["fallback"]]
-        for bout in bouts:
+        # The report's stages were admitted under the stamped inner policy;
+        # validate each bout against its own regime's chain. An unstamped
+        # report predates nothing — the frozen default policy applies.
+        report_policy = report.get("inner_policy", inner_policy.POLICY_ID)
+        expected_methods = inner_policy.method_chain_for_bout(
+            report_policy, len(bouts) - 1 if bouts else 0, search_space
+        )
+        for seen_bout_index, bout in enumerate(bouts):
             bout_methods = [stage.get("method") for stage in bout]
-            if bout_methods != expected_methods[:len(bout_methods)]:
+            bout_chain = inner_policy.method_chain_for_bout(
+                report_policy, seen_bout_index, search_space
+            )
+            if bout_methods != bout_chain[:len(bout_methods)]:
                 errors.append(
                     f"Phase-C method chain {bout_methods!r} does not match "
-                    f"deterministic chain {expected_methods!r}"
+                    f"deterministic chain {bout_chain!r}"
                 )
 
     # Only the final bout may prove that the current chain is exhausted.
@@ -1482,11 +1492,71 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     )
     search_space = _read_search_space(candidate_path)
 
-    selected = select_method(len(search_space))
-    method_chain = [selected["method"], *selected["fallback"]]
+    policy_id = inner_policy.load_policy_id(candidate_path)
+    stamped_policy = report.get("inner_policy")
+    if stamped_policy is not None and stamped_policy != policy_id:
+        raise ValueError(
+            f"report was admitted under inner_policy {stamped_policy!r}; "
+            f"framework_cfg now says {policy_id!r}"
+        )
+    from _common import load_run_cfg
+
+    legacy_bout_trials = int(
+        load_run_cfg(candidate_path, "tuner").get("bout_trials", DEFAULT_BOUT_TRIALS)
+    )
+
+    def chain_for(bout: int) -> list:
+        return inner_policy.method_chain_for_bout(policy_id, bout, search_space)
+
+    def extras(bout: int, method) -> dict:
+        return {
+            "bout_regime": inner_policy.regime_for_bout_index(bout),
+            "bout_trials": inner_policy.expected_bout_trials(
+                policy_id, bout, legacy_bout_trials
+            ),
+            "sampler": (
+                inner_policy.bo_sampler_for_bout(policy_id, bout)
+                if method == "bo"
+                else None
+            ),
+        }
+
+    def start_new_bout(next_bout: int) -> dict:
+        """The previous bout is closed and finalized; begin the next one."""
+        if (
+            policy_id == inner_policy.POLICY_ID
+            and inner_policy.regime_for_bout_index(next_bout) == inner_policy.DEEP
+            and not inner_policy.has_movable_continuous(search_space)
+        ):
+            # The candidate has no DEEP action (design §2.1): no continuous
+            # dimension for SPSA to move. Selection excludes such candidates;
+            # this backstop finalizes best-so-far rather than silently running
+            # a TPE/grid bout still labeled DEEP.
+            result = finalizable_tuning_result(report)
+            return {
+                **common,
+                "action": "finalize",
+                "method": None,
+                "reason": "deep_bout_requires_movable_continuous",
+                "best_score": result["best_score"],
+                "bout_index": next_bout - 1,
+                "method_chain": [],
+                **extras(next_bout - 1, None),
+            }
+        chain = chain_for(next_bout)
+        return {
+            **common,
+            "action": "run",
+            "method": chain[0],
+            "reason": "start_new_bout",
+            "bout_index": next_bout,
+            "method_chain": chain,
+            **extras(next_bout, chain[0]),
+        }
+
     common = {
-        "n_dims": selected["n_dims"],
-        "method_chain": method_chain,
+        "n_dims": len(search_space),
+        "inner_policy": policy_id,
     }
     phase_c = report.get("phase_c")
     if phase_c is not None and not isinstance(phase_c, dict):
@@ -1496,12 +1566,15 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     else:
         stages = phase_c["stages"]
     if stages == []:
+        method_chain = chain_for(0)
         return {
             **common,
             "action": "run",
             "method": method_chain[0],
             "reason": "phase_c_not_started",
             "bout_index": 0,
+            "method_chain": method_chain,
+            **extras(0, method_chain[0]),
         }
     if not isinstance(stages, list) or not all(
         isinstance(stage, dict) for stage in stages
@@ -1510,15 +1583,16 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     from _common import stages_by_bout
 
     bouts = stages_by_bout(stages)
-    for bout in bouts:
+    for seen_bout_index, bout in enumerate(bouts):
         bout_methods = [stage.get("method") for stage in bout]
+        bout_chain = chain_for(seen_bout_index)
         if (
-            len(bout) > len(method_chain)
-            or bout_methods != method_chain[:len(bout)]
+            len(bout) > len(bout_chain)
+            or bout_methods != bout_chain[:len(bout)]
         ):
             raise ValueError(
                 f"Phase-C method chain {bout_methods!r} does not match "
-                f"{method_chain!r}"
+                f"{bout_chain!r}"
             )
         if any(
             stage.get("status") != "rejected"
@@ -1532,6 +1606,7 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
 
     current = bouts[-1]
     bout_index = len(bouts) - 1
+    method_chain = chain_for(bout_index)
     methods = [stage.get("method") for stage in current]
     final_stage = current[-1]
     final_status = final_stage.get("status")
@@ -1548,6 +1623,8 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
                 "reason": "evaluation_budget_reached",
                 "budget_scope": scope,
                 "bout_index": bout_index,
+                "method_chain": method_chain,
+                **extras(bout_index, methods[-1]),
             }
         return {
             **common,
@@ -1555,20 +1632,25 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             "method": methods[-1],
             "reason": "resume_interrupted_stage",
             "bout_index": bout_index,
+            "method_chain": method_chain,
+            **extras(bout_index, methods[-1]),
         }
     if final_status == "rejected":
         if final_stage.get("trials") not in (None, []):
             raise ValueError("a rejected Phase-C stage cannot contain trials")
         if len(current) < len(method_chain):
+            method = method_chain[len(current)]
             return {
                 **common,
                 "action": "run",
-                "method": method_chain[len(current)],
+                "method": method,
                 "reason": "run_deterministic_fallback",
                 "bout_index": bout_index,
+                "method_chain": method_chain,
+                **extras(bout_index, method),
             }
         if applied_close:
-            return _start_new_bout(common, method_chain, bout_index)
+            return start_new_bout(bout_index + 1)
         result = finalizable_tuning_result(report)
         return {
             **common,
@@ -1577,9 +1659,11 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             "reason": "method_chain_exhausted",
             "best_score": result["best_score"],
             "bout_index": bout_index,
+            "method_chain": method_chain,
+            **extras(bout_index, None),
         }
     if applied_close:
-        return _start_new_bout(common, method_chain, bout_index)
+        return start_new_bout(bout_index + 1)
     result = finalizable_tuning_result(report)
     return {
         **common,
@@ -1588,17 +1672,8 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
         "reason": f"terminal_{final_status}",
         "best_score": result["best_score"],
         "bout_index": bout_index,
-    }
-
-
-def _start_new_bout(common: dict, method_chain: list, bout_index: int) -> dict:
-    """The previous bout is closed and finalized; begin the next one."""
-    return {
-        **common,
-        "action": "run",
-        "method": method_chain[0],
-        "reason": "start_new_bout",
-        "bout_index": bout_index + 1,
+        "method_chain": method_chain,
+        **extras(bout_index, None),
     }
 
 
@@ -1777,10 +1852,29 @@ def _candidate_structure_sha256(candidate_path: Path) -> str:
             continue
         normalized_body.append(node)
     tree.body = normalized_body
-    normalized = ast.dump(
-        tree,
-        annotate_fields=True,
-        include_attributes=False,
+    def stable_ast(value):
+        if isinstance(value, ast.AST):
+            # Root tuner and task objective intentionally run in different uv
+            # projects. Python 3.12 added the empty ``type_params`` field to
+            # several existing nodes, so ast.dump of identical source differs
+            # between the supported 3.11 and 3.12+ interpreters. Serialize the
+            # semantic fields ourselves and omit that version-only field.
+            return [
+                type(value).__name__,
+                [
+                    [field, stable_ast(getattr(value, field))]
+                    for field in value._fields
+                    if field != "type_params"
+                ],
+            ]
+        if isinstance(value, list):
+            return [stable_ast(item) for item in value]
+        return value
+
+    normalized = json.dumps(
+        stable_ast(tree),
+        ensure_ascii=False,
+        separators=(",", ":"),
     ).encode()
     return _sha256_bytes(normalized)
 
@@ -2842,11 +2936,6 @@ def finalized_tuning_record(
 # Search-space induction and proposal validation
 # =============================================================================
 
-# When a survived config sits outside the inducer's proposed range, extend past
-# it by this fraction of the gap so the value lands *interior*, not on the new
-# edge — the search needs room beyond known-good points. Single source of truth.
-MARGIN_FRAC = 0.25
-
 
 def _as_tuple(entry):
     """JSON delivers SEARCH_SPACE entries as lists; restore the tuple form
@@ -2854,74 +2943,18 @@ def _as_tuple(entry):
     return tuple(entry)
 
 
-def _expand_space_entry(entry, values):
-    """Widen one `(kind, ...)` entry to include all of `values` (the survived
-    configs' values for this key), with margin for numerics or by union for
-    categoricals. Returns (new_entry_tuple, reasons[]). Only expands where a
-    value is outside; degenerate ranges get a min-width floor."""
-    entry = _as_tuple(entry)
-    kind = entry[0]
-    reasons: list = []
-    if kind == "categorical":
-        opts = list(entry[1])
-        for v in values:
-            if not _categorical_contains(opts, v):
-                opts.append(v)
-                reasons.append(f"added option {v!r}")
-        return ("categorical", opts), reasons
-
-    original_lo, original_hi = float(entry[1]), float(entry[2])
-    lo, hi = original_lo, original_hi
-    tail = list(entry[3:])  # e.g. ["log"] for float
-    nums = [float(v) for v in values
-            if isinstance(v, (int, float)) and not isinstance(v, bool)]
-    observed_lo = min(nums) if nums else original_lo
-    observed_hi = max(nums) if nums else original_hi
-
-    if "log" in tail:
-        # Apply margin in log space so positive distributions stay positive and
-        # equal evidence yields the same box regardless of config order.
-        log_lo, log_hi = math.log(original_lo), math.log(original_hi)
-        if observed_lo < original_lo:
-            observed_log_lo = math.log(observed_lo)
-            lo = math.exp(
-                observed_log_lo
-                - MARGIN_FRAC * (log_hi - observed_log_lo)
-            )
-            reasons.append(f"widened low to include {observed_lo}")
-        if observed_hi > original_hi:
-            observed_log_hi = math.log(observed_hi)
-            hi = math.exp(
-                observed_log_hi
-                + MARGIN_FRAC * (observed_log_hi - log_lo)
-            )
-            reasons.append(f"widened high to include {observed_hi}")
-    else:
-        if observed_lo < original_lo:
-            lo = observed_lo - MARGIN_FRAC * (original_hi - observed_lo)
-            reasons.append(f"widened low to include {observed_lo}")
-        if observed_hi > original_hi:
-            hi = observed_hi + MARGIN_FRAC * (observed_hi - original_lo)
-            reasons.append(f"widened high to include {observed_hi}")
-
-    if kind == "int":
-        lo, hi = int(math.floor(lo)), int(math.ceil(hi))
-        return ("int", lo, hi), reasons
-
-    return ("float", lo, hi, *tail), reasons
-
-
 def check_search_space(authoritative_schema: dict, proposed: dict, configs: list) -> dict:
     """Validate proposed SEARCH_SPACE and configs against the full PARAM_SCHEMA.
 
-    Configs at this boundary are proposals, not observations.  They may widen a
-    numeric range only after their exact keys, types, log positivity, and
-    categorical membership are proven against the frozen schema.
+    Validate-only: the proposed space is accepted or rejected, never rewritten.
+    Configs at this boundary are proposals, not observations, so a config
+    outside the proposed range is an inconsistency the proposer must resolve —
+    widening the box here would create parameter values that no one checked for
+    executability against `make_model`, and those values then reach every
+    sampler and consume objective budget.
 
-    Returns
-    {ok, finalized_space, expansions[], errors[]}. Hard errors (kind/key
-    mismatch, bad tuple) leave finalized_space None and ok False; otherwise the
-    finalized space is the proposed one widened to contain all configs."""
+    Returns {ok, finalized_space, errors[]}. On ok the finalized space is the
+    proposed one verbatim; any error leaves finalized_space None."""
     errors: list = []
     if not isinstance(authoritative_schema, dict):
         errors.append({
@@ -3011,47 +3044,38 @@ def check_search_space(authoritative_schema: dict, proposed: dict, configs: list
                         f"PARAM_SCHEMA {_safe_repr(schema_entry)}"
                     ),
                 })
+                continue
+            space_entry = (
+                _as_tuple(proposed[key])
+                if isinstance(proposed.get(key), (tuple, list))
+                else proposed.get(key)
+            )
+            # The space is never widened to swallow an out-of-range config, so
+            # the proposer must reconcile the two. Reporting it here keeps the
+            # fix in the same self-fix loop as every other proposal error,
+            # rather than surfacing later as a warmstart bounds violation.
+            if valid_space_entry(space_entry) and not _value_in_bounds(
+                config[key], space_entry
+            ):
+                errors.append({
+                    "code": "config_outside_space",
+                    "key": key,
+                    "config_index": index,
+                    "detail": (
+                        f"value {_safe_repr(config[key])} is outside the "
+                        f"proposed SEARCH_SPACE {_safe_repr(proposed[key])}; "
+                        "widen the proposed range or move the config inside it"
+                    ),
+                })
     if errors:
-        return {"ok": False, "finalized_space": None, "expansions": [], "errors": errors}
+        return {"ok": False, "finalized_space": None, "errors": errors}
 
-    finalized, expansions = {}, []
-    for key in authoritative_schema:  # preserve schema key order
-        values = [config[key] for config in configs]
-        schema_entry = authoritative_schema[key]
-        if _schema_kind(schema_entry) == "categorical":
-            observed = values
-            values = [
-                option
-                for option in schema_entry[1]
-                if _categorical_contains(observed, option)
-            ]
-        try:
-            new_entry, reasons = _expand_space_entry(proposed[key], values)
-        except (OverflowError, TypeError, ValueError) as exc:
-            errors.append({
-                "code": "expansion_error",
-                "key": key,
-                "detail": f"cannot safely expand numeric range: {exc}",
-            })
-            continue
-        if not valid_space_entry(new_entry):
-            errors.append({
-                "code": "expansion_error",
-                "key": key,
-                "detail": f"expanded entry {_safe_repr(new_entry)} is invalid or non-finite",
-            })
-            continue
-        finalized[key] = list(new_entry)  # JSON-friendly (lists, not tuples)
-        if reasons:
-            expansions.append({"key": key, "reasons": reasons})
-    if errors:
-        return {
-            "ok": False,
-            "finalized_space": None,
-            "expansions": [],
-            "errors": errors,
-        }
-    return {"ok": True, "finalized_space": finalized, "expansions": expansions, "errors": []}
+    # Preserve schema key order: it drives deterministic grid/CMA encodings and
+    # is part of the candidate execution revision.
+    finalized = {
+        key: list(_as_tuple(proposed[key])) for key in authoritative_schema
+    }
+    return {"ok": True, "finalized_space": finalized, "errors": []}
 
 
 def validate_proposals(
@@ -3064,9 +3088,11 @@ def validate_proposals(
     Continuation-only (spec §6): proposals re-warm the NEXT bout, which
     exists only after an earlier bout closed applied. When the report has no
     finalized bout yet, every proposal is rejected with reason
-    ``first_bout_has_no_rewarm`` and nothing is written. An inconsistent
-    close makes ``has_applied_close`` raise ValueError; that propagates
-    (fail closed).
+    ``first_bout_has_no_rewarm`` and nothing is written. Under the frozen
+    policy, CONTINUE (HEBO) and DEEP (SPSA) also reject proposals
+    (``hebo_bout_has_no_rewarm`` / ``deep_bout_has_no_rewarm``). An
+    inconsistent close makes ``has_applied_close`` raise ValueError; that
+    propagates (fail closed).
 
     Deterministic disposal of LLM-proposed configs: each proposal must be a
     param dict with the exact SEARCH_SPACE key set, in-bounds values, and a
@@ -3085,13 +3111,48 @@ def validate_proposals(
     report_path = Path(report_path)
     if not isinstance(proposals, list):
         proposals = []
-    if not has_applied_close(read_tune_report(report_path)):
+    report = read_tune_report(report_path)
+    if not has_applied_close(report):
         return {
             "ok": False,
             "proposed_count": len(proposals),
             "accepted": [],
             "rejected": [
                 {"index": index, "reason": "first_bout_has_no_rewarm"}
+                for index in range(len(proposals))
+            ],
+        }
+    policy_id = inner_policy.load_policy_id(candidate_path)
+    # The bout these proposals would be consumed by: when every stage is
+    # finalized that is the next new bout, otherwise the in-flight one.
+    stages = report.get("phase_c", {}).get("stages") or []
+    from _common import stages_by_bout
+
+    bouts = stages_by_bout(stages)
+    last_finalized = last_finalized_stage_index(report)
+    target_bout = (
+        len(bouts)
+        if last_finalized is not None and last_finalized == len(stages) - 1
+        else max(0, len(bouts) - 1)
+    )
+    if not inner_policy.rewarm_allowed(policy_id, target_bout):
+        regime = inner_policy.regime_for_bout_index(target_bout)
+        if regime == inner_policy.DEEP:
+            # A DEEP bout must form complete SPSA pairs; a re-warm
+            # proposal displacing one leg would break the pair.
+            reason = "deep_bout_has_no_rewarm"
+        elif regime == inner_policy.CONTINUE:
+            # Prompt-v2 HEBO generates its own pool; Phase-R proposals
+            # would only displace that protocol.
+            reason = "hebo_bout_has_no_rewarm"
+        else:
+            reason = "first_bout_has_no_rewarm"
+        return {
+            "ok": False,
+            "proposed_count": len(proposals),
+            "accepted": [],
+            "rejected": [
+                {"index": index, "reason": reason}
                 for index in range(len(proposals))
             ],
         }
@@ -3458,11 +3519,22 @@ def _incumbent_retry_candidate(
     )
 
 
+def movable_continuous_flags(run_dir: Path, ledger: dict) -> dict:
+    """Per-candidate DEEP eligibility flag, shared with the scheduler's
+    state builder (see inner_policy.load_movable_continuous_flags)."""
+    return inner_policy.load_movable_continuous_flags(run_dir, ledger)
+
+
 def _partition_candidates(
     ledger: dict,
     candidates: list[dict],
     budget: _CandidateBudgetState,
+    *,
+    policy_id: str = inner_policy.POLICY_ID,
+    movable_continuous: dict | None = None,
 ) -> _CandidatePools:
+    movable = movable_continuous or {}
+
     def eligible(record: dict) -> bool:
         return _candidate_cap_allows(
             record,
@@ -3471,6 +3543,17 @@ def _partition_candidates(
             ledger,
             str(record.get("run_id")),
         )
+
+    def deep_ineligible(record: dict) -> bool:
+        """The next bout is DEEP but no continuous dimension can move: the
+        candidate has no DEEP action (design §2.1) — it is done, never
+        silently routed to a TPE/grid bout still labeled DEEP."""
+        if policy_id != inner_policy.POLICY_ID:
+            return False
+        next_bout = int(record.get("tuning_bouts") or (1 if record.get("tune") else 0))
+        if inner_policy.regime_for_bout_index(next_bout) != inner_policy.DEEP:
+            return False
+        return movable.get(str(record.get("run_id")), True) is False
 
     fresh = [
         record
@@ -3484,6 +3567,7 @@ def _partition_candidates(
         and record.get("last_bout_improved") is not False
         and _is_finite_score(record.get("final_best_score"))
         and eligible(record)
+        and not deep_ineligible(record)
     ]
     non_responders = [
         record
@@ -3630,6 +3714,7 @@ def _selected_candidate_result(
     *,
     top_percentile: float,
     bout_trials: int | None,
+    policy_id: str = inner_policy.POLICY_ID,
 ) -> dict:
     selected = choice.selected
     assert selected is not None
@@ -3637,6 +3722,11 @@ def _selected_candidate_result(
         selected.get("tuning_bouts")
         or (1 if selected.get("tune") else 0)
     )
+    bout_regime = inner_policy.regime_for_bout_index(tuning_bouts)
+    if policy_id == inner_policy.POLICY_ID:
+        bout_size = inner_policy.bout_size(bout_regime)
+    else:
+        bout_size = bout_trials
     if choice.is_continuation:
         reason = (
             f"continuation: responder with fewest bouts ({tuning_bouts}) "
@@ -3664,6 +3754,8 @@ def _selected_candidate_result(
         "reason": reason,
         "is_continuation": choice.is_continuation,
         "bout_index": tuning_bouts,
+        "bout_regime": bout_regime,
+        "inner_policy": policy_id,
         "tuning_bouts": tuning_bouts,
         "last_bout_improved": selected.get("last_bout_improved"),
         "best_warm_score": selected.get("best_warm_score"),
@@ -3692,14 +3784,14 @@ def _selected_candidate_result(
                 if isinstance(budget.per_candidate_cap, int)
                 else None
             ),
-            bout_trials,
+            bout_size,
         )
         if isinstance(value, int)
     ]
     result["budget_allocation"] = {
         **budget.receipt,
         "candidate_attempts": candidate_used,
-        "bout_trials": bout_trials,
+        "bout_trials": bout_size,
         "trial_cap": min(caps) if caps else None,
     }
     return result
@@ -3713,6 +3805,8 @@ def select_candidate(
     bout_trials: int | None = None,
     budget_allocation: dict | None = None,
     last_bout_was_first: bool | None = None,
+    policy_id: str = inner_policy.POLICY_ID,
+    movable_continuous: dict | None = None,
 ) -> dict:
     """Which candidate receives the next tuning bout (progressive §15), or none.
 
@@ -3763,7 +3857,13 @@ def select_candidate(
             ),
         }
 
-    pools = _partition_candidates(ledger, candidates, budget)
+    pools = _partition_candidates(
+        ledger,
+        candidates,
+        budget,
+        policy_id=policy_id,
+        movable_continuous=movable_continuous,
+    )
     choice = _choose_candidate(
         pools,
         top_percentile=top_percentile,
@@ -3782,6 +3882,7 @@ def select_candidate(
         budget,
         top_percentile=top_percentile,
         bout_trials=bout_trials,
+        policy_id=policy_id,
     )
 
 
@@ -3882,11 +3983,13 @@ def cmd_check_search_space(args) -> int:
     configs = json.loads(Path(args.configs_json).read_text())
     result = check_search_space(schema, proposed, configs)
     if result["ok"]:
-        # Persist the finalized (expanded) space back to the SAME artifact so the
-        # caller never hand-extracts finalized_space from stdout — writing the whole
-        # verdict dict there would corrupt the contract apply_search_space reads.
-        # On error, leave the proposed file untouched for the agent's self-fix loop;
-        # stdout carries the verdict (ok / expansions / errors) either way.
+        # Persist the finalized space back to the SAME artifact so the caller
+        # never hand-extracts finalized_space from stdout — writing the whole
+        # verdict dict there would corrupt the contract apply_search_space
+        # reads. The entries are the proposed ones verbatim; only key order is
+        # normalized to the schema's. On error, leave the proposed file
+        # untouched for the agent's self-fix loop; stdout carries the verdict
+        # either way.
         space_path = Path(args.space_json)
         tmp_path = space_path.with_suffix(space_path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(result["finalized_space"], indent=2) + "\n")
@@ -3986,6 +4089,12 @@ def _v3_2_selection(ledger_path: Path, scenarios: int | None) -> dict:
         "reason": view["reason"],
         "is_continuation": bool(candidate and candidate.bouts_used > 0),
         "bout_index": candidate.bouts_used if candidate else 0,
+        "bout_regime": (
+            inner_policy.regime_for_bout_index(candidate.bouts_used)
+            if candidate
+            else None
+        ),
+        "inner_policy": inner_policy.load_policy_id(ledger_path),
         "tuning_bouts": candidate.bouts_used if candidate else 0,
         "n_candidates": len(state.candidates),
         "scheduler": {
@@ -4001,9 +4110,13 @@ def _v3_2_selection(ledger_path: Path, scenarios: int | None) -> dict:
         },
         "budget_allocation": {
             "global_remaining": state.remaining_budget,
-            # v3.2 admits a bout at full B or not at all: there is no
-            # truncated bout to allocate a smaller cap for.
-            "trial_cap": state.contract.bout_trials if selected else None,
+            # v3.2 admits a bout at its full regime cost or not at all:
+            # there is no truncated bout to allocate a smaller cap for.
+            "trial_cap": (
+                state.contract.bout_cost(candidate.bouts_used)
+                if selected
+                else None
+            ),
             "bout_trials": state.contract.bout_trials,
         },
     }
@@ -4027,6 +4140,12 @@ def cmd_select_candidate(args) -> int:
     else:
         n_min = math.ceil(100.0 / (100.0 - top_p)) if top_p < 100 else DEFAULT_N_MIN
     bout = int(rc.get("bout_trials", DEFAULT_BOUT_TRIALS))
+    policy_id = inner_policy.load_policy_id(led)
+    movable = (
+        movable_continuous_flags(led.parent, ledger)
+        if policy_id == inner_policy.POLICY_ID
+        else None
+    )
     try:
         result = select_candidate(
             ledger,
@@ -4035,6 +4154,8 @@ def cmd_select_candidate(args) -> int:
             bout_trials=bout,
             budget_allocation=budget_status(led.parent),
             last_bout_was_first=_last_bout_was_first(led.parent, ledger),
+            policy_id=policy_id,
+            movable_continuous=movable,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
@@ -4105,11 +4226,11 @@ def build_parser() -> argparse.ArgumentParser:
     rf.set_defaults(func=cmd_render_failure)
 
     cs = sub.add_parser("check-search-space",
-                        help="Validate + expand a proposed SEARCH_SPACE against the full schema and proposed warm configs; on ok, overwrite --space-json in place with the finalized space.")
+                        help="Validate a proposed SEARCH_SPACE against the full schema and proposed warm configs (validate-only, never widened); on ok, rewrite --space-json in place in schema key order.")
     cs.add_argument("--candidate-path", required=True, type=Path,
                     help="train.py whose PARAM_SCHEMA gives the authoritative kinds")
     cs.add_argument("--space-json", required=True, type=Path,
-                    help="JSON of the proposed SEARCH_SPACE {key: [kind, ...]}; overwritten in place with the finalized (expanded) space on ok")
+                    help="JSON of the proposed SEARCH_SPACE {key: [kind, ...]}; rewritten in place in schema key order on ok")
     cs.add_argument("--configs-json", required=True, type=Path,
                     help="JSON list of proposed warm-config param dicts")
     cs.set_defaults(func=cmd_check_search_space)

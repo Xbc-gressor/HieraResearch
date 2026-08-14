@@ -29,6 +29,7 @@ from tools.scheduler.evidence import (  # noqa: E402
     FIRST,
     INFRA_FAILURE,
     LATER,
+    PRIOR_ID,
     SCIENTIFIC_INVALID,
     VALID,
     ArrivalModel,
@@ -68,6 +69,8 @@ def state(
     *candidates: CandidateView,
     budget: int = 100,
     contract: ResourceContract | None = None,
+    n_roots: int | None = None,
+    n_seed: int = 0,
 ) -> SchedulerState:
     contract = contract or ResourceContract()
     scores = [c.best_score for c in candidates if not c.crashed]
@@ -76,11 +79,13 @@ def state(
         remaining_budget=budget,
         candidates=tuple(candidates),
         contract=contract,
+        n_roots=n_roots,
+        n_seed=n_seed,
     )
 
 
-def tuning_model(*records: TuningRecord) -> TuningModel:
-    return TuningModel.from_records(records)
+def tuning_model(*records: TuningRecord, use_prior: bool = False) -> TuningModel:
+    return TuningModel.from_records(records, use_prior=use_prior)
 
 
 def bout(klass: str, gain: float, *, status: str = VALID, cost: int = 10):
@@ -92,9 +97,35 @@ class AdmissionTest(unittest.TestCase):
 
     def test_partial_budget_admits_no_bout(self):
         contract = ResourceContract()
-        view = candidate("001", 1.0)
-        self.assertIsNone(ineligibility_reason(view, 10, contract))
-        self.assertIn("cannot admit a full", ineligibility_reason(view, 9, contract))
+        # Regime costs (design §2): a FIRST bout admits at full B_FIRST=8,
+        # a CONTINUE/DEEP bout at full B=10 — never truncated.
+        first = candidate("001", 1.0)
+        self.assertIsNone(ineligibility_reason(first, 8, contract))
+        self.assertIn("cannot admit a full", ineligibility_reason(first, 7, contract))
+        later = candidate("002", 1.0, bouts=1)
+        self.assertIsNone(ineligibility_reason(later, 10, contract))
+        self.assertIn("cannot admit a full", ineligibility_reason(later, 9, contract))
+
+    def test_deep_bout_requires_a_movable_continuous_dimension(self):
+        contract = ResourceContract()
+        deep = candidate("001", 1.0, bouts=2, has_movable_continuous=False)
+        self.assertEqual(
+            ineligibility_reason(deep, 1000, contract),
+            "no movable continuous dimension for a DEEP bout",
+        )
+        # The same candidate is admitted while its next bout is CONTINUE.
+        pre_deep = candidate("001", 1.0, bouts=1, has_movable_continuous=False)
+        self.assertIsNone(ineligibility_reason(pre_deep, 1000, contract))
+
+    def test_lifetime_cost_is_policy_aware(self):
+        self.assertEqual(ResourceContract().lifetime_cost(), 38)
+        self.assertEqual(
+            ResourceContract(first_bout_trials=10).lifetime_cost(), 40
+        )
+        self.assertEqual(
+            ResourceContract(bout_trials=8, first_bout_trials=8).lifetime_cost(),
+            32,
+        )
 
     def test_bout_cap_is_permanent(self):
         contract = ResourceContract()
@@ -129,12 +160,17 @@ class TransitionTest(unittest.TestCase):
         )
         self.assertEqual(after.candidates[1].best_score, 4.0)
         self.assertEqual(after.global_best, 4.0)
-        self.assertEqual(after.remaining_budget, 90)
+        # "002" was untuned: the bout charges the FIRST-regime cost B_FIRST=8.
+        self.assertEqual(after.remaining_budget, 92)
 
     def test_negative_gain_is_floored_but_still_charges(self):
         after = state(candidate("001", 5.0)).apply_bout("001", -2.0)
         self.assertEqual(after.candidates[0].best_score, 5.0)
         self.assertEqual(after.candidates[0].previous_gain, -2.0)
+        self.assertEqual(after.remaining_budget, 92)
+
+    def test_continuation_bout_charges_the_full_b(self):
+        after = state(candidate("001", 5.0, bouts=1)).apply_bout("001", 1.0)
         self.assertEqual(after.remaining_budget, 90)
 
     def test_gain_below_headroom_does_not_move_the_global_best(self):
@@ -289,6 +325,42 @@ class EvidenceDerivationTest(unittest.TestCase):
         )
         self.assertEqual(records[0].status, INFRA_FAILURE)
 
+    def test_cost_counts_objective_attempts_not_trial_rows(self):
+        """A preflight-rejected leg leaves a trial row but reserved no
+        objective slot (`timed_preflight` never calls `reserve_evaluation`),
+        while every scored or failed row passed `reserve_evaluation` on the
+        way in. Cost must be the latter, matching evaluation_attempts.jsonl —
+        the degenerate DEEP shape (plus legs scored, minus legs rejected, no
+        gradient update) is a valid outcome whose true cost is 10, not 20.
+        """
+        records = self._records(
+            self._report(
+                [
+                    {
+                        "bout_index": 0,
+                        "method": "spsa",
+                        "status": "ok",
+                        "pairs_attempted": 10,
+                        "updates_applied": 0,
+                        "preflight_rejections": 9,
+                        "trials": [
+                            *[{"score": 9.0 + i * 0.1} for i in range(10)],
+                            {"score": None, "status": "failed"},
+                            *[{"status": "preflight_rejected"} for _ in range(9)],
+                        ],
+                    }
+                ]
+            )
+        )
+        self.assertEqual(records[0].status, VALID)
+        self.assertEqual(records[0].cost, 11)
+        # Termination shape rides along as diagnostics — recorded, never
+        # conditioned on (§4.3) — so a degenerate bout stays distinguishable
+        # from a complete one without changing the model's inputs.
+        self.assertEqual(records[0].diagnostics["preflight_rejected_trials"], 9)
+        self.assertEqual(records[0].diagnostics["pairs_attempted"], 10)
+        self.assertEqual(records[0].diagnostics["updates_applied"], 0)
+
 
 class ArrivalEvidenceTest(unittest.TestCase):
     """Gaps are anchored to the pre-episode raw global best (eq. 7)."""
@@ -358,24 +430,118 @@ class ArrivalEvidenceTest(unittest.TestCase):
         self.assertFalse(ArrivalModel.from_records([episode]).episodes)
 
 
-class ModelSupportTest(unittest.TestCase):
-    """Pooled fallback is usable but is not exact-class support."""
+class FrozenPriorTest(unittest.TestCase):
+    """The design prior is versioned, class-separated, and FIRST-costed."""
 
-    def test_pooled_fallback_is_not_exact_support(self):
-        model = tuning_model(*(bout(FIRST, 1.0) for _ in range(3)))
+    def test_prior_id_and_class_costs(self):
+        from tools.scheduler.evidence import frozen_tuning_records
+
+        records = frozen_tuning_records()
+        first = [r for r in records if r.bout_class == FIRST]
+        later = [r for r in records if r.bout_class == LATER]
+        self.assertEqual(len(first), 4)
+        self.assertEqual(len(later), 4)
+        self.assertTrue(all(r.cost == 8 for r in first))
+        self.assertTrue(all(r.cost == 10 for r in later))
+        self.assertTrue(all(r.diagnostics.get("prior_id") == PRIOR_ID for r in records))
+        self.assertGreater(max(r.gain for r in first), max(r.gain for r in later))
+
+
+class ModelSupportTest(unittest.TestCase):
+    """Exact class wins; otherwise the frozen prior, never the other class."""
+
+    def test_prior_is_not_exact_support(self):
+        model = TuningModel.from_records(
+            [bout(FIRST, 1.0) for _ in range(3)], use_prior=True
+        )
         self.assertTrue(model.supported(LATER))
         self.assertFalse(model.exact_supported(LATER))
-        self.assertEqual(model.usage_mode(LATER), "pooled")
+        self.assertEqual(model.usage_mode(LATER), "prior")
         self.assertEqual(model.usage_mode(FIRST), "exact")
 
-    def test_empty_model_is_unsupported(self):
+    def test_empty_model_without_prior_is_unsupported(self):
         model = tuning_model()
         self.assertFalse(model.supported(FIRST))
         self.assertEqual(model.usage_mode(FIRST), "unsupported")
 
+    def test_empty_model_with_prior_is_supported(self):
+        model = TuningModel.from_records([], use_prior=True)
+        self.assertTrue(model.supported(FIRST))
+        self.assertTrue(model.supported(LATER))
+        self.assertEqual(model.usage_mode(FIRST), "prior")
+        self.assertEqual(model.usage_mode(LATER), "prior")
+        self.assertGreaterEqual(model.exact_count(FIRST), 0)
+        self.assertFalse(model.exact_supported(FIRST))
+
+    def test_first_is_never_pooled_into_later(self):
+        model = TuningModel.from_records(
+            [bout(FIRST, 1.0) for _ in range(3)], use_prior=False
+        )
+        self.assertTrue(model.supported(FIRST))
+        self.assertFalse(model.supported(LATER))
+        self.assertEqual(model.usage_mode(LATER), "unsupported")
+
+
+class SeedSetGateTest(unittest.TestCase):
+    """Defer while reserved fresh roots are still arriving."""
+
+    def test_incomplete_seed_set_defers_without_rollout(self):
+        decision = decide(
+            state(
+                candidate("000", 1.0),
+                candidate("001", 1.03),
+                n_roots=2,
+                n_seed=5,
+            ),
+            TuningModel.from_records([], use_prior=True),
+            ArrivalModel.from_records([], use_prior=True),
+        )
+        self.assertEqual(decision.action, "DEFER")
+        self.assertIsNone(decision.run_id)
+        self.assertTrue(decision.reason.startswith("seed set incomplete"))
+        self.assertFalse(decision.values)
+        self.assertTrue(decision.evidence_mode["seed_set_incomplete"])
+        self.assertEqual(decision.evidence_mode["n_roots"], 2)
+        self.assertEqual(decision.evidence_mode["n_seed"], 5)
+
+    def test_complete_seed_set_uses_rollout(self):
+        decision = decide(
+            state(
+                candidate("000", 1.0),
+                candidate("001", 1.03),
+                n_roots=5,
+                n_seed=5,
+            ),
+            TuningModel.from_records([], use_prior=True),
+            ArrivalModel.from_records([], use_prior=True),
+            config=PolicyConfig(rollout=RolloutConfig(scenarios=4)),
+        )
+        self.assertFalse(decision.reason.startswith("seed set incomplete"))
+        self.assertTrue(decision.values)
+        self.assertFalse(decision.evidence_mode["seed_set_incomplete"])
+
+    def test_gate_does_not_fire_when_defer_cannot_buy_a_round(self):
+        # FIRST still fits; a generation slot does not.
+        contract = ResourceContract(k_eval=20, first_bout_trials=8)
+        decision = decide(
+            state(
+                candidate("000", 1.0),
+                budget=15,
+                contract=contract,
+                n_roots=2,
+                n_seed=5,
+            ),
+            TuningModel.from_records([], use_prior=True),
+            ArrivalModel.from_records([], use_prior=True),
+            config=PolicyConfig(rollout=RolloutConfig(scenarios=4)),
+        )
+        self.assertFalse(decision.reason.startswith("seed set incomplete"))
+        self.assertEqual(decision.action, "TUNE")
+        self.assertEqual(decision.run_id, "000")
+
 
 class CoverageTest(unittest.TestCase):
-    """Coverage collects exact-class evidence under ONE shared cap (§6)."""
+    """Sample-seeking coverage is off; cold start uses the frozen prior."""
 
     def _decide(self, tuning, arrival, spent=0, **kwargs):
         return decide(
@@ -389,33 +555,49 @@ class CoverageTest(unittest.TestCase):
             coverage_spent=spent,
         )
 
-    def test_pooled_later_still_triggers_coverage(self):
+    def test_thin_later_does_not_force_a_later_bout(self):
         decision = self._decide(
-            tuning_model(*(bout(FIRST, 1.0) for _ in range(3))),
-            ArrivalModel.from_records([]),
+            TuningModel.from_records(
+                [bout(FIRST, 1.0) for _ in range(3)], use_prior=True
+            ),
+            ArrivalModel.from_records([], use_prior=True),
         )
-        self.assertEqual(decision.action, "TUNE")
-        self.assertEqual(decision.run_id, "002")  # the only LATER-class target
-        self.assertIn("LATER", decision.reason)
+        self.assertFalse(decision.reason.startswith("coverage:"))
+        self.assertEqual(decision.evidence_mode[LATER], "prior")
+        self.assertEqual(decision.evidence_mode[FIRST], "exact")
 
-    def test_first_is_collected_before_later(self):
-        decision = self._decide(tuning_model(), ArrivalModel.from_records([]))
-        self.assertEqual(decision.run_id, "001")
-        self.assertIn("FIRST", decision.reason)
-
-    def test_shared_cap_stops_forcing(self):
+    def test_empty_current_run_does_not_force_first(self):
         decision = self._decide(
-            tuning_model(), ArrivalModel.from_records([]), spent=6
+            TuningModel.from_records([], use_prior=True),
+            ArrivalModel.from_records([], use_prior=True),
+        )
+        self.assertFalse(decision.reason.startswith("coverage:"))
+        self.assertFalse(decision.reason.startswith("fallback"))
+        self.assertTrue(decision.values)
+        self.assertIn(decision.action, {"TUNE", "DEFER"})
+        self.assertEqual(decision.evidence_mode[FIRST], "prior")
+        self.assertEqual(decision.evidence_mode[LATER], "prior")
+        self.assertEqual(decision.evidence_mode["arrival"], "prior")
+        self.assertEqual(decision.evidence_mode["prior_id"], PRIOR_ID)
+
+    def test_coverage_gate_is_gone_even_with_old_thresholds(self):
+        decision = self._decide(
+            TuningModel.from_records([], use_prior=True),
+            ArrivalModel.from_records([], use_prior=True),
+            budget_cap=6,
+            min_first=3,
+            min_later=3,
         )
         self.assertFalse(decision.reason.startswith("coverage:"))
 
     def test_evidence_mode_is_recorded(self):
         decision = self._decide(
-            tuning_model(*(bout(FIRST, 1.0) for _ in range(3))),
-            ArrivalModel.from_records([]),
-            spent=6,
+            TuningModel.from_records(
+                [bout(FIRST, 1.0) for _ in range(3)], use_prior=True
+            ),
+            ArrivalModel.from_records([], use_prior=True),
         )
-        self.assertEqual(decision.evidence_mode[LATER], "pooled")
+        self.assertEqual(decision.evidence_mode[LATER], "prior")
         self.assertEqual(decision.evidence_mode[FIRST], "exact")
 
 
@@ -564,7 +746,13 @@ class TieRuleTest(unittest.TestCase):
         self.assertEqual(decision.run_id, "009")
 
 
-def run_dir_fixture(tmp: str, *, budget: int = 100, tuner: dict | None = None) -> Path:
+def run_dir_fixture(
+    tmp: str,
+    *,
+    budget: int = 100,
+    tuner: dict | None = None,
+    got: dict | None = None,
+) -> Path:
     """A synthetic v3.2 run directory: two warm candidates, no objective."""
     run_dir = Path(tmp) / "runs" / "toy" / "tag"
     run_dir.mkdir(parents=True)
@@ -572,6 +760,8 @@ def run_dir_fixture(tmp: str, *, budget: int = 100, tuner: dict | None = None) -
         "max_evaluations": budget,
         "tuner": {"scheduler_policy": "v3_2", **(tuner or {})},
     }
+    if got:
+        config["got"] = got
     (run_dir / "framework_cfg.json").write_text(json.dumps(config))
     (run_dir / "evaluation_attempts.jsonl").write_text("")
     (run_dir / "ledger.json").write_text(
@@ -639,21 +829,62 @@ class RunIntegrationTest(unittest.TestCase):
                 1,
             )
 
-    def test_repeated_queries_do_not_inflate_coverage(self):
+    def test_repeated_queries_do_not_inflate_the_decision_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run_dir(tmp)
             ledger = run_dir / "ledger.json"
             for _ in range(4):
                 decide_for_run(ledger, scenarios=4)
-            self.assertEqual(SchedulerStore(run_dir).coverage_spent(), 1)
+            store = SchedulerStore(run_dir)
+            self.assertEqual(store.coverage_spent(), 0)
+            self.assertEqual(
+                len([r for r in store.decisions() if r["kind"] == "scheduler_decision"]),
+                1,
+            )
 
-    def test_executed_bout_binds_the_decision_and_reopens_deciding(self):
+    def test_cold_start_is_not_sample_seeking_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp)
+            view = decide_for_run(run_dir / "ledger.json", scenarios=4)
+            self.assertFalse(str(view["reason"]).startswith("coverage:"))
+            self.assertEqual(view["evidence_mode"][FIRST], "prior")
+            self.assertEqual(view["evidence_mode"][LATER], "prior")
+            self.assertEqual(view["evidence_mode"]["arrival"], "prior")
+            self.assertEqual(view["prior_id"], PRIOR_ID)
+            # Two warm roots, default n_seed=5: the seed-set gate defers.
+            self.assertEqual(view["action"], "DEFER")
+            self.assertTrue(str(view["reason"]).startswith("seed set incomplete"))
+            self.assertEqual(view["evidence_mode"]["n_roots"], 2)
+            self.assertEqual(view["evidence_mode"]["n_seed"], 5)
+
+    def test_complete_seed_set_on_a_live_run_uses_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp, got={"n_seed": 2})
+            view = decide_for_run(run_dir / "ledger.json", scenarios=4)
+            self.assertFalse(str(view["reason"]).startswith("seed set incomplete"))
+            self.assertIn(view["action"], {"TUNE", "DEFER"})
+            store = SchedulerStore(run_dir)
+            receipt = next(
+                row
+                for row in store.decisions()
+                if row["kind"] == "scheduler_decision"
+            )
+            self.assertIn("q_hat", receipt)
+            self.assertFalse(receipt["evidence_mode"]["seed_set_incomplete"])
+
+    def test_executed_action_binds_the_decision_and_reopens_deciding(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run_dir(tmp)
             ledger = run_dir / "ledger.json"
             first = decide_for_run(ledger, scenarios=4)
-            self.assertEqual(first["action"], "TUNE")
-            execute_bout(ledger, first["run_id"])
+            if first["action"] == "TUNE":
+                execute_bout(ledger, first["run_id"])
+            else:
+                data = json.loads(ledger.read_text())
+                data["records"].append(
+                    {"run_id": "002", "status": "keep", "best_warm_score": 6.0}
+                )
+                ledger.write_text(json.dumps(data))
 
             second = decide_for_run(ledger, scenarios=4)
             self.assertNotEqual(first["decision_id"], second["decision_id"])
@@ -664,9 +895,11 @@ class RunIntegrationTest(unittest.TestCase):
             ]
             self.assertEqual(len(outcomes), 1)
             self.assertEqual(outcomes[0]["decision_id"], first["decision_id"])
-            self.assertEqual(outcomes[0]["executed_run_id"], first["run_id"])
-            self.assertEqual(outcomes[0]["status"], VALID)
-            self.assertEqual(outcomes[0]["consumed_evaluations"], 10)
+            self.assertEqual(outcomes[0]["executed_action"], first["action"])
+            if first["action"] == "TUNE":
+                self.assertEqual(outcomes[0]["executed_run_id"], first["run_id"])
+                self.assertEqual(outcomes[0]["status"], VALID)
+                self.assertEqual(outcomes[0]["consumed_evaluations"], 10)
 
     def test_snapshot_round_trips_through_replay(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -740,6 +973,30 @@ class ConfigCompatibilityTest(unittest.TestCase):
             "deep_tune_budget_fraction",
         )
 
+    def test_per_candidate_cap_of_38_is_the_full_contract(self):
+        config, _ = self._read(
+            {
+                "max_evaluations": 120,
+                "tuner": {
+                    "scheduler_policy": "v3_2",
+                    "deep_tune_per_candidate_cap": 38,
+                },
+            }
+        )
+        self.assertEqual(config["tuner"]["deep_tune_per_candidate_cap"], 38)
+
+    def test_per_candidate_cap_of_37_is_rejected(self):
+        self._expect_error(
+            {
+                "max_evaluations": 120,
+                "tuner": {
+                    "scheduler_policy": "v3_2",
+                    "deep_tune_per_candidate_cap": 37,
+                },
+            },
+            "8 + 10 x 3 = 38",
+        )
+
     def test_per_candidate_cap_below_bout_contract_rejected(self):
         self._expect_error(
             {
@@ -770,9 +1027,12 @@ class CalibrationTest(unittest.TestCase):
 
     def _executed_run(self, tmp: str):
         """A run with one decision made, executed, and reconciled."""
-        run_dir = run_dir_fixture(tmp)
+        # Two roots already present: set n_seed so the seed-set gate is
+        # not the thing being calibrated.
+        run_dir = run_dir_fixture(tmp, got={"n_seed": 2})
         ledger = run_dir / "ledger.json"
         first = decide_for_run(ledger, scenarios=4)
+        self.assertEqual(first["action"], "TUNE")
         execute_bout(ledger, first["run_id"])
         decide_for_run(ledger, scenarios=4)
         return run_dir, ledger

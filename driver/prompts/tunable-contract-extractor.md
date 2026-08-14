@@ -143,8 +143,28 @@ randomized.
 
 **A proposed `SEARCH_SPACE`** — one entry per key, **same kind** as the schema:
 `("float", lo, hi)` / `("float", lo, hi, "log")` / `("int", lo, hi)` /
-`("categorical", [opts])`. A conservative region centered where you expect low
-scores. 
+`("categorical", [opts])`. Bracket where you expect low scores, but do **not**
+carve a tight box around the incumbent: an edge that ends exactly at the best
+known value amputates the direction tuning was still improving toward, and the
+deep-tuner cannot explore what you never proposed. Concrete anchors: rate/scale
+axes the schema declares **log-sampled** (`("float", lo, hi, "log")` — most
+learning rates and temperatures) span **at least two orders of magnitude** when
+the task admits it — they live in decades, not ±50%. Plain linear floats do
+not: uniform sampling over a 100× linear range spends ~90% of draws in the top
+decade, so give them bounds reasoned from the natural domain and the budget
+instead (a ratio inside [0, 1]; a weight decay inside a stability-motivated
+interval) — width without a sampling-scale reason only dilutes coverage. The
+schema pins each axis's kind and log mode; propose within them, never around
+them. Capacity axes (depth, width, hidden sizes) reach **at least a halving
+below and a doubling above** the incumbent, unless the per-evaluation budget
+forbids it — a short-budget task that can still train a 4-layer model must not
+floor `depth` at the incumbent's 6 just because 6 is what was written. Set the LOW
+side from what the budget can still train and the HIGH side from where the
+mechanism plausibly saturates, never from the incumbent's own value alone.
+`check-search-space` neither widens nor repairs what you propose: every warm
+config must already sit **inside** the space you write, and the space itself is
+the final one. Leave the room the tuner will need — nothing downstream can
+invent width you never proposed.
 
 `SEARCH_SPACE` is sampled as a Cartesian product, so every combination inside
 it must be executable. Do not expose two raw coordinates when one coordinate's
@@ -201,7 +221,7 @@ Re-run this command after every edit to `train.py`, `PARAM_SCHEMA`, or config
 materialization. `warmstart_eval.py` rejects a stale or missing receipt before
 `BASE_PARAMS`, import, preflight, or `score_fn`.
 
-### 2c. Validate + expand (self-fix loop)
+### 2c. Validate (self-fix loop)
 
 ```bash
 python tools/tuners/tune_tools.py check-search-space \
@@ -209,12 +229,15 @@ python tools/tuners/tune_tools.py check-search-space \
   --configs-json <candidate_dir>/_warm_configs.json
 ```
 
-- **exit 0** — it overwrote `_search_space.json` with the finalized (expanded)
-  space; `expansions[]` says what it widened. Proceed to 2d.
+- **exit 0** — the proposed space is the finalized space; `_search_space.json`
+  is rewritten in schema key order, entries unchanged. Proceed to 2d.
 - **exit 1** — fix per `errors[]` (`schema_mismatch` / `missing_key` /
-  `extra_key` / `bad_tuple` / `config_key_mismatch` /
-  `config_value_invalid`). A config value outside the schema is never added to
-  the search space—fix `_warm_configs.json` and re-run until ok.
+  `extra_key` / `bad_tuple` / `config_key_mismatch` / `config_value_invalid` /
+  `config_outside_space`). The space is never widened for you: a config outside
+  it means either the range is too tight for the region you meant to explore
+  (widen `_search_space.json`, with a reason) or the config is wrong (fix
+  `_warm_configs.json`). Decide which — every bound you write is one you
+  believe `make_model` can execute — and re-run until ok.
 
 ### 2d. Write the finalized space into the candidate
 

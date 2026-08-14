@@ -1,24 +1,26 @@
-"""The scheduler decision: coverage, rollout comparison, frozen tie rule (§6, §7).
+"""The scheduler decision: seed-set gate, then rollout (§6, §7).
 
 One decision runs three stages:
 
 1. **Terminal check** — no admissible full-bout TUNE and no executable
    DEFER means there is nothing to decide.
-2. **Coverage** — when the current-run evidence cannot support the models
-   the rollout needs, the rollout would be sampling from a distribution
-   that does not exist. The scheduler then takes a bounded mechanical
-   bootstrap: collect the missing class of evidence directly. This is
-   evidence-gated cold start, not an exploration bonus, and every forced
-   collection draws on ONE run-level coverage budget. Once that cap is
-   spent the policy falls back to a frozen rule rather than exploring
-   forever.
+2. **Seed-set gate** — while `n_roots < n_seed` and DEFER can still buy
+   another generation round, defer. Those reserved fresh roots arrive
+   whether we tune or not; a FIRST spent before the set is visible is
+   a timing error, not a value comparison.
 3. **Rollout** — paired full-remaining-budget comparison of every root
    action, then the frozen tie rule when the champion's margin is inside
    the estimator's resolution.
 
+Predictive models start from the versioned design prior in `prior.py`.
+Current-run records replace a class once that class has enough of its own
+observations. The scheduler does not force a TUNE or DEFER to fill a
+class count: spending run budget to feed `P(Z, D | q)` inverts the
+objective.
+
 `POLICY_VERSION` is part of every receipt. Rollout values are only
-comparable across decisions that share a policy and a reference policy, so
-a change to either must change the version.
+comparable across decisions that share a policy, a reference policy, and
+the same prior id.
 """
 
 from __future__ import annotations
@@ -26,8 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from .contract import CandidateView
 from .evidence import (
+    PRIOR_ID,
     ArrivalModel,
     FIRST,
     LATER,
@@ -42,29 +44,23 @@ from .rollout import (
 )
 from .state import SchedulerState
 
-POLICY_VERSION = "scheduler-v3.2"
+POLICY_VERSION = "scheduler-v3.2.2"
 
 
 @dataclass(frozen=True)
 class CoverageConfig:
-    """Bounded evidence bootstrap (§6). Config, not frozen design.
+    """Disabled sample-seeking coverage. Kept so receipts and configs
+    still carry the field; `budget_cap=0` means the gate never fires.
 
-    `budget_cap` is a single run-level total shared by every forced
-    collection — the design requires one shared cap so cold start cannot
-    consume the run one class at a time.
-
-    `min_first` / `min_later` are how much evidence of a class's OWN kind
-    coverage tries to collect before it stops forcing. They are what makes
-    coverage do anything at all: without them the model's pooled fallback
-    reports every class "supported" the moment three records of any class
-    exist, and the FIRST/LATER split the model is built around would never
-    be estimated from FIRST/LATER data.
+    Earlier builds forced 3 FIRST + 3 LATER bouts (and arrival episodes)
+    so the plug-in model would have exact-class support. That spent the
+    run on the scheduler's own evidence instead of terminal raw best.
     """
 
-    budget_cap: int = 6
-    min_first: int = 3
-    min_later: int = 3
-    min_arrival_episodes: int = 2
+    budget_cap: int = 0
+    min_first: int = 0
+    min_later: int = 0
+    min_arrival_episodes: int = 0
 
 
 @dataclass(frozen=True)
@@ -84,10 +80,10 @@ class Decision:
     margin: dict | None = None
     coverage_spent: int = 0
     tie_broken: bool = False
-    #: Per-bout-class estimation mode at decision time: "exact", "pooled",
-    #: or "unsupported". A Q value computed against pooled FIRST+LATER
-    #: records is not the same quantity as one computed against the class's
-    #: own records, so the receipt has to say which one it is.
+    #: Per-class estimation mode at decision time: "exact", "prior", or
+    #: "unsupported". A Q value computed against the frozen design prior
+    #: is not the same quantity as one computed against this run's own
+    #: records, so the receipt has to say which one it is.
     evidence_mode: dict = field(default_factory=dict)
 
     def receipt(
@@ -105,6 +101,7 @@ class Decision:
             "decision_id": decision_id,
             "state_snapshot_id": snapshot_id,
             "policy_version": POLICY_VERSION,
+            "prior_id": PRIOR_ID,
             "reference_policy_version": (
                 config.rollout.reference_policy.version
             ),
@@ -129,77 +126,6 @@ class Decision:
             "global_best": state.global_best,
             "remaining_budget": state.remaining_budget,
         }
-
-
-def _coverage_target(
-    state: SchedulerState,
-    tuning: TuningModel,
-    arrival: ArrivalModel,
-    coverage: CoverageConfig,
-    spent: int,
-) -> tuple[str, str | None, str] | None:
-    """The one action forced to collect missing evidence, if any.
-
-    The gate is the *exact-class* count, not `supported()`. `supported()`
-    accepts the pooled FIRST+LATER fallback, which is what the rollout uses
-    when it must sample something; coverage is the mechanism that tries to
-    make that fallback unnecessary, so it has to see the class counts
-    themselves. Gating on `supported()` would end coverage the moment any
-    three bouts existed and leave the FIRST/LATER distinction permanently
-    estimated from pooled data.
-
-    Returns None once both classes are covered as far as this state can
-    reach, or the shared cap is spent — in both cases the caller proceeds to
-    the normal path (rollout, or the frozen fallback when the models still
-    cannot support one).
-    """
-    if spent >= coverage.budget_cap:
-        return None
-
-    eligible = state.eligible()
-    first_pool = [c for c in eligible if c.is_first]
-    later_pool = [c for c in eligible if not c.is_first]
-
-    # A FIRST bout is only collectable while an untuned candidate exists,
-    # and a LATER bout only after some candidate has been tuned once. The
-    # order below asks for whichever class is both short and reachable.
-    first_short = tuning.exact_count(FIRST) < coverage.min_first
-    later_short = tuning.exact_count(LATER) < coverage.min_later
-    if first_short and first_pool:
-        return (
-            "TUNE",
-            _coverage_pick(first_pool, state),
-            f"coverage: {tuning.exact_count(FIRST)}/{coverage.min_first} "
-            "FIRST tuning records in this run",
-        )
-    if later_short and later_pool:
-        return (
-            "TUNE",
-            _coverage_pick(later_pool, state),
-            f"coverage: {tuning.exact_count(LATER)}/{coverage.min_later} "
-            "LATER tuning records in this run",
-        )
-    if not arrival.supported() and state.defer_available():
-        return (
-            "DEFER",
-            None,
-            "coverage: fewer than "
-            f"{coverage.min_arrival_episodes} observed arrival episodes",
-        )
-    return None
-
-
-def _coverage_pick(pool: Sequence[CandidateView], state: SchedulerState) -> str:
-    """Which candidate serves a coverage bout.
-
-    Deterministic and evidence-oriented: the smallest headroom, so the
-    forced bout is also the one most likely to be useful, with run_id
-    breaking ties for replayability.
-    """
-    return min(
-        pool,
-        key=lambda candidate: (state.headroom(candidate), candidate.run_id),
-    ).run_id
 
 
 def _models_usable(
@@ -299,12 +225,23 @@ def _tie_break(
     return min(values, key=order)
 
 
-def _evidence_mode(tuning: TuningModel, arrival: ArrivalModel) -> dict:
-    return {
+def _evidence_mode(
+    tuning: TuningModel,
+    arrival: ArrivalModel,
+    state: SchedulerState | None = None,
+) -> dict:
+    mode = {
         FIRST: tuning.usage_mode(FIRST),
         LATER: tuning.usage_mode(LATER),
+        "arrival": arrival.usage_mode(),
         "arrival_episodes": len(arrival.episodes),
+        "prior_id": PRIOR_ID,
     }
+    if state is not None:
+        mode["n_roots"] = state.n_roots
+        mode["n_seed"] = state.n_seed
+        mode["seed_set_incomplete"] = state.seed_set_incomplete()
+    return mode
 
 
 def decide(
@@ -317,7 +254,7 @@ def decide(
 ) -> Decision:
     """Choose TUNE(i) or DEFER for one decision point."""
     config = config or PolicyConfig()
-    mode = _evidence_mode(tuning, arrival)
+    mode = _evidence_mode(tuning, arrival, state)
 
     if state.terminal():
         return Decision(
@@ -327,21 +264,19 @@ def decide(
             evidence_mode=mode,
         )
 
-    target = _coverage_target(
-        state, tuning, arrival, config.coverage, coverage_spent
-    )
-    if target is not None:
-        action, run_id, reason = target
+    if state.seed_set_incomplete():
         return Decision(
-            action=action,
-            run_id=run_id,
-            reason=reason,
-            coverage_spent=coverage_spent + 1,
+            action="DEFER",
+            run_id=None,
+            reason=(
+                f"seed set incomplete ({state.n_roots}/{state.n_seed}); "
+                "defer until the reserved fresh roots are visible"
+            ),
             evidence_mode=mode,
         )
 
     if not _models_usable(state, tuning, arrival):
-        return _fallback(state, "insufficient current-run evidence", mode)
+        return _fallback(state, "models have no support", mode)
 
     values = evaluate_actions(state, tuning, arrival, config.rollout)
     if not values:

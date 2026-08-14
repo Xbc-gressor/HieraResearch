@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import os
 from pathlib import Path
 import py_compile
@@ -18,7 +17,6 @@ import apply_search_space  # noqa: E402
 from _common import load_candidate_modules  # noqa: E402
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
-    _expand_space_entry,
     _read_search_space,
     _schema_accepts_value,
     _valid_schema_entry,
@@ -458,45 +456,63 @@ class SearchSpaceBoundaryTests(unittest.TestCase):
             {error["code"] for error in verdict["errors"]},
         )
 
-    def test_expansion_is_permutation_invariant(self) -> None:
-        numeric_results = {
-            repr(_expand_space_entry(("float", 0.0, 1.0), list(values)))
-            for values in itertools.permutations([-10.0, 10.0, 0.5])
+    def test_out_of_space_config_is_rejected_not_absorbed(self) -> None:
+        # The space is validate-only: a config outside the proposed range is an
+        # error the proposer fixes, never an expansion that invents endpoints
+        # nobody checked against make_model.
+        proposed = {
+            "depth": ["int", 1, 5],
+            "rate": ["float", 0.001, 1.0, "log"],
+            "mode": ["categorical", ["allowed", "other"]],
         }
-        self.assertEqual(len(numeric_results), 1)
 
-        log_results = {
-            repr(_expand_space_entry(("float", 0.01, 1.0, "log"), list(values)))
-            for values in itertools.permutations([0.001, 10.0, 0.1])
-        }
-        self.assertEqual(len(log_results), 1)
-        log_space, _ = _expand_space_entry(
-            ("float", 0.01, 1.0, "log"),
-            [0.001, 10.0, 0.1],
+        verdict = check_search_space(
+            SCHEMA, proposed, [{"depth": 9, "rate": 0.1, "mode": "allowed"}]
         )
-        self.assertGreater(log_space[1], 0)
-        self.assertLess(log_space[1], 0.001)
-        self.assertGreater(log_space[2], 10.0)
 
-    def test_categorical_expansion_uses_schema_order_not_config_order(self) -> None:
+        self.assertFalse(verdict["ok"])
+        self.assertIn(
+            "config_outside_space",
+            {error["code"] for error in verdict["errors"]},
+        )
+        self.assertIsNone(verdict["finalized_space"])
+
+    def test_finalized_space_is_the_proposal_verbatim(self) -> None:
+        proposed = {
+            "rate": ["float", 0.001, 1.0, "log"],
+            "depth": ["int", 1, 5],
+            "mode": ["categorical", ["allowed", "other"]],
+        }
+
+        verdict = check_search_space(
+            SCHEMA, proposed, [{"depth": 1, "rate": 0.001, "mode": "allowed"}]
+        )
+
+        self.assertTrue(verdict["ok"])
+        # Entries unchanged (edge-sitting configs included); only key order is
+        # normalized to the schema's, which the execution revision binds.
+        self.assertEqual(verdict["finalized_space"], proposed)
+        self.assertEqual(
+            list(verdict["finalized_space"]), list(SCHEMA)
+        )
+
+    def test_config_option_outside_proposed_categorical_is_rejected(self) -> None:
+        # Schema-legal but not proposed: the option list is no longer unioned
+        # in, so the proposer must widen it deliberately.
         proposed = {
             "depth": ["int", 1, 5],
             "rate": ["float", 0.001, 1.0, "log"],
             "mode": ["categorical", ["allowed"]],
         }
-        forward = [
-            {"depth": 3, "rate": 0.1, "mode": "other"},
-            {"depth": 4, "rate": 0.2, "mode": "allowed"},
-        ]
 
-        one = check_search_space(SCHEMA, proposed, forward)
-        two = check_search_space(SCHEMA, proposed, list(reversed(forward)))
+        verdict = check_search_space(
+            SCHEMA, proposed, [{"depth": 3, "rate": 0.1, "mode": "other"}]
+        )
 
-        self.assertTrue(one["ok"])
-        self.assertEqual(one, two)
-        self.assertEqual(
-            one["finalized_space"]["mode"],
-            ["categorical", ["allowed", "other"]],
+        self.assertFalse(verdict["ok"])
+        self.assertIn(
+            "config_outside_space",
+            {error["code"] for error in verdict["errors"]},
         )
 
 

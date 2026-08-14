@@ -1,0 +1,927 @@
+"""Regime-conditioned inner-tuner policy (deferred-random8-hebo10-spsa10-v1).
+
+Covers the policy module itself and its wiring through phase-c-action, stage
+admission, validate-proposals, select-candidate, the driver job builder, and
+the bout kernels that changed shape: bo --sampler random (FIRST),
+hebo_search (CONTINUE, prompt-v2 pool + official HEBO MACE), and
+spsa_search (DEEP). Legacy-pinned behavior lives in the pre-existing
+test files (test_deep_tune_governance et al.); this file exercises the new
+default policy.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "tools" / "tuners"))
+
+import _common  # noqa: E402
+import inner_policy  # noqa: E402
+from _common import (  # noqa: E402
+    DeepTuneStageAdmissionError,
+    deep_tune_time_budget,
+)
+from bo_search import main as bo_main  # noqa: E402
+from driver.jobs import build_driver_job  # noqa: E402
+from driver.roles import InvocationContext  # noqa: E402
+from driver.session import FakeSessionRunner  # noqa: E402
+import hebo_search  # noqa: E402
+from hebo_search import main as hebo_main  # noqa: E402
+from spsa_search import main as spsa_main  # noqa: E402
+from tune_tools import (  # noqa: E402
+    _candidate_execution_revision,
+    phase_c_action,
+    select_candidate,
+    validate_proposals,
+)
+
+
+POLICY = inner_policy.POLICY_ID
+
+
+def _write_candidate(
+    candidate: Path,
+    *,
+    space: dict,
+    base: dict,
+    schema: dict | None = None,
+) -> Path:
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    if schema is None:
+        schema = {}
+        for key, entry in space.items():
+            if entry[0] == "float" and len(entry) >= 4 and entry[3] == "log":
+                schema[key] = ("float", "log")
+            elif entry[0] == "categorical":
+                schema[key] = ("categorical", list(entry[1]))
+            else:
+                schema[key] = entry[0]
+    candidate.write_text(
+        f"PARAM_SCHEMA = {schema!r}\n"
+        f"SEARCH_SPACE = {space!r}\n"
+        f"BASE_PARAMS = {base!r}\n"
+        "def make_model(params):\n"
+        "    return params\n"
+    )
+    (candidate.parent / "prepare.py").write_text(
+        "def evaluate_config(make_model, params):\n"
+        "    return 0.0\n"
+    )
+    return candidate
+
+
+def _fresh_report(candidate: Path, space: dict, base: dict) -> dict:
+    return {
+        "phase_a": {
+            "status": "ok",
+            "candidate_code_revision": _candidate_execution_revision(candidate),
+            "search_space": {k: list(v) for k, v in space.items()},
+            "warm_start_configs": [{"params": dict(base), "score": 1.0}],
+            "best_warm_params": dict(base),
+            "best_warm_score": 1.0,
+        }
+    }
+
+
+def _finalize_bout(report: dict, candidate: Path, *, best: float) -> None:
+    """Stamp a validated applied close over the report's current stages."""
+    stages = report["phase_c"]["stages"]
+    report["final_best_params"] = dict(report["phase_a"]["best_warm_params"])
+    report["final_best_score"] = best
+    report["applied_to_base_params"] = True
+    report["last_finalized_stage_index"] = len(stages) - 1
+
+
+def _fixture(root: Path, *, space: dict, base: dict, legacy: bool = False):
+    candidate = _write_candidate(
+        root / "candidates" / "001" / "train.py", space=space, base=base
+    )
+    if legacy:
+        (root / "framework_cfg.json").write_text(
+            json.dumps({"tuner": {"inner_policy": "legacy"}})
+        )
+    report = _fresh_report(candidate, space, base)
+    report_path = candidate.parent / "tune_report.json"
+    report_path.write_text(json.dumps(report))
+    return candidate, report_path
+
+
+FLOAT3 = {"a": ("float", 0.0, 1.0), "b": ("float", 1e-4, 1.0, "log"), "c": ("float", -1.0, 1.0)}
+BASE3 = {"a": 0.5, "b": 0.01, "c": 0.0}
+INT_ONLY = {"n": ("int", 1, 4)}
+INT_BASE = {"n": 2}
+
+
+class InnerPolicyUnitTest(unittest.TestCase):
+    def test_regime_and_bout_size(self):
+        self.assertEqual(
+            [inner_policy.regime_for_bout_index(i) for i in range(4)],
+            ["FIRST", "CONTINUE", "DEEP", "DEEP"],
+        )
+        self.assertEqual(
+            [inner_policy.bout_size(r) for r in ("FIRST", "CONTINUE", "DEEP")],
+            [8, 10, 10],
+        )
+
+    def test_expected_bout_trials(self):
+        self.assertEqual(
+            inner_policy.expected_bout_trials(POLICY, 0, 10), 8
+        )
+        self.assertEqual(
+            inner_policy.expected_bout_trials(POLICY, 2, 10), 10
+        )
+        self.assertEqual(
+            inner_policy.expected_bout_trials("legacy", 0, 10), 10
+        )
+
+    def test_method_chains(self):
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(POLICY, 0, FLOAT3), ["bo"]
+        )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(POLICY, 1, FLOAT3),
+            ["hebo"],
+        )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(POLICY, 1, INT_ONLY),
+            ["hebo"],
+        )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(POLICY, 2, FLOAT3), ["spsa"]
+        )
+        # legacy: every bout keeps the old production chain.
+        self.assertEqual(
+            inner_policy.method_chain_for_bout("legacy", 0, INT_ONLY),
+            ["grid", "bo"],
+        )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout("legacy", 2, FLOAT3),
+            ["bo", "cmaes"],
+        )
+
+    def test_sampler_and_rewarm_rules(self):
+        self.assertEqual(inner_policy.bo_sampler_for_bout(POLICY, 0), "random")
+        self.assertEqual(inner_policy.bo_sampler_for_bout(POLICY, 1), "tpe")
+        self.assertEqual(inner_policy.bo_sampler_for_bout("legacy", 0), "tpe")
+        self.assertEqual(
+            [inner_policy.rewarm_allowed(POLICY, i) for i in range(4)],
+            [False, False, False, False],
+        )
+        self.assertEqual(
+            [inner_policy.rewarm_allowed("legacy", i) for i in range(4)],
+            [False, True, True, True],
+        )
+
+    def test_has_movable_continuous(self):
+        self.assertTrue(inner_policy.has_movable_continuous(FLOAT3))
+        self.assertFalse(inner_policy.has_movable_continuous(INT_ONLY))
+        self.assertFalse(
+            inner_policy.has_movable_continuous({"x": ("float", 1.0, 1.0)})
+        )
+
+    def test_load_movable_continuous_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, _ = _fixture(Path(tmp), space=INT_ONLY, base=INT_BASE)
+            ledger = {"records": [{"run_id": "001"}, {"run_id": "404"}]}
+            flags = inner_policy.load_movable_continuous_flags(tmp, ledger)
+            self.assertEqual(flags, {"001": False})
+
+
+class PhaseCActionRegimeTest(unittest.TestCase):
+    def test_first_bout_is_random_bo8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            report = json.loads(report_path.read_text())
+            action = phase_c_action(report, candidate)
+            self.assertEqual(
+                (
+                    action["action"],
+                    action["method"],
+                    action["sampler"],
+                    action["bout_regime"],
+                    action["bout_trials"],
+                    action["method_chain"],
+                    action["inner_policy"],
+                ),
+                ("run", "bo", "random", "FIRST", 8, ["bo"], POLICY),
+            )
+
+    def test_continue_bout_is_hebo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "status": "ok",
+                        "trials": [{"params": dict(BASE3), "score": 0.9}],
+                    }
+                ]
+            }
+            _finalize_bout(report, candidate, best=0.9)
+            action = phase_c_action(report, candidate)
+            self.assertEqual(
+                (
+                    action["action"],
+                    action["method"],
+                    action["sampler"],
+                    action["bout_regime"],
+                    action["bout_trials"],
+                ),
+                ("run", "hebo", None, "CONTINUE", 10),
+            )
+            self.assertEqual(action["method_chain"], ["hebo"])
+
+    def test_deep_bout_is_spsa(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "status": "ok",
+                        "trials": [{"params": dict(BASE3), "score": 0.9}],
+                    },
+                    {
+                        "method": "hebo",
+                        "bout_index": 1,
+                        "status": "ok",
+                        "trials": [{"params": dict(BASE3), "score": 0.8}],
+                    },
+                ]
+            }
+            _finalize_bout(report, candidate, best=0.8)
+            action = phase_c_action(report, candidate)
+            self.assertEqual(
+                (
+                    action["action"],
+                    action["method"],
+                    action["sampler"],
+                    action["bout_regime"],
+                    action["bout_trials"],
+                ),
+                ("run", "spsa", None, "DEEP", 10),
+            )
+
+    def test_deep_bout_without_movable_continuous_finalizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp), space=INT_ONLY, base=INT_BASE
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "status": "ok",
+                        "trials": [{"params": dict(INT_BASE), "score": 0.9}],
+                    },
+                    {
+                        "method": "hebo",
+                        "bout_index": 1,
+                        "status": "ok",
+                        "trials": [{"params": dict(INT_BASE), "score": 0.8}],
+                    },
+                ]
+            }
+            _finalize_bout(report, candidate, best=0.8)
+            action = phase_c_action(report, candidate)
+            self.assertEqual(action["action"], "finalize")
+            self.assertEqual(
+                action["reason"], "deep_bout_requires_movable_continuous"
+            )
+    def test_legacy_pin_keeps_grid_primary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp), space=INT_ONLY, base=INT_BASE, legacy=True
+            )
+            report = json.loads(report_path.read_text())
+            action = phase_c_action(report, candidate)
+            self.assertEqual((action["action"], action["method"]), ("run", "grid"))
+            self.assertEqual(action["inner_policy"], "legacy")
+            self.assertEqual(action["bout_trials"], 10)
+
+
+class AdmissionRegimeTest(unittest.TestCase):
+    def test_first_bout_admits_only_bo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            budget = deep_tune_time_budget(candidate, report_path, "bo")
+            self.assertEqual(budget["bout_index"], 0)
+            budget["_phase_c_lock_handle"].close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            with self.assertRaisesRegex(
+                DeepTuneStageAdmissionError, "outside deterministic chain"
+            ):
+                deep_tune_time_budget(candidate, report_path, "grid")
+
+    def test_deep_bout_admits_spsa_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "status": "ok",
+                        "trials": [{"params": dict(BASE3), "score": 0.9}],
+                    },
+                    {
+                        "method": "hebo",
+                        "bout_index": 1,
+                        "status": "ok",
+                        "trials": [{"params": dict(BASE3), "score": 0.8}],
+                    },
+                ]
+            }
+            _finalize_bout(report, candidate, best=0.8)
+            report_path.write_text(json.dumps(report))
+            # hebo already closed terminally inside bout 1, so re-requesting it
+            # is refused before any bout-2 work can start.
+            with self.assertRaisesRegex(
+                DeepTuneStageAdmissionError, "cannot be rerun"
+            ):
+                deep_tune_time_budget(candidate, report_path, "hebo")
+            budget = deep_tune_time_budget(candidate, report_path, "spsa")
+            try:
+                self.assertEqual(budget["bout_index"], 2)
+            finally:
+                budget["_phase_c_lock_handle"].close()
+
+
+class ValidateProposalsDeepGuardTest(unittest.TestCase):
+    def _two_finalized_bouts(self, candidate, report_path):
+        report = json.loads(report_path.read_text())
+        report["phase_c"] = {
+            "stages": [
+                {
+                    "method": "bo",
+                    "status": "ok",
+                    "trials": [{"params": dict(BASE3), "score": 0.9}],
+                },
+                {
+                    "method": "hebo",
+                    "bout_index": 1,
+                    "status": "ok",
+                    "trials": [{"params": dict(BASE3), "score": 0.8}],
+                },
+            ]
+        }
+        _finalize_bout(report, candidate, best=0.8)
+        report_path.write_text(json.dumps(report))
+
+    def test_continue_bout_rejects_proposals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "status": "ok",
+                        "trials": [{"params": dict(BASE3), "score": 0.9}],
+                    }
+                ]
+            }
+            _finalize_bout(report, candidate, best=0.9)
+            report_path.write_text(json.dumps(report))
+            result = validate_proposals(
+                candidate, report_path, [{"a": 0.7, "b": 0.5, "c": 0.2}]
+            )
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                [r["reason"] for r in result["rejected"]],
+                ["hebo_bout_has_no_rewarm"],
+            )
+
+    def test_deep_bout_rejects_proposals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            self._two_finalized_bouts(candidate, report_path)
+            result = validate_proposals(
+                candidate, report_path, [{"a": 0.7, "b": 0.5, "c": 0.2}]
+            )
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                [r["reason"] for r in result["rejected"]],
+                ["deep_bout_has_no_rewarm"],
+            )
+
+
+class SelectCandidateRegimeTest(unittest.TestCase):
+    @staticmethod
+    def _budget():
+        return {
+            "remaining": 500,
+            "deep_tune": {
+                "remaining": 200,
+                "total_cap": 200,
+                "per_candidate_cap": 40,
+                "per_candidate": [],
+            },
+        }
+
+    def test_first_bout_trial_cap_is_eight(self):
+        ledger = {
+            "records": [
+                {
+                    "run_id": "001",
+                    "status": "keep",
+                    "best_warm_score": 1.0,
+                }
+            ]
+        }
+        result = select_candidate(
+            ledger,
+            n_min=1,
+            top_percentile=80,
+            bout_trials=10,
+            budget_allocation=self._budget(),
+        )
+        self.assertEqual(result["run_id"], "001")
+        self.assertEqual(result["bout_regime"], "FIRST")
+        self.assertEqual(result["budget_allocation"]["trial_cap"], 8)
+
+    def test_deep_ineligible_candidate_is_not_selected(self):
+        record = {
+            "run_id": "001",
+            "status": "keep",
+            "best_warm_score": 1.0,
+            "tune": True,
+            "tuning_bouts": 2,
+            "last_bout_improved": True,
+            "final_best_score": 0.5,
+        }
+        ledger = {"records": [record]}
+        result = select_candidate(
+            ledger,
+            n_min=1,
+            top_percentile=80,
+            bout_trials=10,
+            budget_allocation=self._budget(),
+            movable_continuous={"001": False},
+        )
+        self.assertIsNone(result["run_id"])
+        result = select_candidate(
+            ledger,
+            n_min=1,
+            top_percentile=80,
+            bout_trials=10,
+            budget_allocation=self._budget(),
+            movable_continuous={"001": True},
+        )
+        self.assertEqual(result["run_id"], "001")
+        self.assertEqual(result["bout_regime"], "DEEP")
+        self.assertEqual(result["budget_allocation"]["trial_cap"], 10)
+
+
+class BoRandomSamplerTest(unittest.TestCase):
+    """FIRST-bout kernel: explicit RandomSampler, deferred inside the bout."""
+
+    def _run_bo(self, tmp, *, legacy: bool, n_trials: int, deferred: int):
+        candidate, report_path = _fixture(
+            Path(tmp), space=FLOAT3, base=BASE3, legacy=legacy
+        )
+        report = json.loads(report_path.read_text())
+        report["phase_a"]["deferred_configs"] = [
+            {"params": {"a": 0.1, "b": 0.001, "c": -0.5}},
+            {"params": {"a": 0.9, "b": 0.5, "c": 0.5}},
+        ][:deferred]
+        report_path.write_text(json.dumps(report))
+        train_module = mock.Mock(
+            SEARCH_SPACE={k: tuple(v) for k, v in FLOAT3.items()},
+            BASE_PARAMS=dict(BASE3),
+            make_model=object(),
+        )
+        scores = iter([0.9, 0.85, 0.8, 0.75, 0.7, 0.65])
+        with mock.patch(
+            "bo_search.load_candidate_modules",
+            return_value=(train_module, object()),
+        ), mock.patch(
+            "bo_search.resolve_score_fn", return_value=object()
+        ), mock.patch(
+            "bo_search.resolve_preflight_fn", return_value=None
+        ), mock.patch(
+            "bo_search.timed_eval", side_effect=lambda *a, **k: next(scores)
+        ) as eval_mock, mock.patch(
+            "bo_search.write_json"
+        ) as write_result, mock.patch.object(
+            sys,
+            "argv",
+            [
+                "bo_search.py",
+                "--candidate-path",
+                str(candidate),
+                "--tune-report-json",
+                str(report_path),
+                "--n-trials",
+                str(n_trials),
+                "--sampler",
+                "random",
+            ],
+        ):
+            self.assertEqual(bo_main(), 0)
+        return write_result.call_args.args[0], eval_mock
+
+    def test_random_sampler_reports_zero_model_driven(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, eval_mock = self._run_bo(tmp, legacy=False, n_trials=4, deferred=0)
+            self.assertEqual(result["sampler"], "random")
+            self.assertEqual(result["model_driven_trials"], 0)
+            self.assertEqual(result["random_fallback_trials"], 4)
+            self.assertEqual(eval_mock.call_count, 4)
+
+    def test_deferred_occupy_first_bout_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, eval_mock = self._run_bo(tmp, legacy=False, n_trials=4, deferred=2)
+            # 2 deferred + 2 random draws = the bout's 4, never 4 + 2.
+            self.assertEqual(eval_mock.call_count, 4)
+            self.assertEqual(result["trials_completed"], 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, eval_mock = self._run_bo(tmp, legacy=True, n_trials=4, deferred=2)
+            # legacy: deferred are extra trials on top of the bout budget.
+            self.assertEqual(eval_mock.call_count, 6)
+
+
+class SpsaSearchTest(unittest.TestCase):
+    def _seed_finalized_bouts(self, report, *, base, second_method):
+        """Two finalized bouts so the spsa stage admits at bout 2."""
+        report["phase_c"] = {
+            "stages": [
+                {
+                    "method": "bo",
+                    "status": "ok",
+                    "trials": [{"params": dict(base), "score": 0.9}],
+                },
+                {
+                    "method": second_method,
+                    "bout_index": 1,
+                    "status": "ok",
+                    "trials": [{"params": dict(base), "score": 0.8}],
+                },
+            ]
+        }
+        _finalize_bout(report, None, best=0.8)
+
+    def _run_spsa(
+        self, tmp, *, n_evals=10, space=FLOAT3, base=BASE3, eval_fn=None
+    ):
+        candidate, report_path = _fixture(Path(tmp), space=space, base=base)
+        report = json.loads(report_path.read_text())
+        self._seed_finalized_bouts(report, base=base, second_method="hebo")
+        report_path.write_text(json.dumps(report))
+        train_module = mock.Mock(
+            SEARCH_SPACE={k: tuple(v) for k, v in space.items()},
+            BASE_PARAMS=dict(base),
+            make_model=object(),
+        )
+
+        def fake_eval(evaluate, make_model, params, *args, **kwargs):
+            return float(sum(float(v) for v in params.values()))
+
+        with mock.patch(
+            "spsa_search.load_candidate_modules",
+            return_value=(train_module, object()),
+        ), mock.patch(
+            "spsa_search.resolve_score_fn", return_value=object()
+        ), mock.patch(
+            "spsa_search.resolve_preflight_fn", return_value=None
+        ), mock.patch(
+            "spsa_search.timed_eval",
+            side_effect=eval_fn or fake_eval,
+        ) as eval_mock, mock.patch(
+            "spsa_search.write_json"
+        ) as write_result, mock.patch.object(
+            sys,
+            "argv",
+            [
+                "spsa_search.py",
+                "--candidate-path",
+                str(candidate),
+                "--tune-report-json",
+                str(report_path),
+                "--n-evals",
+                str(n_evals),
+            ],
+        ):
+            self.assertEqual(spsa_main(), 0)
+        report = json.loads(report_path.read_text())
+        return write_result.call_args.args[0], eval_mock, report
+
+    def test_ten_evals_buy_five_pairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, eval_mock, report = self._run_spsa(tmp)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["trials_attempted"], 10)
+            self.assertEqual(result["pairs_attempted"], 5)
+            self.assertEqual(eval_mock.call_count, 10)
+            stage = report["phase_c"]["stages"][-1]
+            self.assertEqual(stage["method"], "spsa")
+            self.assertEqual(stage["status"], "ok")
+            self.assertEqual(stage["spsa_state"]["k"], 5)
+            rows = stage["trials"]
+            self.assertEqual(len(rows), 10)
+            self.assertEqual(
+                {(row["spsa_k"], row["spsa_side"]) for row in rows},
+                {(k, side) for k in range(5) for side in ("plus", "minus")},
+            )
+
+    def test_interrupted_bout_resumes_the_exact_pair(self):
+        class Boom(Exception):
+            pass
+
+        calls = {"plus": None}
+
+        def flaky_eval(evaluate, make_model, params, *args, **kwargs):
+            # Pair 0 completes; pair 1's plus leg dies loudly (infra flake:
+            # not config-infeasible), leaving the stage running with its pair
+            # state persisted.
+            if len(calls["all"]) == 2:
+                calls["plus"] = dict(params)
+                raise Boom("infra death")
+            calls["all"].append(dict(params))
+            return float(sum(float(v) for v in params.values()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            report = json.loads(report_path.read_text())
+            self._seed_finalized_bouts(report, base=BASE3, second_method="hebo")
+            report_path.write_text(json.dumps(report))
+            train_module = mock.Mock(
+                SEARCH_SPACE={k: tuple(v) for k, v in FLOAT3.items()},
+                BASE_PARAMS=dict(BASE3),
+                make_model=object(),
+            )
+
+            def invoke(eval_fn, n_evals=10):
+                calls["all"] = []
+                with mock.patch(
+                    "spsa_search.load_candidate_modules",
+                    return_value=(train_module, object()),
+                ), mock.patch(
+                    "spsa_search.resolve_score_fn", return_value=object()
+                ), mock.patch(
+                    "spsa_search.resolve_preflight_fn", return_value=None
+                ), mock.patch(
+                    "spsa_search.timed_eval", side_effect=eval_fn
+                ) as eval_mock, mock.patch(
+                    "spsa_search.write_json"
+                ), mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "spsa_search.py",
+                        "--candidate-path",
+                        str(candidate),
+                        "--tune-report-json",
+                        str(report_path),
+                        "--n-evals",
+                        str(n_evals),
+                    ],
+                ):
+                    spsa_main()
+                return eval_mock
+
+            # Invocation 1 dies mid-pair-1 (its plus leg is a paid failure row).
+            with self.assertRaises(Boom):
+                invoke(flaky_eval)
+            report = json.loads(report_path.read_text())
+            stage = report["phase_c"]["stages"][-1]
+            self.assertEqual(stage["status"], "running")
+            self.assertEqual(stage["spsa_state"]["k"], 1)
+            self.assertEqual(stage["spsa_state"]["pending_pair"]["k"], 1)
+
+            # Invocation 2 resumes: the recorded failed plus leg is recovered,
+            # never re-evaluated; the bout then runs to its 10-eval close.
+            def normal_eval(evaluate, make_model, params, *args, **kwargs):
+                calls["all"].append(dict(params))
+                return float(sum(float(v) for v in params.values()))
+
+            second = invoke(normal_eval)
+            self.assertNotIn(calls["plus"], calls["all"])
+            # pair-1's minus leg + pairs 2..4 = 7 fresh evaluations; the bout
+            # closes at exactly 10 objective spends across both invocations.
+            self.assertEqual(second.call_count, 7)
+            report = json.loads(report_path.read_text())
+            stage = report["phase_c"]["stages"][-1]
+            self.assertEqual(stage["status"], "ok")
+            self.assertEqual(stage["spsa_state"]["k"], 5)
+            self.assertNotIn("pending_pair", stage["spsa_state"])
+
+    def test_no_movable_continuous_rejects_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, eval_mock, report = self._run_spsa(
+                tmp, space=INT_ONLY, base=INT_BASE
+            )
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(eval_mock.call_count, 0)
+            stage = report["phase_c"]["stages"][-1]
+            self.assertEqual(stage["status"], "rejected")
+
+
+class HeboSearchTest(unittest.TestCase):
+    """CONTINUE kernel: prompt-v2 pool + injected MACE ranker, no real objective."""
+
+    def _pool_receipt(self, offset: float) -> dict:
+        return {
+            "configs": [
+                {
+                    "a": 0.11 + offset + 0.01 * index,
+                    "b": 0.002 * (index + 1),
+                    "c": -0.4 + 0.05 * index,
+                }
+                for index in range(5)
+            ],
+            "order": [0, 1, 2, 3, 4],
+            "rationale": "scripted pool",
+        }
+
+    def test_continue_bout_executes_ranked_pool_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            report = json.loads(report_path.read_text())
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "status": "ok",
+                        "trials": [
+                            {
+                                "params": {
+                                    "a": 0.05 * index,
+                                    "b": 0.001 * (index + 1),
+                                    "c": 0.1 * index - 0.5,
+                                },
+                                "score": 1.1 + 0.01 * index,
+                            }
+                            for index in range(8)
+                        ],
+                    }
+                ]
+            }
+            _finalize_bout(report, candidate, best=1.0)
+            report_path.write_text(json.dumps(report))
+
+            runner = FakeSessionRunner(
+                [
+                    {"receipt": self._pool_receipt(0.0)},
+                    {"receipt": self._pool_receipt(0.2)},
+                ]
+            )
+            rank_calls = []
+
+            def rank_fn(*, search_space, history, pool, seed):
+                rank_calls.append(pool)
+                # Unique first-Pareto member at index 1.
+                return [[0.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+
+            scores = iter([0.42, 0.41])
+            hebo_search._TEST_SESSION_RUNNER = runner
+            hebo_search._TEST_RANK_FN = rank_fn
+            try:
+                with mock.patch(
+                    "hebo_search.timed_eval",
+                    side_effect=lambda *a, **k: next(scores),
+                ) as eval_mock, mock.patch(
+                    "hebo_search.write_json"
+                ) as write_result, mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "hebo_search.py",
+                        "--candidate-path",
+                        str(candidate),
+                        "--tune-report-json",
+                        str(report_path),
+                        "--n-evals",
+                        "2",
+                    ],
+                ):
+                    self.assertEqual(hebo_main(), 0)
+            finally:
+                hebo_search._TEST_SESSION_RUNNER = None
+                hebo_search._TEST_RANK_FN = None
+
+            receipt = write_result.call_args.args[0]
+            self.assertEqual(receipt["method"], "hebo")
+            self.assertEqual(receipt["status"], "ok")
+            self.assertEqual(receipt["trials_completed"], 2)
+            self.assertEqual(eval_mock.call_count, 2)
+            self.assertEqual(len(rank_calls), 2)
+            report = json.loads(report_path.read_text())
+            stage = report["phase_c"]["stages"][-1]
+            self.assertEqual(stage["method"], "hebo")
+            self.assertEqual(stage["status"], "ok")
+            self.assertEqual(len(stage["trials"]), 2)
+            self.assertEqual(stage["trials"][0]["params"]["a"], 0.12)
+            extras = runner.calls[0][1].extra
+            self.assertIn("~0.005", extras["history"])
+            self.assertIn("genuinely different regions", extras["protocol"])
+
+
+class DriverJobHeboTest(unittest.TestCase):
+    def test_hebo_argv_uses_repo_root_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            task = repo / "tasks" / "toy"
+            task.mkdir(parents=True)
+            (task / "task.toml").write_text(
+                '[env]\ntype = "uv"\nproject = "tasks/toy"\n'
+            )
+            run_dir = repo / "runs" / "toy" / "r1"
+            candidate_dir = run_dir / "candidates" / "007"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "train.py").write_text("# candidate\n")
+            (candidate_dir / "tune_report.json").write_text(
+                json.dumps({"phase_a": {}})
+            )
+            ctx = InvocationContext(
+                task="toy", tag="r1", run_dir=run_dir,
+                invocation_id=3, run_id="007",
+            )
+            with mock.patch(
+                "driver.jobs._phase_c_action",
+                return_value={
+                    "action": "run",
+                    "method": "hebo",
+                    "bout_trials": 10,
+                    "sampler": None,
+                },
+            ):
+                argv, _, _ = build_driver_job(
+                    "tuner-orchestrator",
+                    ctx,
+                    {
+                        "kind": "phase_c",
+                        "run_id": "007",
+                        "method": "hebo",
+                        "trial_cap": 10,
+                    },
+                    repo_root=repo,
+                )
+            joined = " ".join(argv)
+            self.assertIn("hebo_search.py", joined)
+            self.assertEqual(argv[argv.index("--n-evals") + 1], "10")
+            self.assertEqual(argv[argv.index("--project") + 1], str(repo))
+            self.assertNotIn("--directory", argv)
+
+
+class DriverJobSpsaTest(unittest.TestCase):
+    def test_spsa_argv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            task = repo / "tasks" / "toy"
+            task.mkdir(parents=True)
+            (task / "task.toml").write_text(
+                '[env]\ntype = "uv"\nproject = "tasks/toy"\n'
+            )
+            run_dir = repo / "runs" / "toy" / "r1"
+            candidate_dir = run_dir / "candidates" / "007"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "train.py").write_text("# candidate\n")
+            (candidate_dir / "tune_report.json").write_text(
+                json.dumps({"phase_a": {}})
+            )
+            ctx = InvocationContext(
+                task="toy", tag="r1", run_dir=run_dir,
+                invocation_id=3, run_id="007",
+            )
+            with mock.patch(
+                "driver.jobs._phase_c_action",
+                return_value={
+                    "action": "run",
+                    "method": "spsa",
+                    "bout_trials": 10,
+                    "sampler": None,
+                },
+            ):
+                argv, _, _ = build_driver_job(
+                    "tuner-orchestrator",
+                    ctx,
+                    {
+                        "kind": "phase_c",
+                        "run_id": "007",
+                        "method": "spsa",
+                        "trial_cap": 10,
+                    },
+                    repo_root=repo,
+                )
+            self.assertIn("spsa_search.py", " ".join(argv))
+            self.assertEqual(argv[argv.index("--n-evals") + 1], "10")
+
+
+if __name__ == "__main__":
+    unittest.main()

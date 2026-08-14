@@ -1,6 +1,7 @@
 """Shared helpers for hyperparameter tuner scripts under tools/tuners/.
 
-Loaded by warmstart_eval.py, grid_search.py, bo_search.py, cmaes_search.py.
+Loaded by warmstart_eval.py, grid_search.py, bo_search.py, cmaes_search.py,
+hebo_search.py, spsa_search.py.
 
 Contract assumed of the candidate's train.py:
 - BASE_PARAMS: dict[str, Any]
@@ -484,7 +485,6 @@ def _deep_tune_time_budget_locked(
         _read_search_space,
         has_applied_close,
         has_validated_applied_close,
-        select_method,
         validate_candidate_execution_revision,
         validate_phase_a_candidate_state,
     )
@@ -503,13 +503,23 @@ def _deep_tune_time_budget_locked(
         search_space = _read_search_space(Path(ref_path))
     except (SystemExit, ValueError) as exc:
         raise DeepTuneStageAdmissionError(str(exc)) from None
-    selected = select_method(len(search_space))
-    method_chain = [selected["method"], *selected["fallback"]]
-    if method not in method_chain:
+    import inner_policy
+
+    policy_id = inner_policy.load_policy_id(ref_path)
+    # The report self-describes the policy its stages were admitted under;
+    # finalization validates against the stamp. A mid-run policy change is a
+    # hard error, never a silent chain reinterpretation.
+    stamped_policy = report.get("inner_policy")
+    if stamped_policy is None:
+        report["inner_policy"] = policy_id
+    elif stamped_policy != policy_id:
         raise DeepTuneStageAdmissionError(
-            f"method {method!r} is outside deterministic chain {method_chain!r}"
+            f"report was admitted under inner_policy {stamped_policy!r}; "
+            f"framework_cfg now says {policy_id!r}"
         )
-    position = method_chain.index(method)
+
+    def chain_for(bout: int) -> list:
+        return inner_policy.method_chain_for_bout(policy_id, bout, search_space)
 
     current = bouts[-1] if bouts else []
     methods = [stage.get("method") for stage in current]
@@ -521,24 +531,42 @@ def _deep_tune_time_budget_locked(
         raise DeepTuneStageAdmissionError(
             f"phase_c bout contains duplicate method stages: {methods!r}"
         )
-    expected_prefix = method_chain[:position]
-    actual_prefix = methods[:position]
-    if actual_prefix != expected_prefix or any(
-        current[index].get("status") != "rejected"
-        for index in range(min(position, len(current)))
-    ):
-        raise DeepTuneStageAdmissionError(
-            f"method {method!r} requires rejected prefix {expected_prefix!r}; "
-            f"found methods/statuses "
-            f"{[(stage.get('method'), stage.get('status')) for stage in current]!r}"
-        )
 
     current_terminal = bool(current) and all(
         item.get("status") in _TERMINAL_STAGE_STATUSES for item in current
     )
     stage = None
-    bout_index = len(bouts) - 1 if bouts else 0
-    if current_terminal and method == method_chain[0]:
+    # A terminal bout continues its own chain for every method except the
+    # NEXT bout's chain head (e.g. a rejected primary still falls back inside
+    # its bout); each bout's chain is regime-conditioned (FIRST/CONTINUE/DEEP
+    # differ under the regime-conditioned inner policy).
+    new_bout_chain = chain_for(len(bouts)) if current_terminal else None
+    opens_new_bout = current_terminal and method == new_bout_chain[0]
+    if opens_new_bout:
+        bout_index = len(bouts)
+        method_chain = new_bout_chain
+        position = 0
+    else:
+        bout_index = len(bouts) - 1 if bouts else 0
+        method_chain = chain_for(bout_index)
+        if method not in method_chain:
+            raise DeepTuneStageAdmissionError(
+                f"method {method!r} is outside deterministic chain {method_chain!r}"
+            )
+        position = method_chain.index(method)
+        expected_prefix = method_chain[:position]
+        actual_prefix = methods[:position]
+        if actual_prefix != expected_prefix or any(
+            current[index].get("status") != "rejected"
+            for index in range(min(position, len(current)))
+        ):
+            raise DeepTuneStageAdmissionError(
+                f"method {method!r} requires rejected prefix {expected_prefix!r}; "
+                f"found methods/statuses "
+                f"{[(stage.get('method'), stage.get('status')) for stage in current]!r}"
+            )
+
+    if opens_new_bout:
         # The previous bout's chain closed out (finalizable or exhausted). A
         # validated applied close lets a NEW bout restart the chain — the new
         # stage reuses the method under the next bout_index.
@@ -547,7 +575,6 @@ def _deep_tune_time_budget_locked(
                 "the previous bout must be finalized "
                 "(tools/finalize_tuning.py) before a new bout starts"
             )
-        bout_index = len(bouts)
         # Re-warm proposals are scoped to one bout. validate-proposals tags
         # its list with the bout it targets (pending_proposals_bout_index);
         # the orchestrator validates BEFORE launching the search, so the list
@@ -732,6 +759,7 @@ def timed_eval(
     phase: str = "unknown",
     method: str = "unknown",
     expected_execution_revision: dict | None = None,
+    python_cmd: list[str] | None = None,
 ) -> float:
     """Run one config evaluation under the task's per-evaluation limit.
 
@@ -739,6 +767,12 @@ def timed_eval(
     When ``per_runtime_limit`` is configured, run in a fresh subprocess and
     hard-kill its process group at that limit. The objective reservation happens
     first, so a subprocess timeout remains an admitted/charged attempt.
+
+    ``python_cmd`` overrides the subprocess interpreter prefix (e.g. the
+    task uv project). When set, evaluation ALWAYS runs in that subprocess —
+    never in-process — so a repo-root caller (HEBO's SDK process) cannot
+    import the candidate. Absent ``python_cmd``, the historical same-
+    interpreter path is unchanged.
 
     Timeouts, child-process errors, missing results, and non-finite scores raise
     so callers record an auditable failed trial instead of caching ``+inf`` as
@@ -751,23 +785,28 @@ def timed_eval(
         method=method,
     )
     runtime_limit = read_runtime_limit(candidate_path)
-    if runtime_limit is None:
+    if runtime_limit is None and python_cmd is None:
         score = float(evaluate(make_model, params))
         if not is_finite_score(score):
             raise ValueError(f"evaluation returned non-finite score: {score!r}")
         return score
     eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
-    out, err, returncode = _communicate_with_limit(
-        [
-            sys.executable,
-            eval_one,
-            str(candidate_path),
-            json.dumps(params),
-            json.dumps(expected_execution_revision),
-        ],
-        limit=runtime_limit,
-        label="evaluation exceeded per_runtime_limit",
-    )
+    command = [
+        *(python_cmd or [sys.executable]),
+        eval_one,
+        str(candidate_path),
+        json.dumps(params),
+        json.dumps(expected_execution_revision),
+    ]
+    if runtime_limit is None:
+        proc = subprocess.run(command, capture_output=True, text=True)
+        out, err, returncode = proc.stdout, proc.stderr, int(proc.returncode)
+    else:
+        out, err, returncode = _communicate_with_limit(
+            command,
+            limit=runtime_limit,
+            label="evaluation exceeded per_runtime_limit",
+        )
     for line in out.splitlines():
         if line.startswith("RESULT:"):
             try:
@@ -798,12 +837,17 @@ def timed_preflight(
     *,
     expected_execution_revision: dict | None = None,
     probe_mode: str = "preflight",
+    python_cmd: list[str] | None = None,
 ) -> dict | None:
     """Run one task-owned no-score probe in an isolated subprocess.
 
     ``probe_mode`` selects which task hook runs: ``"preflight"`` (the
     correctness check, ``evaluation.preflight_fn``) or ``"resource"`` (the
     worst-case memory envelope, ``evaluation.resource_probe_fn``).
+
+    ``python_cmd`` overrides the subprocess interpreter prefix (same split
+    as :func:`timed_eval`). Absent, the historical same-interpreter
+    subprocess is unchanged.
 
     Returns ``None`` when the task declares no hook for the requested mode, so
     callers should choose the mode from the task's declarations rather than
@@ -822,7 +866,7 @@ def timed_preflight(
     preflight_one = str(Path(__file__).resolve().parent / "_preflight_one.py")
     out, err, returncode = _communicate_with_limit(
         [
-            sys.executable,
+            *(python_cmd or [sys.executable]),
             preflight_one,
             str(candidate_path),
             json.dumps(params),

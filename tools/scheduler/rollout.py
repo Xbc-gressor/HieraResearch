@@ -130,11 +130,12 @@ class _ScenarioClock:
         )
 
 
-def _bout_cost(outcome, bout_trials: int) -> int:
+def _bout_cost(outcome, cap: int) -> int:
     """What a resampled bout charges the simulated budget.
 
-    The observed cost is authoritative, capped at the contract's `B`
-    because a bout can never admit more. Zero is a real observation, not a
+    The observed cost is authoritative, capped at the bout's regime cost
+    (``B_FIRST`` for a first bout, ``B`` otherwise) because a bout can never
+    admit more. Zero is a real observation, not a
     missing one: a bout whose whole method chain was rejected reserved no
     objective slot, so charging it a full `B` would make the simulated
     budget drain faster than the real one and shorten every rollout that
@@ -142,7 +143,7 @@ def _bout_cost(outcome, bout_trials: int) -> int:
     free bout cannot be repeated without end.
     """
     observed = int(outcome.cost)
-    return max(0, min(observed, bout_trials))
+    return max(0, min(observed, cap))
 
 
 def _next_round_generation(
@@ -240,7 +241,9 @@ def _simulate(
             state = state.apply_bout(
                 candidate.run_id,
                 gain,
-                cost=_bout_cost(outcome, state.contract.bout_trials),
+                cost=_bout_cost(
+                    outcome, state.contract.bout_cost(candidate.bouts_used)
+                ),
             )
         elif kind != "DEFER":
             break

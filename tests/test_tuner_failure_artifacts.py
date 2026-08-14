@@ -208,6 +208,11 @@ class FailureArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate_path = Path(tmp) / "train.py"
             report_path = Path(tmp) / "tune_report.json"
+            # Fallback-stage mechanics predate the regime-conditioned inner
+            # policy: legacy chains keep bo -> cmaes at bout 0.
+            (Path(tmp) / "framework_cfg.json").write_text(
+                json.dumps({"tuner": {"inner_policy": "legacy"}})
+            )
             fixed_params = {"width": 1.0, "depth": 4, "mode": "only"}
             candidate_path.write_text(
                 "PARAM_SCHEMA = {\n"
@@ -308,6 +313,11 @@ class FailureArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate_path = Path(tmp) / "train.py"
             report_path = Path(tmp) / "tune_report.json"
+            # Fallback-stage mechanics predate the regime-conditioned inner
+            # policy: legacy chains keep bo -> cmaes at bout 0.
+            (Path(tmp) / "framework_cfg.json").write_text(
+                json.dumps({"tuner": {"inner_policy": "legacy"}})
+            )
             params = {"x": 1, "y": 1, "z": 1}
             candidate_path.write_text(
                 "PARAM_SCHEMA = {'x': 'int', 'y': 'int', 'z': 'int'}\n"
@@ -392,6 +402,11 @@ class FailureArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate_path = Path(tmp) / "train.py"
             report_path = Path(tmp) / "tune_report.json"
+            # Fallback-stage mechanics predate the regime-conditioned inner
+            # policy: legacy chains keep bo -> cmaes at bout 0.
+            (Path(tmp) / "framework_cfg.json").write_text(
+                json.dumps({"tuner": {"inner_policy": "legacy"}})
+            )
             candidate_path.write_text(
                 "PARAM_SCHEMA = {'x': 'int', 'y': 'int', 'z': 'int'}\n"
                 "SEARCH_SPACE = {\n"
@@ -554,6 +569,11 @@ class FailureArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate_path = Path(tmp) / "train.py"
             report_path = Path(tmp) / "tune_report.json"
+            # Fallback-stage mechanics predate the regime-conditioned inner
+            # policy: legacy chains keep bo -> cmaes at bout 0.
+            (Path(tmp) / "framework_cfg.json").write_text(
+                json.dumps({"tuner": {"inner_policy": "legacy"}})
+            )
             params = {"x": 1, "y": 1, "z": 1}
             candidate_path.write_text(
                 "PARAM_SCHEMA = {'x': 'int', 'y': 'int', 'z': 'int'}\n"

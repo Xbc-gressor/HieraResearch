@@ -189,9 +189,11 @@ def _validate_scheduler_v3_2(config: dict, tuner: dict, path: Path) -> None:
       returning full TUNE while `reserve_evaluation` starts refusing the
       reservations, so a chosen bout dies partway and the realized
       transition stops matching the simulated one.
-    * **`deep_tune_per_candidate_cap` below `B * MAX_BOUTS`.** The legacy
-      per-candidate attempt cap is what v3.2's bout cap replaces. Left
-      smaller, it truncates a bout the scheduler admitted at full `B`.
+    * **`deep_tune_per_candidate_cap` below the policy-aware lifetime
+      cost.** The legacy per-candidate attempt cap is what v3.2's bout
+      cap replaces. Left smaller, it truncates a bout the scheduler
+      admitted at full `B`. The frozen regime-conditioned policy is
+      ``8+10+10+10=38``, not ``10*4=40``.
 
     Rejecting here rather than at decide time is deliberate: the failure is
     a property of the run's configuration, so it should stop the run before
@@ -209,16 +211,33 @@ def _validate_scheduler_v3_2(config: dict, tuner: dict, path: Path) -> None:
             "(B x MAX_BOUTS_PER_CANDIDATE) is the only Phase-C ceiling under "
             "v3.2; set it to null"
         )
-    bout_trials = int(tuner.get("bout_trials", 10))
-    max_bouts = int(tuner.get("max_bouts_per_candidate", 4))
+    from scheduler.contract import (
+        B_FIRST,
+        BOUT_TRIALS,
+        MAX_BOUTS_PER_CANDIDATE,
+        ResourceContract,
+    )
+
+    bout_trials = int(tuner.get("bout_trials", BOUT_TRIALS))
+    max_bouts = int(tuner.get("max_bouts_per_candidate", MAX_BOUTS_PER_CANDIDATE))
+    # Same first-bout cost session.contract_for uses: the frozen inner
+    # policy charges B_FIRST; the explicit legacy inner policy does not.
+    legacy_inner = str(tuner.get("inner_policy", "")) == "legacy"
+    contract = ResourceContract(
+        bout_trials=bout_trials,
+        max_bouts=max_bouts,
+        first_bout_trials=bout_trials if legacy_inner else B_FIRST,
+    )
+    required = contract.lifetime_cost()
     per_candidate_cap = int(tuner.get("deep_tune_per_candidate_cap", 40))
-    required = bout_trials * max_bouts
     if per_candidate_cap < required:
+        later_bouts = max(0, max_bouts - 1)
         raise RunConfigError(
             f"{path}: tuner.deep_tune_per_candidate_cap ({per_candidate_cap}) "
-            f"is below the v3.2 bout contract ({bout_trials} trials x "
-            f"{max_bouts} bouts = {required}); it would truncate a bout the "
-            "scheduler admitted at full B"
+            f"is below the v3.2 bout contract "
+            f"({contract.first_bout_trials} + {bout_trials} x {later_bouts} "
+            f"= {required}); it would truncate a bout the scheduler "
+            "admitted at full B"
         )
 
 

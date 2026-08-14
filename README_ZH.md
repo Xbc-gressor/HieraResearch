@@ -37,6 +37,15 @@
 
 ### 3.2 运行实验
 
+先在仓库根同步框架环境；这一次同步同时安装 CONTINUE policy 所需的
+HEBO MACE 与 CPU-only torch，不需要再为 HEBO 单独执行 `uv sync`：
+
+```bash
+uv sync --frozen
+```
+
+任务仍是独立 uv project，所以首次运行某个 `tasks/<task>/` 前仍需同步该任务的固定评估环境。
+
 用 driver 启动完整实验（真实 SDK 会话，消耗 API 额度）：
 
 ```bash
@@ -144,7 +153,7 @@ step 0+1: tunable-contract-extractor
 
 - **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
   - 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——首个 bout 门控：种群 ≥ `N_min`（P=80 时推导为 5）且按 `best_warm_score` 的最佳未调优候选在前 20%；继续 bout 跳过百分位门控但要求上一 bout 有改进 —— 选择**一个** bout；无合格者 → 返回 `none`（有效的无操作）
-  - Phase C：基于维度的方法选择（grid n_dims≤2 / bo=多元 TPE ≥3；cmaes 仅作后备；见 HPO 基准 `dev_plan/hpo-benchmark-report.md`）；以全部历史 trial 为先验，每 bout 至多 `tuner.bout_trials`（默认 10）次客观评估
+  - Phase C：按 bout regime 的确定性内层策略（`tuner.inner_policy`，默认 `deferred-random8-hebo10-spsa10-v1`）：FIRST（0 个已完成 bout，8 次评估）= `bo` + 显式 `RandomSampler`，deferred 热配置占前几个槽；CONTINUE（1 个，10 次）= prompt-v2 HEBO（LLM pool POOL=5 + 官方 HEBO MACE；噪声范围指示 + 异质化候选要求；无 TPE/grid/cmaes 后备）；DEEP（2–3 个，10 次）= `spsa` 两侧扰动（5 个完整 pair，仅从当前 incumbent 出发，无可动连续维的候选无 DEEP 动作）；以全部历史 trial 为先验
   - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后在 warm incumbent 与**所有 bout 的全部 trial** 上取全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与分级 `evaluation_depth`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
   详见 §5.7。
 
@@ -242,8 +251,8 @@ Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运�
 流程：
 
 1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——首个 bout 门控：种群 ≥ `N_min`（P=80 时推导为 5）且按 `best_warm_score` 的最佳未调优候选在前 20%；继续 bout 跳过百分位门控但要求上一 bout 有改进（`last_bout_improved`），无响应者不再调优。首个 bout 优先于继续 bout（证据覆盖优先）；继续 bout 之间按 bout 数最少、再按调优后最佳分数排序（warm 分与调优分互不比较）→ 选择**一个** bout
-2. Phase R（仅继续 bout）：orchestrator 依据已有 trial 历史提出至多 `tuner.rewarm_proposals`（默认 3）个配置，经 `tune_tools.py validate-proposals` 确定性校验（在空间内、schema 兼容、去重）后写入 `phase_c.pending_proposals`，由搜索脚本在 bout 预算内**优先**评估
-3. Phase C：按维度确定性选择方法（`grid`/`bo`/`cmaes`），以全部历史 trial 为先验续搜
+2. Phase R：冻结策略下从不接受 orchestrator 再热提案（FIRST 消耗 step 0+1 的 deferred 配置；CONTINUE 是 HEBO 自生成 pool，`hebo_bout_has_no_rewarm`；DEEP 拒绝提案，`deep_bout_has_no_rewarm`——SPSA pair 必须完整）。仅 `tuner.inner_policy=legacy` 的 CONTINUE bout 仍走旧的至多 `tuner.rewarm_proposals`（默认 3）条提案路径
+3. Phase C：按 bout regime 选方法（FIRST=bo+RandomSampler 8 槽 / CONTINUE=hebo 10 槽 / DEEP=spsa 10 槽；见 `tools/tuners/inner_policy.py`），以全部历史 trial 为先验续搜
 4. Finalize：运行 `tools/finalize_tuning.py`；它验证当前 bout 的 Phase C 已终止，在 warm  incumbent 与**所有 bout 的全部 trial** 上取全局最佳、写回 `BASE_PARAMS`、关闭 report，并一次性更新 ledger（`tuning_bouts`、`last_bout_improved`、分级 `evaluation_depth`；**无重新运行**；可按 bout 安全重试）。若搜索进程被杀死或 report 非终态，则不应用参数且不更新 ledger。
 
 资格不足（种群太小、顶层已调优且无响应继续、或预算/上限耗尽）返回 `none`——有效的无操作。
@@ -365,10 +374,13 @@ python tools/validate_tasks.py
 调优脚本：
 
 - `_common.py`：共享加载、搜索空间、试验读取逻辑
-- `tune_tools.py`：调优编排的确定性 CLI——`select-candidate`（解耦深度调优的候选选择门控：种群 ≥ N_min 且前 20% 中的最佳未调优候选）、`select-method`（基于维度的 grid/bo/cmaes 选择）、`select-best`（全局最佳试验）、`lineage-evidence`、`check-search-space` 等。
+- `tune_tools.py`：调优编排的确定性 CLI——`select-candidate`（解耦深度调优的候选选择门控：种群 ≥ N_min 且前 20% 中的最佳未调优候选）、`select-method`（基于维度的 grid/bo/cmaes 选择，即 legacy CONTINUE 规则）、`select-best`（全局最佳试验）、`lineage-evidence`、`check-search-space`（校验 + 按 outlier/贴边 margin 扩箱）等。
+- `inner_policy.py`：regime 条件内层策略（`deferred-random8-hebo10-spsa10-v1`）——FIRST/CONTINUE/DEEP 的 bout 大小、方法链、sampler 与 rewarm 规则的唯一来源。
 - `warmstart_eval.py`：顺序评估热配置（恢复 / 崩溃时停止），构建 `BASE_PARAMS` + 写 `phase_a`
 - `grid_search.py`：低维搜索空间
-- `bo_search.py`：使用贝叶斯优化（通过 Optuna 的多元 TPE）的中维搜索空间
+- `bo_search.py`：使用贝叶斯优化（通过 Optuna 的多元 TPE）的中维搜索空间；`--sampler random` 时为 FIRST bout 的显式 RandomSampler 内核
+- `hebo_search.py`：CONTINUE bout 的 prompt-v2 HEBO（LLM pool + 官方 HEBO MACE；在仓库根环境跑搜索，评估仍走任务 uv 项目）
+- `spsa_search.py`：DEEP bout 的两侧 SPSA（5 个完整扰动 pair，pair 状态持久化可精确续跑）
 - `cmaes_search.py`：使用 CMA-ES 的高维搜索空间
 - `../finalize_tuning.py`：验证 Phase C 终态并以 fail-closed 方式统一应用全局最佳、关闭报告和 ledger
 

@@ -87,12 +87,10 @@ class SchedulerStore:
     def coverage_spent(self) -> int:
         """Forced-evidence collections charged to the shared cap.
 
-        Counts distinct decisions, which is only a faithful charge because
-        `decisions()` holds one row per decision *point* rather than one per
-        query: re-asking for the same state reuses the open decision instead
-        of appending another. Counting bound outcomes instead would undercount
-        — the execution layer binds an outcome only after the bout finishes,
-        so a coverage bout would be free to re-force itself while running.
+        Counts distinct decisions whose reason still starts with
+        `coverage:`. Sample-seeking coverage is disabled
+        (`budget_cap=0`), so this is normally zero; the counter stays so
+        old receipts remain readable.
         """
         return sum(
             1

@@ -57,8 +57,30 @@ class SchedulerState:
     remaining_budget: int
     candidates: tuple[CandidateView, ...]
     contract: ResourceContract = field(default_factory=ResourceContract)
+    #: Non-crash roots, same census `got_select.derive_state` uses for
+    #: `n_seed`. `None` means the caller did not supply a ledger census
+    #: (unit tests); the seed-set gate then stays off.
+    n_roots: int | None = None
+    #: `got.n_seed` in force for this run. `0` disables the seed-set gate.
+    n_seed: int = 0
     #: Recorded, never conditioned on (design §4.3).
     diagnostics: dict = field(default_factory=dict)
+
+    def seed_set_incomplete(self) -> bool:
+        """True while the reserved fresh set is still arriving.
+
+        `got_select.decide_gen` emits one fresh per round until
+        `n_roots >= n_seed`. Those roots arrive whether we tune or not;
+        spending a FIRST before the set is visible throws away the option
+        to pick among them. The gate only fires when DEFER can actually
+        buy another generation round.
+        """
+        return (
+            self.n_roots is not None
+            and self.n_seed > 0
+            and self.n_roots < self.n_seed
+            and self.defer_available()
+        )
 
     def headroom(self, candidate: CandidateView) -> float:
         """h_i = m_i - g, how far this candidate is from the global best."""
@@ -100,11 +122,18 @@ class SchedulerState:
     ) -> "SchedulerState":
         """Charge one bout on `run_id` and apply equation (2).
 
-        `cost` defaults to the full bout. A terminated bout that consumed
-        fewer evaluations passes its actual consumption so simulated and
-        realized budget accounting agree (§4.2).
+        `cost` defaults to the bout's full regime cost (B_FIRST for a first
+        bout, B otherwise). A terminated bout that consumed fewer evaluations
+        passes its actual consumption so simulated and realized budget
+        accounting agree (§4.2).
         """
-        charged = self.contract.bout_trials if cost is None else int(cost)
+        if cost is None:
+            target = next(
+                (c for c in self.candidates if c.run_id == run_id), None
+            )
+            charged = self.contract.bout_cost(target.bouts_used if target else 1)
+        else:
+            charged = int(cost)
         if charged < 0:
             raise ValueError("bout cost must be non-negative")
         updated = []
@@ -190,6 +219,7 @@ class SchedulerState:
                 "bout_trials": self.contract.bout_trials,
                 "max_bouts": self.contract.max_bouts,
                 "k_eval": self.contract.k_eval,
+                "first_bout_trials": self.contract.first_bout_trials,
             },
             "candidates": [
                 {
@@ -199,6 +229,7 @@ class SchedulerState:
                     "previous_gain": candidate.previous_gain,
                     "headroom": self.headroom(candidate),
                     "deferred_warm_backlog": candidate.deferred_warm_backlog,
+                    "has_movable_continuous": candidate.has_movable_continuous,
                     "eligible": ineligibility_reason(
                         candidate, self.remaining_budget, self.contract
                     )
@@ -210,6 +241,8 @@ class SchedulerState:
                 for candidate in self.candidates
             ],
             "defer_available": self.defer_available(),
+            "n_roots": self.n_roots,
+            "n_seed": self.n_seed,
             "diagnostics": self.diagnostics,
         }
 
@@ -221,6 +254,7 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
         bout_trials=int(contract_fields.get("bout_trials", 10)),
         max_bouts=int(contract_fields.get("max_bouts", 4)),
         k_eval=int(contract_fields.get("k_eval", 2)),
+        first_bout_trials=int(contract_fields.get("first_bout_trials", 8)),
     )
     candidates = tuple(
         CandidateView(
@@ -229,6 +263,7 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
             bouts_used=int(row.get("bouts_used", 0)),
             previous_gain=row.get("previous_gain"),
             deferred_warm_backlog=int(row.get("deferred_warm_backlog", 0)),
+            has_movable_continuous=bool(row.get("has_movable_continuous", True)),
             # `eligible` in a snapshot is the derived verdict; the causes
             # that are not budget-dependent are restored here so the
             # predicate recomputes the same answer.
@@ -239,11 +274,15 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
         )
         for row in snapshot.get("candidates", [])
     )
+    n_roots = snapshot.get("n_roots")
+    n_seed = snapshot.get("n_seed", 0)
     return SchedulerState(
         global_best=float(snapshot["global_best"]),
         remaining_budget=int(snapshot["remaining_budget"]),
         candidates=candidates,
         contract=contract,
+        n_roots=None if n_roots is None else int(n_roots),
+        n_seed=int(n_seed) if n_seed is not None else 0,
         diagnostics=snapshot.get("diagnostics", {}),
     )
 
@@ -290,6 +329,53 @@ def candidate_score(record: dict) -> float | None:
     return None
 
 
+def count_noncrash_roots(ledger: dict) -> int:
+    """Non-crash roots, same census `got_select.derive_state` uses.
+
+    `Graph.from_ledger` only admits a finite `final_best_score` (or a
+    crash). Warm-only records that the scheduler already sees via
+    `best_warm_score` are the same nodes after `record-run`, so the
+    census fills that field when it is missing — the parent/crash
+    predicate stays the graph's.
+    """
+    from got_graph import Graph
+
+    records = []
+    for record in ledger.get("records", []):
+        if record.get("status") == "crash" or is_finite_score(
+            record.get("final_best_score")
+        ):
+            records.append(record)
+            continue
+        score = candidate_score(record)
+        if score is None:
+            continue
+        filled = dict(record)
+        filled["final_best_score"] = score
+        records.append(filled)
+    graph = Graph.from_ledger({"records": records}, structural_stats=False)
+    return sum(
+        1 for root in graph.roots() if graph.nodes[root].status != "crash"
+    )
+
+
+def seed_quota(run_dir: Path | None) -> int:
+    """`got.n_seed` for this run; 0 when the gate should stay off."""
+    from got_select import DEFAULT_CFG
+
+    if run_dir is None:
+        return 0
+    from run_cfg import load_run_cfg
+
+    got = load_run_cfg(run_dir, "got")
+    raw = got.get("n_seed", DEFAULT_CFG["n_seed"])
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return int(DEFAULT_CFG["n_seed"])
+    return value if value > 0 else 0
+
+
 def build_state(
     ledger: dict,
     *,
@@ -297,13 +383,16 @@ def build_state(
     contract: ResourceContract | None = None,
     deferred_backlog: dict[str, int] | None = None,
     previous_gains: dict[str, float] | None = None,
+    movable_continuous: dict[str, bool] | None = None,
     diagnostics: dict | None = None,
+    n_seed: int = 0,
 ) -> SchedulerState:
     """Assemble the exact mechanical state from the ledger and budget."""
     contract = contract or ResourceContract()
     blocked = _unresolved_descendant_ids(ledger)
     backlog = deferred_backlog or {}
     gains = previous_gains or {}
+    movable = movable_continuous or {}
     candidates = []
     for record in ledger.get("records", []):
         run_id = str(record.get("run_id"))
@@ -320,6 +409,7 @@ def build_state(
                 has_unresolved_descendant=run_id in blocked,
                 crashed=record.get("status") == "crash",
                 deferred_warm_backlog=int(backlog.get(run_id, 0)),
+                has_movable_continuous=bool(movable.get(run_id, True)),
             )
         )
     scores = [
@@ -330,6 +420,8 @@ def build_state(
         remaining_budget=int(remaining_budget),
         candidates=tuple(candidates),
         contract=contract,
+        n_roots=count_noncrash_roots(ledger),
+        n_seed=int(n_seed),
         diagnostics=diagnostics or {},
     )
 
@@ -368,13 +460,17 @@ def load_state(
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     run_dir = ledger_path.parent
     remaining = _remaining_budget(run_dir)
+    from tuners.inner_policy import load_movable_continuous_flags
+
     return build_state(
         ledger,
         remaining_budget=remaining,
         contract=contract,
         deferred_backlog=deferred_warm_backlog(run_dir, ledger),
         previous_gains=previous_gains(run_dir, ledger),
+        movable_continuous=load_movable_continuous_flags(run_dir, ledger),
         diagnostics=diagnostics,
+        n_seed=seed_quota(run_dir),
     )
 
 

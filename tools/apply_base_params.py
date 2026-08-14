@@ -25,9 +25,10 @@ Guards (hard-reject with nonzero exit, never a partial write):
 - The rewritten file must still parse (re-checked before writing).
 
 This tool bound-checks the incoming values against the unique literal
-SEARCH_SPACE. Warm proposals are widened first by `check-search-space`, so a
-valid best remains applicable without clamping; bypassing that reconciliation
-is a hard error rather than an internally inconsistent candidate.
+SEARCH_SPACE. `check-search-space` already proved every warm proposal sits
+inside that space, so a valid best remains applicable without clamping;
+bypassing that reconciliation is a hard error rather than an internally
+inconsistent candidate.
 Inline comments *inside* the BASE_PARAMS literal are not preserved (only that
 block is written); surrounding code and comments are untouched.
 """

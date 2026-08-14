@@ -2,13 +2,17 @@
 
 You are the **decoupled tuning step** of the loop (design §15, progressive).
 Once per round you pick **one** candidate from the whole population and run
-**one tuning bout** on it in place: a fixed slice of `tuner.bout_trials`
-objective attempts (default 10). A first bout deep-tunes a promising untuned
-candidate; a continuation bout resumes a tuned candidate that responded to
-its last bout. After each bout the candidate is finalized (best-so-far
-applied, ledger updated) and stays eligible for later bouts until its
-lifetime `tuner.deep_tune_per_candidate_cap` is spent or a bout improves
-nothing. **One invocation = at most one bout** (often zero — a valid no-op).
+**one tuning bout** on it in place: a fixed slice of objective attempts whose
+size is set by the bout's regime under the run's inner tuner policy
+(`tuner.inner_policy`, default `deferred-random8-hebo10-spsa10-v1`):
+**FIRST = 8** (0 completed bouts), **CONTINUE = 10** (1), **DEEP = 10** (2–3).
+A first bout deep-tunes a promising untuned candidate; a continuation bout
+resumes a tuned candidate that responded to its last bout; a DEEP bout is a
+late bout on a twice-responding candidate. After each bout the candidate is
+finalized (best-so-far applied, ledger updated) and stays eligible for later
+bouts until its lifetime `tuner.deep_tune_per_candidate_cap` is spent, its 4
+bouts are used, or a bout improves nothing. **One invocation = at most one
+bout** (often zero — a valid no-op).
 
 **Warm-start is already done** — step 0 (`tunable-contract-extractor`) proposed K
 configs and step 1 (eval-K) evaluated them, writing each candidate's `phase_a`
@@ -54,9 +58,11 @@ Pick which candidate gets the next bout — over the **whole population**:
 python tools/tuners/tune_tools.py select-candidate --ledger <run_dir>/ledger.json
 ```
 
-It prints `{run_id, reason, is_continuation, bout_index, tuning_bouts,
-last_bout_improved, best_warm_score, final_best_score, percentile,
-n_candidates, budget_allocation}`. First bouts require the legacy gate:
+It prints `{run_id, reason, is_continuation, bout_index, bout_regime,
+tuning_bouts, last_bout_improved, best_warm_score, final_best_score, percentile,
+n_candidates, budget_allocation}`. `bout_regime` is `FIRST` (bout_index 0),
+`CONTINUE` (1), or `DEEP` (2–3); the bout runs at that regime's size. First
+bouts require the legacy gate:
 population (non-crash, has `best_warm_score`) ≥ `N_min` (derived as 5 for
 P=80) **and** the best untuned candidate in the top (100−`P`)% by
 `best_warm_score`. Continuations skip the percentile gate but require the
@@ -70,8 +76,10 @@ retry-eligible incumbent) is selected before the fresh gate runs; after a
 continuation (or when no continuation waits), the fresh gate decides. Continuations rank by fewest
 bouts, then best tuned score — warm and tuned scores are never compared
 against each other. A candidate with an unresolved primary descendant is
-temporarily ineligible. `budget_allocation.trial_cap` is
-`min(tuner.bout_trials, per-candidate cap remaining, budget remaining)`.
+temporarily ineligible. A candidate whose next bout is DEEP but whose
+`SEARCH_SPACE` has no non-degenerate continuous dimension is **not**
+eligible — SPSA cannot move it, and no DEEP action exists for it. `budget_allocation.trial_cap` is
+`min(regime bout size, per-candidate cap remaining, budget remaining)`.
 
 **When `tuner.scheduler_policy` is `v3_2`** the same command answers from the
 scheduler v3.2 policy instead, and the receipt carries an extra `scheduler`
@@ -89,6 +97,10 @@ block. Read it, do not re-derive it:
   `TUNE` and `null` otherwise. The gate is budget and bout-cap
   (`tuner.max_bouts_per_candidate`, default 4), not the percentile /
   alternation / responder rules above; those do not apply under this policy.
+  The scheduler also does not force a TUNE just to collect FIRST/LATER
+  observations — cold start uses a frozen design prior. While
+  `n_roots < n_seed` and another generation round still fits, it defers
+  so the reserved fresh roots can arrive before the first FIRST.
 - The decision is already recorded under `<run_dir>/.scheduler/`. The
   scheduler derives both its evidence and the decision→execution binding from
   the ledger and each candidate's `tune_report.json`, so you report nothing
@@ -140,14 +152,18 @@ themselves via `load_candidate_modules`. (Step 1 already recorded this
 candidate's `best_warm_score` / `phase_a` into the ledger — that is how
 `select-candidate` saw it — so you do not re-record `phase_a`.)
 
-### Phase R — Re-warm proposals (continuation bouts only)
+### Phase R — Re-warm proposals (legacy CONTINUE only)
 
-When `is_continuation` is true, BEFORE launching the search, read the
-candidate's `tune_report.json` trial history and propose up to
-`tuner.rewarm_proposals` (default 3) configs that your read of the evidence
-says are most promising (near the incumbent's best region unless trials say
-it is exhausted; justify each in one line in your working notes). Write them
-to a scratch JSON file and validate:
+The frozen policy (`deferred-random8-hebo10-spsa10-v1`) never takes
+orchestrator re-warm proposals: FIRST consumes the deferred-config supply
+from step 0+1; CONTINUE is the prompt-v2 HEBO arm, which generates its
+own pool (`validate-proposals` rejects them with `hebo_bout_has_no_rewarm`);
+DEEP is 5 complete SPSA pairs, and a proposal displacing one leg would
+break the pair (`deep_bout_has_no_rewarm`). Skip this phase.
+
+Under `tuner.inner_policy=legacy` only, a CONTINUE bout (`bout_index` ≥ 1)
+may still propose up to `tuner.rewarm_proposals` (default 3) configs
+BEFORE launching the search. Write them to a scratch JSON file and validate:
 
 ```
 python tools/tuners/tune_tools.py validate-proposals \
@@ -159,10 +175,10 @@ python tools/tuners/tune_tools.py validate-proposals \
 Exit 0 → the accepted configs were written to `phase_c.pending_proposals`
 and the search scripts attempt them FIRST, inside the bout's `trial_cap`
 (they displace search trials, never add to them). Exit 1 → every proposal
-was rejected (out-of-space, schema-incompatible, or already attempted);
-proceed with the plain search, noting the rejection reasons in your receipt.
-Never hand-edit `pending_proposals` or the report yourself. First bouts
-never get proposals — they consume the deferred-config supply from step 0+1.
+was rejected (out-of-space, schema-incompatible, already attempted, or
+the bout has no rewarm); proceed with the plain search, noting the
+rejection reasons in your receipt. Never hand-edit `pending_proposals`
+or the report yourself.
 
 ### Phase C — Single-method search
 
@@ -184,12 +200,29 @@ never get proposals — they consume the deferred-config supply from step 0+1.
    finalized bout, `phase-c-action` returns `{"action": "run", "reason":
    "start_new_bout"}` — that is how the NEXT invocation recognizes a
    continuation.
+   The regime-conditioned inner policy (`deferred-random8-hebo10-spsa10-v1`)
+   fixes which method a bout opens with:
+   - **FIRST** (bout_index 0, 8 trials) — `bo` driven by an explicit Optuna
+     `RandomSampler` over the production distributions (`--sampler random`);
+     its `model_driven_trials` is always 0. Deferred warm configs from step
+     0+1 are evaluated first and **occupy slots inside the 8**.
+   - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
+     one bout-scoped `bench-pool-proposer` session (noise-range notes +
+     heterogeneity requirement) generates POOL=5 configs per step; official
+     HEBO MACE ranks the pool and one config is executed. No TPE/grid/cmaes
+     fallback labeled HEBO, no Phase-R proposals.
+   - **DEEP** (bout_index 2–3, 10 evals) — `spsa`: two-sided SPSA, 5 complete
+     perturbation pairs over the non-degenerate continuous dimensions,
+     starting from the applied incumbent. No re-warm proposals, no deferred
+     backlog: the bout is exactly the pairs.
 2. The returned method's search script takes these **default trial-cap args, which
    you MAY override**:
    - `grid` → `--resolution 5 --max-trials 100 --patience 6`
    - `bo` → `--n-trials 40` + **adaptive patience** `min(20, max(12, round(1.5·n_dims)))` by default
      (benchmark-tuned; patience=6 suppressed HPO). `--patience N` forces a fixed value.
    - `cmaes` → `--popsize 8 --max-evals 64 --patience 20`
+   - `spsa` → `--n-evals 10` (5 pairs; no patience — the schedule is fixed)
+   - `hebo` → `--n-evals 10` (prompt-v2 LLM pool + official HEBO MACE; no patience)
 
    Clamp the chosen method's trial/eval cap (`--n-trials`/`--max-trials`) to
    `budget_allocation.trial_cap` from Phase S when the cap is smaller than the
@@ -197,7 +230,8 @@ never get proposals — they consume the deferred-config supply from step 0+1.
    atomic reservation layer is still authoritative because deferred configs
    are evaluated before the optimizer's own nominal cap.
 
-   All three stop early via the shared `PatienceMonitor`. Grid shuffles combos
+   Grid, BO, and CMA-ES stop early via the shared `PatienceMonitor`; SPSA runs
+   its fixed pair schedule. Grid shuffles combos
    with `--seed`; CMA-ES also keeps its `es.stop()` σ-convergence. No direction
    to pass — all minimize.
 3. Request the corresponding driver-owned script (it reads the step-1 **evaluated** warm trials from

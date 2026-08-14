@@ -2,8 +2,8 @@
 
 The evidence log is what the predictive models are estimated from, so it
 cannot depend on a role session remembering to report an outcome: a
-forgotten call does not raise, it silently leaves the model empty and pins
-the scheduler in its coverage/fallback path for the rest of the run. The
+forgotten call does not raise, it silently leaves the current-run log
+empty so the models stay on the frozen design prior. The
 artifacts already record everything both models need —
 
 * a bout's `(Z, D, cost)` is in the candidate's `tune_report.json`

@@ -588,7 +588,7 @@ def _prepare_run(
     )
 
     # This is the mandatory data boundary. `check-search-space` remains useful
-    # for proposing/expanding the space, but skipping it must never let an
+    # for proposing/validating the space, but skipping it must never let an
     # invalid row mutate BASE_PARAMS, the report, or consume an objective slot.
     try:
         all_configs, _literal_search_space = _validated_warm_configs(

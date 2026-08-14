@@ -58,7 +58,8 @@ def test_phase_c_job_must_match_deterministic_action(tmp_path: Path) -> None:
     }
     with mock.patch(
         "driver.jobs._phase_c_action",
-        return_value={"action": "run", "method": "bo"},
+        return_value={"action": "run", "method": "bo", "bout_trials": 10,
+                      "sampler": "tpe"},
     ):
         argv, _, _ = build_driver_job(
             "tuner-orchestrator", ctx, request, repo_root=repo
@@ -85,7 +86,8 @@ def test_v3_phase_c_job_requires_the_complete_bout_cap(tmp_path: Path) -> None:
     }
     with mock.patch(
         "driver.jobs._phase_c_action",
-        return_value={"action": "run", "method": "bo"},
+        return_value={"action": "run", "method": "bo", "bout_trials": 10,
+                      "sampler": "tpe"},
     ):
         with pytest.raises(DriverJobError, match="complete bout"):
             build_driver_job("tuner-orchestrator", ctx, request, repo_root=repo)

@@ -21,7 +21,10 @@ from tune_tools import _candidate_execution_revision  # noqa: E402
 
 
 def _report(*, stage_status: str) -> dict:
+    # Finalization-mechanics fixtures predate the regime-conditioned inner
+    # policy: a grid stage at bout 0 is legal under the legacy chains.
     return {
+        "inner_policy": "legacy",
         "phase_a": {
             "status": "ok",
             "warm_start_configs": [{"params": {"x": 1.0}, "score": 1.0}],
@@ -561,6 +564,8 @@ class TuningFinalizationTests(unittest.TestCase):
     def test_fixed_space_no_search_receipt_is_finalizable(self) -> None:
         params = {"a": 1.0, "b": 2.0, "c": "only"}
         report = {
+            # bo -> cmaes fallback at bout 0 is a legacy-chain history.
+            "inner_policy": "legacy",
             "phase_a": {
                 "status": "ok",
                 "warm_start_configs": [{"params": params, "score": 0.5}],

@@ -145,6 +145,7 @@ def cmd_evidence(args) -> int:
         json.dumps(
             {
                 "scope": evidence_mod.EVIDENCE_SCOPE,
+                "prior_id": evidence_mod.PRIOR_ID,
                 "tuning": tuning.summary(),
                 "arrival": arrival.summary(),
                 "coverage_spent": store.coverage_spent(),
