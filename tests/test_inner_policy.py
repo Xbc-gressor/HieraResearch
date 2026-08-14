@@ -24,7 +24,6 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 
-import _common  # noqa: E402
 import inner_policy  # noqa: E402
 from _common import (  # noqa: E402
     DeepTuneStageAdmissionError,

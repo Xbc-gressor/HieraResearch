@@ -720,7 +720,7 @@ def test_seed_determinism_of_ctx_rngs(make_checkpoint, tmp_path):
 
     result_a = run(42, "cell_a")
     result_b = run(42, "cell_b")
-    result_c = run(7, "cell_c")
+    run(7, "cell_c")
     trace_a = [
         (event["proposal"], event["score"])
         for event in evaluation_events(tmp_path / "cell_a")

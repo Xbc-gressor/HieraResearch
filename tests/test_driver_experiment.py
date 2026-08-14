@@ -173,10 +173,10 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
-        status = run_experiment("fake-task", "t1", runner=runner, model="m",
-                                repo_root=self.repo, cmd=cmd,
-                                semantic_policy="coverage_attempt",
-                                scheduler_policy="v3_2")
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd,
+                       semantic_policy="coverage_attempt",
+                       scheduler_policy="v3_2")
         self.assertEqual(cmd._ledger().get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["background-researcher", "idea-generator",
@@ -345,8 +345,8 @@ class ExperimentTests(unittest.TestCase):
              "side_effects": writer_effect},
             {"fail": ["budget exhausted mid-extraction"]},
         ])
-        status = run_experiment("fake-task", "t1", runner=runner, model="m",
-                                repo_root=self.repo, cmd=cmd)
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
         self.assertTrue(any("resolve-unevaluated" in c for c in cmd.calls))
         self.assertNotEqual(cmd._ledger().get("phase"), "blocked")
 

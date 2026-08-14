@@ -215,7 +215,7 @@ def test_tied_front_uses_seeded_uniform_choice(tmp_path) -> None:
 
     # Same seed => identical selection (run the seed-5 cell again verbatim).
     receipt = pool_receipt(0.005)
-    repeat = run(
+    run(
         continuation_checkpoint(tmp_path, name="ck5b"),
         tmp_path / "out5b",
         seed=5,

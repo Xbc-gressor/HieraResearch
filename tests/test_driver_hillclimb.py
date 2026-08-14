@@ -1,5 +1,4 @@
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -151,7 +150,7 @@ class HillclimbTests(unittest.TestCase):
              "side_effects": edit_train_py("# v2\n")},
         ])
         # exhaust budget after the second evaluation so the loop stops
-        status = run_hillclimb(
+        run_hillclimb(
             "fake-task", "t1", runner=runner, model="m",
             repo_root=self.repo, cmd=cmd, max_evaluations=3,
         )

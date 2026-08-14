@@ -592,9 +592,9 @@ class ExperienceTransitionTests(unittest.TestCase):
 
     def _regrade_lightly(self, *run_ids: str) -> None:
         """Re-grade fixture comparator children as lightly tuned in place."""
-        for record in self.ledger["records"]:
-            if record["run_id"] in run_ids:
-                record["evaluation_depth"] = "tuned_lightly"
+        for entry in self.ledger["records"]:
+            if entry["run_id"] in run_ids:
+                entry["evaluation_depth"] = "tuned_lightly"
 
     def _third_lightly_edge(self) -> None:
         """Add a third matched pair and grade its child tuned_lightly."""

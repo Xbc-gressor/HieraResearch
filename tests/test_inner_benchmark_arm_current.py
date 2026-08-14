@@ -14,7 +14,6 @@ import objective  # noqa: E402
 import runner  # noqa: E402
 from arms import current  # noqa: E402
 from ib_support import (  # noqa: E402
-    BASE,
     cfg,
     evaluation_events,
     fake_eval_by_params,
@@ -248,7 +247,7 @@ def test_same_seed_replays_tpe_sequence_with_warm_history(tmp_path) -> None:
     out_a, out_b, out_c = (tmp_path / name for name in ("a", "b", "c"))
     result_a = run(out_a, seed=7)
     result_b = run(out_b, seed=7)
-    result_c = run(out_c, seed=8)
+    run(out_c, seed=8)
 
     assert result_a["status"] == result_b["status"] == "ok"
     proposals_a = [event["proposal"] for event in evaluation_events(out_a)]

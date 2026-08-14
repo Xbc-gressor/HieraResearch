@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runner  # noqa: E402
 from arms import local_tr  # noqa: E402
 from ib_support import (  # noqa: E402
-    cfg,
     evaluation_events,
     fake_eval_by_params,
     fake_eval_from,
