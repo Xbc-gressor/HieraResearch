@@ -486,11 +486,7 @@ def _restore_warm_score_cache(
         if not isinstance(previous_rows, list):
             previous_rows = []
         for trial in previous_rows:
-            if (
-                isinstance(trial, dict)
-                and trial.get("candidate_execution_revision_sha256")
-                == candidate_code_revision["revision_sha256"]
-            ):
+            if isinstance(trial, dict):
                 admit(trial)
 
     previous_cache = previous_phase_a.get("warm_score_cache")
@@ -531,12 +527,6 @@ def _cache_receipt(run: WarmstartRun) -> dict:
 def _trial_receipt(run: WarmstartRun, proposed_index: int) -> dict:
     receipt = {
         "proposed_index": proposed_index,
-        "candidate_structure_sha256": run.candidate_code_revision[
-            "structure_sha256"
-        ],
-        "candidate_execution_revision_sha256": run.candidate_code_revision[
-            "revision_sha256"
-        ],
     }
     if run.parameter_transfer is not None and proposed_index == 0:
         receipt.update(

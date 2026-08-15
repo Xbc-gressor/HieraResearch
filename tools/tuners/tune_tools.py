@@ -1829,16 +1829,30 @@ def _read_literal_mapping(train_path: Path, name: str) -> dict:
     return value
 
 
-def _candidate_structure_sha256(candidate_path: Path) -> str:
-    """Hash strategy-bearing code while ignoring materialized tuning literals.
+def _candidate_structure_snapshot(candidate_path: Path) -> str:
+    """Record strategy-bearing source without generated tuner literals.
 
     SEARCH_SPACE is absent when transfer is first built and BASE_PARAMS is
-    absent until warm evaluation.  Removing both assignments makes the same
-    receipt valid across those deterministic materialization steps, while any
-    edit to PARAM_SCHEMA or executable candidate code invalidates it.
+    absent until warm evaluation. Removing both assignments makes the same
+    snapshot valid across those deterministic materialization steps. The
+    remaining source is persisted and compared directly; it is not re-encoded
+    through Python-version-specific AST or tokenizer node kinds.
     """
-    tree = ast.parse(Path(candidate_path).read_text(errors="replace"))
-    normalized_body = []
+    source = Path(candidate_path).read_text(errors="replace")
+    tree = ast.parse(source)
+    lines = source.splitlines(keepends=True)
+    line_starts: list[int] = []
+    offset = 0
+    for line in lines:
+        line_starts.append(offset)
+        offset += len(line)
+
+    def source_offset(line_no: int, byte_col: int) -> int:
+        line = lines[line_no - 1]
+        char_col = len(line.encode("utf-8")[:byte_col].decode("utf-8"))
+        return line_starts[line_no - 1] + char_col
+
+    ignored_ranges: list[tuple[int, int]] = []
     for node in tree.body:
         targets: list[ast.AST] = []
         if isinstance(node, ast.Assign):
@@ -1851,34 +1865,20 @@ def _candidate_structure_sha256(candidate_path: Path) -> str:
             if isinstance(target, ast.Name)
         }
         if names & {"BASE_PARAMS", "SEARCH_SPACE"}:
-            continue
-        normalized_body.append(node)
-    tree.body = normalized_body
-    def stable_ast(value):
-        if isinstance(value, ast.AST):
-            # Root tuner and task objective intentionally run in different uv
-            # projects. Python 3.12 added the empty ``type_params`` field to
-            # several existing nodes, so ast.dump of identical source differs
-            # between the supported 3.11 and 3.12+ interpreters. Serialize the
-            # semantic fields ourselves and omit that version-only field.
-            return [
-                type(value).__name__,
-                [
-                    [field, stable_ast(getattr(value, field))]
-                    for field in value._fields
-                    if field != "type_params"
-                ],
-            ]
-        if isinstance(value, list):
-            return [stable_ast(item) for item in value]
-        return value
+            ignored_ranges.append(
+                (
+                    source_offset(node.lineno, node.col_offset),
+                    source_offset(node.end_lineno, node.end_col_offset),
+                )
+            )
 
-    normalized = json.dumps(
-        stable_ast(tree),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode()
-    return _sha256_bytes(normalized)
+    for start, end in sorted(ignored_ranges, reverse=True):
+        source = source[:start] + source[end:]
+    return "\n".join(
+        line.rstrip()
+        for line in source.splitlines()
+        if line.strip()
+    )
 
 
 def _candidate_execution_revision(candidate_path: Path) -> dict:
@@ -1926,8 +1926,8 @@ def _candidate_execution_revision(candidate_path: Path) -> dict:
             }
 
     revision = {
-        "schema_version": 4,
-        "structure_sha256": _candidate_structure_sha256(candidate_path),
+        "schema_version": 5,
+        "structure_snapshot": _candidate_structure_snapshot(candidate_path),
         "search_space": _json_native(search_space),
         # Mapping order drives deterministic grid/CMA encodings. Dict equality
         # and canonical JSON hashes intentionally ignore it, so carry the key
@@ -1936,7 +1936,6 @@ def _candidate_execution_revision(candidate_path: Path) -> dict:
         "prepare_sha256": _file_sha256(prepare_path),
         "evaluation_contract": evaluation_contract,
     }
-    revision["revision_sha256"] = _json_sha256(revision)
     return revision
 
 
@@ -2496,7 +2495,7 @@ def build_parameter_transfer(
             "path": _display_path(candidate_path),
             "brief_path": _display_path(brief_path),
             "brief_sha256": _file_sha256(brief_path),
-            "structure_sha256": _candidate_structure_sha256(candidate_path),
+            "structure_snapshot": _candidate_structure_snapshot(candidate_path),
             "param_schema": _json_native(child_schema),
             "defaults": child_defaults,
         },

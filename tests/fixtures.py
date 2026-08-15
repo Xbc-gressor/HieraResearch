@@ -478,7 +478,7 @@ def attach_matched_transfer(
             "path": f"candidates/{child['run_id']}/train.py",
             "brief_path": f"candidates/{child['run_id']}/_candidate_brief.json",
             "brief_sha256": "sha256:" + "1" * 64,
-            "structure_sha256": "sha256:" + "2" * 64,
+            "structure_snapshot": "fixture",
             "param_schema": child_schema,
             "defaults": child_defaults,
         },

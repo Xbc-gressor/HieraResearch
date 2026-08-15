@@ -310,10 +310,6 @@ class SemanticEdgePersistenceTests(unittest.TestCase):
             candidate_revision = _candidate_execution_revision(
                 candidate_dir / "train.py"
             )
-            for row in observations:
-                row["candidate_execution_revision_sha256"] = (
-                    candidate_revision["revision_sha256"]
-                )
             report_path.write_text(
                 json.dumps(
                     {

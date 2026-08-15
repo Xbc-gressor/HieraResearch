@@ -112,25 +112,13 @@ def evaluate_config(make_model, params):
                 "cache_sha256",
                 first_report["phase_a"]["warm_score_cache"],
             )
-            self.assertEqual(first_revision["schema_version"], 4)
-            self.assertTrue(first_revision["structure_sha256"].startswith("sha256:"))
+            self.assertEqual(first_revision["schema_version"], 5)
+            self.assertTrue(first_revision["structure_snapshot"])
             self.assertNotIn("search_space_sha256", first_revision)
             self.assertTrue(first_revision["prepare_sha256"].startswith("sha256:"))
-            self.assertTrue(first_revision["revision_sha256"].startswith("sha256:"))
-            self.assertEqual(
-                {
-                    row["candidate_structure_sha256"]
-                    for row in first_report["phase_a"]["warm_start_configs"]
-                },
-                {first_revision["structure_sha256"]},
-            )
-            self.assertEqual(
-                {
-                    row["candidate_execution_revision_sha256"]
-                    for row in first_report["phase_a"]["warm_start_configs"]
-                },
-                {first_revision["revision_sha256"]},
-            )
+            for row in first_report["phase_a"]["warm_start_configs"]:
+                self.assertNotIn("candidate_structure_sha256", row)
+                self.assertNotIn("candidate_execution_revision_sha256", row)
 
             resumed_eval = self._run(candidate, configs_path, report_path)
             resumed_eval.assert_not_called()
@@ -181,13 +169,9 @@ def evaluate_config(make_model, params):
                 changed_report["phase_a"]["trials_attempted"],
                 2 * expected_evaluations,
             )
-            self.assertEqual(
-                {
-                    row["candidate_structure_sha256"]
-                    for row in changed_report["phase_a"]["warm_start_configs"]
-                },
-                {changed_revision["structure_sha256"]},
-            )
+            for row in changed_report["phase_a"]["warm_start_configs"]:
+                self.assertNotIn("candidate_structure_sha256", row)
+                self.assertNotIn("candidate_execution_revision_sha256", row)
             self.assertNotIn("phase_c", changed_report)
             self.assertNotIn("final_best_params", changed_report)
             self.assertNotIn("final_best_score", changed_report)
@@ -228,10 +212,7 @@ def evaluate_config(make_model, params):
                 first_revision["prepare_sha256"],
                 second_revision["prepare_sha256"],
             )
-            self.assertNotEqual(
-                first_revision["revision_sha256"],
-                second_revision["revision_sha256"],
-            )
+            self.assertNotEqual(first_revision, second_revision)
 
     def test_fresh_candidate_cache_is_invalidated_by_code_revision(self) -> None:
         self._assert_revision_bound_resume(provided=False)
@@ -271,17 +252,14 @@ def evaluate_config(make_model, params):
             report = json.loads(report_path.read_text())
             second_revision = report["phase_a"]["candidate_code_revision"]
             self.assertEqual(
-                second_revision["structure_sha256"],
-                first_revision["structure_sha256"],
+                second_revision["structure_snapshot"],
+                first_revision["structure_snapshot"],
             )
             self.assertNotEqual(
                 second_revision["search_space"],
                 first_revision["search_space"],
             )
-            self.assertNotEqual(
-                second_revision["revision_sha256"],
-                first_revision["revision_sha256"],
-            )
+            self.assertNotEqual(second_revision, first_revision)
             self.assertEqual(report["phase_a"]["trials_attempted"], 4)
 
     def test_invalid_nonzero_config_fails_before_any_persistent_write(self) -> None:
@@ -421,10 +399,7 @@ def evaluate_config(make_model, params):
             )
             recovered = phase_a["warm_start_configs"][0]
             self.assertEqual(recovered["proposed_index"], 1)
-            self.assertEqual(
-                recovered["candidate_execution_revision_sha256"],
-                phase_a["candidate_code_revision"]["revision_sha256"],
-            )
+            self.assertNotIn("candidate_execution_revision_sha256", recovered)
             self.assertEqual(
                 phase_a["deferred_configs"],
                 [{"params": {"x": 3}}],

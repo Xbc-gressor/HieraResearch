@@ -609,12 +609,6 @@ def evaluate_config(make_model, params):
                     "params": receipt["projection"]["params"],
                     "score": 7.0,
                     "proposed_index": 0,
-                    "candidate_structure_sha256": phase_a[
-                        "candidate_code_revision"
-                    ]["structure_sha256"],
-                    "candidate_execution_revision_sha256": phase_a[
-                        "candidate_code_revision"
-                    ]["revision_sha256"],
                     "role": "inherited_control",
                     "parameter_transfer_receipt_sha256": receipt[
                         "receipt_sha256"

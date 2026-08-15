@@ -955,7 +955,7 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         "path",
         "brief_path",
         "brief_sha256",
-        "structure_sha256",
+        "structure_snapshot",
         "param_schema",
         "defaults",
     }

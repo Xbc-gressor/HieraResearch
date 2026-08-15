@@ -17,6 +17,7 @@ import apply_search_space  # noqa: E402
 from _common import load_candidate_modules  # noqa: E402
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
+    _candidate_structure_snapshot,
     _read_search_space,
     _schema_accepts_value,
     _valid_schema_entry,
@@ -40,6 +41,16 @@ class ContractIdentityTests(unittest.TestCase):
         path = Path(tmp.name) / "train.py"
         path.write_text(source)
         return tmp, path
+
+    def test_structure_snapshot_accepts_ellipsis_slices(self) -> None:
+        tmp, path = self._candidate(
+            "def select(x, d):\n    return x[..., :d]\n"
+        )
+        self.addCleanup(tmp.cleanup)
+
+        snapshot = _candidate_structure_snapshot(path)
+
+        self.assertIn("...", snapshot)
 
     def test_duplicate_runtime_binding_is_rejected_everywhere(self) -> None:
         tmp, path = self._candidate(
@@ -339,10 +350,12 @@ def make_model(params):
         path.write_text(second)
         after = _candidate_execution_revision(path)
 
-        self.assertEqual(before["structure_sha256"], after["structure_sha256"])
+        self.assertEqual(
+            before["structure_snapshot"], after["structure_snapshot"]
+        )
         self.assertEqual(before["search_space"], after["search_space"])
         self.assertNotEqual(before["search_space_keys"], after["search_space_keys"])
-        self.assertNotEqual(before["revision_sha256"], after["revision_sha256"])
+        self.assertNotEqual(before, after)
 
     def test_stale_bytecode_and_mid_load_rewrite_are_refused(self) -> None:
         """A candidate rewritten under the loader must not be scored as this one."""
