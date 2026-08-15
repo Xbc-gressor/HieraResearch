@@ -24,21 +24,30 @@ The frozen production contract::
              | eligible once they reach the DEEP regime — never a silent
              | TPE/grid bout still labeled DEEP/SPSA.
 
-Under the new policy a bout's deferred-warm backlog occupies slots INSIDE
-``B_q`` (design §2 rule 4); the legacy policy kept them as extra trials on
-top of the bout budget.
+A comparison arm keeps the same CONTINUE / DEEP kernels and bout sizes
+but replaces FIRST with the inner-benchmark ``local_tr`` arm::
+
+    inner_tuner_policy_id = localtr8-hebo10-spsa10-v1
+
+Under every regime-conditioned policy a bout's deferred-warm backlog
+occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
+them as extra trials on top of the bout budget.
 
 The switch is per-run: ``framework_cfg.json`` ``tuner.inner_policy`` —
-``deferred-random8-hebo10-spsa10-v1`` (default) or ``legacy`` (the
-pre-policy uniform behavior: every bout runs the CONTINUE rule at
-``tuner.bout_trials``). Stdlib-only at module level so both ``tune_tools``
-and ``_common`` can import it without cycles.
+``deferred-random8-hebo10-spsa10-v1`` (default),
+``localtr8-hebo10-spsa10-v1``, or ``legacy`` (the pre-policy uniform
+behavior: every bout runs the CONTINUE rule at ``tuner.bout_trials``).
+Stdlib-only at module level so both ``tune_tools`` and ``_common`` can
+import it without cycles.
 """
 
 from __future__ import annotations
 
 POLICY_ID = "deferred-random8-hebo10-spsa10-v1"
+LOCAL_TR_POLICY_ID = "localtr8-hebo10-spsa10-v1"
 LEGACY_POLICY_ID = "legacy"
+REGIME_POLICY_IDS = (POLICY_ID, LOCAL_TR_POLICY_ID)
+KNOWN_POLICY_IDS = (*REGIME_POLICY_IDS, LEGACY_POLICY_ID)
 
 FIRST = "FIRST"
 CONTINUE = "CONTINUE"
@@ -52,6 +61,11 @@ MAX_BOUTS_PER_CANDIDATE = 4
 _REGIME_BOUT_SIZES = {FIRST: B_FIRST, CONTINUE: B_CONTINUE, DEEP: B_DEEP}
 
 
+def is_regime_policy(policy_id: str) -> bool:
+    """Whether ``policy_id`` is a FIRST/CONTINUE/DEEP regime contract."""
+    return policy_id in REGIME_POLICY_IDS
+
+
 def load_policy_id(ref_path) -> str:
     """``tuner.inner_policy`` from the run's framework_cfg (default: the
     frozen policy)."""
@@ -59,11 +73,9 @@ def load_policy_id(ref_path) -> str:
 
     raw = load_run_cfg(ref_path, "tuner").get("inner_policy", POLICY_ID)
     policy_id = str(raw)
-    if policy_id not in (POLICY_ID, LEGACY_POLICY_ID):
-        raise ValueError(
-            f"tuner.inner_policy must be {POLICY_ID!r} or {LEGACY_POLICY_ID!r}; "
-            f"got {raw!r}"
-        )
+    if policy_id not in KNOWN_POLICY_IDS:
+        allowed = " or ".join(repr(item) for item in KNOWN_POLICY_IDS)
+        raise ValueError(f"tuner.inner_policy must be {allowed}; got {raw!r}")
     return policy_id
 
 
@@ -85,7 +97,7 @@ def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: in
 
     The legacy policy sizes every bout by the run's ``tuner.bout_trials``.
     """
-    if policy_id == LEGACY_POLICY_ID:
+    if not is_regime_policy(policy_id):
         return int(legacy_bout_trials)
     return bout_size(regime_for_bout_index(bout_index))
 
@@ -93,27 +105,29 @@ def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: in
 def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -> list:
     """The deterministic method chain for one bout.
 
-    FIRST -> ["bo"] (driven with an explicit RandomSampler; see
-    :func:`bo_sampler_for_bout`). CONTINUE -> ["hebo"] (prompt-v2 LLM pool
-    + official HEBO MACE; no TPE/cmaes fallback). DEEP -> ["spsa"].
+    Default FIRST -> ["bo"] (explicit RandomSampler; see
+    :func:`bo_sampler_for_bout`). ``localtr8-hebo10-spsa10-v1`` FIRST ->
+    ["local_tr"]. CONTINUE -> ["hebo"] (prompt-v2 LLM pool + official HEBO
+    MACE; no TPE/cmaes fallback). DEEP -> ["spsa"].
     """
     from tune_tools import select_method  # function-level: tune_tools imports us
 
     selected = select_method(len(search_space))
     legacy = [selected["method"], *selected["fallback"]]
-    if policy_id != POLICY_ID:
+    if not is_regime_policy(policy_id):
         return legacy
     regime = regime_for_bout_index(bout_index)
     if regime == FIRST:
-        return ["bo"]
+        return ["local_tr"] if policy_id == LOCAL_TR_POLICY_ID else ["bo"]
     if regime == DEEP:
         return ["spsa"]
     return ["hebo"]
 
 
 def bo_sampler_for_bout(policy_id: str, bout_index: int) -> str:
-    """Which Optuna sampler drives a ``bo`` stage: FIRST bouts are explicit
-    random draws; every other bo stage keeps multivariate TPE."""
+    """Which Optuna sampler drives a ``bo`` stage: default-policy FIRST
+    bouts are explicit random draws; every other bo stage keeps
+    multivariate TPE."""
     if policy_id == POLICY_ID and regime_for_bout_index(bout_index) == FIRST:
         return "random"
     return "tpe"
@@ -121,8 +135,9 @@ def bo_sampler_for_bout(policy_id: str, bout_index: int) -> str:
 
 def deferred_occupy_bout_slots(policy_id: str) -> bool:
     """Whether deferred-warm configs consume slots inside the bout budget
-    (new policy, design §2 rule 4) instead of extending it (legacy)."""
-    return policy_id == POLICY_ID
+    (regime-conditioned policies, design §2 rule 4) instead of extending
+    it (legacy)."""
+    return is_regime_policy(policy_id)
 
 
 def rewarm_allowed(policy_id: str, bout_index: int) -> bool:
@@ -132,7 +147,7 @@ def rewarm_allowed(policy_id: str, bout_index: int) -> bool:
     HEBO CONTINUE arm generates its own pool, so Phase-R proposals would
     only displace that protocol.
     """
-    if policy_id != POLICY_ID:
+    if not is_regime_policy(policy_id):
         return bout_index >= 1
     return False
 

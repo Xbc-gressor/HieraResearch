@@ -39,8 +39,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--scheduler-policy",
-        choices=["legacy", "v3_2"],
+        choices=["legacy", "legacy_wide", "v3_2"],
         help="tuner scheduler policy; new runs default to v3_2",
+    )
+    run.add_argument(
+        "--inner-tuner-policy",
+        choices=[
+            "deferred-random8-hebo10-spsa10-v1",
+            "localtr8-hebo10-spsa10-v1",
+            "legacy",
+        ],
+        help="regime-conditioned inner-tuner policy; new runs default to "
+             "deferred-random8-hebo10-spsa10-v1",
+    )
+    run.add_argument(
+        "--k-eval",
+        type=int,
+        help="how many proposed warm configs are evaluated at step 0+1 "
+             "(minimum 2; template default 2). Frozen once run artifacts exist",
     )
     run.add_argument("--cli-path", help="system claude CLI path; default is the "
                                         "SDK-bundled CLI (pinned via uv.lock)")
@@ -86,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
             llm_intelligence_score=args.llm_intelligence_score,
             semantic_policy=args.semantic_policy,
             scheduler_policy=args.scheduler_policy,
+            inner_policy=args.inner_tuner_policy,
+            k_eval=args.k_eval,
             cli_path=args.cli_path,
         )
         print(json.dumps(status, indent=2, sort_keys=True))

@@ -11,6 +11,8 @@ Usage:
       [--llm-intelligence-score <score>]
       [--semantic-policy <policy>]
       [--scheduler-policy <policy>]
+      [--inner-tuner-policy <policy>]
+      [--k-eval <count>]
       [--max-evaluations <count>]
       [--timeout <seconds>]
 
@@ -18,6 +20,7 @@ Example:
     python tools/init_run.py tabular-model-search exp-20260630 \
       --dimension-strategy llm_induced \
       --llm-intelligence-score 70 \
+      --k-eval 2 \
       --max-evaluations 200 \
       --timeout 60
 """
@@ -45,13 +48,19 @@ SEMANTIC_POLICIES = (
     "gain_uncertainty",
     "gain_uncertainty_nocost",
 )
-SCHEDULER_POLICIES = ("legacy", "v3_2")
+SCHEDULER_POLICIES = ("legacy", "legacy_wide", "v3_2")
+INNER_POLICIES = (
+    "deferred-random8-hebo10-spsa10-v1",
+    "localtr8-hebo10-spsa10-v1",
+    "legacy",
+)
 
 # Defaults for newly initialized experiment runs. Existing runs that omit
 # these keys keep their historical runtime fallbacks; init_run never rewrites
 # an existing run merely because the defaults changed.
 DEFAULT_SEMANTIC_POLICY = "coverage_attempt"
 DEFAULT_SCHEDULER_POLICY = "v3_2"
+DEFAULT_INNER_POLICY = "deferred-random8-hebo10-spsa10-v1"
 DEFAULT_MAX_EVALUATIONS = 200
 
 
@@ -94,6 +103,8 @@ def initialize_run(
     llm_intelligence_score: float | None = None,
     semantic_policy: str | None = None,
     scheduler_policy: str | None = None,
+    inner_policy: str | None = None,
+    k_eval: int | None = None,
     max_evaluations: int | None = None,
     per_runtime_limit: float | None = None,
 ) -> Path:
@@ -131,6 +142,8 @@ def initialize_run(
             semantic_policy = DEFAULT_SEMANTIC_POLICY
         if scheduler_policy is None:
             scheduler_policy = DEFAULT_SCHEDULER_POLICY
+        if inner_policy is None:
+            inner_policy = DEFAULT_INNER_POLICY
 
     # New runs inherit a task-appropriate limit instead of blindly retaining
     # the generic template's 60 seconds. Existing run-local choices remain
@@ -165,6 +178,22 @@ def initialize_run(
         raise ValueError(
             f"scheduler policy must be one of {list(SCHEDULER_POLICIES)}"
         )
+    if inner_policy is not None and inner_policy not in INNER_POLICIES:
+        raise ValueError(
+            f"inner tuner policy must be one of {list(INNER_POLICIES)}"
+        )
+    if (
+        k_eval is not None
+        and (
+            not isinstance(k_eval, int)
+            or isinstance(k_eval, bool)
+            or k_eval < 2
+        )
+    ):
+        raise ValueError(
+            "k_eval must be an integer of at least 2 so a non-fresh candidate "
+            "has one selectable row beyond its fidelity control"
+        )
     if (
         max_evaluations is not None
         and (
@@ -190,6 +219,8 @@ def initialize_run(
         and llm_intelligence_score is None
         and semantic_policy is None
         and scheduler_policy is None
+        and inner_policy is None
+        and k_eval is None
         and max_evaluations is None
         and per_runtime_limit is None
     ):
@@ -324,6 +355,51 @@ def initialize_run(
         else:
             print(f"Scheduler policy already set to {scheduler_policy}.")
 
+    if inner_policy is not None:
+        section = config.get("tuner", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: tuner must be an object")
+        current = section.get("inner_policy")
+        existing_artifacts = [
+            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
+        ]
+        if current != inner_policy and existing_artifacts:
+            raise ValueError(
+                "cannot change inner tuner policy after run artifacts exist: "
+                + ", ".join(existing_artifacts)
+            )
+        if current != inner_policy:
+            config["tuner"] = {
+                **section,
+                "inner_policy": inner_policy,
+            }
+            updates.append(f"inner_policy={inner_policy}")
+        else:
+            print(f"Inner tuner policy already set to {inner_policy}.")
+
+    if k_eval is not None:
+        section = config.get("tuner", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: tuner must be an object")
+        current = section.get("K_eval")
+        existing_artifacts = [
+            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
+        ]
+        # Frozen per run: K_eval is the per-candidate screening cost that the
+        # scheduler's resource contract, got_select's admission cap, and every
+        # recorded arrival episode are denominated in. Changing it mid-run
+        # would make earlier and later screening costs incomparable.
+        if current != k_eval and existing_artifacts:
+            raise ValueError(
+                "cannot change K_eval after run artifacts exist: "
+                + ", ".join(existing_artifacts)
+            )
+        if current != k_eval:
+            config["tuner"] = {**section, "K_eval": k_eval}
+            updates.append(f"K_eval={k_eval}")
+        else:
+            print(f"K_eval already set to {k_eval}.")
+
     if max_evaluations is not None:
         config["max_evaluations"] = max_evaluations
         updates.append(f"max_evaluations={max_evaluations}")
@@ -384,6 +460,26 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--inner-tuner-policy",
+        dest="inner_policy",
+        choices=INNER_POLICIES,
+        help=(
+            "regime-conditioned inner-tuner policy; new runs default to "
+            f"{DEFAULT_INNER_POLICY}"
+        ),
+    )
+    parser.add_argument(
+        "--k-eval",
+        dest="k_eval",
+        type=int,
+        metavar="COUNT",
+        help=(
+            "how many of the K proposed warm configs are evaluated at "
+            "step 0+1 (minimum 2; template default 2). Frozen once run "
+            "artifacts exist"
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         "--per-runtime-limit",
         dest="per_runtime_limit",
@@ -401,6 +497,8 @@ def main() -> int:
             llm_intelligence_score=args.llm_intelligence_score,
             semantic_policy=args.semantic_policy,
             scheduler_policy=args.scheduler_policy,
+            inner_policy=args.inner_policy,
+            k_eval=args.k_eval,
             max_evaluations=args.max_evaluations,
             per_runtime_limit=args.per_runtime_limit,
         )

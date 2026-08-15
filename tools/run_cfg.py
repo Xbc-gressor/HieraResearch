@@ -130,13 +130,32 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             )
 
     if "scheduler_policy" in tuner:
-        # Scheduler v3.2 is an isolated policy arm; anything else is the
-        # legacy percentile/alternation gate. A typo here must fail loudly
-        # rather than silently run the arm the experiment is comparing against.
+        # Scheduler v3.2 is an isolated policy arm; `legacy` and `legacy_wide`
+        # are the percentile/alternation gate, differing only in how widely a
+        # first-bout non-responder may be re-admitted. A typo here must fail
+        # loudly rather than silently run the arm the experiment compares
+        # against.
         value = tuner["scheduler_policy"]
-        if value not in ("legacy", "v3_2"):
+        if value not in ("legacy", "legacy_wide", "v3_2"):
             raise RunConfigError(
-                f"{path}: tuner.scheduler_policy must be 'legacy' or 'v3_2'"
+                f"{path}: tuner.scheduler_policy must be 'legacy', "
+                "'legacy_wide', or 'v3_2'"
+            )
+
+    if "inner_policy" in tuner:
+        # Keep this list in lockstep with tuners.inner_policy.KNOWN_POLICY_IDS.
+        # run_cfg is imported from stdlib-only helpers; do not import the
+        # tuner package here.
+        known = (
+            "deferred-random8-hebo10-spsa10-v1",
+            "localtr8-hebo10-spsa10-v1",
+            "legacy",
+        )
+        value = tuner["inner_policy"]
+        if value not in known:
+            allowed = " or ".join(repr(item) for item in known)
+            raise RunConfigError(
+                f"{path}: tuner.inner_policy must be {allowed}"
             )
 
     for key in ("scheduler_scenarios", "max_bouts_per_candidate"):
@@ -220,8 +239,9 @@ def _validate_scheduler_v3_2(config: dict, tuner: dict, path: Path) -> None:
 
     bout_trials = int(tuner.get("bout_trials", BOUT_TRIALS))
     max_bouts = int(tuner.get("max_bouts_per_candidate", MAX_BOUTS_PER_CANDIDATE))
-    # Same first-bout cost session.contract_for uses: the frozen inner
-    # policy charges B_FIRST; the explicit legacy inner policy does not.
+    # Same first-bout cost session.contract_for uses: every
+    # regime-conditioned inner policy charges B_FIRST; only the explicit
+    # legacy inner policy does not.
     legacy_inner = str(tuner.get("inner_policy", "")) == "legacy"
     contract = ResourceContract(
         bout_trials=bout_trials,

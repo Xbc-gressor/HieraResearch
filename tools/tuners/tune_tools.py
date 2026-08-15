@@ -1127,7 +1127,9 @@ def _phase_c_finalization_state(
             errors.append(f"phase_c.stages[{index}] must be an object")
             statuses.append(None)
             continue
-        if stage.get("method") not in {"grid", "bo", "cmaes", "spsa", "hebo"}:
+        if stage.get("method") not in {
+            "grid", "bo", "cmaes", "spsa", "hebo", "local_tr"
+        }:
             errors.append(f"phase_c.stages[{index}].method is invalid")
         status = stage.get("status")
         statuses.append(status if isinstance(status, str) else None)
@@ -1524,7 +1526,7 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     def start_new_bout(next_bout: int) -> dict:
         """The previous bout is closed and finalized; begin the next one."""
         if (
-            policy_id == inner_policy.POLICY_ID
+            inner_policy.is_regime_policy(policy_id)
             and inner_policy.regime_for_bout_index(next_bout) == inner_policy.DEEP
             and not inner_policy.has_movable_continuous(search_space)
         ):
@@ -3492,13 +3494,61 @@ def _candidate_cap_allows(
     )
 
 
+def _warm_percentile(record: dict, candidates: list[dict]) -> float:
+    """How much of the population `record` beats, by warm score.
+
+    Both gates rank on this one statistic over the whole population: the
+    fresh gate for the best untuned candidate, and `legacy_wide`'s retry
+    band for a single-bout non-responder — whose `final_best_score` IS its
+    warm best, since its one bout improved nothing over the pre-bout
+    incumbent. Nothing is compared across the warm/tuned line.
+    """
+    value = record["best_warm_score"]
+    worse = sum(
+        1
+        for other in candidates
+        if other is not record and other["best_warm_score"] > value
+    )
+    count = len(candidates)
+    return 100.0 * worse / (count - 1) if count > 1 else 100.0
+
+
 def _incumbent_retry_candidate(
     candidates: list[dict],
     non_responders: list[dict],
+    *,
+    top_percentile: float = DEFAULT_TOP_PERCENTILE,
+    wide: bool = False,
 ) -> dict | None:
-    """Return the one-bout run-best non-responder eligible for confirmation."""
-    if not non_responders:
+    """Return the one-bout non-responder eligible for a confirmation bout.
+
+    `legacy` exempts only the run-best final score: a first bout is mostly
+    startup, so one non-response is weak evidence, but only the incumbent's
+    ceiling justifies the extra trials. `legacy_wide` (`wide=True`) widens
+    the exemption to the top (100-`top_percentile`)% of the population — the
+    same band, over the same candidates, that admits a first bout — on the
+    reasoning that the evidence is equally weak for any near-incumbent, and
+    a strict run-best test discards a candidate the run may still need. Both
+    keep the bout cap at one and rank the retry below every waiting
+    responder.
+    """
+    eligible = [
+        record
+        for record in non_responders
+        if int(record.get("tuning_bouts") or 1) == 1
+        and _is_finite_score(record.get("final_best_score"))
+    ]
+    if not eligible:
         return None
+    if wide:
+        in_band = [
+            record
+            for record in eligible
+            if _warm_percentile(record, candidates) >= top_percentile
+        ]
+        if not in_band:
+            return None
+        return min(in_band, key=lambda record: record["best_warm_score"])
     finals = [
         float(record["final_best_score"])
         for record in candidates
@@ -3510,10 +3560,8 @@ def _incumbent_retry_candidate(
     return next(
         (
             record
-            for record in non_responders
-            if int(record.get("tuning_bouts") or 1) == 1
-            and _is_finite_score(record.get("final_best_score"))
-            and float(record["final_best_score"]) == best_final
+            for record in eligible
+            if float(record["final_best_score"]) == best_final
         ),
         None,
     )
@@ -3532,6 +3580,8 @@ def _partition_candidates(
     *,
     policy_id: str = inner_policy.POLICY_ID,
     movable_continuous: dict | None = None,
+    top_percentile: float = DEFAULT_TOP_PERCENTILE,
+    wide_retry: bool = False,
 ) -> _CandidatePools:
     movable = movable_continuous or {}
 
@@ -3548,7 +3598,7 @@ def _partition_candidates(
         """The next bout is DEEP but no continuous dimension can move: the
         candidate has no DEEP action (design §2.1) — it is done, never
         silently routed to a TPE/grid bout still labeled DEEP."""
-        if policy_id != inner_policy.POLICY_ID:
+        if not inner_policy.is_regime_policy(policy_id):
             return False
         next_bout = int(record.get("tuning_bouts") or (1 if record.get("tune") else 0))
         if inner_policy.regime_for_bout_index(next_bout) != inner_policy.DEEP:
@@ -3588,6 +3638,8 @@ def _partition_candidates(
         incumbent_retry=_incumbent_retry_candidate(
             candidates,
             non_responders,
+            top_percentile=top_percentile,
+            wide=wide_retry,
         ),
         all_at_cap=bool(cap_flags) and not any(cap_flags),
     )
@@ -3627,15 +3679,7 @@ def _choose_candidate(
             pools.fresh,
             key=lambda record: record["best_warm_score"],
         )
-        value = best_fresh["best_warm_score"]
-        worse = sum(
-            1
-            for record in pools.candidates
-            if record is not best_fresh
-            and record["best_warm_score"] > value
-        )
-        count = len(pools.candidates)
-        percentile = 100.0 * worse / (count - 1) if count > 1 else 100.0
+        percentile = _warm_percentile(best_fresh, pools.candidates)
         if percentile >= top_percentile:
             return _CandidateChoice(
                 selected=best_fresh,
@@ -3715,6 +3759,7 @@ def _selected_candidate_result(
     top_percentile: float,
     bout_trials: int | None,
     policy_id: str = inner_policy.POLICY_ID,
+    wide_retry: bool = False,
 ) -> dict:
     selected = choice.selected
     assert selected is not None
@@ -3723,7 +3768,7 @@ def _selected_candidate_result(
         or (1 if selected.get("tune") else 0)
     )
     bout_regime = inner_policy.regime_for_bout_index(tuning_bouts)
-    if policy_id == inner_policy.POLICY_ID:
+    if inner_policy.is_regime_policy(policy_id):
         bout_size = inner_policy.bout_size(bout_regime)
     else:
         bout_size = bout_trials
@@ -3737,6 +3782,12 @@ def _selected_candidate_result(
                 "incumbent retry: run-best candidate's first bout improved "
                 "nothing; one confirmation bout"
             )
+            if wide_retry:
+                reason = (
+                    "incumbent retry (wide): a top "
+                    f"{100 - top_percentile:.0f}% candidate's first bout "
+                    "improved nothing; one confirmation bout"
+                )
         if choice.alternation:
             reason = (
                 "alternation: responder follows last round's first bout; "
@@ -3807,6 +3858,7 @@ def select_candidate(
     last_bout_was_first: bool | None = None,
     policy_id: str = inner_policy.POLICY_ID,
     movable_continuous: dict | None = None,
+    wide_retry: bool = False,
 ) -> dict:
     """Which candidate receives the next tuning bout (progressive §15), or none.
 
@@ -3820,7 +3872,10 @@ def select_candidate(
     holds the run's best final score earns one confirmation bout, ranked
     below waiting responders (a first bout is mostly TPE startup, so one
     non-response is weak evidence — but only the incumbent's ceiling
-    justifies the extra trials).
+    justifies the extra trials). `wide_retry=True` (scheduler_policy
+    `legacy_wide`) widens that exemption from the run best alone to the
+    top (100-top_percentile)% of the population by warm score — the same
+    band that admits a first bout; nothing else about the gate changes.
 
     Ranking is like-for-like and alternates: when the run's last finalized
     bout was a first bout (last_bout_was_first=True), a waiting responder is
@@ -3863,6 +3918,8 @@ def select_candidate(
         budget,
         policy_id=policy_id,
         movable_continuous=movable_continuous,
+        top_percentile=top_percentile,
+        wide_retry=wide_retry,
     )
     choice = _choose_candidate(
         pools,
@@ -3883,6 +3940,7 @@ def select_candidate(
         top_percentile=top_percentile,
         bout_trials=bout_trials,
         policy_id=policy_id,
+        wide_retry=wide_retry,
     )
 
 
@@ -4126,7 +4184,8 @@ def cmd_select_candidate(args) -> int:
     led = Path(args.ledger)
     ledger = json.loads(led.read_text())
     rc = _run_cfg(led, "tuner")  # explicit flag wins; else framework_cfg.json; else module default
-    if str(rc.get("scheduler_policy", "legacy")) == "v3_2":
+    scheduler_policy = str(rc.get("scheduler_policy", "legacy"))
+    if scheduler_policy == "v3_2":
         print(json.dumps(_v3_2_selection(led, rc.get("scheduler_scenarios")), indent=2))
         return 0
     top_p = args.top_percentile if args.top_percentile is not None else float(rc.get("top_percentile", DEFAULT_TOP_PERCENTILE))
@@ -4143,7 +4202,7 @@ def cmd_select_candidate(args) -> int:
     policy_id = inner_policy.load_policy_id(led)
     movable = (
         movable_continuous_flags(led.parent, ledger)
-        if policy_id == inner_policy.POLICY_ID
+        if inner_policy.is_regime_policy(policy_id)
         else None
     )
     try:
@@ -4156,6 +4215,7 @@ def cmd_select_candidate(args) -> int:
             last_bout_was_first=_last_bout_was_first(led.parent, ledger),
             policy_id=policy_id,
             movable_continuous=movable,
+            wide_retry=scheduler_policy == "legacy_wide",
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from None

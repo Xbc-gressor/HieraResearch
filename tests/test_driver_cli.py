@@ -27,6 +27,13 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--model", result.stderr)
 
+    def test_inner_tuner_policy_choices_are_exposed(self) -> None:
+        result = self.run_cli("run", "--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--inner-tuner-policy", result.stdout)
+        self.assertIn("localtr8-hebo10-spsa10-v1", result.stdout)
+        self.assertIn("deferred-random8-hebo10-spsa10-v1", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

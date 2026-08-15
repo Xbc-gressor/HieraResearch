@@ -45,6 +45,10 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 "coverage_attempt",
             )
             self.assertEqual(config["tuner"]["scheduler_policy"], "v3_2")
+            self.assertEqual(
+                config["tuner"]["inner_policy"],
+                "deferred-random8-hebo10-spsa10-v1",
+            )
 
     def test_policy_comparison_arms_are_persisted_from_explicit_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -57,11 +61,16 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 "comparison",
                 semantic_policy="coverage",
                 scheduler_policy="legacy",
+                inner_policy="localtr8-hebo10-spsa10-v1",
             )
 
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["semantic_search"]["policy"], "coverage")
             self.assertEqual(config["tuner"]["scheduler_policy"], "legacy")
+            self.assertEqual(
+                config["tuner"]["inner_policy"],
+                "localtr8-hebo10-spsa10-v1",
+            )
 
     def test_existing_run_is_not_rewritten_to_new_policy_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -87,6 +96,10 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["max_evaluations"], 200)
             self.assertEqual(config["tuner"]["scheduler_policy"], "v3_2")
+            self.assertEqual(
+                config["tuner"]["inner_policy"],
+                "deferred-random8-hebo10-spsa10-v1",
+            )
 
     def test_explicit_induced_strategy_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

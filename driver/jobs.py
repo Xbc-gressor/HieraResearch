@@ -247,8 +247,9 @@ def build_driver_job(
             f"trial_cap {trial_cap} != bout_trials {bout_trials}"
         )
     script = repo_root / "tools" / "tuners" / f"{method}_search.py"
-    if method == "hebo":
-        # Repo-root env: SDK session + official HEBO ranker. Evaluations
+    if method in ("hebo", "local_tr"):
+        # Repo-root env: HEBO needs the SDK session + official ranker;
+        # local_tr needs the inner-benchmark codec/numpy stack. Evaluations
         # stay in the task project via timed_eval(python_cmd=...).
         argv = [
             "uv",

@@ -1,7 +1,7 @@
 """Shared helpers for hyperparameter tuner scripts under tools/tuners/.
 
 Loaded by warmstart_eval.py, grid_search.py, bo_search.py, cmaes_search.py,
-hebo_search.py, spsa_search.py.
+hebo_search.py, local_tr_search.py, spsa_search.py.
 
 Contract assumed of the candidate's train.py:
 - BASE_PARAMS: dict[str, Any]

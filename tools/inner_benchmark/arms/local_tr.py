@@ -78,7 +78,14 @@ class LocalTrustRegion:
                 if trial.status in _EXECUTED
             ]
 
-        radius = R0
+        # Production FIRST-bout resume injects the persisted radius; the
+        # benchmark cell contract stays cold-start R0 when extras omit it.
+        extras = getattr(ctx, "extras", None) or {}
+        try:
+            radius = float(extras.get("tr_radius", R0))
+        except (TypeError, ValueError):
+            radius = R0
+        radius = min(R_MAX, max(R_MIN, radius))
         try:
             while True:
                 anchor_z, anchor_cats = codec.encode(ctx.state.incumbent_config)

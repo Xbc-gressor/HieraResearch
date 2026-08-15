@@ -189,6 +189,7 @@ class ExperimentTests(unittest.TestCase):
         init_call = next(call for call in cmd.calls if "init_run.py" in call)
         self.assertIn("--semantic-policy coverage_attempt", init_call)
         self.assertIn("--scheduler-policy v3_2", init_call)
+        self.assertNotIn("--inner-tuner-policy", init_call)
 
     def test_tuner_contradiction_corrected_in_same_session(self) -> None:
         write_task(self.repo)

@@ -100,13 +100,21 @@ def _finalize_bout(report: dict, candidate: Path, *, best: float) -> None:
     report["last_finalized_stage_index"] = len(stages) - 1
 
 
-def _fixture(root: Path, *, space: dict, base: dict, legacy: bool = False):
+def _fixture(
+    root: Path,
+    *,
+    space: dict,
+    base: dict,
+    legacy: bool = False,
+    inner_policy_id: str | None = None,
+):
     candidate = _write_candidate(
         root / "candidates" / "001" / "train.py", space=space, base=base
     )
-    if legacy:
+    policy_id = "legacy" if legacy else inner_policy_id
+    if policy_id is not None:
         (root / "framework_cfg.json").write_text(
-            json.dumps({"tuner": {"inner_policy": "legacy"}})
+            json.dumps({"tuner": {"inner_policy": policy_id}})
         )
     report = _fresh_report(candidate, space, base)
     report_path = candidate.parent / "tune_report.json"
@@ -157,6 +165,24 @@ class InnerPolicyUnitTest(unittest.TestCase):
         self.assertEqual(
             inner_policy.method_chain_for_bout(POLICY, 2, FLOAT3), ["spsa"]
         )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(
+                inner_policy.LOCAL_TR_POLICY_ID, 0, FLOAT3
+            ),
+            ["local_tr"],
+        )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(
+                inner_policy.LOCAL_TR_POLICY_ID, 1, FLOAT3
+            ),
+            ["hebo"],
+        )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(
+                inner_policy.LOCAL_TR_POLICY_ID, 2, FLOAT3
+            ),
+            ["spsa"],
+        )
         # legacy: every bout keeps the old production chain.
         self.assertEqual(
             inner_policy.method_chain_for_bout("legacy", 0, INT_ONLY),
@@ -178,6 +204,22 @@ class InnerPolicyUnitTest(unittest.TestCase):
         self.assertEqual(
             [inner_policy.rewarm_allowed("legacy", i) for i in range(4)],
             [False, True, True, True],
+        )
+        self.assertEqual(
+            inner_policy.bo_sampler_for_bout(inner_policy.LOCAL_TR_POLICY_ID, 0),
+            "tpe",
+        )
+        self.assertEqual(
+            [
+                inner_policy.rewarm_allowed(inner_policy.LOCAL_TR_POLICY_ID, i)
+                for i in range(4)
+            ],
+            [False, False, False, False],
+        )
+        self.assertTrue(inner_policy.is_regime_policy(inner_policy.LOCAL_TR_POLICY_ID))
+        self.assertEqual(
+            inner_policy.expected_bout_trials(inner_policy.LOCAL_TR_POLICY_ID, 0, 10),
+            8,
         )
 
     def test_has_movable_continuous(self):
@@ -311,6 +353,37 @@ class PhaseCActionRegimeTest(unittest.TestCase):
             self.assertEqual(action["inner_policy"], "legacy")
             self.assertEqual(action["bout_trials"], 10)
 
+    def test_local_tr_policy_first_bout_is_local_tr8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=inner_policy.LOCAL_TR_POLICY_ID,
+            )
+            report = json.loads(report_path.read_text())
+            action = phase_c_action(report, candidate)
+            self.assertEqual(
+                (
+                    action["action"],
+                    action["method"],
+                    action["sampler"],
+                    action["bout_regime"],
+                    action["bout_trials"],
+                    action["method_chain"],
+                    action["inner_policy"],
+                ),
+                (
+                    "run",
+                    "local_tr",
+                    None,
+                    "FIRST",
+                    8,
+                    ["local_tr"],
+                    inner_policy.LOCAL_TR_POLICY_ID,
+                ),
+            )
+
 
 class AdmissionRegimeTest(unittest.TestCase):
     def test_first_bout_admits_only_bo(self):
@@ -326,6 +399,30 @@ class AdmissionRegimeTest(unittest.TestCase):
                 DeepTuneStageAdmissionError, "outside deterministic chain"
             ):
                 deep_tune_time_budget(candidate, report_path, "grid")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(Path(tmp), space=FLOAT3, base=BASE3)
+            with self.assertRaisesRegex(
+                DeepTuneStageAdmissionError, "outside deterministic chain"
+            ):
+                deep_tune_time_budget(candidate, report_path, "local_tr")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=inner_policy.LOCAL_TR_POLICY_ID,
+            )
+            with self.assertRaisesRegex(
+                DeepTuneStageAdmissionError, "outside deterministic chain"
+            ):
+                deep_tune_time_budget(candidate, report_path, "bo")
+            budget = deep_tune_time_budget(candidate, report_path, "local_tr")
+            try:
+                self.assertEqual(budget["bout_index"], 0)
+            finally:
+                budget["_phase_c_lock_handle"].close()
 
     def test_deep_bout_admits_spsa_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -829,6 +926,112 @@ class HeboSearchTest(unittest.TestCase):
             extras = runner.calls[0][1].extra
             self.assertIn("~0.005", extras["history"])
             self.assertIn("genuinely different regions", extras["protocol"])
+
+
+class DriverJobLocalTrTest(unittest.TestCase):
+    def test_local_tr_argv_uses_repo_root_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            task = repo / "tasks" / "toy"
+            task.mkdir(parents=True)
+            (task / "task.toml").write_text(
+                '[env]\ntype = "uv"\nproject = "tasks/toy"\n'
+            )
+            run_dir = repo / "runs" / "toy" / "r1"
+            candidate_dir = run_dir / "candidates" / "007"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "train.py").write_text("# candidate\n")
+            (candidate_dir / "tune_report.json").write_text(
+                json.dumps({"phase_a": {}})
+            )
+            ctx = InvocationContext(
+                task="toy", tag="r1", run_dir=run_dir,
+                invocation_id=3, run_id="007",
+            )
+            with mock.patch(
+                "driver.jobs._phase_c_action",
+                return_value={
+                    "action": "run",
+                    "method": "local_tr",
+                    "bout_trials": 8,
+                    "sampler": None,
+                },
+            ):
+                argv, _, _ = build_driver_job(
+                    "tuner-orchestrator",
+                    ctx,
+                    {
+                        "kind": "phase_c",
+                        "run_id": "007",
+                        "method": "local_tr",
+                        "trial_cap": 8,
+                    },
+                    repo_root=repo,
+                )
+            joined = " ".join(argv)
+            self.assertIn("local_tr_search.py", joined)
+            self.assertEqual(argv[argv.index("--n-evals") + 1], "8")
+            self.assertEqual(argv[argv.index("--project") + 1], str(repo))
+            self.assertNotIn("--directory", argv)
+
+
+class LocalTrSearchTest(unittest.TestCase):
+    """FIRST kernel of localtr8-hebo10-spsa10-v1: deferred inside the bout."""
+
+    def _run_local_tr(self, tmp, *, n_evals: int, deferred: int):
+        candidate, report_path = _fixture(
+            Path(tmp),
+            space=FLOAT3,
+            base=BASE3,
+            inner_policy_id=inner_policy.LOCAL_TR_POLICY_ID,
+        )
+        report = json.loads(report_path.read_text())
+        report["phase_a"]["deferred_configs"] = [
+            {"params": {"a": 0.1, "b": 0.001, "c": -0.5}},
+            {"params": {"a": 0.9, "b": 0.5, "c": 0.5}},
+        ][:deferred]
+        report_path.write_text(json.dumps(report))
+        scores = iter([0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55])
+        import local_tr_search
+
+        with mock.patch(
+            "local_tr_search.timed_eval",
+            side_effect=lambda *a, **k: next(scores),
+        ) as eval_mock, mock.patch(
+            "local_tr_search.write_json"
+        ) as write_result, mock.patch.object(
+            sys,
+            "argv",
+            [
+                "local_tr_search.py",
+                "--candidate-path",
+                str(candidate),
+                "--tune-report-json",
+                str(report_path),
+                "--n-evals",
+                str(n_evals),
+                "--seed",
+                "7",
+            ],
+        ):
+            self.assertEqual(local_tr_search.main(), 0)
+        return write_result.call_args.args[0], eval_mock, report_path
+
+    def test_deferred_occupy_first_bout_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, eval_mock, report_path = self._run_local_tr(
+                tmp, n_evals=4, deferred=2
+            )
+            self.assertEqual(result["method"], "local_tr")
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(eval_mock.call_count, 4)
+            self.assertEqual(result["trials_completed"], 4)
+            self.assertEqual(result["deferred_evaluated"], 2)
+            report = json.loads(report_path.read_text())
+            stage = report["phase_c"]["stages"][-1]
+            self.assertEqual(stage["method"], "local_tr")
+            self.assertEqual(stage["trials"][0]["source"], "deferred")
+            self.assertEqual(stage["trials"][2]["source"], "local_tr")
 
 
 class DriverJobHeboTest(unittest.TestCase):

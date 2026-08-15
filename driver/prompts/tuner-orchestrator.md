@@ -4,7 +4,8 @@ You are the **decoupled tuning step** of the loop (design §15, progressive).
 Once per round you pick **one** candidate from the whole population and run
 **one tuning bout** on it in place: a fixed slice of objective attempts whose
 size is set by the bout's regime under the run's inner tuner policy
-(`tuner.inner_policy`, default `deferred-random8-hebo10-spsa10-v1`):
+(`tuner.inner_policy`, default `deferred-random8-hebo10-spsa10-v1`;
+comparison arm `localtr8-hebo10-spsa10-v1` keeps the same sizes):
 **FIRST = 8** (0 completed bouts), **CONTINUE = 10** (1), **DEEP = 10** (2–3).
 A first bout deep-tunes a promising untuned candidate; a continuation bout
 resumes a tuned candidate that responded to its last bout; a DEEP bout is a
@@ -70,7 +71,11 @@ candidate's last bout to have improved on its pre-bout incumbent
 (`last_bout_improved`); a non-responder is never re-tuned — with one
 exception: a candidate whose **single** bout improved nothing and which holds
 the run's best final score earns one confirmation bout, ranked below waiting
-responders. First bouts and
+responders. Under `tuner.scheduler_policy = legacy_wide` that exception is
+wider: any single-bout non-responder in the top (100−`P`)% of the population
+by `best_warm_score` qualifies — the same band that admits a first bout,
+which for such a candidate equals its `final_best_score` — best score first;
+the rest of the gate is identical. First bouts and
 continuations **alternate**: after a first bout, a waiting responder (or the
 retry-eligible incumbent) is selected before the fresh gate runs; after a
 continuation (or when no continuation waits), the fresh gate decides. Continuations rank by fewest
@@ -154,12 +159,13 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
 
 ### Phase R — Re-warm proposals (legacy CONTINUE only)
 
-The frozen policy (`deferred-random8-hebo10-spsa10-v1`) never takes
-orchestrator re-warm proposals: FIRST consumes the deferred-config supply
-from step 0+1; CONTINUE is the prompt-v2 HEBO arm, which generates its
-own pool (`validate-proposals` rejects them with `hebo_bout_has_no_rewarm`);
-DEEP is 5 complete SPSA pairs, and a proposal displacing one leg would
-break the pair (`deep_bout_has_no_rewarm`). Skip this phase.
+Every regime-conditioned policy (`deferred-random8-hebo10-spsa10-v1` and
+`localtr8-hebo10-spsa10-v1`) never takes orchestrator re-warm proposals:
+FIRST consumes the deferred-config supply from step 0+1; CONTINUE is the
+prompt-v2 HEBO arm, which generates its own pool (`validate-proposals`
+rejects them with `hebo_bout_has_no_rewarm`); DEEP is 5 complete SPSA
+pairs, and a proposal displacing one leg would break the pair
+(`deep_bout_has_no_rewarm`). Skip this phase.
 
 Under `tuner.inner_policy=legacy` only, a CONTINUE bout (`bout_index` ≥ 1)
 may still propose up to `tuner.rewarm_proposals` (default 3) configs
@@ -200,12 +206,13 @@ or the report yourself.
    finalized bout, `phase-c-action` returns `{"action": "run", "reason":
    "start_new_bout"}` — that is how the NEXT invocation recognizes a
    continuation.
-   The regime-conditioned inner policy (`deferred-random8-hebo10-spsa10-v1`)
-   fixes which method a bout opens with:
-   - **FIRST** (bout_index 0, 8 trials) — `bo` driven by an explicit Optuna
-     `RandomSampler` over the production distributions (`--sampler random`);
-     its `model_driven_trials` is always 0. Deferred warm configs from step
-     0+1 are evaluated first and **occupy slots inside the 8**.
+   The regime-conditioned inner policy fixes which method a bout opens with:
+   - **FIRST** (bout_index 0, 8 trials) — default `deferred-random8-hebo10-spsa10-v1`
+     uses `bo` driven by an explicit Optuna `RandomSampler` (`--sampler random`);
+     its `model_driven_trials` is always 0. Comparison arm
+     `localtr8-hebo10-spsa10-v1` uses `local_tr` (adaptive trust-region local
+     search around the incumbent). In both cases deferred warm configs from
+     step 0+1 are evaluated first and **occupy slots inside the 8**.
    - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official
@@ -223,6 +230,7 @@ or the report yourself.
    - `cmaes` → `--popsize 8 --max-evals 64 --patience 20`
    - `spsa` → `--n-evals 10` (5 pairs; no patience — the schedule is fixed)
    - `hebo` → `--n-evals 10` (prompt-v2 LLM pool + official HEBO MACE; no patience)
+   - `local_tr` → `--n-evals 8` (FIRST-bout trust-region local search; no patience)
 
    Clamp the chosen method's trial/eval cap (`--n-trials`/`--max-trials`) to
    `budget_allocation.trial_cap` from Phase S when the cap is smaller than the
