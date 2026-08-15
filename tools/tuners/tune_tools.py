@@ -1526,7 +1526,7 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     def start_new_bout(next_bout: int) -> dict:
         """The previous bout is closed and finalized; begin the next one."""
         if (
-            inner_policy.is_regime_policy(policy_id)
+            inner_policy.deep_requires_movable_continuous(policy_id)
             and inner_policy.regime_for_bout_index(next_bout) == inner_policy.DEEP
             and not inner_policy.has_movable_continuous(search_space)
         ):
@@ -3139,11 +3139,14 @@ def validate_proposals(
     )
     if not inner_policy.rewarm_allowed(policy_id, target_bout):
         regime = inner_policy.regime_for_bout_index(target_bout)
-        if regime == inner_policy.DEEP:
+        method = inner_policy.method_chain_for_bout(
+            policy_id, target_bout, _read_search_space(candidate_path)
+        )[0]
+        if regime == inner_policy.DEEP and method == "spsa":
             # A DEEP bout must form complete SPSA pairs; a re-warm
             # proposal displacing one leg would break the pair.
             reason = "deep_bout_has_no_rewarm"
-        elif regime == inner_policy.CONTINUE:
+        elif method == "hebo":
             # Prompt-v2 HEBO generates its own pool; Phase-R proposals
             # would only displace that protocol.
             reason = "hebo_bout_has_no_rewarm"
@@ -3598,7 +3601,7 @@ def _partition_candidates(
         """The next bout is DEEP but no continuous dimension can move: the
         candidate has no DEEP action (design §2.1) — it is done, never
         silently routed to a TPE/grid bout still labeled DEEP."""
-        if not inner_policy.is_regime_policy(policy_id):
+        if not inner_policy.deep_requires_movable_continuous(policy_id):
             return False
         next_bout = int(record.get("tuning_bouts") or (1 if record.get("tune") else 0))
         if inner_policy.regime_for_bout_index(next_bout) != inner_policy.DEEP:
@@ -4202,7 +4205,7 @@ def cmd_select_candidate(args) -> int:
     policy_id = inner_policy.load_policy_id(led)
     movable = (
         movable_continuous_flags(led.parent, ledger)
-        if inner_policy.is_regime_policy(policy_id)
+        if inner_policy.deep_requires_movable_continuous(policy_id)
         else None
     )
     try:

@@ -55,7 +55,7 @@ uv run python -m driver run tabular-model-search <tag> \
   [--inner-tuner-policy POLICY]
 ```
 
-新 experiment run 默认启用 `coverage_attempt` 语义策略、scheduler `v3_2` 和 inner-tuner `deferred-random8-hebo10-spsa10-v1`；无需预建目录或手改 JSON。要跑旧对照臂，显式传 `--semantic-policy coverage`（或 `coverage_experience`）、`--scheduler-policy legacy` 和/或 `--inner-tuner-policy localtr8-hebo10-spsa10-v1`（FIRST 换成 `local_tr`）/`legacy`。所有解析后的选择都会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
+新 experiment run 默认启用 `coverage_attempt` 语义策略、scheduler `v3_2` 和 inner-tuner `deferred-random8-hebo10-spsa10-v1`；无需预建目录或手改 JSON。要跑旧对照臂，显式传 `--semantic-policy coverage`（或 `coverage_experience`）、`--scheduler-policy legacy` 和/或 `--inner-tuner-policy localtr8-hebo10-spsa10-v1`（FIRST 换成 `local_tr`）/`localtr8-hebo10-hebo10-v1`（FIRST 为 `local_tr`，其余每个 bout 都是 HEBO）/`legacy`。所有解析后的选择都会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
 
 `--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations`、`--timeout`、`--semantic-policy`、`--scheduler-policy` 与 `--inner-tuner-policy` 经 `tools/init_run.py` 持久化到 `framework_cfg.json`；`--timeout` 是单次评估时限的别名，不是会话看门狗。scheduler `v3_2` 需要有限的 `max_evaluations`；新 run 模板默认提供 200。
 
@@ -154,7 +154,7 @@ step 0+1: tunable-contract-extractor
 
 - **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
   - 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——首个 bout 门控：种群 ≥ `N_min`（P=80 时推导为 5）且按 `best_warm_score` 的最佳未调优候选在前 20%；继续 bout 跳过百分位门控但要求上一 bout 有改进 —— 选择**一个** bout；无合格者 → 返回 `none`（有效的无操作）
-  - Phase C：按 bout regime 的确定性内层策略（`tuner.inner_policy`，默认 `deferred-random8-hebo10-spsa10-v1`）：FIRST（0 个已完成 bout，8 次评估）= `bo` + 显式 `RandomSampler`，deferred 热配置占前几个槽；对照臂 `localtr8-hebo10-spsa10-v1` 仅把 FIRST 换成 `local_tr`（自适应 trust-region 局部搜索），CONTINUE/DEEP 不变；CONTINUE（1 个，10 次）= prompt-v2 HEBO（LLM pool POOL=5 + 官方 HEBO MACE；噪声范围指示 + 异质化候选要求；无 TPE/grid/cmaes 后备）；DEEP（2–3 个，10 次）= `spsa` 两侧扰动（5 个完整 pair，仅从当前 incumbent 出发，无可动连续维的候选无 DEEP 动作）；以全部历史 trial 为先验
+  - Phase C：按 bout regime 的确定性内层策略（`tuner.inner_policy`，默认 `deferred-random8-hebo10-spsa10-v1`）：FIRST（0 个已完成 bout，8 次评估）= `bo` + 显式 `RandomSampler`，deferred 热配置占前几个槽；对照臂 `localtr8-hebo10-spsa10-v1` 仅把 FIRST 换成 `local_tr`（自适应 trust-region 局部搜索），CONTINUE/DEEP 不变；对照臂 `localtr8-hebo10-hebo10-v1` 在此基础上再把 DEEP 也换成 HEBO（即除 FIRST 外全是 HEBO），因其 DEEP 不是 SPSA，无可动连续维的候选仍保留 DEEP 动作；CONTINUE（1 个，10 次）= prompt-v2 HEBO（LLM pool POOL=5 + 官方 HEBO MACE；噪声范围指示 + 异质化候选要求；无 TPE/grid/cmaes 后备）；DEEP（2–3 个，10 次）= `spsa` 两侧扰动（5 个完整 pair，仅从当前 incumbent 出发，无可动连续维的候选无 DEEP 动作）；以全部历史 trial 为先验
   - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后在 warm incumbent 与**所有 bout 的全部 trial** 上取全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与分级 `evaluation_depth`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
   详见 §5.7。
 
@@ -253,8 +253,8 @@ Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运�
 流程：
 
 1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`——首个 bout 门控：种群 ≥ `N_min`（P=80 时推导为 5）且按 `best_warm_score` 的最佳未调优候选在前 20%；继续 bout 跳过百分位门控但要求上一 bout 有改进（`last_bout_improved`），无响应者不再调优。首个 bout 优先于继续 bout（证据覆盖优先）；继续 bout 之间按 bout 数最少、再按调优后最佳分数排序（warm 分与调优分互不比较）→ 选择**一个** bout
-2. Phase R：冻结策略下从不接受 orchestrator 再热提案（FIRST 消耗 step 0+1 的 deferred 配置；CONTINUE 是 HEBO 自生成 pool，`hebo_bout_has_no_rewarm`；DEEP 拒绝提案，`deep_bout_has_no_rewarm`——SPSA pair 必须完整）。仅 `tuner.inner_policy=legacy` 的 CONTINUE bout 仍走旧的至多 `tuner.rewarm_proposals`（默认 3）条提案路径
-3. Phase C：按 bout regime 选方法（默认 FIRST=bo+RandomSampler 8 槽 / CONTINUE=hebo 10 槽 / DEEP=spsa 10 槽；`localtr8-hebo10-spsa10-v1` 的 FIRST 为 `local_tr` 8 槽；见 `tools/tuners/inner_policy.py`），以全部历史 trial 为先验续搜
+2. Phase R：冻结策略下从不接受 orchestrator 再热提案（FIRST 消耗 step 0+1 的 deferred 配置；HEBO bout 自生成 pool，`hebo_bout_has_no_rewarm`；SPSA DEEP bout 拒绝提案，`deep_bout_has_no_rewarm`——pair 必须完整）。仅 `tuner.inner_policy=legacy` 的 CONTINUE bout 仍走旧的至多 `tuner.rewarm_proposals`（默认 3）条提案路径
+3. Phase C：按 bout regime 选方法（默认 FIRST=bo+RandomSampler 8 槽 / CONTINUE=hebo 10 槽 / DEEP=spsa 10 槽；`localtr8-hebo10-spsa10-v1` 的 FIRST 为 `local_tr` 8 槽；`localtr8-hebo10-hebo10-v1` 的 FIRST 为 `local_tr` 8 槽、DEEP 为 hebo 10 槽；见 `tools/tuners/inner_policy.py`），以全部历史 trial 为先验续搜
 4. Finalize：运行 `tools/finalize_tuning.py`；它验证当前 bout 的 Phase C 已终止，在 warm  incumbent 与**所有 bout 的全部 trial** 上取全局最佳、写回 `BASE_PARAMS`、关闭 report，并一次性更新 ledger（`tuning_bouts`、`last_bout_improved`、分级 `evaluation_depth`；**无重新运行**；可按 bout 安全重试）。若搜索进程被杀死或 report 非终态，则不应用参数且不更新 ledger。
 
 资格不足（种群太小、顶层已调优且无响应继续、或预算/上限耗尽）返回 `none`——有效的无操作。
@@ -377,13 +377,13 @@ python tools/validate_tasks.py
 
 - `_common.py`：共享加载、搜索空间、试验读取逻辑
 - `tune_tools.py`：调优编排的确定性 CLI——`select-candidate`（解耦深度调优的候选选择门控：种群 ≥ N_min 且前 20% 中的最佳未调优候选）、`select-method`（基于维度的 grid/bo/cmaes 选择，即 legacy CONTINUE 规则）、`select-best`（全局最佳试验）、`lineage-evidence`、`check-search-space`（校验 + 按 outlier/贴边 margin 扩箱）等。
-- `inner_policy.py`：regime 条件内层策略（默认 `deferred-random8-hebo10-spsa10-v1`；对照臂 `localtr8-hebo10-spsa10-v1`）——FIRST/CONTINUE/DEEP 的 bout 大小、方法链、sampler 与 rewarm 规则的唯一来源。
+- `inner_policy.py`：regime 条件内层策略（默认 `deferred-random8-hebo10-spsa10-v1`；对照臂 `localtr8-hebo10-spsa10-v1`、`localtr8-hebo10-hebo10-v1`）——FIRST/CONTINUE/DEEP 的 bout 大小、方法链、sampler 与 rewarm 规则的唯一来源。
 - `warmstart_eval.py`：顺序评估热配置（恢复 / 崩溃时停止），构建 `BASE_PARAMS` + 写 `phase_a`
 - `grid_search.py`：低维搜索空间
 - `bo_search.py`：使用贝叶斯优化（通过 Optuna 的多元 TPE）的中维搜索空间；`--sampler random` 时为 FIRST bout 的显式 RandomSampler 内核
 - `hebo_search.py`：CONTINUE bout 的 prompt-v2 HEBO（LLM pool + 官方 HEBO MACE；在仓库根环境跑搜索，评估仍走任务 uv 项目）
 - `spsa_search.py`：DEEP bout 的两侧 SPSA（5 个完整扰动 pair，pair 状态持久化可精确续跑）
-- `local_tr_search.py`：对照臂 `localtr8-hebo10-spsa10-v1` 的 FIRST bout（inner-benchmark `local_tr`；deferred 热配置占 8 槽内的前几个）
+- `local_tr_search.py`：对照臂 `localtr8-hebo10-spsa10-v1` / `localtr8-hebo10-hebo10-v1` 的 FIRST bout（inner-benchmark `local_tr`；deferred 热配置占 8 槽内的前几个）
 - `cmaes_search.py`：使用 CMA-ES 的高维搜索空间
 - `../finalize_tuning.py`：验证 Phase C 终态并以 fail-closed 方式统一应用全局最佳、关闭报告和 ledger
 
@@ -525,7 +525,7 @@ runs/<task>/<tag>/framework_cfg.json
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
 - **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；新 run 默认使用 `coverage_attempt`。`coverage`、`coverage_experience` 等对照臂可通过 `--semantic-policy` 显式选择
 - **`tuner.scheduler_policy`**：新 run 默认 `v3_2`；旧 percentile/alternation 调度器通过 `--scheduler-policy legacy` 显式选择
-- **`tuner.inner_policy`**：新 run 默认 `deferred-random8-hebo10-spsa10-v1`；对照臂 `localtr8-hebo10-spsa10-v1`（FIRST=`local_tr`）和 `legacy` 通过 `--inner-tuner-policy` 显式选择
+- **`tuner.inner_policy`**：新 run 默认 `deferred-random8-hebo10-spsa10-v1`；对照臂 `localtr8-hebo10-spsa10-v1`（FIRST=`local_tr`）、`localtr8-hebo10-hebo10-v1`（FIRST=`local_tr`，其余 bout 全是 HEBO）和 `legacy` 通过 `--inner-tuner-policy` 显式选择
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

@@ -52,6 +52,7 @@ SCHEDULER_POLICIES = ("legacy", "legacy_wide", "v3_2")
 INNER_POLICIES = (
     "deferred-random8-hebo10-spsa10-v1",
     "localtr8-hebo10-spsa10-v1",
+    "localtr8-hebo10-hebo10-v1",
     "legacy",
 )
 

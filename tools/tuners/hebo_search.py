@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Prompt-v2 HEBO continuation bout (CONTINUE regime of inner policy
-deferred-random8-hebo10-spsa10-v1).
+"""Prompt-v2 HEBO bout (CONTINUE regime of inner policy
+deferred-random8-hebo10-spsa10-v1; CONTINUE and DEEP under
+localtr8-hebo10-hebo10-v1).
 
-A CONTINUE bout is 10 objective evaluations of the inner-benchmark
+A HEBO bout is 10 objective evaluations of the inner-benchmark
 ``pool_hebo_mace`` protocol (PLAN §6.4), ported onto the production
 Phase-C stage machinery:
 
@@ -78,6 +79,7 @@ from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 import arm_api  # noqa: E402
 import checkpoint as checkpoint_mod  # noqa: E402
 import codec as codec_mod  # noqa: E402
+import inner_policy  # noqa: E402
 import llm  # noqa: E402
 import space as space_mod  # noqa: E402
 import state as state_mod  # noqa: E402
@@ -253,13 +255,19 @@ def _build_checkpoint(
     incumbent: tuple[dict, float],
     contract,
     remaining: int,
+    bout_index: int,
 ) -> checkpoint_mod.Checkpoint:
     incumbent_params, incumbent_score = incumbent
     incumbent_identity = contract.params_identity(incumbent_params)
+    # The arm is regime-agnostic, but the checkpoint's regime/stratum is
+    # read-only context the proposer session sees: report the bout's real
+    # regime. Under localtr8-hebo10-hebo10-v1 this kernel also serves DEEP
+    # bouts (bout_index >= 2).
+    deep = inner_policy.regime_for_bout_index(bout_index) == inner_policy.DEEP
     return checkpoint_mod.Checkpoint(
         checkpoint_id=candidate_path.parent.name,
-        regime="continuation",
-        stratum="cont_improved",
+        regime="deep" if deep else "continuation",
+        stratum="deep" if deep else "cont_improved",
         source={"candidate_id": candidate_path.parent.name, "kind": "unknown"},
         checkpoint_dir=candidate_path.parent,
         candidate_relpath=".",
@@ -359,6 +367,7 @@ def main() -> int:
         incumbent=incumbent,
         contract=contract,
         remaining=remaining,
+        bout_index=bout_index,
     )
     codec = codec_mod.Codec(contract)
     history_trials = [

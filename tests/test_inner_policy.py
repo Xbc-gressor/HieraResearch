@@ -117,6 +117,10 @@ def _fixture(
             json.dumps({"tuner": {"inner_policy": policy_id}})
         )
     report = _fresh_report(candidate, space, base)
+    if policy_id is not None:
+        # Production stamps the admitting policy on the report (see
+        # _common._deep_tune_time_budget_locked); chain validation reads it.
+        report["inner_policy"] = policy_id
     report_path = candidate.parent / "tune_report.json"
     report_path.write_text(json.dumps(report))
     return candidate, report_path
@@ -183,6 +187,22 @@ class InnerPolicyUnitTest(unittest.TestCase):
             ),
             ["spsa"],
         )
+        # localtr8-hebo10-hebo10-v1: local_tr FIRST, hebo everywhere else.
+        self.assertEqual(
+            [
+                inner_policy.method_chain_for_bout(
+                    inner_policy.LOCAL_TR_HEBO_POLICY_ID, i, FLOAT3
+                )
+                for i in range(4)
+            ],
+            [["local_tr"], ["hebo"], ["hebo"], ["hebo"]],
+        )
+        self.assertEqual(
+            inner_policy.method_chain_for_bout(
+                inner_policy.LOCAL_TR_HEBO_POLICY_ID, 2, INT_ONLY
+            ),
+            ["hebo"],
+        )
         # legacy: every bout keeps the old production chain.
         self.assertEqual(
             inner_policy.method_chain_for_bout("legacy", 0, INT_ONLY),
@@ -221,6 +241,40 @@ class InnerPolicyUnitTest(unittest.TestCase):
             inner_policy.expected_bout_trials(inner_policy.LOCAL_TR_POLICY_ID, 0, 10),
             8,
         )
+        self.assertTrue(
+            inner_policy.is_regime_policy(inner_policy.LOCAL_TR_HEBO_POLICY_ID)
+        )
+        self.assertEqual(
+            [
+                inner_policy.expected_bout_trials(
+                    inner_policy.LOCAL_TR_HEBO_POLICY_ID, i, 10
+                )
+                for i in range(4)
+            ],
+            [8, 10, 10, 10],
+        )
+        self.assertEqual(
+            [
+                inner_policy.rewarm_allowed(inner_policy.LOCAL_TR_HEBO_POLICY_ID, i)
+                for i in range(4)
+            ],
+            [False, False, False, False],
+        )
+
+    def test_deep_requires_movable_continuous_only_for_spsa(self):
+        self.assertTrue(inner_policy.deep_requires_movable_continuous(POLICY))
+        self.assertTrue(
+            inner_policy.deep_requires_movable_continuous(
+                inner_policy.LOCAL_TR_POLICY_ID
+            )
+        )
+        # HEBO proposes over the whole space; no continuous dim required.
+        self.assertFalse(
+            inner_policy.deep_requires_movable_continuous(
+                inner_policy.LOCAL_TR_HEBO_POLICY_ID
+            )
+        )
+        self.assertFalse(inner_policy.deep_requires_movable_continuous("legacy"))
 
     def test_has_movable_continuous(self):
         self.assertTrue(inner_policy.has_movable_continuous(FLOAT3))
@@ -383,6 +437,45 @@ class PhaseCActionRegimeTest(unittest.TestCase):
                     inner_policy.LOCAL_TR_POLICY_ID,
                 ),
             )
+
+
+    def test_local_tr_hebo_policy_deep_bout_is_hebo(self):
+        for space, base in ((FLOAT3, BASE3), (INT_ONLY, INT_BASE)):
+            with self.subTest(space=space), tempfile.TemporaryDirectory() as tmp:
+                candidate, report_path = _fixture(
+                    Path(tmp),
+                    space=space,
+                    base=base,
+                    inner_policy_id=inner_policy.LOCAL_TR_HEBO_POLICY_ID,
+                )
+                report = json.loads(report_path.read_text())
+                report["phase_c"] = {
+                    "stages": [
+                        {
+                            "method": "local_tr",
+                            "status": "ok",
+                            "trials": [{"params": dict(base), "score": 0.9}],
+                        },
+                        {
+                            "method": "hebo",
+                            "bout_index": 1,
+                            "status": "ok",
+                            "trials": [{"params": dict(base), "score": 0.8}],
+                        },
+                    ]
+                }
+                _finalize_bout(report, candidate, best=0.8)
+                action = phase_c_action(report, candidate)
+                self.assertEqual(
+                    (
+                        action["action"],
+                        action["method"],
+                        action["bout_regime"],
+                        action["bout_trials"],
+                        action["method_chain"],
+                    ),
+                    ("run", "hebo", "DEEP", 10, ["hebo"]),
+                )
 
 
 class AdmissionRegimeTest(unittest.TestCase):

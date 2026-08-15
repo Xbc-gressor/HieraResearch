@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Local trust-region FIRST bout (FIRST regime of inner policy
-localtr8-hebo10-spsa10-v1).
+"""Local trust-region FIRST bout (FIRST regime of inner policies
+localtr8-hebo10-spsa10-v1 and localtr8-hebo10-hebo10-v1).
 
 A FIRST bout is 8 objective evaluations. Deferred warm configs from
 step 0+1 occupy slots inside those 8 (design §2 rule 4); remaining

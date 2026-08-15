@@ -5,7 +5,8 @@ Once per round you pick **one** candidate from the whole population and run
 **one tuning bout** on it in place: a fixed slice of objective attempts whose
 size is set by the bout's regime under the run's inner tuner policy
 (`tuner.inner_policy`, default `deferred-random8-hebo10-spsa10-v1`;
-comparison arm `localtr8-hebo10-spsa10-v1` keeps the same sizes):
+comparison arms `localtr8-hebo10-spsa10-v1` and `localtr8-hebo10-hebo10-v1`
+keep the same sizes):
 **FIRST = 8** (0 completed bouts), **CONTINUE = 10** (1), **DEEP = 10** (2–3).
 A first bout deep-tunes a promising untuned candidate; a continuation bout
 resumes a tuned candidate that responded to its last bout; a DEEP bout is a
@@ -159,12 +160,11 @@ candidate's `best_warm_score` / `phase_a` into the ledger — that is how
 
 ### Phase R — Re-warm proposals (legacy CONTINUE only)
 
-Every regime-conditioned policy (`deferred-random8-hebo10-spsa10-v1` and
-`localtr8-hebo10-spsa10-v1`) never takes orchestrator re-warm proposals:
-FIRST consumes the deferred-config supply from step 0+1; CONTINUE is the
-prompt-v2 HEBO arm, which generates its own pool (`validate-proposals`
-rejects them with `hebo_bout_has_no_rewarm`); DEEP is 5 complete SPSA
-pairs, and a proposal displacing one leg would break the pair
+No regime-conditioned policy takes orchestrator re-warm proposals:
+FIRST consumes the deferred-config supply from step 0+1; a HEBO bout
+generates its own pool (`validate-proposals` rejects them with
+`hebo_bout_has_no_rewarm`); an SPSA DEEP bout is 5 complete pairs, and a
+proposal displacing one leg would break the pair
 (`deep_bout_has_no_rewarm`). Skip this phase.
 
 Under `tuner.inner_policy=legacy` only, a CONTINUE bout (`bout_index` ≥ 1)
@@ -209,10 +209,11 @@ or the report yourself.
    The regime-conditioned inner policy fixes which method a bout opens with:
    - **FIRST** (bout_index 0, 8 trials) — default `deferred-random8-hebo10-spsa10-v1`
      uses `bo` driven by an explicit Optuna `RandomSampler` (`--sampler random`);
-     its `model_driven_trials` is always 0. Comparison arm
-     `localtr8-hebo10-spsa10-v1` uses `local_tr` (adaptive trust-region local
-     search around the incumbent). In both cases deferred warm configs from
-     step 0+1 are evaluated first and **occupy slots inside the 8**.
+     its `model_driven_trials` is always 0. Comparison arms
+     `localtr8-hebo10-spsa10-v1` and `localtr8-hebo10-hebo10-v1` use
+     `local_tr` (adaptive trust-region local search around the incumbent). In
+     every case deferred warm configs from step 0+1 are evaluated first and
+     **occupy slots inside the 8**.
    - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official
@@ -221,7 +222,10 @@ or the report yourself.
    - **DEEP** (bout_index 2–3, 10 evals) — `spsa`: two-sided SPSA, 5 complete
      perturbation pairs over the non-degenerate continuous dimensions,
      starting from the applied incumbent. No re-warm proposals, no deferred
-     backlog: the bout is exactly the pairs.
+     backlog: the bout is exactly the pairs. Under
+     `localtr8-hebo10-hebo10-v1` the DEEP bout is `hebo` instead — the same
+     CONTINUE kernel — so a candidate with no movable continuous dimension
+     still has a DEEP action there.
 2. The returned method's search script takes these **default trial-cap args, which
    you MAY override**:
    - `grid` → `--resolution 5 --max-trials 100 --patience 6`

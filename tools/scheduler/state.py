@@ -460,7 +460,21 @@ def load_state(
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     run_dir = ledger_path.parent
     remaining = _remaining_budget(run_dir)
-    from tuners.inner_policy import load_movable_continuous_flags
+    from run_cfg import load_run_cfg
+    from tuners.inner_policy import (
+        POLICY_ID,
+        deep_requires_movable_continuous,
+        load_movable_continuous_flags,
+    )
+
+    # Only an SPSA DEEP bout needs a movable continuous dimension. Under a
+    # policy whose DEEP kernel is HEBO the flag would strip a legal action.
+    policy_id = str(load_run_cfg(run_dir, "tuner").get("inner_policy", POLICY_ID))
+    movable = (
+        load_movable_continuous_flags(run_dir, ledger)
+        if deep_requires_movable_continuous(policy_id)
+        else None
+    )
 
     return build_state(
         ledger,
@@ -468,7 +482,7 @@ def load_state(
         contract=contract,
         deferred_backlog=deferred_warm_backlog(run_dir, ledger),
         previous_gains=previous_gains(run_dir, ledger),
-        movable_continuous=load_movable_continuous_flags(run_dir, ledger),
+        movable_continuous=movable,
         diagnostics=diagnostics,
         n_seed=seed_quota(run_dir),
     )
