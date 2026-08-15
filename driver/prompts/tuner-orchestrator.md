@@ -5,7 +5,8 @@ Once per round you pick **one** candidate from the whole population and run
 **one tuning bout** on it in place: a fixed slice of objective attempts whose
 size is set by the bout's regime under the run's inner tuner policy
 (`tuner.inner_policy`, default `deferred-random8-hebo10-spsa10-v1`;
-comparison arms `localtr8-hebo10-spsa10-v1` and `localtr8-hebo10-hebo10-v1`
+comparison arms `localtr8-hebo10-spsa10-v1`, `localtr8-hebo10-hebo10-v1`,
+and `selfrank8-hebo10-hebo10`
 keep the same sizes):
 **FIRST = 8** (0 completed bouts), **CONTINUE = 10** (1), **DEEP = 10** (2–3).
 A first bout deep-tunes a promising untuned candidate; a continuation bout
@@ -214,6 +215,9 @@ or the report yourself.
      `local_tr` (adaptive trust-region local search around the incumbent). In
      every case deferred warm configs from step 0+1 are evaluated first and
      **occupy slots inside the 8**.
+     `selfrank8-hebo10-hebo10` instead uses `selfrank`: the existing
+     `llm_pool_self_rank` arm proposes POOL=5 and executes its own rank-1
+     surviving config; deferred warm configs still occupy the first slots.
    - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official
@@ -235,6 +239,7 @@ or the report yourself.
    - `spsa` → `--n-evals 10` (5 pairs; no patience — the schedule is fixed)
    - `hebo` → `--n-evals 10` (prompt-v2 LLM pool + official HEBO MACE; no patience)
    - `local_tr` → `--n-evals 8` (FIRST-bout trust-region local search; no patience)
+   - `selfrank` → `--n-evals 8` (FIRST-bout LLM pool self-rank; no patience)
 
    Clamp the chosen method's trial/eval cap (`--n-trials`/`--max-trials`) to
    `budget_allocation.trial_cap` from Phase S when the cap is smaller than the

@@ -93,6 +93,31 @@ def test_v3_phase_c_job_requires_the_complete_bout_cap(tmp_path: Path) -> None:
             build_driver_job("tuner-orchestrator", ctx, request, repo_root=repo)
 
 
+def test_selfrank_job_uses_repo_root_pool_runner(tmp_path: Path) -> None:
+    repo, ctx = _fixture(tmp_path)
+    request = {
+        "kind": "phase_c",
+        "run_id": "007",
+        "method": "selfrank",
+        "trial_cap": 8,
+    }
+    with mock.patch(
+        "driver.jobs._phase_c_action",
+        return_value={
+            "action": "run",
+            "method": "selfrank",
+            "bout_trials": 8,
+        },
+    ):
+        argv, log, _ = build_driver_job(
+            "tuner-orchestrator", ctx, request, repo_root=repo
+        )
+    assert argv[:3] == ["uv", "--project", str(repo)]
+    assert argv[4:6] == ["python", str(repo / "tools/tuners/selfrank_search.py")]
+    assert argv[-2:] == ["--n-evals", "8"]
+    assert log.name == "_phase_c_selfrank.log"
+
+
 def test_driver_job_handoff_waits_then_resumes_same_session(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     store = ReceiptStore(run_dir)

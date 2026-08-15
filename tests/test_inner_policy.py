@@ -35,6 +35,7 @@ from driver.roles import InvocationContext  # noqa: E402
 from driver.session import FakeSessionRunner  # noqa: E402
 import hebo_search  # noqa: E402
 from hebo_search import main as hebo_main  # noqa: E402
+from arms.llm_pool_self_rank import ARM as SELF_RANK_ARM  # noqa: E402
 from spsa_search import main as spsa_main  # noqa: E402
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
@@ -203,6 +204,15 @@ class InnerPolicyUnitTest(unittest.TestCase):
             ),
             ["hebo"],
         )
+        self.assertEqual(
+            [
+                inner_policy.method_chain_for_bout(
+                    inner_policy.SELF_RANK_HEBO_POLICY_ID, i, FLOAT3
+                )
+                for i in range(4)
+            ],
+            [["selfrank"], ["hebo"], ["hebo"], ["hebo"]],
+        )
         # legacy: every bout keeps the old production chain.
         self.assertEqual(
             inner_policy.method_chain_for_bout("legacy", 0, INT_ONLY),
@@ -272,6 +282,11 @@ class InnerPolicyUnitTest(unittest.TestCase):
         self.assertFalse(
             inner_policy.deep_requires_movable_continuous(
                 inner_policy.LOCAL_TR_HEBO_POLICY_ID
+            )
+        )
+        self.assertFalse(
+            inner_policy.deep_requires_movable_continuous(
+                inner_policy.SELF_RANK_HEBO_POLICY_ID
             )
         )
         self.assertFalse(inner_policy.deep_requires_movable_continuous("legacy"))
@@ -476,6 +491,34 @@ class PhaseCActionRegimeTest(unittest.TestCase):
                     ),
                     ("run", "hebo", "DEEP", 10, ["hebo"]),
                 )
+
+    def test_selfrank_policy_first_bout_is_selfrank8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=inner_policy.SELF_RANK_HEBO_POLICY_ID,
+            )
+            action = phase_c_action(json.loads(report_path.read_text()), candidate)
+            self.assertEqual(
+                (
+                    action["action"],
+                    action["method"],
+                    action["bout_regime"],
+                    action["bout_trials"],
+                    action["method_chain"],
+                    action["inner_policy"],
+                ),
+                (
+                    "run",
+                    "selfrank",
+                    "FIRST",
+                    8,
+                    ["selfrank"],
+                    inner_policy.SELF_RANK_HEBO_POLICY_ID,
+                ),
+            )
 
 
 class AdmissionRegimeTest(unittest.TestCase):
@@ -1019,6 +1062,67 @@ class HeboSearchTest(unittest.TestCase):
             extras = runner.calls[0][1].extra
             self.assertIn("~0.005", extras["history"])
             self.assertIn("genuinely different regions", extras["protocol"])
+
+    def test_first_selfrank_consumes_deferred_inside_eight_slot_bout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=inner_policy.SELF_RANK_HEBO_POLICY_ID,
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_a"]["deferred_configs"] = [
+                {"params": {"a": 0.7, "b": 0.02, "c": 0.2}}
+            ]
+            report_path.write_text(json.dumps(report))
+            runner = FakeSessionRunner(
+                [{"receipt": self._pool_receipt(0.0)}]
+            )
+            old_method, old_arm = hebo_search.METHOD, hebo_search.ARM
+            hebo_search.METHOD = "selfrank"
+            hebo_search.ARM = SELF_RANK_ARM
+            hebo_search._TEST_SESSION_RUNNER = runner
+            try:
+                with mock.patch(
+                    "hebo_search.timed_eval", side_effect=[0.4, 0.3]
+                ) as eval_mock, mock.patch(
+                    "hebo_search.write_json"
+                ) as write_result, mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "selfrank_search.py",
+                        "--candidate-path",
+                        str(candidate),
+                        "--tune-report-json",
+                        str(report_path),
+                        "--n-evals",
+                        "2",
+                    ],
+                ):
+                    self.assertEqual(hebo_main(), 0)
+            finally:
+                hebo_search._TEST_SESSION_RUNNER = None
+                hebo_search.METHOD, hebo_search.ARM = old_method, old_arm
+
+            receipt = write_result.call_args.args[0]
+            self.assertEqual(receipt["method"], "selfrank")
+            self.assertEqual(receipt["deferred_evaluated"], 1)
+            self.assertEqual(eval_mock.call_count, 2)
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][-1]
+            self.assertEqual(stage["method"], "selfrank")
+            self.assertEqual(
+                [row["source"] for row in stage["trials"]],
+                ["deferred", "pool_self_rank1"],
+            )
+            # The fresh proposer session sees the deferred factual outcome.
+            self.assertIn("0.4", runner.calls[0][1].extra["incumbent"])
+            # A FIRST bout must not be described to the proposer as a
+            # continuation: this kernel now serves all three regimes.
+            candidate_block = runner.calls[0][1].extra["candidate"]
+            self.assertIn("regime: first", candidate_block)
+            self.assertIn("stratum: first", candidate_block)
 
 
 class DriverJobLocalTrTest(unittest.TestCase):

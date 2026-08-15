@@ -1128,7 +1128,7 @@ def _phase_c_finalization_state(
             statuses.append(None)
             continue
         if stage.get("method") not in {
-            "grid", "bo", "cmaes", "spsa", "hebo", "local_tr"
+            "grid", "bo", "cmaes", "spsa", "hebo", "local_tr", "selfrank"
         }:
             errors.append(f"phase_c.stages[{index}].method is invalid")
         status = stage.get("status")

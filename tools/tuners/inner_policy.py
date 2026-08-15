@@ -39,15 +39,19 @@ continuous-dimension eligibility rule does not apply under that policy:
 HEBO proposes over the whole space, so an integer/categorical-only
 candidate still has a DEEP action.
 
+The ``selfrank8-hebo10-hebo10`` comparison policy instead runs the
+inner-benchmark LLM-pool self-rank arm for FIRST, then HEBO for every later
+bout. Deferred warm configs still occupy slots inside FIRST's eight spends.
+
 Under every regime-conditioned policy a bout's deferred-warm backlog
 occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
 them as extra trials on top of the bout budget.
 
 The switch is per-run: ``framework_cfg.json`` ``tuner.inner_policy`` —
 ``deferred-random8-hebo10-spsa10-v1`` (default),
-``localtr8-hebo10-spsa10-v1``, ``localtr8-hebo10-hebo10-v1``, or
-``legacy`` (the pre-policy uniform behavior: every bout runs the CONTINUE
-rule at ``tuner.bout_trials``).
+``localtr8-hebo10-spsa10-v1``, ``localtr8-hebo10-hebo10-v1``,
+``selfrank8-hebo10-hebo10``, or ``legacy`` (the pre-policy uniform
+behavior: every bout runs the CONTINUE rule at ``tuner.bout_trials``).
 Stdlib-only at module level so both ``tune_tools`` and ``_common`` can
 import it without cycles.
 """
@@ -57,8 +61,14 @@ from __future__ import annotations
 POLICY_ID = "deferred-random8-hebo10-spsa10-v1"
 LOCAL_TR_POLICY_ID = "localtr8-hebo10-spsa10-v1"
 LOCAL_TR_HEBO_POLICY_ID = "localtr8-hebo10-hebo10-v1"
+SELF_RANK_HEBO_POLICY_ID = "selfrank8-hebo10-hebo10"
 LEGACY_POLICY_ID = "legacy"
-REGIME_POLICY_IDS = (POLICY_ID, LOCAL_TR_POLICY_ID, LOCAL_TR_HEBO_POLICY_ID)
+REGIME_POLICY_IDS = (
+    POLICY_ID,
+    LOCAL_TR_POLICY_ID,
+    LOCAL_TR_HEBO_POLICY_ID,
+    SELF_RANK_HEBO_POLICY_ID,
+)
 #: Regime policies whose FIRST bout is the inner-benchmark ``local_tr`` arm.
 LOCAL_TR_FIRST_POLICY_IDS = (LOCAL_TR_POLICY_ID, LOCAL_TR_HEBO_POLICY_ID)
 KNOWN_POLICY_IDS = (*REGIME_POLICY_IDS, LEGACY_POLICY_ID)
@@ -121,10 +131,11 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
 
     Default FIRST -> ["bo"] (explicit RandomSampler; see
     :func:`bo_sampler_for_bout`). ``localtr8-hebo10-spsa10-v1`` and
-    ``localtr8-hebo10-hebo10-v1`` FIRST -> ["local_tr"]. CONTINUE ->
+    ``localtr8-hebo10-hebo10-v1`` FIRST -> ["local_tr"], while
+    ``selfrank8-hebo10-hebo10`` FIRST -> ["selfrank"]. CONTINUE ->
     ["hebo"] (prompt-v2 LLM pool + official HEBO MACE; no TPE/cmaes
     fallback). DEEP -> ["spsa"], except under
-    ``localtr8-hebo10-hebo10-v1``, whose DEEP bouts are ["hebo"] too.
+    the two ``*-hebo10-hebo10`` policies, whose DEEP bouts are ["hebo"] too.
     """
     from tune_tools import select_method  # function-level: tune_tools imports us
 
@@ -134,10 +145,13 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
         return legacy
     regime = regime_for_bout_index(bout_index)
     if regime == FIRST:
-        return (
-            ["local_tr"] if policy_id in LOCAL_TR_FIRST_POLICY_IDS else ["bo"]
-        )
-    if regime == DEEP and policy_id != LOCAL_TR_HEBO_POLICY_ID:
+        if policy_id == SELF_RANK_HEBO_POLICY_ID:
+            return ["selfrank"]
+        return ["local_tr"] if policy_id in LOCAL_TR_FIRST_POLICY_IDS else ["bo"]
+    if regime == DEEP and policy_id not in (
+        LOCAL_TR_HEBO_POLICY_ID,
+        SELF_RANK_HEBO_POLICY_ID,
+    ):
         return ["spsa"]
     return ["hebo"]
 
@@ -145,11 +159,14 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
 def deep_requires_movable_continuous(policy_id: str) -> bool:
     """Whether a DEEP bout needs a non-degenerate continuous dimension.
 
-    Only two-sided SPSA does. ``localtr8-hebo10-hebo10-v1`` runs HEBO in
-    the DEEP regime, which proposes over the whole space, so a candidate
-    with only integer/categorical dimensions keeps its DEEP action.
+    Only two-sided SPSA does. The HEBO-DEEP policies propose over the whole
+    space, so a candidate with only integer/categorical dimensions keeps its
+    DEEP action.
     """
-    return is_regime_policy(policy_id) and policy_id != LOCAL_TR_HEBO_POLICY_ID
+    return is_regime_policy(policy_id) and policy_id not in (
+        LOCAL_TR_HEBO_POLICY_ID,
+        SELF_RANK_HEBO_POLICY_ID,
+    )
 
 
 def bo_sampler_for_bout(policy_id: str, bout_index: int) -> str:

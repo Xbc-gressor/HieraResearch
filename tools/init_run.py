@@ -55,6 +55,7 @@ INNER_POLICIES = (
     "deferred-random8-hebo10-spsa10-v1",
     "localtr8-hebo10-spsa10-v1",
     "localtr8-hebo10-hebo10-v1",
+    "selfrank8-hebo10-hebo10",
     "legacy",
 )
 

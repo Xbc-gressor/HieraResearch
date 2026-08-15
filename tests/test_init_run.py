@@ -72,6 +72,22 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 "localtr8-hebo10-spsa10-v1",
             )
 
+            self.assertEqual(
+                initialize_run(
+                    repo_root,
+                    "toy",
+                    "selfrank",
+                    inner_policy="selfrank8-hebo10-hebo10",
+                ).name,
+                "selfrank",
+            )
+            self.assertEqual(
+                json.loads(
+                    (repo_root / "runs/toy/selfrank/framework_cfg.json").read_text()
+                )["tuner"]["inner_policy"],
+                "selfrank8-hebo10-hebo10",
+            )
+
     def test_existing_run_is_not_rewritten_to_new_policy_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Prompt-v2 HEBO bout (CONTINUE regime of inner policy
+"""Production LLM-pool bout runner: HEBO MACE by default.
+
+HEBO serves the CONTINUE regime of inner policy
 deferred-random8-hebo10-spsa10-v1; CONTINUE and DEEP under
-localtr8-hebo10-hebo10-v1).
+localtr8-hebo10-hebo10-v1 and selfrank8-hebo10-hebo10. The thin
+selfrank_search entry point replaces the selector with llm_pool_self_rank for
+FIRST while retaining this stage/evaluation adapter.
 
 A HEBO bout is 10 objective evaluations of the inner-benchmark
 ``pool_hebo_mace`` protocol (PLAN §6.4), ported onto the production
@@ -53,17 +57,20 @@ from _common import (  # noqa: E402
     EvaluationBudgetExhausted,
     append_preflight_attempt,
     append_trial,
+    attempted_config_identities,
     cast_params_to_search_space,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
     is_config_infeasible_error,
     is_finite_score,
     params_identity,
+    read_deferred_configs,
     read_prior_trials,
     read_runtime_limit,
     read_tune_report,
     search_space_for_json,
     set_stage_meta,
+    split_configs_by_space,
     timed_eval,
     timed_preflight,
     write_json,
@@ -89,6 +96,13 @@ from driver.events import EventsLog  # noqa: E402
 
 METHOD = "hebo"
 MAX_CONSECUTIVE_PREFLIGHT_REJECTS = 5
+
+#: Inner-policy regime -> the frozen checkpoint's (regime, stratum) vocabulary.
+_CHECKPOINT_REGIME = {
+    inner_policy.FIRST: ("first", "first"),
+    inner_policy.CONTINUE: ("continuation", "cont_improved"),
+    inner_policy.DEEP: ("deep", "deep"),
+}
 
 # In-process test seams. Production CLI never sets these.
 _TEST_SESSION_RUNNER = None
@@ -148,7 +162,7 @@ def _read_run_model(candidate_path: Path) -> str:
     if run_dir is None:
         raise ValueError(
             f"{candidate_path} is not inside a run directory; "
-            "hebo needs run_metadata.json for the pinned model id"
+            f"{METHOD} needs run_metadata.json for the pinned model id"
         )
     meta_path = run_dir / "run_metadata.json"
     if not meta_path.is_file():
@@ -262,12 +276,13 @@ def _build_checkpoint(
     # The arm is regime-agnostic, but the checkpoint's regime/stratum is
     # read-only context the proposer session sees: report the bout's real
     # regime. Under localtr8-hebo10-hebo10-v1 this kernel also serves DEEP
-    # bouts (bout_index >= 2).
-    deep = inner_policy.regime_for_bout_index(bout_index) == inner_policy.DEEP
+    # bouts (bout_index >= 2), and under selfrank8-hebo10-hebo10 it serves
+    # the FIRST bout (bout_index 0) as well.
+    regime, stratum = _CHECKPOINT_REGIME[inner_policy.regime_for_bout_index(bout_index)]
     return checkpoint_mod.Checkpoint(
         checkpoint_id=candidate_path.parent.name,
-        regime="deep" if deep else "continuation",
-        stratum="deep" if deep else "cont_improved",
+        regime=regime,
+        stratum=stratum,
         source={"candidate_id": candidate_path.parent.name, "kind": "unknown"},
         checkpoint_dir=candidate_path.parent,
         candidate_relpath=".",
@@ -304,7 +319,7 @@ def main() -> int:
     search_space = _read_literal_mapping(args.candidate_path, "SEARCH_SPACE")
     base_params = _read_literal_mapping(args.candidate_path, "BASE_PARAMS")
     if not isinstance(base_params, dict):
-        raise ValueError("hebo requires BASE_PARAMS (the applied incumbent)")
+        raise ValueError(f"{METHOD} requires BASE_PARAMS (the applied incumbent)")
 
     contract = space_mod.read_contract(args.candidate_path)
     if not contract.varying_dimensions:
@@ -408,9 +423,10 @@ def main() -> int:
 
         model = args.model or _read_run_model(args.candidate_path)
         session_runner = SDKSessionRunner(
-            model=model, events=EventsLog(args.candidate_path.parent / "_hebo_llm")
+            model=model,
+            events=EventsLog(args.candidate_path.parent / f"_{METHOD}_llm"),
         )
-    run_dir = args.candidate_path.parent / "_hebo_llm"
+    run_dir = args.candidate_path.parent / f"_{METHOD}_llm"
     run_dir.mkdir(parents=True, exist_ok=True)
     events_path = getattr(getattr(session_runner, "events", None), "path", None)
     if events_path is None:
@@ -419,7 +435,7 @@ def main() -> int:
         runner=session_runner,
         run_dir=run_dir,
         task=_task_name(args.candidate_path) or "unknown",
-        tag=f"{args.candidate_path.parent.name}--hebo--bout{bout_index}",
+        tag=f"{args.candidate_path.parent.name}--{METHOD}--bout{bout_index}",
     )
 
     extras: dict = {"session_factory": factory}
@@ -431,19 +447,6 @@ def main() -> int:
     def emit(values: dict) -> None:
         pending_arm_extras.update(values)
 
-    ctx = arm_api.CellContext(
-        contract=contract,
-        codec=codec,
-        state=cell_state,
-        checkpoint=frozen,
-        rng=random.Random(args.seed),
-        np_rng=np.random.default_rng(args.seed),
-        budget=remaining,
-        seed=int(args.seed),
-        extras=extras,
-        emit=emit,
-    )
-
     counters = {
         "objective_attempts": 0,
         "objective_completed": 0,
@@ -451,6 +454,9 @@ def main() -> int:
         "budget_exhausted": False,
         "budget_exhausted_scope": None,
         "consecutive_rejects": 0,
+        "deferred_evaluated": 0,
+        "deferred_skipped_outside_space": 0,
+        "deferred_skipped_already_seen": 0,
     }
     failure_refs: list[str] = []
     last_arm_state: dict = {}
@@ -465,7 +471,7 @@ def main() -> int:
                 args.tune_report_json,
                 METHOD,
                 bout_index=bout_index,
-                hebo_state=payload,
+                **{f"{METHOD}_state": payload},
             )
 
     def run_proposal(cast: dict, proposal: arm_api.Proposal) -> arm_api.Feedback:
@@ -600,13 +606,70 @@ def main() -> int:
 
     gen = None
     try:
+        # FIRST self-rank follows the regime-policy contract: deferred warm
+        # configs consume slots inside B_FIRST before the arm proposes. HEBO
+        # only serves later regimes, so it has no deferred backlog.
+        if (
+            METHOD == "selfrank"
+            and inner_policy.regime_for_bout_index(bout_index) == inner_policy.FIRST
+        ):
+            deferred_in_space, deferred_outside = split_configs_by_space(
+                read_deferred_configs(args.tune_report_json), search_space
+            )
+            counters["deferred_skipped_outside_space"] = len(deferred_outside)
+            seen = attempted_config_identities(args.tune_report_json, search_space)
+            for raw in deferred_in_space:
+                if cell_state.budget_remaining <= 0:
+                    break
+                try:
+                    cast = contract.cast(raw)
+                except (TypeError, ValueError, ArithmeticError):
+                    counters["deferred_skipped_already_seen"] += 1
+                    continue
+                identity = params_identity(cast)
+                if identity in seen:
+                    counters["deferred_skipped_already_seen"] += 1
+                    continue
+                proposal = arm_api.Proposal(params=cast, source="deferred")
+                deferred_feedback = run_proposal(cast, proposal)
+                seen.add(identity)
+                if deferred_feedback.kind == "outcome":
+                    counters["deferred_evaluated"] += 1
+
+            # The proposer must see the charged deferred outcomes as factual
+            # history, including an improved incumbent, rather than the
+            # pre-deferred checkpoint snapshot.
+            refreshed_incumbent = _best_so_far(
+                args.tune_report_json, search_space
+            ) or incumbent
+            frozen = _build_checkpoint(
+                candidate_path=args.candidate_path,
+                report=read_tune_report(args.tune_report_json),
+                incumbent=refreshed_incumbent,
+                contract=contract,
+                remaining=cell_state.budget_remaining,
+                bout_index=bout_index,
+            )
+
+        ctx = arm_api.CellContext(
+            contract=contract,
+            codec=codec,
+            state=cell_state,
+            checkpoint=frozen,
+            rng=random.Random(args.seed),
+            np_rng=np.random.default_rng(args.seed),
+            budget=cell_state.budget_remaining,
+            seed=int(args.seed),
+            extras=extras,
+            emit=emit,
+        )
         gen = ARM.run(ctx)
         feedback = None
         while cell_state.budget_remaining > 0:
             proposal = next(gen) if feedback is None else gen.send(feedback)
             if not isinstance(proposal, arm_api.Proposal):
                 raise arm_api.ArmError(
-                    f"hebo arm yielded a non-Proposal: {type(proposal).__name__}"
+                    f"{METHOD} arm yielded a non-Proposal: {type(proposal).__name__}"
                 )
             last_arm_state = dict(proposal.arm_state or {})
             persist_arm_state()
@@ -688,7 +751,7 @@ def main() -> int:
         if cell_state.budget_remaining > 0:
             close_status = "failed"
             close_reason = (
-                f"hebo arm exhausted early with "
+                f"{METHOD} arm exhausted early with "
                 f"budget_remaining={cell_state.budget_remaining}"
             )
     finally:
@@ -698,7 +761,7 @@ def main() -> int:
             except Exception:
                 if close_status == "ok":
                     close_status = "failed"
-                    close_reason = "hebo arm raised during generator close"
+                    close_reason = f"{METHOD} arm raised during generator close"
 
     persist_arm_state()
     stage_elapsed = deep_tune_stage_elapsed(time_budget)
@@ -728,7 +791,7 @@ def main() -> int:
 
     if close_status == "ok" and counters["objective_completed"] == 0:
         close_status = "failed"
-        close_reason = "hebo produced no completed trial"
+        close_reason = f"{METHOD} produced no completed trial"
 
     totals = pending_arm_extras
     receipt = {
@@ -741,6 +804,13 @@ def main() -> int:
         "llm_calls": totals.get("llm_calls", 0),
         "ranker_fallback_count": totals.get("ranker_fallback_count", 0),
         "internal_duplicate_count": totals.get("internal_duplicate_count", 0),
+        "deferred_evaluated": counters["deferred_evaluated"],
+        "deferred_skipped_outside_space": counters[
+            "deferred_skipped_outside_space"
+        ],
+        "deferred_skipped_already_seen": counters[
+            "deferred_skipped_already_seen"
+        ],
         "failure_refs": failure_refs[-3:],
         "elapsed_seconds": round(stage_elapsed, 1),
         "search_space": search_space_for_json(search_space),
@@ -763,6 +833,7 @@ def main() -> int:
         time_limit_seconds=time_budget["limit_seconds"],
         llm_calls=totals.get("llm_calls", 0),
         ranker_fallback_count=totals.get("ranker_fallback_count", 0),
+        deferred_evaluated=counters["deferred_evaluated"],
     )
     write_json(receipt)
     return 0

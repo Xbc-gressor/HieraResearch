@@ -158,6 +158,7 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "deferred-random8-hebo10-spsa10-v1",
             "localtr8-hebo10-spsa10-v1",
             "localtr8-hebo10-hebo10-v1",
+            "selfrank8-hebo10-hebo10",
             "legacy",
         )
         value = tuner["inner_policy"]

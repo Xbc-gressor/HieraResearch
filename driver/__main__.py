@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
             "deferred-random8-hebo10-spsa10-v1",
             "localtr8-hebo10-spsa10-v1",
             "localtr8-hebo10-hebo10-v1",
+            "selfrank8-hebo10-hebo10",
             "legacy",
         ],
         help="regime-conditioned inner-tuner policy; new runs default to "

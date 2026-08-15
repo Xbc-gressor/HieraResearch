@@ -33,6 +33,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("--inner-tuner-policy", result.stdout)
         self.assertIn("localtr8-hebo10-spsa10-v1", result.stdout)
         self.assertIn("deferred-random8-hebo10-spsa10-v1", result.stdout)
+        self.assertIn("selfrank8-hebo10-hebo10", result.stdout)
 
 
     def test_warm_config_count_knobs_are_exposed(self) -> None:
