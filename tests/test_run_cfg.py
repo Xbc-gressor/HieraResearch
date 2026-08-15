@@ -65,6 +65,13 @@ class RunConfigTunerValidationTests(unittest.TestCase):
         ):
             self._read({"K_eval": 1})
 
+    def test_k_proposes_a_row_beyond_the_control(self) -> None:
+        with self.assertRaisesRegex(
+            run_cfg.RunConfigError,
+            "tuner.K must be at least 2",
+        ):
+            self._read({"K": 1})
+
     def test_top_percentile_must_be_finite_and_half_open_bounded(self) -> None:
         for value in (
             -0.1,

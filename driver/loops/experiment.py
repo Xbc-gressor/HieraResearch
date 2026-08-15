@@ -435,7 +435,7 @@ def _dimension_strategy(run_dir: Path) -> str | None:
 
 def _init_run_extra(dimension_strategy, llm_intelligence_score,
                     semantic_policy, scheduler_policy, inner_policy,
-                    k_eval) -> list[str]:
+                    k_warm, k_eval) -> list[str]:
     extra = []
     if dimension_strategy:
         extra += ["--dimension-strategy", dimension_strategy]
@@ -447,6 +447,8 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
         extra += ["--scheduler-policy", scheduler_policy]
     if inner_policy is not None:
         extra += ["--inner-tuner-policy", inner_policy]
+    if k_warm is not None:
+        extra += ["--k-warm", str(k_warm)]
     if k_eval is not None:
         extra += ["--k-eval", str(k_eval)]
     return extra
@@ -455,13 +457,14 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
 def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
            events, max_evaluations, timeout, dimension_strategy,
            llm_intelligence_score, semantic_policy, scheduler_policy,
-           inner_policy, k_eval, model, cli_path) -> None:
+           inner_policy, k_warm, k_eval, model, cli_path) -> None:
     extra = _init_run_extra(
         dimension_strategy,
         llm_intelligence_score,
         semantic_policy,
         scheduler_policy,
         inner_policy,
+        k_warm,
         k_eval,
     )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
@@ -758,7 +761,8 @@ def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
 def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    max_evaluations=None, timeout=None, dimension_strategy=None,
                    llm_intelligence_score=None, semantic_policy=None,
-                   scheduler_policy=None, inner_policy=None, k_eval=None,
+                   scheduler_policy=None, inner_policy=None, k_warm=None,
+                   k_eval=None,
                    cli_path=None, cmd=common.run_cmd,
                    job_runner=execute_driver_job) -> dict:
     """Set up or resume a run, then advance it until blocked or complete."""
@@ -772,7 +776,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _setup(runner, store, task, tag, run_dir, task_toml, repo_root,
                    cmd, events, max_evaluations, timeout, dimension_strategy,
                    llm_intelligence_score, semantic_policy, scheduler_policy,
-                   inner_policy, k_eval, model, cli_path)
+                   inner_policy, k_warm, k_eval, model, cli_path)
         else:
             # Explicit CLI overrides must never disappear merely because the
             # run directory already exists. init_run applies mutable limits,
@@ -784,6 +788,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 semantic_policy,
                 scheduler_policy,
                 inner_policy,
+                k_warm,
                 k_eval,
             )
             if max_evaluations is not None or timeout is not None or extra:

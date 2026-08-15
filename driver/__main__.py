@@ -54,6 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
              "deferred-random8-hebo10-spsa10-v1",
     )
     run.add_argument(
+        "--k-warm",
+        type=int,
+        help="how many warm configs are proposed per candidate at step 0+1 "
+             "(minimum 2; template default 5). The K - K_eval leftovers are "
+             "deferred to the promoted candidate's first tuning bout. "
+             "Frozen once run artifacts exist",
+    )
+    run.add_argument(
         "--k-eval",
         type=int,
         help="how many proposed warm configs are evaluated at step 0+1 "
@@ -104,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             semantic_policy=args.semantic_policy,
             scheduler_policy=args.scheduler_policy,
             inner_policy=args.inner_tuner_policy,
+            k_warm=args.k_warm,
             k_eval=args.k_eval,
             cli_path=args.cli_path,
         )

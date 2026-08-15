@@ -12,6 +12,7 @@ Usage:
       [--semantic-policy <policy>]
       [--scheduler-policy <policy>]
       [--inner-tuner-policy <policy>]
+      [--k-warm <count>]
       [--k-eval <count>]
       [--max-evaluations <count>]
       [--timeout <seconds>]
@@ -20,6 +21,7 @@ Example:
     python tools/init_run.py tabular-model-search exp-20260630 \
       --dimension-strategy llm_induced \
       --llm-intelligence-score 70 \
+      --k-warm 5 \
       --k-eval 2 \
       --max-evaluations 200 \
       --timeout 60
@@ -105,6 +107,7 @@ def initialize_run(
     semantic_policy: str | None = None,
     scheduler_policy: str | None = None,
     inner_policy: str | None = None,
+    k_warm: int | None = None,
     k_eval: int | None = None,
     max_evaluations: int | None = None,
     per_runtime_limit: float | None = None,
@@ -196,6 +199,18 @@ def initialize_run(
             "has one selectable row beyond its fidelity control"
         )
     if (
+        k_warm is not None
+        and (
+            not isinstance(k_warm, int)
+            or isinstance(k_warm, bool)
+            or k_warm < 2
+        )
+    ):
+        raise ValueError(
+            "k_warm must be an integer of at least 2 so at least one row "
+            "beyond the control is proposed"
+        )
+    if (
         max_evaluations is not None
         and (
             not isinstance(max_evaluations, int)
@@ -221,6 +236,7 @@ def initialize_run(
         and semantic_policy is None
         and scheduler_policy is None
         and inner_policy is None
+        and k_warm is None
         and k_eval is None
         and max_evaluations is None
         and per_runtime_limit is None
@@ -374,6 +390,27 @@ def initialize_run(
         else:
             print(f"Inner tuner policy already set to {inner_policy}.")
 
+    if k_warm is not None:
+        section = config.get("tuner", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: tuner must be an object")
+        current = section.get("K")
+        # Frozen per run for the same reason as K_eval: K fixes how many warm
+        # configs the extractor proposes per candidate, so K - K_eval is the
+        # deferred-config count every promoted candidate's FIRST bout inherits.
+        # Changing it mid-run would make earlier and later candidates'
+        # screening and first-bout composition incomparable.
+        if current != k_warm and existing_artifacts:
+            raise ValueError(
+                "cannot change K after run artifacts exist: "
+                + ", ".join(existing_artifacts)
+            )
+        if current != k_warm:
+            config["tuner"] = {**section, "K": k_warm}
+            updates.append(f"K={k_warm}")
+        else:
+            print(f"K already set to {k_warm}.")
+
     if k_eval is not None:
         section = config.get("tuner", {})
         if not isinstance(section, dict):
@@ -463,6 +500,18 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--k-warm",
+        dest="k_warm",
+        type=int,
+        metavar="COUNT",
+        help=(
+            "how many warm configs the tunable-contract-extractor proposes "
+            "per candidate (minimum 2; template default 5). K - K_eval of "
+            "them are DEFERRED to the promoted candidate's first tuning "
+            "bout. Frozen once run artifacts exist"
+        ),
+    )
+    parser.add_argument(
         "--k-eval",
         dest="k_eval",
         type=int,
@@ -492,6 +541,7 @@ def main() -> int:
             semantic_policy=args.semantic_policy,
             scheduler_policy=args.scheduler_policy,
             inner_policy=args.inner_policy,
+            k_warm=args.k_warm,
             k_eval=args.k_eval,
             max_evaluations=args.max_evaluations,
             per_runtime_limit=args.per_runtime_limit,

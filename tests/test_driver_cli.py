@@ -35,5 +35,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("deferred-random8-hebo10-spsa10-v1", result.stdout)
 
 
+    def test_warm_config_count_knobs_are_exposed(self) -> None:
+        result = self.run_cli("run", "--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--k-warm", result.stdout)
+        self.assertIn("--k-eval", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

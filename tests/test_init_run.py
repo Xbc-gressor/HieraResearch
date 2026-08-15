@@ -339,6 +339,39 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 100,
             )
 
+    def test_warm_config_count_is_persisted_and_frozen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+
+            run_dir = initialize_run(repo_root, "toy", "k-warm", k_warm=8)
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(config["tuner"]["K"], 8)
+
+            (run_dir / "ledger.json").write_text("{}")
+            # Idempotent re-application stays legal; a change does not.
+            initialize_run(repo_root, "toy", "k-warm", k_warm=8)
+            with self.assertRaisesRegex(ValueError, "cannot change K after"):
+                initialize_run(repo_root, "toy", "k-warm", k_warm=5)
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(config["tuner"]["K"], 8)
+
+    def test_warm_config_count_must_leave_a_row_beyond_the_control(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+
+            for index, value in enumerate((1, 0, -3)):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "k_warm must be an integer of at least 2"
+                    ):
+                        initialize_run(
+                            repo_root, "toy", f"bad-k-warm-{index}", k_warm=value
+                        )
+
     def test_run_limits_can_change_when_resuming(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

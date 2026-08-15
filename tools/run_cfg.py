@@ -84,12 +84,20 @@ def _validate_positive_number_override(config: dict, key: str, path: Path) -> No
 def _validate_tuner_config(tuner: dict, path: Path) -> None:
     """Validate every tuner override consumed by deterministic Python code."""
     # These consumers treat null as "use the derived/default value".
-    for key in ("K_eval", "n_min", "bo_patience"):
+    for key in ("K", "K_eval", "n_min", "bo_patience"):
         _validate_optional_positive_int(
             tuner,
             key,
             path,
             label=f"tuner.{key}",
+        )
+    if (
+        tuner.get("K") is not None
+        and int(tuner["K"]) < 2
+    ):
+        raise RunConfigError(
+            f"{path}: tuner.K must be at least 2 so a candidate proposes "
+            "one row beyond its control"
         )
     if (
         tuner.get("K_eval") is not None
