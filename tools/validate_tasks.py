@@ -17,7 +17,7 @@ REQUIRED_SECTIONS = {
     "env": {"type", "project"},
     "run": {"working_dir", "timeout_seconds"},
     "evaluation": {"score_fn"},
-    "result": {"metric", "parser", "required_patterns", "results_file"},
+    "result": {"metric", "required_patterns"},
     "constraints": {"editable_files", "readonly_files", "allow_dependencies"},
 }
 EVALUATION_CONTRACT_HEADING = "## Evaluation Contract"
@@ -156,11 +156,6 @@ def validate_task(task_dir: Path) -> list[str]:
     if isinstance(result, dict):
         if not isinstance(result.get("metric"), str) or not result.get("metric"):
             errors.append(f"{task_toml}: result.metric must be a non-empty string")
-        parser = result.get("parser")
-        if not isinstance(parser, str):
-            errors.append(f"{task_toml}: result.parser must be a string")
-        elif not (ROOT / parser).is_file():
-            errors.append(f"{task_toml}: result.parser does not exist: {parser}")
         patterns = result.get("required_patterns")
         if not isinstance(patterns, list) or not all(isinstance(item, str) for item in patterns):
             errors.append(f"{task_toml}: result.required_patterns must be a list of strings")
@@ -170,9 +165,6 @@ def validate_task(task_dir: Path) -> list[str]:
                     re.compile(pattern)
                 except re.error as exc:
                     errors.append(f"{task_toml}: invalid result.required_patterns entry {pattern!r}: {exc}")
-        if not isinstance(result.get("results_file"), str) or not result.get("results_file"):
-            errors.append(f"{task_toml}: result.results_file must be a non-empty string")
-
     seed = data.get("seed")
     seed_entrypoint = "train.py"
     seed_can_generate_entrypoint = True

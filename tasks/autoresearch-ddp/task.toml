@@ -44,9 +44,7 @@ resource_probe_fn = "resource_probe_config"
 
 [result]
 metric = "val_bpb"
-parser = "tools/parse_result.py"
 required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
-results_file = "ledger.json"
 
 [constraints]
 editable_files = ["train.py"]

@@ -32,9 +32,7 @@ preflight_fn = "preflight_config"
 
 [result]
 metric = "val_bpb"
-parser = "tools/parse_result.py"
 required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
-results_file = "ledger.json"
 
 [constraints]
 editable_files = ["train.py"]

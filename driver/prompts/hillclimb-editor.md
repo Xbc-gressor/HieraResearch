@@ -70,8 +70,8 @@ specifics):
 - `result.metric` — the metric to minimize (lower-is-better; a
   higher-is-better metric must already be negated inside the task's own
   evaluation).
-- `result.parser` / `result.required_patterns` — what the run output must
-  contain; the working copy must keep printing `<result.metric>: <value>`.
+- `result.required_patterns` — what the run output must contain; the working
+  copy must keep printing `<result.metric>: <value>`.
 - `constraints.editable_files` — the file(s) you may edit (the entrypoint).
 - `constraints.readonly_files` — never edit these (always includes
   `prepare.py`).
@@ -86,9 +86,9 @@ Contract declares (`dataset` for the tabular tasks, `problem` for
 `es-optimization-design`) — AND an `if __name__ == "__main__":` block that
 imports the task's `evaluate_config`/`score_fn`, calls
 `score_fn(make_model, PARAMS)`, and prints `<result.metric>: <value>` (plus a
-`best_model:` line if the parser wants it). **Never delete the `__main__`
-driver when editing** — without it the run prints nothing and looks like a
-crash.
+`best_model:` line if `result.required_patterns` requires it). **Never delete
+the `__main__` driver when editing** — without it the run prints nothing and
+looks like a crash.
 
 Do not rewrite, replace, or redirect an existing `if __name__ == "__main__":`
 driver. For `autoresearch-baseline`, keep

@@ -16,9 +16,7 @@ score_fn = "evaluate_config"
 
 [result]
 metric = "neg_mean_balanced_accuracy"
-parser = "tools/parse_result.py"
 required_patterns = ["^score:", "^best_model:"]
-results_file = "ledger.json"
 
 [constraints]
 editable_files = ["train.py", "pyproject.toml", "uv.lock"]

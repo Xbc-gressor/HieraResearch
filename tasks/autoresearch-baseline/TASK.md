@@ -137,7 +137,7 @@ uv --directory tasks/autoresearch-baseline run python train.py
 Under manual mode, read the printed summary directly. Under hillclimb, redirect
 it to the run log, validate the required result patterns, and append exactly one
 row per reserved objective attempt to `results.tsv`; do not create a framework
-ledger or invoke the legacy `parse_result.py --ledger` path.
+ledger. The hillclimb driver consumes the log directly.
 
 Under the experiment loop there is **no `python train.py` run**: a candidate is
 scored only where the tuner scripts call `evaluate_config`:
@@ -180,7 +180,7 @@ depth:            8
 
 The key metric is `val_bpb`, and lower is better. In standalone mode a
 completed run should include both `val_bpb:` and `peak_vram_mb:` in the run
-log; the generic task parser is declared in `task.toml`.
+log, as declared by `result.required_patterns` in `task.toml`.
 
 Under the experiment loop there is no log parse: `tunable-contract-extractor`
 records `final_best_score` = `best_warm_score` straight into the candidate's

@@ -17,76 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import new_candidate  # noqa: E402
 import got_select  # noqa: E402
-import parse_result  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
-
-
-class LegacyResultParserTests(unittest.TestCase):
-    def test_parser_calls_current_record_run_contract(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            log_path = tmp_path / "run.log"
-            ledger_path = tmp_path / "ledger.json"
-            log_path.write_text("val_bpb: 0.95\npeak_vram_mb: 1024\n")
-            calls: list[dict] = []
-
-            def strict_record_run(
-                ledger_path_arg,
-                task_name,
-                run_id,
-                *,
-                final_best_score=None,
-                status="auto",
-                candidate_name=None,
-                description=None,
-            ):
-                calls.append(
-                    {
-                        "ledger": ledger_path_arg,
-                        "task": task_name,
-                        "run_id": run_id,
-                        "score": final_best_score,
-                        "status": status,
-                        "candidate_name": candidate_name,
-                        "description": description,
-                    }
-                )
-                return {
-                    "run_id": run_id,
-                    "status": "keep",
-                    "final_best_score": final_best_score,
-                }
-
-            argv = [
-                "parse_result.py",
-                str(log_path),
-                "--ledger",
-                str(ledger_path),
-                "--task",
-                "autoresearch-baseline",
-            ]
-            with (
-                mock.patch.object(
-                    parse_result,
-                    "load_task_config",
-                    return_value={
-                        "result": {
-                            "metric": "val_bpb",
-                            "required_patterns": [
-                                "^val_bpb:",
-                                "^peak_vram_mb:",
-                            ],
-                        }
-                    },
-                ),
-                mock.patch.object(parse_result, "record_run", strict_record_run),
-                mock.patch.object(sys, "argv", argv),
-                redirect_stdout(io.StringIO()),
-            ):
-                self.assertEqual(parse_result.main(), 0)
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["score"], 0.95)
 
 
 class UsageAndLifecycleTests(unittest.TestCase):

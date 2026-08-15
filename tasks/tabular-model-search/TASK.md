@@ -122,7 +122,7 @@ Comparison rules:
   `prepare.py`.
 - Do not catch broad training or scoring exceptions and convert them into
   artificial scores. If a candidate cannot train or score, let the process fail
-  so the parser records the run as `crash`.
+  so the framework records the attempt as `crash`.
 
 ## Run
 

@@ -170,7 +170,7 @@ docs.
 3. Fill in `TASK.md` (human brief plus the `## Evaluation Contract` section —
    the prose semantics and hard rules for how a candidate trains, scores, and
    reports) and `task.toml` (machine config: the single `[evaluation].score_fn`
-   — the one `config → score` function — plus metric, parser, required patterns,
+   — the one `config → score` function — plus metric, required patterns,
    optional candidate overrides, file constraints). The split is deliberate:
    the function name is config in `task.toml`; its semantics are prose in
    `TASK.md`. There is no separate official run — warm-start eval and Phase C

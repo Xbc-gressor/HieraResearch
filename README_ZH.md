@@ -176,7 +176,7 @@ step 0+1: tunable-contract-extractor
 - 按**轮次**推进循环：一代 ≤B 个想法经过 step 0+1，然后一次解耦深度调优步骤
 - 依次调用 `idea-generator`（SELECT + IDEATE）、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator` 角色会话
 - 用 `crash-diagnosis` 角色进行崩溃分析
-- 无单独的候选运行；extractor/tuner 各自使用 `record-run` + `set-tuning` 记录分数（无 `parse_result`）
+- 无单独的候选运行或日志解析阶段；extractor/tuner 各自使用 `record-run` + `set-tuning` 记录分数
 - 通过 `tools/ledger.py` 维护 `ledger.json` 和派生的 `loop_state.md`
 - 拥有预算检查、升级链与崩溃恢复；持续直到硬停止条件（`blocked` 事件带具体原因）
 
@@ -315,9 +315,7 @@ python tools/ledger.py show            ...   # 读取单个记录或整个账本
 
 `loop_state.md` 是 `ledger.json` 的派生视图，由 `ledger.py` 重新生成；不单独手动编辑。
 
-### 7.3 parse_result.py（兼容 parser；当前循环未使用）
-
-S-GoT 单函数模型没有运行日志——分数通过 extractor/tuner `record-run` 直接写入，因此当前循环不会调用此脚本。它仍是 `task.toml` 声明的向后兼容日志 parser：在已有 framework ledger record 时解析运行日志，再通过 `ledger.py` 的当前 `record_run` 合约写入结果。Hillclimb 没有 framework ledger，按任务协议直接验证 required patterns 并读取 metric：
+当前 experiment run 的持久状态文件为：
 
 ```text
 runs/<task-name>/<tag>/ledger.json
@@ -326,7 +324,7 @@ runs/<task-name>/<tag>/loop_state.md
 
 根据 task.toml 指标判断改进（分数始终越小越好）。仅改进结果标记为 `keep`。
 
-### 7.4 got_graph.py / got_cdag.py / got_select.py
+### 7.3 got_graph.py / got_cdag.py / got_select.py
 
 外层 S-GoT 图搜索确定性计算层（纯函数；单元可测试）：
 
@@ -334,7 +332,7 @@ runs/<task-name>/<tag>/loop_state.md
 - `got_cdag.py`：结构互补性 `c̃_dag`——开发 DAG 上的祖先影响扩散向量 + 余弦；计算余弦前排除两个目标节点各自的单位 self 分量，避免人为制造结构正交性
 - `got_select.py`：SELECT 层。`idea-generator` 调用 `python tools/got_select.py decide --ledger <path>` 获取本轮的行动：bootstrap/stall fresh 规则，或在前沿叶子上按 op 解耦定额选 ≤B 个动作：op 级收购 `U_op=ḡ_op+c_pucb·√σN/(1+Nop_op)` → `W=softmax(U/τ)` → 最大余数法分配 B 个槽位（确定性，受可用动作数封顶），各 op 内按 `Q` 取顶（`improve: V_max`；`crossover: geomean(V)·(1+c̃_dag)`），两 op 不混排竞争同一排序。所有全局派生量从记录重新计算；无持久状态。
 
-### 7.5 background_contract.py
+### 7.4 background_contract.py
 
 `background.md` 与候选语义归因之间的确定性合约层：
 
@@ -348,11 +346,11 @@ runs/<task-name>/<tag>/loop_state.md
 
 `python tools/validate_background.py` 使用合成 DAG 回归这些合约。
 
-### 7.6 semantic_search.py
+### 7.5 semantic_search.py
 
 图行动之后的语义选点层：`propose` 为 fresh/improve/crossover 生成有界合法点（按账本当前 `search_space_state` revision 过滤/排序：运行时剪枝的假设出局，被剪维度钉在显式基线）；`select` 可替换 `coverage`、`gain`、`gain_uncertainty`、`gain_uncertainty_nocost` 策略并输出 point + policy receipt，提案集与收据都带 revision 戳，过期即拒。策略可替换而不改变 registry、祖先或观测历史。
 
-### 7.7 search_backends.py
+### 7.6 search_backends.py
 
 受 Arbor 检索层启发的轻量适配器，但不导入 Arbor runtime：
 
@@ -363,7 +361,7 @@ runs/<task-name>/<tag>/loop_state.md
 - 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash 和访问内容 hash；token 永不进入运行产物
 - `python tools/validate_search_backends.py` 提供完全离线的回归检查
 
-### 7.8 validate_tasks.py
+### 7.7 validate_tasks.py
 
 检查 `tasks/` 任务包结构和 `task.toml`。
 
@@ -371,7 +369,7 @@ runs/<task-name>/<tag>/loop_state.md
 python tools/validate_tasks.py
 ```
 
-### 7.9 tools/tuners/
+### 7.8 tools/tuners/
 
 调优脚本：
 

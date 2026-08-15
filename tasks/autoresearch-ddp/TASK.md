@@ -182,7 +182,7 @@ uv --directory tasks/autoresearch-ddp run python train.py
 Under manual mode, read the printed summary directly. Under hillclimb, redirect
 it to the run log, validate the required result patterns, and append exactly one
 row per reserved objective attempt to `results.tsv`; do not create a framework
-ledger or invoke the legacy `parse_result.py --ledger` path.
+ledger. The hillclimb driver consumes the log directly.
 
 Under the experiment loop there is **no `python train.py` run**: a candidate is
 scored only where the tuner scripts call `evaluate_config`:
@@ -228,7 +228,7 @@ The key metric is `val_bpb`, and lower is better. `peak_vram_mb` is the max
 across ranks; `mfu_percent`, `total_tokens_M`, and the effective batch account
 for all ranks (the H100 peak-FLOPS constant is multiplied by the world size).
 In standalone mode a completed run should include both `val_bpb:` and
-`peak_vram_mb:` in the run log; the generic task parser is declared in
+`peak_vram_mb:` in the run log, as declared by `result.required_patterns` in
 `task.toml`.
 
 Under the experiment loop there is no log parse: `tunable-contract-extractor`
