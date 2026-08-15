@@ -176,6 +176,19 @@ BENCH_ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"configs": "list", "order": "list", "rationale": "?str"},
     ),
+    # Same-pool shadow experiment: one fresh, tool-free session judges one
+    # pair and is then discarded. A/B are opaque positions, not proposer
+    # ranks; the standalone runner maps the verdict back to pool indexes.
+    "bench-pool-pairwise-judge": RoleDefinition(
+        name="bench-pool-pairwise-judge",
+        prompt_file="bench-pool-pairwise-judge.md",
+        tools=(),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={
+            "winner": ("enum", "A", "B"),
+            "reasoning": "?str",
+        },
+    ),
     # Param-only hillclimb editor (production hillclimb-editor narrowed to
     # SEARCH_SPACE parameter values; one change per invocation).
     "bench-hillclimb-editor": RoleDefinition(
@@ -497,6 +510,7 @@ def first_message_blocks(
     protocol: str,
     budget_remaining: int,
     trials: Iterable | None = None,
+    live_incumbent: tuple[dict, float] | None = None,
     evidence: list | None = None,
     candidate_kind: str | None = None,
 ) -> dict:
@@ -507,7 +521,9 @@ def first_message_blocks(
     stratum, inherited-control flag), incumbent (params + score), history
     (executed trials; defaults to the checkpoint's history), protocol (the
     arm's own protocol description slot), budget (remaining objective
-    evaluations). ``evidence``: extra read-only text blocks appended under
+    evaluations). ``live_incumbent`` overrides the frozen checkpoint
+    incumbent for a replayed or later in-bout factual snapshot. ``evidence``:
+    extra read-only text blocks appended under
     one ``evidence`` key when provided — currently restricted to
     same-candidate history (see module docstring).
 
@@ -533,11 +549,18 @@ def first_message_blocks(
         f"incumbent is the inherited control: "
         f"{checkpoint.incumbent_is_inherited_control}",
     ])
+    if live_incumbent is None:
+        incumbent_params = checkpoint.incumbent.params
+        incumbent_score = checkpoint.incumbent.score
+        incumbent_heading = "Checkpoint incumbent"
+    else:
+        incumbent_params, incumbent_score = live_incumbent
+        incumbent_heading = "Current incumbent"
     incumbent = "\n".join([
-        "Checkpoint incumbent — the config to beat; only a strictly lower "
+        f"{incumbent_heading} — the config to beat; only a strictly lower "
         "score improves it:",
-        f"params: {_compact_params(checkpoint.incumbent.params)}",
-        f"score: {checkpoint.incumbent.score}",
+        f"params: {_compact_params(incumbent_params)}",
+        f"score: {incumbent_score}",
     ])
     blocks = {
         "search_space": format_search_space(contract),

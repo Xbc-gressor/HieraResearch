@@ -146,6 +146,10 @@ EXPECTED_SCHEMAS = {
     "bench-rewarm-proposer": {"configs": "list", "rationale": "?str"},
     "bench-active-set": {"parameter": "str", "step": "float", "rationale": "?str"},
     "bench-pool-proposer": {"configs": "list", "order": "list", "rationale": "?str"},
+    "bench-pool-pairwise-judge": {
+        "winner": ("enum", "A", "B"),
+        "reasoning": "?str",
+    },
     "bench-hillclimb-editor": {"edited": "bool", "summary": "str"},
 }
 
@@ -168,14 +172,23 @@ def test_role_registry_matches_brief_contract() -> None:
             else:
                 assert (spec[1:] if spec.startswith("?") else spec) in _TYPE_CHECKS, name
         dummy = {
-            key: _DUMMY_VALUES[spec[1:] if spec.startswith("?") else spec]
+            key: (
+                spec[1]
+                if isinstance(spec, tuple)
+                else _DUMMY_VALUES[spec[1:] if spec.startswith("?") else spec]
+            )
             for key, spec in role.receipt_schema.items()
         }
         assert validate_receipt(role.receipt_schema, dummy) == [], name
 
 
 def test_pure_proposal_roles_carry_no_tools() -> None:
-    for name in ("bench-rewarm-proposer", "bench-active-set", "bench-pool-proposer"):
+    for name in (
+        "bench-rewarm-proposer",
+        "bench-active-set",
+        "bench-pool-proposer",
+        "bench-pool-pairwise-judge",
+    ):
         assert llm.BENCH_ROLES[name].tools == (), name
     assert llm.BENCH_ROLES["bench-hillclimb-editor"].tools == ("Read", "Edit")
 
@@ -470,6 +483,21 @@ def test_first_message_blocks_trials_override(tmp_path) -> None:
         make_checkpoint(tmp_path), make_contract(), protocol="p",
         budget_remaining=7, trials=[])
     assert blocks["history"] == llm.HISTORY_READING_NOTES + "(no executed trials yet)"
+
+
+def test_first_message_blocks_live_incumbent_override(tmp_path) -> None:
+    live = {"depth": 7, "lr": 0.02, "mode": "slow", "seed": 7}
+    blocks = llm.first_message_blocks(
+        make_checkpoint(tmp_path),
+        make_contract(),
+        protocol="p",
+        budget_remaining=4,
+        live_incumbent=(live, 2.5),
+    )
+    assert '"depth":7' in blocks["incumbent"]
+    assert '"mode":"slow"' in blocks["incumbent"]
+    assert "2.5" in blocks["incumbent"]
+    assert "3.0" not in blocks["incumbent"]
 
 
 def test_first_message_blocks_candidate_kind(tmp_path) -> None:
