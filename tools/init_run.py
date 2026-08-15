@@ -229,6 +229,17 @@ def initialize_run(
     config = _read_framework_config(target) if target.exists() else {}
     updates: list[str] = []
 
+    # Frozen-value guard. It protects a choice this run already recorded, so it
+    # only applies once framework_cfg.json exists. A run dir pre-seeded from
+    # outside (a frozen background, a copied catalog) has made no such choice:
+    # the values in a freshly copied template are defaults, not commitments,
+    # and treating them as frozen would reject every non-default flag.
+    existing_artifacts = (
+        [name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()]
+        if target_existed
+        else []
+    )
+
     # v3.2 allocates a finite run-global budget and is invalid without one.
     # The maintained template already carries 200; keep initialization valid
     # even when a deployment intentionally omits the template.
@@ -249,9 +260,6 @@ def initialize_run(
                 f"{target}: space_initialization.dimension_strategy must be one of "
                 f"{sorted(DIMENSION_STRATEGIES)}"
             )
-        existing_artifacts = [
-            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
-        ]
         if current != dimension_strategy and existing_artifacts:
             raise ValueError(
                 "cannot change dimension strategy after semantic artifacts exist: "
@@ -287,9 +295,6 @@ def initialize_run(
             and normalized_score.is_integer()
         ):
             normalized_score = int(normalized_score)
-        existing_artifacts = [
-            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
-        ]
         if (
             (current is None or float(current) != float(normalized_score))
             and existing_artifacts
@@ -316,9 +321,6 @@ def initialize_run(
         if not isinstance(section, dict):
             raise ValueError(f"{target}: semantic_search must be an object")
         current = section.get("policy")
-        existing_artifacts = [
-            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
-        ]
         if current != semantic_policy and existing_artifacts:
             raise ValueError(
                 "cannot change semantic policy after semantic artifacts exist: "
@@ -338,9 +340,6 @@ def initialize_run(
         if not isinstance(section, dict):
             raise ValueError(f"{target}: tuner must be an object")
         current = section.get("scheduler_policy")
-        existing_artifacts = [
-            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
-        ]
         if current != scheduler_policy and existing_artifacts:
             raise ValueError(
                 "cannot change scheduler policy after run artifacts exist: "
@@ -360,9 +359,6 @@ def initialize_run(
         if not isinstance(section, dict):
             raise ValueError(f"{target}: tuner must be an object")
         current = section.get("inner_policy")
-        existing_artifacts = [
-            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
-        ]
         if current != inner_policy and existing_artifacts:
             raise ValueError(
                 "cannot change inner tuner policy after run artifacts exist: "
@@ -382,9 +378,6 @@ def initialize_run(
         if not isinstance(section, dict):
             raise ValueError(f"{target}: tuner must be an object")
         current = section.get("K_eval")
-        existing_artifacts = [
-            name for name in SEMANTIC_ARTIFACTS if (run_dir / name).exists()
-        ]
         # Frozen per run: K_eval is the per-candidate screening cost that the
         # scheduler's resource contract, got_select's admission cap, and every
         # recorded arrival episode are denominated in. Changing it mid-run
