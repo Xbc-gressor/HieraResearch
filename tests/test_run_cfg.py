@@ -166,6 +166,44 @@ class RunConfigTunerValidationTests(unittest.TestCase):
                 ):
                     self._read({"deep_tune_time_limit_seconds": value})
 
+    def test_mixup_turbo_requires_complete_anchor_contract(self) -> None:
+        base = {
+            "max_evaluations": 68,
+            "tuner": {
+                "scheduler_policy": "anchor_challenger_v1",
+                "inner_policy": "mixup24-turbo20-v1",
+                "deep_tune_budget_fraction": None,
+                "deep_tune_per_candidate_cap": 44,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "framework_cfg.json"
+            path.write_text(json.dumps(base))
+            self.assertEqual(
+                read_framework_cfg(path)["tuner"]["inner_policy"],
+                "mixup24-turbo20-v1",
+            )
+
+            bad_scheduler = json.loads(json.dumps(base))
+            bad_scheduler["tuner"]["scheduler_policy"] = "v3_2"
+            path.write_text(json.dumps(bad_scheduler))
+            with self.assertRaisesRegex(
+                RunConfigError, "requires tuner.scheduler_policy"
+            ):
+                read_framework_cfg(path)
+
+            short_cap = json.loads(json.dumps(base))
+            short_cap["tuner"]["deep_tune_per_candidate_cap"] = 43
+            path.write_text(json.dumps(short_cap))
+            with self.assertRaisesRegex(RunConfigError, "three-bout schedule"):
+                read_framework_cfg(path)
+
+            short_run = json.loads(json.dumps(base))
+            short_run["max_evaluations"] = 67
+            path.write_text(json.dumps(short_run))
+            with self.assertRaisesRegex(RunConfigError, "tournament reserve"):
+                read_framework_cfg(path)
+
 
 class ProgressiveTunerKnobsTest(unittest.TestCase):
     def setUp(self):

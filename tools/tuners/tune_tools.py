@@ -1128,7 +1128,8 @@ def _phase_c_finalization_state(
             statuses.append(None)
             continue
         if stage.get("method") not in {
-            "grid", "bo", "cmaes", "spsa", "hebo", "local_tr", "selfrank"
+            "grid", "bo", "cmaes", "spsa", "hebo", "local_tr", "selfrank",
+            "mixup", "turbo",
         }:
             errors.append(f"phase_c.stages[{index}].method is invalid")
         status = stage.get("status")
@@ -1525,6 +1526,23 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
 
     def start_new_bout(next_bout: int) -> dict:
         """The previous bout is closed and finalized; begin the next one."""
+        numeric_from = inner_policy.numeric_required_from_bout_index(policy_id)
+        if (
+            numeric_from is not None
+            and next_bout >= numeric_from
+            and not inner_policy.has_movable_numeric(search_space)
+        ):
+            result = finalizable_tuning_result(report)
+            return {
+                **common,
+                "action": "finalize",
+                "method": None,
+                "reason": "turbo_bout_requires_movable_numeric",
+                "best_score": result["best_score"],
+                "bout_index": next_bout - 1,
+                "method_chain": [],
+                **extras(next_bout - 1, None),
+            }
         if (
             inner_policy.deep_requires_movable_continuous(policy_id)
             and inner_policy.regime_for_bout_index(next_bout) == inner_policy.DEEP
@@ -3142,9 +3160,11 @@ def validate_proposals(
             policy_id, target_bout, _read_search_space(candidate_path)
         )[0]
         if regime == inner_policy.DEEP and method == "spsa":
-            # A DEEP bout must form complete SPSA pairs; a re-warm
-            # proposal displacing one leg would break the pair.
+            # A DEEP SPSA bout must form complete perturbation pairs; a
+            # re-warm proposal displacing one leg would break the pair.
             reason = "deep_bout_has_no_rewarm"
+        elif method == "turbo":
+            reason = "turbo_bout_has_no_rewarm"
         elif method == "hebo":
             # Prompt-v2 HEBO generates its own pool; Phase-R proposals
             # would only displace that protocol.
@@ -3771,7 +3791,11 @@ def _selected_candidate_result(
     )
     bout_regime = inner_policy.regime_for_bout_index(tuning_bouts)
     if inner_policy.is_regime_policy(policy_id):
-        bout_size = inner_policy.bout_size(bout_regime)
+        bout_size = inner_policy.expected_bout_trials(
+            policy_id,
+            tuning_bouts,
+            bout_trials if bout_trials is not None else DEFAULT_BOUT_TRIALS,
+        )
     else:
         bout_size = bout_trials
     if choice.is_continuation:
@@ -4121,8 +4145,8 @@ def _run_cfg(ledger_path: Path, section: str) -> dict:
     return {}
 
 
-def _v3_2_selection(ledger_path: Path, scenarios: int | None) -> dict:
-    """Delegate the choice to the scheduler v3.2 policy arm.
+def _scheduler_selection(ledger_path: Path, scenarios: int | None) -> dict:
+    """Delegate the choice to the configured scheduler policy arm.
 
     The switch is per-run (`tuner.scheduler_policy`), so a scheduler
     experiment changes one isolated layer while the inner tuner and the
@@ -4143,6 +4167,11 @@ def _v3_2_selection(ledger_path: Path, scenarios: int | None) -> dict:
     selected = view["action"] == "TUNE"
     candidate = next(
         (c for c in state.candidates if c.run_id == view["run_id"]), None
+    )
+    selected_bout_cost = (
+        state.contract.bout_cost(candidate.bouts_used)
+        if selected and candidate is not None
+        else None
     )
     return {
         "run_id": view["run_id"] if selected else None,
@@ -4172,12 +4201,8 @@ def _v3_2_selection(ledger_path: Path, scenarios: int | None) -> dict:
             "global_remaining": state.remaining_budget,
             # v3.2 admits a bout at its full regime cost or not at all:
             # there is no truncated bout to allocate a smaller cap for.
-            "trial_cap": (
-                state.contract.bout_cost(candidate.bouts_used)
-                if selected
-                else None
-            ),
-            "bout_trials": state.contract.bout_trials,
+            "trial_cap": selected_bout_cost,
+            "bout_trials": selected_bout_cost,
         },
     }
 
@@ -4187,8 +4212,8 @@ def cmd_select_candidate(args) -> int:
     ledger = json.loads(led.read_text())
     rc = _run_cfg(led, "tuner")  # explicit flag wins; else framework_cfg.json; else module default
     scheduler_policy = str(rc.get("scheduler_policy", "legacy"))
-    if scheduler_policy == "v3_2":
-        print(json.dumps(_v3_2_selection(led, rc.get("scheduler_scenarios")), indent=2))
+    if scheduler_policy in ("v3_2", "anchor_challenger_v1"):
+        print(json.dumps(_scheduler_selection(led, rc.get("scheduler_scenarios")), indent=2))
         return 0
     top_p = args.top_percentile if args.top_percentile is not None else float(rc.get("top_percentile", DEFAULT_TOP_PERCENTILE))
     # n_min DERIVES from top_percentile: the smallest population for which the

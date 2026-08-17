@@ -144,10 +144,15 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
         # loudly rather than silently run the arm the experiment compares
         # against.
         value = tuner["scheduler_policy"]
-        if value not in ("legacy", "legacy_wide", "v3_2"):
+        if value not in (
+            "legacy",
+            "legacy_wide",
+            "v3_2",
+            "anchor_challenger_v1",
+        ):
             raise RunConfigError(
                 f"{path}: tuner.scheduler_policy must be 'legacy', "
-                "'legacy_wide', or 'v3_2'"
+                "'legacy_wide', 'v3_2', or 'anchor_challenger_v1'"
             )
 
     if "inner_policy" in tuner:
@@ -159,6 +164,7 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "localtr8-hebo10-spsa10-v1",
             "localtr8-hebo10-hebo10-v1",
             "selfrank8-hebo10-hebo10",
+            "mixup24-turbo20-v1",
             "legacy",
         )
         value = tuner["inner_policy"]
@@ -166,6 +172,15 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             allowed = " or ".join(repr(item) for item in known)
             raise RunConfigError(
                 f"{path}: tuner.inner_policy must be {allowed}"
+            )
+        if (
+            value == "mixup24-turbo20-v1"
+            and tuner.get("scheduler_policy", "v3_2")
+            != "anchor_challenger_v1"
+        ):
+            raise RunConfigError(
+                f"{path}: tuner.inner_policy 'mixup24-turbo20-v1' requires "
+                "tuner.scheduler_policy 'anchor_challenger_v1'"
             )
 
     for key in ("scheduler_scenarios", "max_bouts_per_candidate"):
@@ -271,6 +286,50 @@ def _validate_scheduler_v3_2(config: dict, tuner: dict, path: Path) -> None:
         )
 
 
+def _validate_anchor_challenger(config: dict, tuner: dict, path: Path) -> None:
+    """Validate the deterministic two-initial / two-later tournament."""
+    max_evaluations = config.get("max_evaluations")
+    if max_evaluations is None:
+        raise RunConfigError(
+            f"{path}: tuner.scheduler_policy 'anchor_challenger_v1' requires "
+            "max_evaluations"
+        )
+    if tuner.get("deep_tune_budget_fraction") is not None:
+        raise RunConfigError(
+            f"{path}: tuner.deep_tune_budget_fraction is incompatible with "
+            "tuner.scheduler_policy 'anchor_challenger_v1'; its hard "
+            "tournament reserve is the only Phase-C ceiling"
+        )
+
+    from tuners.inner_policy import POLICY_ID, expected_bout_trials
+
+    legacy_bout_trials = int(tuner.get("bout_trials", 10))
+    inner_policy_id = str(tuner.get("inner_policy", POLICY_ID))
+    schedule = tuple(
+        expected_bout_trials(inner_policy_id, index, legacy_bout_trials)
+        for index in range(3)
+    )
+    # The second later bout is index 2 when it stays with a responder, but
+    # index 1 when zero gain switches to the other initialized candidate.
+    tournament_total = 2 * schedule[0] + schedule[1] + max(schedule[1:])
+    if int(max_evaluations) < tournament_total:
+        raise RunConfigError(
+            f"{path}: max_evaluations ({max_evaluations}) is below the full "
+            f"anchor/challenger tournament reserve ({tournament_total})"
+        )
+    candidate_lifetime = sum(schedule)
+    per_candidate_cap = int(
+        tuner.get("deep_tune_per_candidate_cap", max(40, candidate_lifetime))
+    )
+    if per_candidate_cap < candidate_lifetime:
+        raise RunConfigError(
+            f"{path}: tuner.deep_tune_per_candidate_cap ({per_candidate_cap}) "
+            f"is below one candidate's three-bout schedule "
+            f"({schedule[0]} + {schedule[1]} + {schedule[2]} = "
+            f"{candidate_lifetime})"
+        )
+
+
 def _validate_framework_cfg(config: dict, path: Path) -> None:
     """Validate the hard-limit fields shared by deterministic consumers."""
     _validate_optional_positive_int(config, "max_evaluations", path)
@@ -285,6 +344,8 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
     _validate_tuner_config(tuner, path)
     if tuner.get("scheduler_policy") == "v3_2":
         _validate_scheduler_v3_2(config, tuner, path)
+    elif tuner.get("scheduler_policy") == "anchor_challenger_v1":
+        _validate_anchor_challenger(config, tuner, path)
 
 
 def read_framework_cfg(path: Any) -> dict:

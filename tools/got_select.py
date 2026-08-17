@@ -249,6 +249,32 @@ def cmd_decide(args) -> int:
         k_eval = 2
     if isinstance(remaining, int):
         admission_cap = remaining // k_eval
+        if tuner_cfg.get("scheduler_policy") == "anchor_challenger_v1":
+            # The tournament's reserve must constrain the real admission
+            # prefix, not merely the later scheduler decision.  Otherwise a
+            # multi-action generation can consume budget already promised to
+            # the late challenger and its two later bouts.
+            from scheduler.session import contract_for
+            from scheduler.state import build_state
+            from scheduler.tournament import (
+                generation_admission_cap,
+                generation_reserve,
+            )
+
+            # Build from the ledger already in hand: the round-1 bootstrap
+            # above admits a missing ledger as an empty run, and the cap
+            # needs only bouts_used/crash facts plus the remaining budget.
+            tournament_state = build_state(
+                data,
+                remaining_budget=remaining,
+                contract=contract_for(path),
+            )
+            reserve_cap = generation_admission_cap(tournament_state)
+            admission_cap = min(admission_cap, reserve_cap)
+            result["diag"]["tournament_generation_reserve"] = (
+                generation_reserve(tournament_state)
+            )
+            result["diag"]["tournament_admission_cap"] = reserve_cap
         result["actions"] = result["actions"][:admission_cap]
         result["diag"]["objective_remaining"] = remaining
         result["diag"]["candidate_admission_cap"] = admission_cap

@@ -47,24 +47,56 @@ class ResourceContract:
     max_bouts: int = MAX_BOUTS_PER_CANDIDATE
     k_eval: int = DEFAULT_K_EVAL
     first_bout_trials: int = B_FIRST
+    # Optional exact per-bout schedule for policies whose resource shape is
+    # not FIRST + repeated-LATER.  v3.2 leaves this unset; the deterministic
+    # anchor/challenger tournament supplies the active inner policy's first
+    # three bout costs here.
+    bout_cost_schedule: tuple[int, ...] | None = None
+    # Some inner policies switch to a numeric-only kernel before the generic
+    # DEEP boundary. None means no additional policy-specific requirement.
+    numeric_required_from_bout_index: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("bout_trials", "max_bouts", "k_eval", "first_bout_trials"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.bout_cost_schedule is not None:
+            if len(self.bout_cost_schedule) != self.max_bouts:
+                raise ValueError(
+                    "bout_cost_schedule must contain exactly max_bouts entries"
+                )
+            for value in self.bout_cost_schedule:
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise ValueError(
+                        "bout_cost_schedule entries must be positive integers"
+                    )
+        required_from = self.numeric_required_from_bout_index
+        if required_from is not None and (
+            not isinstance(required_from, int)
+            or isinstance(required_from, bool)
+            or required_from < 0
+            or required_from >= self.max_bouts
+        ):
+            raise ValueError(
+                "numeric_required_from_bout_index must be a valid bout index"
+            )
 
     def bout_cost(self, bouts_used: int) -> int:
         """Objective evaluations one complete bout charges (design §2:
         ``B_FIRST=8`` for a first bout, ``B=10`` for CONTINUE/DEEP)."""
+        if self.bout_cost_schedule is not None:
+            if bouts_used < 0 or bouts_used >= len(self.bout_cost_schedule):
+                raise ValueError(f"bout index outside contract: {bouts_used}")
+            return self.bout_cost_schedule[bouts_used]
         return self.first_bout_trials if bouts_used == 0 else self.bout_trials
 
     def lifetime_cost(self) -> int:
         """Objective evaluations one candidate spends across its full
         bout contract (design §2: ``8+10+10+10=38`` under the frozen
         regime-conditioned policy)."""
-        if self.max_bouts <= 0:
-            return 0
+        if self.bout_cost_schedule is not None:
+            return sum(self.bout_cost_schedule)
         return self.bout_cost(0) + self.bout_trials * (self.max_bouts - 1)
 
     def bout_admissible(self, remaining_budget: int, bouts_used: int) -> bool:
@@ -106,6 +138,9 @@ class CandidateView:
     #: continuous dimension to perturb. Without one the candidate has no
     #: DEEP action (design §2.1) — it is done after its CONTINUE bout.
     has_movable_continuous: bool = True
+    #: TuRBO can move float and integer dimensions, but not a categorical-only
+    #: space. Used only when the active resource contract requests it.
+    has_movable_numeric: bool = True
 
     @property
     def is_first(self) -> bool:
@@ -128,6 +163,13 @@ def ineligibility_reason(
         return f"bout cap reached ({contract.max_bouts})"
     if candidate.has_unresolved_descendant:
         return "unresolved primary descendant"
+    numeric_from = contract.numeric_required_from_bout_index
+    if (
+        numeric_from is not None
+        and candidate.bouts_used >= numeric_from
+        and not candidate.has_movable_numeric
+    ):
+        return "no varying numeric dimension for this bout"
     if (
         candidate.bouts_used >= DEEP_MIN_BOUTS
         and not candidate.has_movable_continuous

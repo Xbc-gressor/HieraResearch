@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--scheduler-policy",
-        choices=["legacy", "legacy_wide", "v3_2"],
+        choices=["legacy", "legacy_wide", "v3_2", "anchor_challenger_v1"],
         help="tuner scheduler policy; new runs default to v3_2",
     )
     run.add_argument(
@@ -49,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
             "localtr8-hebo10-spsa10-v1",
             "localtr8-hebo10-hebo10-v1",
             "selfrank8-hebo10-hebo10",
+            "mixup24-turbo20-v1",
             "legacy",
         ],
         help="regime-conditioned inner-tuner policy; new runs default to "

@@ -42,6 +42,7 @@ sys.path.insert(0, str(TOOLS / "tuners"))
 
 if __package__ in (None, ""):  # direct script invocation
     sys.path.insert(0, str(TOOLS.parent))
+    from tools.scheduler import tournament  # noqa: E402
     from tools.scheduler.evidence import FIRST, LATER, TuningModel  # noqa: E402
     from tools.scheduler.policy import PolicyConfig, decide  # noqa: E402
     from tools.scheduler.rollout import RolloutConfig  # noqa: E402
@@ -49,6 +50,7 @@ if __package__ in (None, ""):  # direct script invocation
     from tools.scheduler.state import state_from_snapshot  # noqa: E402
     from tools.scheduler.store import SchedulerStore  # noqa: E402
 else:  # pragma: no cover - imported as a package
+    from . import tournament
     from .evidence import FIRST, LATER, TuningModel
     from .policy import PolicyConfig, decide
     from .rollout import RolloutConfig
@@ -144,18 +146,23 @@ def replay_all(store: SchedulerStore) -> dict:
         except (OSError, KeyError, ValueError):
             diverged.append({"decision_id": row.get("decision_id"), "error": "snapshot"})
             continue
-        tuning, arrival = models_for(store, cursor=row.get("evidence_cursor"))
-        config = PolicyConfig(
-            rollout=RolloutConfig(scenarios=int(row.get("paired_scenarios", 64)))
-        )
-        # The receipt's `coverage_spent` already includes this decision's own
-        # charge, so replaying needs the value as of *before* it.
-        spent = int(row.get("coverage_spent", 0)) - (
-            1 if str(row.get("reason", "")).startswith("coverage:") else 0
-        )
-        replayed = decide(
-            state, tuning, arrival, config=config, coverage_spent=spent
-        )
+        if row.get("policy_version") == tournament.POLICY_VERSION:
+            # The tournament is a pure function of the snapshot; replaying it
+            # through the v3.2 rollout policy would report false divergences.
+            replayed = tournament.decide(state)
+        else:
+            tuning, arrival = models_for(store, cursor=row.get("evidence_cursor"))
+            config = PolicyConfig(
+                rollout=RolloutConfig(scenarios=int(row.get("paired_scenarios", 64)))
+            )
+            # The receipt's `coverage_spent` already includes this decision's
+            # own charge, so replaying needs the value as of *before* it.
+            spent = int(row.get("coverage_spent", 0)) - (
+                1 if str(row.get("reason", "")).startswith("coverage:") else 0
+            )
+            replayed = decide(
+                state, tuning, arrival, config=config, coverage_spent=spent
+            )
         if (
             replayed.action != row.get("selected_action")
             or replayed.run_id != row.get("selected_run_id")

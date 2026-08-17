@@ -34,7 +34,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("localtr8-hebo10-spsa10-v1", result.stdout)
         self.assertIn("deferred-random8-hebo10-spsa10-v1", result.stdout)
         self.assertIn("selfrank8-hebo10-hebo10", result.stdout)
-
+        self.assertIn("mixup24-turbo20-v1", result.stdout)
+        self.assertIn("anchor_challenger_v1", result.stdout)
 
     def test_warm_config_count_knobs_are_exposed(self) -> None:
         result = self.run_cli("run", "--help")

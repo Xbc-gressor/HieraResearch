@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Production LLM-pool bout runner: HEBO MACE by default.
+"""Production adapter for inner-benchmark arms: HEBO MACE by default.
 
 HEBO serves the CONTINUE regime of inner policy
 deferred-random8-hebo10-spsa10-v1; CONTINUE and DEEP under
 localtr8-hebo10-hebo10-v1 and selfrank8-hebo10-hebo10. The thin
-selfrank_search entry point replaces the selector with llm_pool_self_rank for
-FIRST while retaining this stage/evaluation adapter.
+selfrank_search and mixup_search replace the pool policy; turbo_search uses
+the same factual-history/evaluation adapter without creating an LLM session.
 
 A HEBO bout is 10 objective evaluations of the inner-benchmark
 ``pool_hebo_mace`` protocol (PLAN §6.4), ported onto the production
@@ -107,6 +107,8 @@ _CHECKPOINT_REGIME = {
 # In-process test seams. Production CLI never sets these.
 _TEST_SESSION_RUNNER = None
 _TEST_RANK_FN = None
+_TEST_SUGGEST_FN = None
+_TEST_ARM_EXTRAS = None
 
 
 def _current_hebo_stage(report: dict) -> dict | None:
@@ -262,6 +264,81 @@ def _stage_spent(stage: dict) -> int:
     return spent
 
 
+def _turbo_factual_outcomes(report: dict) -> list[dict]:
+    outcomes: list[dict] = []
+    for stage in report.get("phase_c", {}).get("stages", []):
+        if not isinstance(stage, dict) or stage.get("method") != "turbo":
+            continue
+        for row in stage.get("trials", []):
+            if not isinstance(row, dict):
+                continue
+            if is_finite_score(row.get("score")):
+                outcomes.append({"status": "ok", "score": float(row["score"])})
+            elif row.get("status") in ("failed", "crash"):
+                outcomes.append({"status": "crash", "score": None})
+    return outcomes
+
+
+def _last_trial_identity(stage: dict, contract) -> str | None:
+    for row in reversed(stage.get("trials", [])):
+        if not isinstance(row, dict) or not isinstance(row.get("params"), dict):
+            continue
+        try:
+            return contract.params_identity(row["params"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
+def _continuation_arm_extras(report: dict, bout_index: int, contract) -> dict:
+    """Restore a clean boundary or recover an interrupted TuRBO proposal."""
+    if METHOD != "turbo":
+        return {}
+    for stage in reversed(report.get("phase_c", {}).get("stages", [])):
+        if not isinstance(stage, dict) or stage.get("method") != METHOD:
+            continue
+        payload = stage.get("turbo_state")
+        if not isinstance(payload, dict):
+            continue
+        final_state = payload.get("turbo_final_state")
+        if isinstance(final_state, dict):
+            return {"turbo_state": final_state}
+        proposal_state = payload.get("turbo_state")
+        if isinstance(proposal_state, dict):
+            proposal_identity = payload.get("turbo_proposal_identity")
+            if not isinstance(proposal_identity, str):
+                raise ValueError(
+                    "interrupted turbo stage is missing its proposal identity"
+                )
+            outcomes = _turbo_factual_outcomes(report)
+            outcomes_seen = proposal_state.get("outcomes_seen")
+            if (
+                not isinstance(outcomes_seen, int)
+                or isinstance(outcomes_seen, bool)
+                or not 0 <= outcomes_seen <= len(outcomes)
+            ):
+                raise ValueError(
+                    "interrupted turbo state has an invalid outcomes_seen cursor"
+                )
+            consumed = _last_trial_identity(stage, contract) == proposal_identity
+            recovery = outcomes[outcomes_seen:]
+            if recovery and not consumed:
+                raise ValueError(
+                    "interrupted turbo outcome does not match its persisted proposal"
+                )
+            return {
+                "turbo_state": proposal_state,
+                "turbo_recovery_outcomes": recovery,
+                "turbo_resume_proposal_consumed": consumed,
+            }
+    if bout_index >= 2:
+        raise ValueError(
+            "turbo bout continuation is missing the previous "
+            "turbo_final_state"
+        )
+    return {}
+
+
 def _build_checkpoint(
     *,
     candidate_path: Path,
@@ -322,7 +399,14 @@ def main() -> int:
         raise ValueError(f"{METHOD} requires BASE_PARAMS (the applied incumbent)")
 
     contract = space_mod.read_contract(args.candidate_path)
-    if not contract.varying_dimensions:
+    varying = contract.varying_dimensions
+    if METHOD == "turbo":
+        varying = tuple(
+            dimension
+            for dimension in contract.numeric_dimensions
+            if not dimension.is_degenerate
+        )
+    if not varying:
         set_stage_meta(
             args.tune_report_json,
             METHOD,
@@ -334,7 +418,11 @@ def main() -> int:
             {
                 "method": METHOD,
                 "status": "rejected",
-                "reason": "pool arm: no varying dimensions",
+                "reason": (
+                    "turbo: no varying numeric dimension"
+                    if METHOD == "turbo"
+                    else "pool arm: no varying dimensions"
+                ),
             }
         )
         return 0
@@ -417,30 +505,36 @@ def main() -> int:
     )
 
     python_cmd = _python_cmd(args.candidate_path)
-    session_runner = _TEST_SESSION_RUNNER
-    if session_runner is None:
-        from driver.session import SDKSessionRunner
+    extras: dict = {}
+    if METHOD != "turbo":
+        session_runner = _TEST_SESSION_RUNNER
+        if session_runner is None:
+            from driver.session import SDKSessionRunner
 
-        model = args.model or _read_run_model(args.candidate_path)
-        session_runner = SDKSessionRunner(
-            model=model,
-            events=EventsLog(args.candidate_path.parent / f"_{METHOD}_llm"),
+            model = args.model or _read_run_model(args.candidate_path)
+            session_runner = SDKSessionRunner(
+                model=model,
+                events=EventsLog(args.candidate_path.parent / f"_{METHOD}_llm"),
+            )
+        run_dir = args.candidate_path.parent / f"_{METHOD}_llm"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        events_path = getattr(getattr(session_runner, "events", None), "path", None)
+        if events_path is None:
+            EventsLog(run_dir)
+        extras["session_factory"] = llm.make_bout_session_factory(
+            runner=session_runner,
+            run_dir=run_dir,
+            task=_task_name(args.candidate_path) or "unknown",
+            tag=f"{args.candidate_path.parent.name}--{METHOD}--bout{bout_index}",
         )
-    run_dir = args.candidate_path.parent / f"_{METHOD}_llm"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    events_path = getattr(getattr(session_runner, "events", None), "path", None)
-    if events_path is None:
-        EventsLog(run_dir)
-    factory = llm.make_bout_session_factory(
-        runner=session_runner,
-        run_dir=run_dir,
-        task=_task_name(args.candidate_path) or "unknown",
-        tag=f"{args.candidate_path.parent.name}--{METHOD}--bout{bout_index}",
-    )
 
-    extras: dict = {"session_factory": factory}
     if _TEST_RANK_FN is not None:
         extras["hebo_rank_fn"] = _TEST_RANK_FN
+    if _TEST_SUGGEST_FN is not None:
+        extras["hebo_suggest_fn"] = _TEST_SUGGEST_FN
+    if isinstance(_TEST_ARM_EXTRAS, dict):
+        extras.update(_TEST_ARM_EXTRAS)
+    extras.update(_continuation_arm_extras(report, bout_index, contract))
 
     pending_arm_extras: dict = {}
 
@@ -611,7 +705,7 @@ def main() -> int:
         # configs consume slots inside B_FIRST before the arm proposes. HEBO
         # only serves later regimes, so it has no deferred backlog.
         if (
-            METHOD == "selfrank"
+            METHOD in ("selfrank", "mixup")
             and inner_policy.regime_for_bout_index(bout_index) == inner_policy.FIRST
         ):
             deferred_in_space, n_deferred_projected, deferred_dropped = (

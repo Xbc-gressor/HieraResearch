@@ -231,9 +231,9 @@ def build_driver_job(
     tuner_cfg = framework_cfg.get("tuner", {})
     if not isinstance(tuner_cfg, dict):
         raise DriverJobError("framework_cfg tuner section must be an object")
-    # The bout's full size is regime-conditioned under the frozen inner policy
-    # (FIRST=8, CONTINUE/DEEP=10); phase-c-action already computed it from the
-    # candidate's bout index. The legacy inner policy keeps tuner.bout_trials.
+    # phase-c-action computes the exact policy-aware size from the candidate's
+    # bout index (normally 8/10/10; mixup24-turbo20-v1 is 24/10/10). The
+    # legacy inner policy keeps tuner.bout_trials.
     bout_trials = _positive_int(
         action.get("bout_trials"), "phase-c-action.bout_trials"
     )
@@ -241,17 +241,20 @@ def build_driver_job(
         raise DriverJobError(
             f"driver_job.trial_cap {trial_cap} exceeds bout_trials {bout_trials}"
         )
-    if tuner_cfg.get("scheduler_policy") == "v3_2" and trial_cap != bout_trials:
+    if tuner_cfg.get("scheduler_policy") in (
+        "v3_2",
+        "anchor_challenger_v1",
+    ) and trial_cap != bout_trials:
         raise DriverJobError(
-            "scheduler v3_2 requires one complete bout: "
+            "complete-bout scheduler requires one complete bout: "
             f"trial_cap {trial_cap} != bout_trials {bout_trials}"
         )
     script = repo_root / "tools" / "tuners" / f"{method}_search.py"
-    if method in ("hebo", "local_tr", "selfrank"):
+    if method in ("hebo", "local_tr", "selfrank", "mixup", "turbo"):
         # Repo-root env: HEBO needs the SDK session + official ranker;
-        # selfrank needs the SDK session; local_tr needs the inner-benchmark
-        # codec/numpy stack. Evaluations stay in the task project via
-        # timed_eval(python_cmd=...).
+        # selfrank/mixup need the SDK session; local_tr/turbo need the
+        # inner-benchmark numerical stack. Evaluations stay in the task
+        # project via timed_eval(python_cmd=...).
         argv = [
             "uv",
             "--project",

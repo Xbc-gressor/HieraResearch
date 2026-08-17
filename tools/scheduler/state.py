@@ -210,17 +210,26 @@ class SchedulerState:
         A mutable ledger revision is not a historical snapshot; this dict is
         what a replay reads to reconstruct the decision exactly.
         """
+        contract = {
+            "bout_trials": self.contract.bout_trials,
+            "max_bouts": self.contract.max_bouts,
+            "k_eval": self.contract.k_eval,
+            "first_bout_trials": self.contract.first_bout_trials,
+        }
+        if self.contract.bout_cost_schedule is not None:
+            contract["bout_cost_schedule"] = list(
+                self.contract.bout_cost_schedule
+            )
+        if self.contract.numeric_required_from_bout_index is not None:
+            contract["numeric_required_from_bout_index"] = (
+                self.contract.numeric_required_from_bout_index
+            )
         return {
             "schema_version": 1,
             "kind": "scheduler_state_snapshot",
             "global_best": self.global_best,
             "remaining_budget": self.remaining_budget,
-            "contract": {
-                "bout_trials": self.contract.bout_trials,
-                "max_bouts": self.contract.max_bouts,
-                "k_eval": self.contract.k_eval,
-                "first_bout_trials": self.contract.first_bout_trials,
-            },
+            "contract": contract,
             "candidates": [
                 {
                     "run_id": candidate.run_id,
@@ -230,6 +239,7 @@ class SchedulerState:
                     "headroom": self.headroom(candidate),
                     "deferred_warm_backlog": candidate.deferred_warm_backlog,
                     "has_movable_continuous": candidate.has_movable_continuous,
+                    "has_movable_numeric": candidate.has_movable_numeric,
                     "eligible": ineligibility_reason(
                         candidate, self.remaining_budget, self.contract
                     )
@@ -255,6 +265,16 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
         max_bouts=int(contract_fields.get("max_bouts", 4)),
         k_eval=int(contract_fields.get("k_eval", 2)),
         first_bout_trials=int(contract_fields.get("first_bout_trials", 8)),
+        bout_cost_schedule=(
+            tuple(int(value) for value in contract_fields["bout_cost_schedule"])
+            if contract_fields.get("bout_cost_schedule") is not None
+            else None
+        ),
+        numeric_required_from_bout_index=(
+            int(contract_fields["numeric_required_from_bout_index"])
+            if contract_fields.get("numeric_required_from_bout_index") is not None
+            else None
+        ),
     )
     candidates = tuple(
         CandidateView(
@@ -264,6 +284,7 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
             previous_gain=row.get("previous_gain"),
             deferred_warm_backlog=int(row.get("deferred_warm_backlog", 0)),
             has_movable_continuous=bool(row.get("has_movable_continuous", True)),
+            has_movable_numeric=bool(row.get("has_movable_numeric", True)),
             # `eligible` in a snapshot is the derived verdict; the causes
             # that are not budget-dependent are restored here so the
             # predicate recomputes the same answer.
@@ -384,6 +405,7 @@ def build_state(
     deferred_backlog: dict[str, int] | None = None,
     previous_gains: dict[str, float] | None = None,
     movable_continuous: dict[str, bool] | None = None,
+    movable_numeric: dict[str, bool] | None = None,
     diagnostics: dict | None = None,
     n_seed: int = 0,
 ) -> SchedulerState:
@@ -393,6 +415,7 @@ def build_state(
     backlog = deferred_backlog or {}
     gains = previous_gains or {}
     movable = movable_continuous or {}
+    numeric = movable_numeric or {}
     candidates = []
     for record in ledger.get("records", []):
         run_id = str(record.get("run_id"))
@@ -410,6 +433,7 @@ def build_state(
                 crashed=record.get("status") == "crash",
                 deferred_warm_backlog=int(backlog.get(run_id, 0)),
                 has_movable_continuous=bool(movable.get(run_id, True)),
+                has_movable_numeric=bool(numeric.get(run_id, True)),
             )
         )
     scores = [
@@ -465,6 +489,7 @@ def load_state(
         POLICY_ID,
         deep_requires_movable_continuous,
         load_movable_continuous_flags,
+        load_movable_numeric_flags,
     )
 
     # Only an SPSA DEEP bout needs a movable continuous dimension. Under a
@@ -475,6 +500,12 @@ def load_state(
         if deep_requires_movable_continuous(policy_id)
         else None
     )
+    movable_numeric = (
+        load_movable_numeric_flags(run_dir, ledger)
+        if contract is not None
+        and contract.numeric_required_from_bout_index is not None
+        else None
+    )
 
     return build_state(
         ledger,
@@ -483,6 +514,7 @@ def load_state(
         deferred_backlog=deferred_warm_backlog(run_dir, ledger),
         previous_gains=previous_gains(run_dir, ledger),
         movable_continuous=movable,
+        movable_numeric=movable_numeric,
         diagnostics=diagnostics,
         n_seed=seed_quota(run_dir),
     )

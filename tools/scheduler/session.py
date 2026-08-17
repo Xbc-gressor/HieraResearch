@@ -27,6 +27,7 @@ from .reconcile import reconcile_path
 from .rollout import RolloutConfig
 from .state import SchedulerState, load_state
 from .store import SchedulerStore
+from . import tournament
 
 
 def config_from_scenarios(scenarios: int | None) -> PolicyConfig:
@@ -60,6 +61,33 @@ def contract_for(ledger_path: Path) -> ResourceContract:
 
     tuner = load_run_cfg(Path(ledger_path).parent, "tuner")
     bout_trials = int(tuner.get("bout_trials", ResourceContract.bout_trials))
+    scheduler_policy = str(tuner.get("scheduler_policy", "v3_2"))
+    if scheduler_policy == tournament.POLICY_ID:
+        # Derive the resource schedule from the executable inner policy rather
+        # than baking mixup's planned 24/10/10 into the scheduler.  This keeps
+        # the scheduler mechanically testable with today's production arms and
+        # makes a future mixup policy change the reserve through one contract.
+        from tuners.inner_policy import POLICY_ID as DEFAULT_INNER_POLICY_ID
+        from tuners.inner_policy import (
+            expected_bout_trials,
+            numeric_required_from_bout_index,
+        )
+
+        inner_policy_id = str(tuner.get("inner_policy", DEFAULT_INNER_POLICY_ID))
+        schedule = tuple(
+            expected_bout_trials(inner_policy_id, index, bout_trials)
+            for index in range(3)
+        )
+        return ResourceContract(
+            bout_trials=schedule[1],
+            max_bouts=3,
+            k_eval=max(2, int(tuner.get("K_eval", ResourceContract.k_eval))),
+            first_bout_trials=schedule[0],
+            bout_cost_schedule=schedule,
+            numeric_required_from_bout_index=(
+                numeric_required_from_bout_index(inner_policy_id)
+            ),
+        )
     # Under the legacy inner policy every bout costs bout_trials; the frozen
     # regime-conditioned policy charges B_FIRST for first bouts (design §2).
     legacy_inner = str(tuner.get("inner_policy", "")) == "legacy"
@@ -93,6 +121,11 @@ def decide_for_run(
     store = SchedulerStore(run_dir)
     contract = contract_for(ledger_path)
     config = config_from_scenarios(scenarios)
+    from run_cfg import load_run_cfg
+
+    scheduler_policy = str(
+        load_run_cfg(run_dir, "tuner").get("scheduler_policy", "v3_2")
+    )
 
     # Evidence first: the models must see every bout and arrival the run's
     # artifacts already record, whether or not anything reported them. This
@@ -109,29 +142,46 @@ def decide_for_run(
     if existing is not None:
         return _view(existing, state, reconciled, reused=True)
 
-    tuning, arrival = models_for(store)
-    decision = decide_policy(
-        state,
-        tuning,
-        arrival,
-        config=config,
-        coverage_spent=store.coverage_spent(),
-    )
+    tuning = arrival = None
+    if scheduler_policy == tournament.POLICY_ID:
+        decision = tournament.decide(state)
+    else:
+        tuning, arrival = models_for(store)
+        decision = decide_policy(
+            state,
+            tuning,
+            arrival,
+            config=config,
+            coverage_spent=store.coverage_spent(),
+        )
     decision_id = store.next_decision_id()
-    receipt = decision.receipt(
-        state=state,
-        evidence_cursor=cursor,
-        config=config,
-        snapshot_id=snapshot_id,
-        decision_id=decision_id,
-    )
+    if scheduler_policy == tournament.POLICY_ID:
+        receipt = tournament.receipt(
+            decision,
+            state=state,
+            evidence_cursor=cursor,
+            snapshot_id=snapshot_id,
+            decision_id=decision_id,
+        )
+    else:
+        receipt = decision.receipt(
+            state=state,
+            evidence_cursor=cursor,
+            config=config,
+            snapshot_id=snapshot_id,
+            decision_id=decision_id,
+        )
     store.append_decision(receipt)
     return _view(
         receipt,
         state,
         reconciled,
         reused=False,
-        evidence={"tuning": tuning.summary(), "arrival": arrival.summary()},
+        evidence=(
+            {"tuning": tuning.summary(), "arrival": arrival.summary()}
+            if tuning is not None and arrival is not None
+            else None
+        ),
     )
 
 

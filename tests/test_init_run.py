@@ -88,6 +88,43 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 "selfrank8-hebo10-hebo10",
             )
 
+    def test_mixup_turbo_policy_sets_its_scheduler_and_lifetime_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+
+            run_dir = initialize_run(
+                repo_root,
+                "toy",
+                "mixup-turbo",
+                scheduler_policy="anchor_challenger_v1",
+                inner_policy="mixup24-turbo20-v1",
+            )
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(
+                config["tuner"]["scheduler_policy"],
+                "anchor_challenger_v1",
+            )
+            self.assertEqual(
+                config["tuner"]["inner_policy"],
+                "mixup24-turbo20-v1",
+            )
+            self.assertEqual(
+                config["tuner"]["deep_tune_per_candidate_cap"],
+                44,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "requires scheduler_policy anchor_challenger_v1"
+            ):
+                initialize_run(
+                    repo_root,
+                    "toy",
+                    "mixup-wrong-scheduler",
+                    inner_policy="mixup24-turbo20-v1",
+                )
+
     def test_existing_run_is_not_rewritten_to_new_policy_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

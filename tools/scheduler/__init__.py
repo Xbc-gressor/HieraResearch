@@ -1,8 +1,9 @@
 """Scheduler v3.2: budget allocation between TUNE(i) and DEFER.
 
 The package is an isolated policy arm. New runs persist
-``tuner.scheduler_policy = "v3_2"`` during initialization; ``legacy`` and
-``legacy_wide`` remain explicit CLI-selectable comparison arms (they differ
+``tuner.scheduler_policy = "v3_2"`` during initialization; the deterministic
+``anchor_challenger_v1`` tournament and ``legacy`` / ``legacy_wide`` remain
+explicit CLI-selectable comparison arms (the legacy pair differ
 only in how widely a first-bout non-responder is re-admitted). Historical
 runs that omit the key retain the legacy percentile/alternation fallback in
 ``tools/tuners/tune_tools.py`` rather than changing behavior on resume.

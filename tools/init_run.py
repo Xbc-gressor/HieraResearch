@@ -50,12 +50,18 @@ SEMANTIC_POLICIES = (
     "gain_uncertainty",
     "gain_uncertainty_nocost",
 )
-SCHEDULER_POLICIES = ("legacy", "legacy_wide", "v3_2")
+SCHEDULER_POLICIES = (
+    "legacy",
+    "legacy_wide",
+    "v3_2",
+    "anchor_challenger_v1",
+)
 INNER_POLICIES = (
     "deferred-random8-hebo10-spsa10-v1",
     "localtr8-hebo10-spsa10-v1",
     "localtr8-hebo10-hebo10-v1",
     "selfrank8-hebo10-hebo10",
+    "mixup24-turbo20-v1",
     "legacy",
 )
 
@@ -247,6 +253,20 @@ def initialize_run(
     config = _read_framework_config(target) if target.exists() else {}
     updates: list[str] = []
 
+    effective_tuner = config.get("tuner", {})
+    effective_tuner = effective_tuner if isinstance(effective_tuner, dict) else {}
+    effective_scheduler = scheduler_policy or effective_tuner.get(
+        "scheduler_policy", DEFAULT_SCHEDULER_POLICY
+    )
+    if (
+        inner_policy == "mixup24-turbo20-v1"
+        and effective_scheduler != "anchor_challenger_v1"
+    ):
+        raise ValueError(
+            "mixup24-turbo20-v1 requires scheduler_policy "
+            "anchor_challenger_v1"
+        )
+
     # Frozen-value guard. It protects a choice this run already recorded, so it
     # only applies once framework_cfg.json exists. A run dir pre-seeded from
     # outside (a frozen background, a copied catalog) has made no such choice:
@@ -258,11 +278,12 @@ def initialize_run(
         else []
     )
 
-    # v3.2 allocates a finite run-global budget and is invalid without one.
+    # Complete-bout schedulers allocate a finite run-global budget and are
+    # invalid without one.
     # The maintained template already carries 200; keep initialization valid
     # even when a deployment intentionally omits the template.
     if (
-        scheduler_policy == "v3_2"
+        scheduler_policy in ("v3_2", "anchor_challenger_v1")
         and max_evaluations is None
         and config.get("max_evaluations") is None
     ):
@@ -390,6 +411,15 @@ def initialize_run(
             updates.append(f"inner_policy={inner_policy}")
         else:
             print(f"Inner tuner policy already set to {inner_policy}.")
+        if inner_policy == "mixup24-turbo20-v1":
+            section = config.get("tuner", {})
+            current_cap = int(section.get("deep_tune_per_candidate_cap", 40))
+            if current_cap < 44:
+                config["tuner"] = {
+                    **section,
+                    "deep_tune_per_candidate_cap": 44,
+                }
+                updates.append("deep_tune_per_candidate_cap=44")
 
     if k_warm is not None:
         section = config.get("tuner", {})

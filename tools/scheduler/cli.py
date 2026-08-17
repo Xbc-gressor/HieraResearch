@@ -30,6 +30,7 @@ sys.path.insert(0, str(TOOLS / "tuners"))
 if __package__ in (None, ""):  # direct script invocation
     sys.path.insert(0, str(TOOLS.parent))
     from tools.scheduler import evidence as evidence_mod  # noqa: E402
+    from tools.scheduler import tournament  # noqa: E402
     from tools.scheduler.policy import (  # noqa: E402
         PolicyConfig,
         decide as decide_policy,
@@ -43,6 +44,7 @@ if __package__ in (None, ""):  # direct script invocation
     from tools.scheduler.store import SchedulerStore  # noqa: E402
 else:  # pragma: no cover - imported as a package
     from . import evidence as evidence_mod
+    from . import tournament
     from .policy import PolicyConfig, decide as decide_policy
     from .rollout import RolloutConfig
     from .session import decide_for_run, models_for
@@ -102,19 +104,24 @@ def cmd_replay(args) -> int:
         raise SystemExit(f"no decision {args.decision_id}")
 
     state = state_from_snapshot(store.get_snapshot(receipt["state_snapshot_id"]))
-    tuning, arrival = models_for(store, cursor=receipt.get("evidence_cursor"))
-    config = PolicyConfig(
-        rollout=RolloutConfig(scenarios=int(receipt.get("paired_scenarios", 64)))
-    )
-    replayed = decide_policy(
-        state,
-        tuning,
-        arrival,
-        config=config,
-        coverage_spent=int(receipt.get("coverage_spent", 0)) - (
-            1 if str(receipt.get("reason", "")).startswith("coverage:") else 0
-        ),
-    )
+    # Replay must use the policy that produced the receipt: the tournament
+    # is a pure function of the snapshot, while v3.2 also needs its models.
+    if receipt.get("policy_version") == tournament.POLICY_VERSION:
+        replayed = tournament.decide(state)
+    else:
+        tuning, arrival = models_for(store, cursor=receipt.get("evidence_cursor"))
+        config = PolicyConfig(
+            rollout=RolloutConfig(scenarios=int(receipt.get("paired_scenarios", 64)))
+        )
+        replayed = decide_policy(
+            state,
+            tuning,
+            arrival,
+            config=config,
+            coverage_spent=int(receipt.get("coverage_spent", 0)) - (
+                1 if str(receipt.get("reason", "")).startswith("coverage:") else 0
+            ),
+        )
     matches = (
         replayed.action == receipt["selected_action"]
         and replayed.run_id == receipt["selected_run_id"]

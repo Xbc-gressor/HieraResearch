@@ -9,12 +9,15 @@ comparison arms `localtr8-hebo10-spsa10-v1`, `localtr8-hebo10-hebo10-v1`,
 and `selfrank8-hebo10-hebo10`
 keep the same sizes):
 **FIRST = 8** (0 completed bouts), **CONTINUE = 10** (1), **DEEP = 10** (2–3).
+The production experiment policy `mixup24-turbo20-v1` is the explicit
+exception: **INITIAL/FIRST = 24**, followed by two **TuRBO = 10** segments;
+it has exactly three bouts and a 44-attempt candidate lifetime.
 A first bout deep-tunes a promising untuned candidate; a continuation bout
 resumes a tuned candidate that responded to its last bout; a DEEP bout is a
 late bout on a twice-responding candidate. After each bout the candidate is
 finalized (best-so-far applied, ledger updated) and stays eligible for later
-bouts until its lifetime `tuner.deep_tune_per_candidate_cap` is spent, its 4
-bouts are used, or a bout improves nothing. **One invocation = at most one
+bouts until its lifetime `tuner.deep_tune_per_candidate_cap` is spent, its
+policy bout contract is complete, or a bout improves nothing. **One invocation = at most one
 bout** (often zero — a valid no-op).
 
 **Warm-start is already done** — step 0 (`tunable-contract-extractor`) proposed K
@@ -87,6 +90,9 @@ temporarily ineligible. A candidate whose next bout is DEEP but whose
 `SEARCH_SPACE` has no non-degenerate continuous dimension is **not**
 eligible — SPSA cannot move it, and no DEEP action exists for it. `budget_allocation.trial_cap` is
 `min(regime bout size, per-candidate cap remaining, budget remaining)`.
+Under `mixup24-turbo20-v1`, both later bouts use TuRBO and require at least one
+non-degenerate float or integer dimension; categoricals remain fixed at the
+current incumbent.
 
 **When `tuner.scheduler_policy` is `v3_2`** the same command answers from the
 scheduler v3.2 policy instead, and the receipt carries an extra `scheduler`
@@ -115,6 +121,18 @@ block. Read it, do not re-derive it:
   asking again before anything has run returns the same open decision
   (`scheduler.reused_open_decision` is true) rather than a new one — a
   corrective follow-up therefore never manufactures a second decision.
+
+**When `tuner.scheduler_policy` is `anchor_challenger_v1`**, the same exact-
+target and complete-bout rules apply: obey the returned `scheduler.action`,
+`run_id`, and `budget_allocation.trial_cap` without percentile re-ranking. The
+policy is deterministic and has no rollout prior. It initializes one early
+anchor after the seed set, defers while generation can preserve the hard
+challenger/later-bout reserve, initializes the best remaining challenger, then
+spends exactly two later bouts. A positive first later-bout gain continues the
+same candidate; zero gain switches to the other initialized candidate. Its
+receipt records the current phase, reserve, and admission cap under
+`scheduler.evidence_mode`. With `mixup24-turbo20-v1`, the full hard reserve is
+`2×24 + 10 + 10 = 68` objective calls.
 
 - **`run_id` is `null`** → no candidate is eligible this round (below
   `N_min`; the top tier is tuned and no continuation responded; every tuned
@@ -218,6 +236,10 @@ or the report yourself.
      `selfrank8-hebo10-hebo10` instead uses `selfrank`: the existing
      `llm_pool_self_rank` arm proposes POOL=5 and executes its own rank-1
      surviving config; deferred warm configs still occupy the first slots.
+     `mixup24-turbo20-v1` instead uses `mixup` for a 24-slot INITIAL bout:
+     official HEBO warmup first, then the LLM pool as `initial_suggest` seeds
+     for HEBO's evolutionary acquisition search. Deferred warm configs occupy
+     slots inside these 24 and their outcomes enter the live HEBO history.
    - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official
@@ -230,6 +252,12 @@ or the report yourself.
      `localtr8-hebo10-hebo10-v1` the DEEP bout is `hebo` instead — the same
      CONTINUE kernel — so a candidate with no movable continuous dimension
      still has a DEEP action there.
+   - Under `mixup24-turbo20-v1`, bout indexes 1 and 2 are both `turbo`, each
+     with 10 evaluations. Together they form one continuous hot-start TuRBO-1
+     trajectory: the second segment restores the first segment's trust-region
+     length, counters, seed, and proposal index while fitting on the complete
+     factual history. If the scheduler switches candidates after zero gain,
+     the other candidate starts its own TuRBO trajectory.
 2. The returned method's search script takes these **default trial-cap args, which
    you MAY override**:
    - `grid` → `--resolution 5 --max-trials 100 --patience 6`
@@ -240,6 +268,8 @@ or the report yourself.
    - `hebo` → `--n-evals 10` (prompt-v2 LLM pool + official HEBO MACE; no patience)
    - `local_tr` → `--n-evals 8` (FIRST-bout trust-region local search; no patience)
    - `selfrank` → `--n-evals 8` (FIRST-bout LLM pool self-rank; no patience)
+   - `mixup` → `--n-evals 24` (INITIAL LLM-seeded official HEBO; no patience)
+   - `turbo` → `--n-evals 10` (one stateful hot-start TuRBO segment; no patience)
 
    Clamp the chosen method's trial/eval cap (`--n-trials`/`--max-trials`) to
    `budget_allocation.trial_cap` from Phase S when the cap is smaller than the

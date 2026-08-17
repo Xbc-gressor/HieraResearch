@@ -118,7 +118,12 @@ def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
             )
         ),
         "per_candidate_cap": int(
-            tuner.get("deep_tune_per_candidate_cap", 40)
+            tuner.get(
+                "deep_tune_per_candidate_cap",
+                44
+                if tuner.get("inner_policy") == "mixup24-turbo20-v1"
+                else 40,
+            )
         ),
         # Phase-C wall clock removed: trials (patience/n_trials/caps above)
         # denominate the budget. Kept as null so receipt shape is stable.

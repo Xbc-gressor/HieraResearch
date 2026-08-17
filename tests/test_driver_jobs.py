@@ -118,6 +118,54 @@ def test_selfrank_job_uses_repo_root_pool_runner(tmp_path: Path) -> None:
     assert log.name == "_phase_c_selfrank.log"
 
 
+@pytest.mark.parametrize(
+    ("method", "trial_cap"),
+    [("mixup", 24), ("turbo", 10)],
+)
+def test_mixup_turbo_jobs_use_repo_root_adapter(
+    tmp_path: Path, method: str, trial_cap: int
+) -> None:
+    repo, ctx = _fixture(tmp_path)
+    (ctx.run_dir / "framework_cfg.json").write_text(
+        json.dumps(
+            {
+                "max_evaluations": 100,
+                "tuner": {
+                    "scheduler_policy": "anchor_challenger_v1",
+                    "inner_policy": "mixup24-turbo20-v1",
+                    "deep_tune_budget_fraction": None,
+                    "deep_tune_per_candidate_cap": 44,
+                },
+            }
+        )
+    )
+    request = {
+        "kind": "phase_c",
+        "run_id": "007",
+        "method": method,
+        "trial_cap": trial_cap,
+    }
+    with mock.patch(
+        "driver.jobs._phase_c_action",
+        return_value={
+            "action": "run",
+            "method": method,
+            "bout_trials": trial_cap,
+        },
+    ):
+        argv, log, _ = build_driver_job(
+            "tuner-orchestrator", ctx, request, repo_root=repo
+        )
+
+    assert argv[:3] == ["uv", "--project", str(repo)]
+    assert argv[4:6] == [
+        "python",
+        str(repo / f"tools/tuners/{method}_search.py"),
+    ]
+    assert argv[-2:] == ["--n-evals", str(trial_cap)]
+    assert log.name == f"_phase_c_{method}.log"
+
+
 def test_driver_job_handoff_waits_then_resumes_same_session(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     store = ReceiptStore(run_dir)
