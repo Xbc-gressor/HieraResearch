@@ -268,6 +268,7 @@ def test_happy_path_ten_evaluations(make_checkpoint, tmp_path):
         6: pytest.approx(30.0),
         8: pytest.approx(40.0),
         10: pytest.approx(50.0),
+        24: None,  # beyond this cell's budget horizon
     }
     assert result["auc"] == pytest.approx(30.0)  # mean of 10,10,...,50,50
     assert result["final_relative_improvement"] == pytest.approx(50.0)
@@ -578,6 +579,7 @@ def test_unsupported_before_first_proposal(make_checkpoint, tmp_path):
         6: None,
         8: None,
         10: None,
+        24: None,
     }
     assert result["auc"] is None
     assert result["beat_initial_incumbent"] is False

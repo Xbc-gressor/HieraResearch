@@ -1,4 +1,5 @@
-"""Pool-proposer driver shared by the four pool-rank arms (PLAN §6.4).
+"""Pool-proposer driver shared by the pool-rank arms (PLAN §6.4) and the
+mixup/alt HEBO arms (PLAN-inner-arms-mixup-alt §3/§4).
 
 One bout-scoped ``bench-pool-proposer`` session per cell; each step asks for
 POOL=5 unique configs + the proposer's self-ranking in ONE call. This module
@@ -52,22 +53,41 @@ POOL_PROTOCOL = (
 
 _EXECUTED = ("ok", "crash")
 
+# report_external_outcome tags (alt arm's BO steps, PLAN §4): each BO outcome
+# enters the LLM session with an explicit provenance label.
+EXTERNAL_OUTCOME_NOTES = {
+    "[hebo_probe]": "executed by the BO surrogate, not from your pool",
+    "[hebo_quasi]": "Sobol warmup point, not selected by the surrogate",
+}
+
 
 class PoolDriver:
-    """Per-cell proposer session driver. One instance per cell (in run())."""
+    """Per-cell proposer session driver. One instance per cell (in run()).
 
-    def __init__(self, ctx) -> None:
-        if not ctx.contract.varying_dimensions:
-            # Uniform across all four pool arms: nothing can move, so every
-            # pool would all-duplicate into ArmError — mark the cell
-            # unsupported instead, before any session exists (zero LLM cost).
-            raise arm_api.Unsupported("pool arm: no varying dimensions")
-        factory = ctx.extras.get("session_factory")
-        if factory is None:
-            raise arm_api.ArmError(
-                "pool arm requires ctx.extras['session_factory'] "
-                "(llm.make_bout_session_factory); the cell wiring provides it"
-            )
+    Keyword increments over the base pool protocol (all default to the
+    original behavior; PLAN §3/§4 arms use them):
+
+    - ``protocol``: replaces the POOL_PROTOCOL text slot of the first
+      message (mixup's seed semantics / alt's alternation semantics);
+    - ``first_trials`` / ``first_live_incumbent``: overrides forwarded to
+      ``llm.first_message_blocks`` so a session created mid-cell renders
+      the LIVE history (including this cell's own quasi/BO rows) and the
+      current incumbent instead of the frozen checkpoint snapshot;
+    - the budget block reports the live ``state.budget_remaining`` at
+      construction (equal to ``ctx.budget`` when the driver is built at
+      cell start, as the existing pool arms do).
+    """
+
+    def __init__(
+        self,
+        ctx,
+        *,
+        protocol: str | None = None,
+        first_trials=None,
+        first_live_incumbent=None,
+    ) -> None:
+        self.precheck(ctx)
+        factory = ctx.extras["session_factory"]
         self._ctx = ctx
         self._contract = ctx.contract
         self._session = factory(
@@ -75,13 +95,31 @@ class PoolDriver:
             first_extras=llm.first_message_blocks(
                 ctx.checkpoint,
                 ctx.contract,
-                protocol=POOL_PROTOCOL,
-                budget_remaining=ctx.budget,
+                protocol=protocol if protocol is not None else POOL_PROTOCOL,
+                budget_remaining=ctx.state.budget_remaining,
+                trials=first_trials,
+                live_incumbent=first_live_incumbent,
             ),
         )
         self.internal_duplicate_count = 0
         self._pending_messages: list[str] = []
         self._consecutive_failures = 0
+
+    @staticmethod
+    def precheck(ctx) -> None:
+        """The pool arms' zero-LLM-cost gates, before any session exists.
+
+        Uniform across the pool arms: nothing can move, so every pool would
+        all-duplicate into ArmError — mark the cell unsupported instead.
+        Arms that defer session creation (alt) call this at arm start.
+        """
+        if not ctx.contract.varying_dimensions:
+            raise arm_api.Unsupported("pool arm: no varying dimensions")
+        if ctx.extras.get("session_factory") is None:
+            raise arm_api.ArmError(
+                "pool arm requires ctx.extras['session_factory'] "
+                "(llm.make_bout_session_factory); the cell wiring provides it"
+            )
 
     def report_outcome(self, params: dict, feedback, *, incumbent_before: float) -> None:
         """Append the authoritative result of the EXECUTED config; it rides on
@@ -114,6 +152,59 @@ class PoolDriver:
                 "exists. Do not propose it again."
             )
         self._pending_messages.append(message)
+
+    def report_external_outcome(
+        self, params: dict, *, status: str, score, incumbent_before: float, tag: str
+    ) -> None:
+        """Append the outcome of a config executed OUTSIDE the pool (alt
+        arm's BO steps), with an explicit provenance tag; rides on the next
+        ask exactly like report_outcome (PLAN-inner-arms-mixup-alt §4:
+        the BO->LLM information channel).
+
+        ``tag`` is ``[hebo_probe]`` (surrogate-selected point) or
+        ``[hebo_quasi]`` (Sobol warmup point); the parenthetical explains
+        the provenance so the proposer never mistakes a probe for its own
+        executed pool member. ``params`` are the CAST params that ran."""
+        try:
+            note = EXTERNAL_OUTCOME_NOTES[tag]
+        except KeyError:
+            raise ValueError(f"unknown external outcome tag {tag!r}") from None
+        message = llm.outcome_message(
+            params,
+            status=status,
+            score=score,
+            incumbent_score=incumbent_before,
+            budget_remaining=self._ctx.state.budget_remaining,
+        )
+        self._pending_messages.append(f"{tag} ({note})\n{message}")
+
+    def report_external_rejection(
+        self, params: dict, *, stage: str, reason: str, tag: str
+    ) -> None:
+        """Append a tagged preflight rejection for an external proposal.
+
+        Unlike an objective outcome, a rejection has no score and consumes no
+        budget.  Keeping it on the same tagged channel is important for alt:
+        the proposer must be able to distinguish a rejected Sobol warmup point
+        from a rejected surrogate probe.
+        """
+        try:
+            note = EXTERNAL_OUTCOME_NOTES[tag]
+        except KeyError:
+            raise ValueError(f"unknown external outcome tag {tag!r}") from None
+        self._pending_messages.append(
+            f"{tag} ({note})\n"
+            f"config: {_compact(params)}\n"
+            f"result: REJECTED by the {stage} preflight ({reason}); no budget "
+            "was consumed and no score exists. Treat this as feasibility "
+            "evidence and do not propose it again."
+        )
+
+    def push_correction(self, message: str) -> None:
+        """Queue an arm-originated correction note on the next ask (e.g.
+        alt's rank-1-was-a-duplicate fallback), same channel as the
+        driver's own receipt corrections."""
+        self._pending_messages.append(f"correction: {message}")
 
     def ask_pool(self) -> dict:
         """Return {"pool": filtered configs in proposer rank order,

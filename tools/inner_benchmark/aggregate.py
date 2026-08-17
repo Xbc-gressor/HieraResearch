@@ -11,8 +11,9 @@ stratum from the frozen checkpoints, and builds the comparison report:
   candidates' raw difficulties are never averaged together (their
   relative improvements only ever meet as per-checkpoint summaries);
 - replicate spread: median across checkpoints of the across-seed range;
-- paired comparison: per (checkpoint, seed) metric delta vs the Current
-  baseline arm (only pairs where both cells exist);
+- paired comparison: per (checkpoint, seed) metric delta vs the baseline arm
+  (``--baseline-arm``, default ``current``; only pairs where both cells
+  exist);
 - attrition: status counts per arm (``ok`` / ``arm_error`` /
   ``unsupported``). Metric summaries skip cells whose metrics are absent
   (zero-evaluation cells carry ``auc: null``); the counts make the
@@ -43,12 +44,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import artifacts  # noqa: E402
 import checkpoint as checkpoint_mod  # noqa: E402
 
-BASELINE_ARM = "current"
+BASELINE_ARM = "current"  # default; --baseline-arm overrides
 
 # Trajectory metrics summarized everywhere; "@k" keys come from
 # result.json's relative_improvement_at (stringified int keys).
 TRAJECTORY_METRICS = ("auc", "final_relative_improvement")
-AT_KEYS = ("2", "4", "6", "8", "10")
+AT_KEYS = ("2", "4", "6", "8", "10", "24")
 COST_KEYS = ("llm_calls", "llm_input_tokens", "llm_output_tokens")
 
 
@@ -150,9 +151,13 @@ def _summary(values: list[float]) -> dict:
     }
 
 
-def summarize(cells: list[dict]) -> dict:
-    """Build the §九 report over cells carrying regime/stratum/strand."""
+def summarize(cells: list[dict], *, baseline_arm: str = BASELINE_ARM) -> dict:
+    """Build the §九 report over cells carrying regime/stratum/strand.
+
+    Paired deltas are computed against ``baseline_arm`` and reported under
+    ``paired_delta_vs_<baseline_arm>``."""
     metric_names = list(TRAJECTORY_METRICS) + [f"at_{k}" for k in AT_KEYS] + ["beat"]
+    paired_key = f"paired_delta_vs_{baseline_arm}"
 
     # per-cell rows (the report's audit surface)
     rows = []
@@ -169,6 +174,7 @@ def summarize(cells: list[dict]) -> dict:
                 "status": result.get("status"),
                 "evaluations": result.get("evaluations"),
                 "auc": result.get("auc"),
+                "final_best_score": result.get("final_best_score"),
                 "final_relative_improvement": result.get(
                     "final_relative_improvement"
                 ),
@@ -206,7 +212,7 @@ def summarize(cells: list[dict]) -> dict:
         eligible = supply[stratum] >= 3
         # Baseline pair index for this stratum: (checkpoint, seed) -> metrics.
         baseline_by_pair = {}
-        for cell in arms.get(BASELINE_ARM, {}).get("cells", []):
+        for cell in arms.get(baseline_arm, {}).get("cells", []):
             metrics = _cell_metrics(cell)
             if metrics is None:
                 continue
@@ -240,9 +246,22 @@ def summarize(cells: list[dict]) -> dict:
                         if values
                     },
                 }
+                # Raw scores are meaningful within one checkpoint only.  Keep
+                # E2's final-best primary result on the per-cell and
+                # per-checkpoint audit surfaces, but never pool it across
+                # candidates or compute direction-ambiguous paired deltas.
+                final_best_scores = [
+                    cell["result"].get("final_best_score")
+                    for cell, _ in entries
+                    if isinstance(cell["result"].get("final_best_score"), (int, float))
+                ]
+                if final_best_scores:
+                    summary_block["final_best_score"] = statistics.median(
+                        final_best_scores
+                    )
                 # Within-checkpoint paired comparison (same seed): always
                 # allowed, in every stratum (§九).
-                if arm != BASELINE_ARM:
+                if arm != baseline_arm:
                     deltas: dict = {name: [] for name in metric_names}
                     for cell, metrics in entries:
                         other = baseline_by_pair.get(
@@ -253,7 +272,7 @@ def summarize(cells: list[dict]) -> dict:
                         for name in metric_names:
                             if metrics[name] is not None and other[name] is not None:
                                 deltas[name].append(metrics[name] - other[name])
-                    summary_block["paired_delta_vs_current"] = {
+                    summary_block[paired_key] = {
                         name: _summary(values)
                         for name, values in deltas.items()
                         if values
@@ -282,7 +301,7 @@ def summarize(cells: list[dict]) -> dict:
                     ]
                     if spreads:
                         replicate_spread[name] = statistics.median(spreads)
-                if arm != BASELINE_ARM:
+                if arm != baseline_arm:
                     # Cross-checkpoint pooled paired comparison — only for an
                     # eligible stratum (PLAN §七 supply rule).
                     deltas = {name: [] for name in metric_names}
@@ -329,7 +348,7 @@ def summarize(cells: list[dict]) -> dict:
                 "per_checkpoint": checkpoint_summaries,
                 "across_checkpoints": across,
                 "replicate_spread": replicate_spread,
-                "paired_delta_vs_current": paired,
+                paired_key: paired,
                 "first_improvement_eval_median": (
                     statistics.median(first_improvements)
                     if first_improvements
@@ -351,10 +370,11 @@ def summarize(cells: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def render_markdown(report: dict) -> str:
+def render_markdown(report: dict, *, baseline_arm: str = BASELINE_ARM) -> str:
     """One table per stratum. Eligible strata (>= 3 checkpoints) get the arm
     ranking table; under-supplied strata get per-checkpoint rows only
     (PLAN §七). The JSON report remains the full audit surface."""
+    paired_key = f"paired_delta_vs_{baseline_arm}"
     lines = ["# Inner-tuner benchmark report", ""]
     for stratum, block in sorted(report["by_stratum"].items()):
         arms = block["arms"]
@@ -367,7 +387,7 @@ def render_markdown(report: dict) -> str:
             lines.append("")
             lines.append(
                 "| arm | checkpoint | seeds | median AUC | median final "
-                "| ΔAUC vs current (within-checkpoint, median/n) |"
+                f"| ΔAUC vs {baseline_arm} (within-checkpoint, median/n) |"
             )
             lines.append("|---|---|---|---|---|---|")
             for arm, bucket in sorted(arms.items()):
@@ -378,7 +398,7 @@ def render_markdown(report: dict) -> str:
                 for ckpt, summary in sorted(per_ckpt.items()):
                     auc = summary.get("auc")
                     final = summary.get("final_relative_improvement")
-                    paired = summary.get("paired_delta_vs_current", {}).get("auc")
+                    paired = summary.get(paired_key, {}).get("auc")
                     paired_text = (
                         "—"
                         if not paired
@@ -396,7 +416,7 @@ def render_markdown(report: dict) -> str:
         lines.append("")
         lines.append(
             "| arm | cells | statuses | median AUC | mean AUC | median final "
-            "| beat rate | paired ΔAUC vs current (median/mean, n) |"
+            f"| beat rate | paired ΔAUC vs {baseline_arm} (median/mean, n) |"
         )
         lines.append("|---|---|---|---|---|---|---|---|")
         for arm, bucket in sorted(arms.items()):
@@ -412,7 +432,7 @@ def render_markdown(report: dict) -> str:
                 value = block_.get(key)
                 return "—" if value is None else f"{value:.2f}"
 
-            paired = (bucket["paired_delta_vs_current"] or {}).get("auc")
+            paired = (bucket[paired_key] or {}).get("auc")
             paired_text = "—"
             if paired:
                 paired_text = (
@@ -453,6 +473,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", default=None, help="write the JSON report here")
     parser.add_argument("--md", default=None, help="write the markdown summary here")
+    parser.add_argument(
+        "--baseline-arm",
+        default=BASELINE_ARM,
+        help="arm the paired deltas are computed against (default: "
+        f"{BASELINE_ARM}; E1/E2 arm sets without `current` use their "
+        "reference arm, e.g. pool_hebo_mace)",
+    )
     return parser
 
 
@@ -460,12 +487,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cells = load_cells(args.cells)
     attach_checkpoint_info(cells, args.checkpoints)
-    report = summarize(cells)
+    report = summarize(cells, baseline_arm=args.baseline_arm)
     text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
     if args.md:
-        Path(args.md).write_text(render_markdown(report), encoding="utf-8")
+        Path(args.md).write_text(
+            render_markdown(report, baseline_arm=args.baseline_arm), encoding="utf-8"
+        )
     if not args.out and not args.md:
         print(text)
     return 0

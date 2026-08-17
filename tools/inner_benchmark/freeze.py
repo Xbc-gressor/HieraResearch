@@ -837,6 +837,15 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
         # into. llm.first_message_blocks renders it in the candidate block.
         "kind": _candidate_kind(candidate_dir, _ledger_records(run_dir)),
         "bouts_included": bouts,
+        # Factual provenance / sensitivity covariate (PLAN-inner-arms-mixup-alt
+        # §6): the production inner-tuner policy id whose FIRST/CONTINUE
+        # kernels produced the rows before this boundary. Null when the
+        # source run did not set one.
+        "tuner_inner_policy": (
+            tuner_cfg.get("inner_policy")
+            if isinstance((tuner_cfg := framework_cfg.get("tuner")), dict)
+            else None
+        ),
         "train_sha256": "sha256:" + hashlib.sha256(train_src.read_bytes()).hexdigest(),
     }
     if run_metadata is not None:

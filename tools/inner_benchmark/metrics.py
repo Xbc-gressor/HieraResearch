@@ -13,11 +13,13 @@ so positive values mean improvement. Crash outcomes never improve best-so-far
 Metric definitions (all evaluation indices are 1-based over objective
 evaluations only):
 
-- ``relative_improvement_at[k]`` for k in (2, 4, 6, 8, 10): best-so-far
+- ``relative_improvement_at[k]`` for k in (2, 4, 6, 8, 10, 24): best-so-far
   relative improvement after k evaluations. A cell that stopped before k
   evaluations reports the improvement it had reached when it stopped — its
   best-so-far curve is CONSTANT past that point (no further evaluation can
-  lower it), so this is the true value at k, not an imputation. None only
+  lower it), so this is the true value at k, not an imputation. k beyond the
+  cell's budget horizon reports None (a 10-eval cell has no eval-24 value);
+  for a 24-eval cell at_24 equals final_relative_improvement. None also
   when the cell ran zero evaluations. In result.json the int keys stringify
   ("2", "4", ...) — analysis code (Task 12) must parse them back to int.
 - ``auc``: mean of the best-so-far relative improvement over the FULL horizon
@@ -56,7 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from arm_api import AGGREGATE_ARM_STATE_KEYS  # noqa: E402
 
-IMPROVEMENT_AT = (2, 4, 6, 8, 10)
+IMPROVEMENT_AT = (2, 4, 6, 8, 10, 24)
 
 COUNT_KEYS = ("crashes", "invalid", "duplicates", "task_preflight_rejected")
 
