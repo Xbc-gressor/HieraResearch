@@ -139,6 +139,19 @@ class SchedulerStore:
                 and row.get("evidence_cursor") == evidence_cursor
             ):
                 return row
+        # STOP spends nothing, so it never gets an outcome row and never
+        # shows up above — but a terminal state re-queried with identical
+        # snapshot and cursor is the same decision, not a new one. Without
+        # this, every idle query against a finished run mints a fresh
+        # dec-#### STOP row.
+        for row in reversed(self.decisions()):
+            if (
+                row.get("kind") == "scheduler_decision"
+                and row.get("selected_action") == "STOP"
+                and row.get("state_snapshot_id") == snapshot_id
+                and row.get("evidence_cursor") == evidence_cursor
+            ):
+                return row
         return None
 
     def record_outcome(

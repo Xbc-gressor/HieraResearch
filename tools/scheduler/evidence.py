@@ -405,6 +405,7 @@ class ArrivalModel:
 def admitted_prefix(
     episode: ArrivalRecord,
     remaining_budget: int,
+    per_candidate_cost: int | None = None,
 ) -> list[tuple[float | None, int]]:
     """The ordered prefix of an episode the remaining budget admits (§5).
 
@@ -417,10 +418,17 @@ def admitted_prefix(
     slots, and the simulator has to charge that cost without gaining a
     candidate. Dropping it here would silently convert a wasted generation
     into a free one.
+
+    `per_candidate_cost` overrides the episode's recorded cost. A simulated
+    admission asks what this episode would cost to admit *now*, under the
+    run's own admission rule, so the rollout passes the contract's `k_eval`
+    — the same number `defer_available` divides by. Without the override an
+    episode recorded (or frozen into the prior) under a different `k_eval`
+    could admit nothing while DEFER still claimed to be available.
     """
     prefix: list[tuple[float | None, int]] = []
     budget = remaining_budget
-    cost = max(1, episode.per_candidate_cost)
+    cost = max(1, per_candidate_cost or episode.per_candidate_cost)
     for gap in episode.warm_gaps:
         if budget < cost:
             break

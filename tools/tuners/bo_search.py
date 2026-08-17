@@ -40,6 +40,7 @@ from _common import (  # noqa: E402
     load_candidate_modules,
     params_identity,
     prior_patience_state,
+    project_configs_into_space,
     read_deferred_configs,
     read_pending_proposals,
     read_prior_infeasible_trials,
@@ -465,11 +466,15 @@ def main() -> int:
     # them as the FIRST trials so BO evaluates them before TPE. They are EXTRA points
     # on top of the TPE budget (n_trials += n_deferred_enqueued), so deep-search depth
     # is unchanged — the saving was purely the evals skipped on un-promoted candidates.
-    # Deferred warm configs outside the (possibly clamped) box are skipped —
-    # never attempted, no budget, no patience effect; the clamp marked that
-    # region infeasible. The skip is accounted via deferred_skipped_outside_space.
-    deferred_in_space, deferred_outside = split_configs_by_space(
-        read_deferred_configs(args.tune_report_json), search_space
+    # Deferred warm configs outside the (possibly clamped) box are projected
+    # onto the bounds rather than skipped — the clamp moved the box after they
+    # were proposed, and dropping them all strips the bout of its warm signal.
+    # Only configs clamping cannot repair are dropped
+    # (deferred_skipped_outside_space); projections are counted separately.
+    deferred_in_space, n_deferred_projected, deferred_dropped = (
+        project_configs_into_space(
+            read_deferred_configs(args.tune_report_json), search_space
+        )
     )
     # Validated LLM re-warm proposals go ahead of even the deferred configs;
     # enqueue order is preserved, so they become the first WAITING trials.
@@ -551,7 +556,8 @@ def main() -> int:
         infeasible_priors_injected=n_infeasible_injected,
         infeasible_prior_rejections=len(infeasible_rejections),
         deferred_rejections=[],
-        deferred_skipped_outside_space=len(deferred_outside),
+        deferred_skipped_outside_space=len(deferred_dropped),
+        deferred_projected_into_space=n_deferred_projected,
         rewarm_proposals_enqueued=n_proposals_enqueued,
         rewarm_skipped_outside_space=len(proposals_outside),
     )
@@ -934,7 +940,8 @@ def main() -> int:
         "budget_exhausted": counters["budget_exhausted"],
         "prior_trials_injected": n_priors_injected,
         "infeasible_priors_injected": n_infeasible_injected,
-        "deferred_skipped_outside_space": len(deferred_outside),
+        "deferred_skipped_outside_space": len(deferred_dropped),
+        "deferred_projected_into_space": n_deferred_projected,
         "n_dims": n_dims,
         "patience": patience,
         "sampler": args.sampler,

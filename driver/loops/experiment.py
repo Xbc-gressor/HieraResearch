@@ -76,6 +76,31 @@ def _tune_flag(run_dir: Path, run_id: str) -> bool:
     return False
 
 
+def _scheduler_stopped(run_dir: Path) -> bool:
+    """True when the v3.2 scheduler's latest decision is a terminal STOP.
+
+    STOP is absorbing: it requires both no affordable bout and no budget
+    for another generation round, and the remaining budget only shrinks.
+    Waiting for two zero-progress rounds after that only spends more role
+    sessions confirming a state the scheduler has already declared final.
+    Legacy runs have no `.scheduler/` store, so this reads as False there.
+    """
+    path = run_dir / ".scheduler" / "decisions.jsonl"
+    if not path.is_file():
+        return False
+    last = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("kind") == "scheduler_decision":
+            last = row
+    return bool(last) and last.get("selected_action") == "STOP"
+
+
 def _invoke(runner, store, role_name, task, tag, run_dir, *,
             run_id=None, round_no=None, extra=None, resume_from=None) -> dict:
     """Invoke one role and return its persisted receipt plus invocation id."""
@@ -860,6 +885,11 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                                       round_no, repo_root, cmd, events,
                                       job_runner)
                 tuner_progressed = bool(tuner_receipt.get("tuned"))
+                if not tuner_progressed and _scheduler_stopped(run_dir):
+                    events.emit("quiescent", round_no=round_no,
+                                reason="scheduler terminal STOP")
+                    _complete_run(run_dir, repo_root, cmd, events)
+                    break
 
             # -----------------------------------------------------------------
             # Completion guard: stop if no operation can spend the budget.

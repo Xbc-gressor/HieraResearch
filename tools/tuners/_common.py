@@ -1419,14 +1419,72 @@ def params_within_search_space(params: dict, search_space: dict) -> bool:
 def split_configs_by_space(configs: list[dict], search_space: dict) -> tuple[list[dict], list[dict]]:
     """Partition param dicts into (inside, outside) the search space.
 
-    Used for deferred warm configs after a space clamp: outside configs are
+    Used for LLM re-warm proposals after a space clamp: outside proposals are
     skipped (never attempted, no budget, no patience effect — the clamp marked
-    that region infeasible) and must be accounted for via the tuners'
-    deferred_skipped_outside_space receipts.
+    that region infeasible) and accounted via rewarm_skipped_outside_space.
+    Deferred warm configs use `project_configs_into_space` instead: they are
+    the bout's entire warm signal, so they get clamped onto the box rather
+    than dropped.
     """
     inside = [p for p in configs if params_within_search_space(p, search_space)]
     outside = [p for p in configs if not params_within_search_space(p, search_space)]
     return inside, outside
+
+
+def _project_config_into_space(params: dict, search_space: dict) -> dict | None:
+    """Clamp one config's numeric values onto the space bounds.
+
+    Returns the projected copy, or None when clamping alone cannot make the
+    config feasible (missing space key, malformed numeric, or a categorical
+    value the space does not offer).
+    """
+    projected = dict(params)
+    for key, entry in search_space.items():
+        if key not in projected:
+            return None
+        kind = entry[0]
+        value = projected[key]
+        if kind in ("int", "float"):
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                return None
+            lo, hi = float(entry[1]), float(entry[2])
+            v = min(max(v, lo), hi)
+            projected[key] = int(round(v)) if kind == "int" else v
+        elif kind == "categorical" and value not in entry[1]:
+            return None
+    return projected
+
+
+def project_configs_into_space(
+    configs: list[dict], search_space: dict
+) -> tuple[list[dict], int, list[dict]]:
+    """Make deferred warm configs executable inside a (possibly clamped) box.
+
+    In-space configs pass through unchanged. Out-of-space configs are
+    projected onto the bounds instead of skipped: the clamp moved the box
+    *after* these configs were proposed, and dropping them silently strips a
+    FIRST bout of its whole deferred-warm queue, degrading it to pure random
+    sampling (observed: a device_batch_size clamp voided all deferred configs
+    at once). Only configs clamping cannot repair are dropped.
+
+    Returns (executable configs in original order, n_projected, dropped).
+    """
+    executable: list[dict] = []
+    dropped: list[dict] = []
+    n_projected = 0
+    for params in configs:
+        if params_within_search_space(params, search_space):
+            executable.append(params)
+            continue
+        projected = _project_config_into_space(params, search_space)
+        if projected is None:
+            dropped.append(params)
+        else:
+            executable.append(projected)
+            n_projected += 1
+    return executable, n_projected, dropped
 
 
 def clamp_search_space_to_preflight(

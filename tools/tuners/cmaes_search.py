@@ -51,6 +51,7 @@ from _common import (  # noqa: E402
     params_identity,
     params_within_search_space,
     prior_patience_state,
+    project_configs_into_space,
     read_deferred_configs,
     read_pending_proposals,
     read_prior_infeasible_trials,
@@ -277,8 +278,12 @@ def main() -> int:
     if rejected_prior is not None:
         seed_params = base_params
 
-    deferred_in_space, deferred_outside = split_configs_by_space(
-        read_deferred_configs(args.tune_report_json), search_space
+    # Deferred warm configs the clamp pushed outside the box are projected
+    # onto the bounds rather than skipped; only unrepairable ones are dropped.
+    deferred_in_space, n_deferred_projected, deferred_dropped = (
+        project_configs_into_space(
+            read_deferred_configs(args.tune_report_json), search_space
+        )
     )
     attempted_identities = attempted_config_identities(
         args.tune_report_json,
@@ -378,7 +383,8 @@ def main() -> int:
                 trials_attempted=0,
                 prior_trials_seen=len(prior_trials),
                 rejected_priors=rejected_priors,
-                deferred_skipped_outside_space=len(deferred_outside),
+                deferred_skipped_outside_space=len(deferred_dropped),
+                deferred_projected_into_space=n_deferred_projected,
                 deferred_skipped_already_seen=deferred_skipped_seen,
             )
             write_json(
@@ -393,7 +399,8 @@ def main() -> int:
                     "trials_attempted": 0,
                     "preflight_rejections": 0,
                     "budget_exhausted": False,
-                    "deferred_skipped_outside_space": len(deferred_outside),
+                    "deferred_skipped_outside_space": len(deferred_dropped),
+                    "deferred_projected_into_space": n_deferred_projected,
                     "deferred_skipped_already_seen": deferred_skipped_seen,
                     "prior_trials_seen": len(prior_trials),
                     "x0_from_prior": True,
@@ -421,7 +428,8 @@ def main() -> int:
             fixed_search_space=True,
             prior_trials_seen=len(prior_trials),
             rejected_priors=rejected_priors,
-            deferred_skipped_outside_space=len(deferred_outside),
+            deferred_skipped_outside_space=len(deferred_dropped),
+            deferred_projected_into_space=n_deferred_projected,
             deferred_skipped_already_seen=deferred_skipped_seen,
         )
         write_json(
@@ -877,7 +885,8 @@ def main() -> int:
         "duplicates_skipped": duplicates_skipped,
         "duplicate_scores_reused": duplicate_scores_reused,
         "budget_exhausted": budget_exhausted,
-        "deferred_skipped_outside_space": len(deferred_outside),
+        "deferred_skipped_outside_space": len(deferred_dropped),
+        "deferred_projected_into_space": n_deferred_projected,
         "deferred_skipped_already_seen": deferred_skipped_seen,
         "prior_trials_seen": len(prior_trials),
         "x0_from_prior": best_prior is not None,

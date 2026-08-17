@@ -260,9 +260,11 @@ or the report yourself.
    `trials_completed`; every deferred call contributes to `trials_attempted`.
    Before searching, each tuner may clamp the numeric search space to the
    preflight-feasible region (`tune_report.json` → `search_space_clamp`);
-   deferred configs outside the clamped box are skipped — never attempted, no
-   budget, no patience effect — and accounted via
-   `deferred_skipped_outside_space` in the stage receipt):
+   deferred configs outside the clamped box are projected onto the box bounds
+   rather than skipped (counted via `deferred_projected_into_space`); only
+   configs clamping cannot repair are dropped — never attempted, no budget, no
+   patience effect — and accounted via `deferred_skipped_outside_space` in the
+   stage receipt):
    Do not invoke a search script with Bash, `nohup`, or a background task.
    Submit an intermediate receipt and let the deterministic driver own the
    process:

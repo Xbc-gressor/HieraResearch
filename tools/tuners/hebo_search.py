@@ -64,13 +64,13 @@ from _common import (  # noqa: E402
     is_config_infeasible_error,
     is_finite_score,
     params_identity,
+    project_configs_into_space,
     read_deferred_configs,
     read_prior_trials,
     read_runtime_limit,
     read_tune_report,
     search_space_for_json,
     set_stage_meta,
-    split_configs_by_space,
     timed_eval,
     timed_preflight,
     write_json,
@@ -456,6 +456,7 @@ def main() -> int:
         "consecutive_rejects": 0,
         "deferred_evaluated": 0,
         "deferred_skipped_outside_space": 0,
+        "deferred_projected_into_space": 0,
         "deferred_skipped_already_seen": 0,
     }
     failure_refs: list[str] = []
@@ -613,10 +614,13 @@ def main() -> int:
             METHOD == "selfrank"
             and inner_policy.regime_for_bout_index(bout_index) == inner_policy.FIRST
         ):
-            deferred_in_space, deferred_outside = split_configs_by_space(
-                read_deferred_configs(args.tune_report_json), search_space
+            deferred_in_space, n_deferred_projected, deferred_dropped = (
+                project_configs_into_space(
+                    read_deferred_configs(args.tune_report_json), search_space
+                )
             )
-            counters["deferred_skipped_outside_space"] = len(deferred_outside)
+            counters["deferred_skipped_outside_space"] = len(deferred_dropped)
+            counters["deferred_projected_into_space"] = n_deferred_projected
             seen = attempted_config_identities(args.tune_report_json, search_space)
             for raw in deferred_in_space:
                 if cell_state.budget_remaining <= 0:
@@ -807,6 +811,9 @@ def main() -> int:
         "deferred_evaluated": counters["deferred_evaluated"],
         "deferred_skipped_outside_space": counters[
             "deferred_skipped_outside_space"
+        ],
+        "deferred_projected_into_space": counters[
+            "deferred_projected_into_space"
         ],
         "deferred_skipped_already_seen": counters[
             "deferred_skipped_already_seen"

@@ -49,6 +49,7 @@ from _common import (  # noqa: E402
     is_config_infeasible_error,
     load_candidate_modules,
     prior_patience_state,
+    project_configs_into_space,
     read_deferred_configs,
     read_pending_proposals,
     search_space_for_json,
@@ -158,12 +159,15 @@ def main() -> int:
     # sweep. They count as normal trials: for grid, proposals, deferred and
     # grid points alike draw down the same --max-trials objective-attempt
     # budget (the orchestrator clamps it to the bout's trial_cap), so up-front
-    # configs displace sweep points. Configs outside the (possibly
-    # clamped) box are skipped — never attempted, no budget, no patience
-    # effect — and accounted via rewarm_skipped_outside_space /
+    # configs displace sweep points. Proposals outside the (possibly clamped)
+    # box are skipped and accounted via rewarm_skipped_outside_space; deferred
+    # configs are projected onto the box instead — dropping them all would
+    # strip the bout of its warm signal — with unrepairable ones accounted via
     # deferred_skipped_outside_space.
-    deferred_in_space, deferred_outside = split_configs_by_space(
-        read_deferred_configs(args.tune_report_json), search_space
+    deferred_in_space, n_deferred_projected, deferred_dropped = (
+        project_configs_into_space(
+            read_deferred_configs(args.tune_report_json), search_space
+        )
     )
     attempted_identities = attempted_config_identities(
         args.tune_report_json,
@@ -211,7 +215,8 @@ def main() -> int:
                    rewarm_proposals_enqueued=len(proposals),
                    rewarm_skipped_outside_space=len(proposals_outside),
                    rewarm_skipped_already_seen=proposals_skipped_seen,
-                   deferred_skipped_outside_space=len(deferred_outside),
+                   deferred_skipped_outside_space=len(deferred_dropped),
+                   deferred_projected_into_space=n_deferred_projected,
                    deferred_skipped_already_seen=deferred_skipped_seen,
                    grid_skipped_already_seen=grid_skipped_seen)
 
@@ -424,7 +429,8 @@ def main() -> int:
         "trials_attempted": trials_attempted,
         "preflight_rejections": preflight_rejections,
         "budget_exhausted": budget_exhausted,
-        "deferred_skipped_outside_space": len(deferred_outside),
+        "deferred_skipped_outside_space": len(deferred_dropped),
+        "deferred_projected_into_space": n_deferred_projected,
         "deferred_skipped_already_seen": deferred_skipped_seen,
         "grid_skipped_already_seen": grid_skipped_seen,
         "trials_planned": total,

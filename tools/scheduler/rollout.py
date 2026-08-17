@@ -164,7 +164,13 @@ def _next_round_generation(
     if not arrival.supported():
         return state
     episode = arrival.sample(clock.arrival())
-    prefix = admitted_prefix(episode, state.remaining_budget)
+    # Charge admission at the contract's k_eval — the same predicate
+    # defer_available divides by — not the episode's recorded cost, so the
+    # simulated DEFER admits at least one arrival exactly when the action
+    # set said DEFER was available.
+    prefix = admitted_prefix(
+        episode, state.remaining_budget, per_candidate_cost=state.contract.k_eval
+    )
     if not prefix:
         return state
     # Every gap in one episode is anchored to the SAME pre-episode global
@@ -254,12 +260,12 @@ def _simulate(
         state = _next_round_generation(state, scenario_id, counter, clock, arrival)
         if kind == "DEFER" and state is before:
             # A DEFER round that admitted no arrival changed nothing at
-            # all. `defer_available` is a mechanical budget predicate, so
-            # it can still be true here — the episode's own per-candidate
-            # cost may exceed what is left, or arrival may be unsupported.
-            # Without this the scenario would spin to `max_steps` and
-            # report the same terminal best, which is a silent stall rather
-            # than an answer.
+            # all. Admission is charged at the contract's k_eval, the same
+            # predicate `defer_available` uses, so with a supported arrival
+            # model this cannot happen; it remains reachable only when
+            # arrival is unsupported. Without the backstop the scenario
+            # would spin to `max_steps` and report the same terminal best —
+            # a silent stall rather than an answer.
             break
         if state.terminal():
             break
