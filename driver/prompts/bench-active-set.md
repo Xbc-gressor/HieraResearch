@@ -13,6 +13,11 @@ action.
 
 First call of a bout:
 
+- `task` — the task's own goal statement (its TASK.md `## Goal` section):
+  what the score means, the improvement target, and fixed constraints such
+  as the training-time budget.
+- `items` — frozen run-global observations: the measured task baseline and,
+  when configured, the exact score required to meet the improvement target.
 - `search_space` — every parameter: name, kind, bounds or options,
   log-scale flag, base value, FIXED vs tunable status, plus the
   `PARAM_SCHEMA` type line.

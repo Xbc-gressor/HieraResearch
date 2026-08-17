@@ -61,6 +61,7 @@ def write_cell(
         "status": status,
         "evaluations": evaluations,
         "auc": auc,
+        "final_best_score": None if auc is None else 100.0 - final,
         "final_relative_improvement": final,
         "relative_improvement_at": {"2": final, "4": final},
         "beat_initial_incumbent": beat,
@@ -130,6 +131,11 @@ def test_eligible_stratum_cross_checkpoint_stats(corpus) -> None:
     tpe = first["arms"]["pool_tpe"]
     # per-checkpoint medians over seeds first
     assert tpe["per_checkpoint"]["A"]["auc"] == 15.0
+    assert tpe["per_checkpoint"]["A"]["final_best_score"] == 83.0
+    # Raw final scores stay auditable per cell/checkpoint and are never
+    # pooled across unlike candidates.
+    assert report["cells"][0].get("final_best_score") is not None
+    assert "final_best_score" not in tpe["across_checkpoints"]
     # across checkpoints: medians A=15, C=21, D=33 -> median 21, mean 23
     assert tpe["across_checkpoints"]["auc"]["median"] == 21.0
     assert tpe["across_checkpoints"]["auc"]["mean"] == pytest.approx(23.0)

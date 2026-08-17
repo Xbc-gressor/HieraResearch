@@ -195,7 +195,23 @@ def make_run(tmp_path, *, report, base_params, candidate_id="007", records=None)
         records = [
             {"run_id": candidate_id, "op": "improve", "candidate_name": "toy-op"}
         ]
-    (run_dir / "ledger.json").write_text(json.dumps({"records": records}))
+    (run_dir / "ledger.json").write_text(json.dumps({
+        "records": records,
+        "items": {
+            "task_baseline": {
+                "schema_version": 1,
+                "kind": "observed_metric",
+                "metric": "val_bpb",
+                "value": 1.2,
+                "direction": "minimize",
+                "source": {
+                    "role": "task_provided_baseline",
+                    "run_id": "000",
+                    "stage": "screening",
+                },
+            }
+        },
+    }))
     return run_dir
 
 
@@ -284,6 +300,8 @@ def test_create_first_regime(two_bout_run, tmp_path):
     assert ckpt.task.per_runtime_limit == 60
     # The environment-partition pin: task.toml's own [env].project.
     assert ckpt.task.project == "tasks/autoresearch-baseline"
+    assert ckpt.task.relative_improvement_over_baseline == pytest.approx(0.075)
+    assert ckpt.items["task_baseline"]["value"] == pytest.approx(1.2)
     # Candidate dir holds train.py + prepare.py ONLY.
     assert sorted(p.name for p in (out / "candidate").iterdir()) == [
         "prepare.py",

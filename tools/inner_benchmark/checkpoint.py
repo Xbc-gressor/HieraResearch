@@ -25,7 +25,9 @@ Schema (required unless noted)::
       "task": {"score_fn": "evaluate_config",
                "preflight_fn": "preflight_config",
                "per_runtime_limit": 900,                   # number or null
-               "project": "tasks/<task>"},                 # optional; see below
+               "project": "tasks/<task>",                  # optional; see below
+               "relative_improvement_over_baseline": 0.075}, # optional
+      "items": {"task_baseline": {"...": "frozen run item"}},
       "incumbent": {"params": {...}, "score": 1.23},
       "incumbent_is_inherited_control": false,
       "history": [{"params": {...}, "score": 1.23 | null,
@@ -81,6 +83,7 @@ class TaskSpec:
     preflight_fn: str
     per_runtime_limit: float | None
     project: str | None = None
+    relative_improvement_over_baseline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,7 @@ class Checkpoint:
     task: TaskSpec
     incumbent: Incumbent
     incumbent_is_inherited_control: bool
+    items: dict = field(default_factory=dict)
     history: tuple[HistoryRow, ...] = ()
     deferred_configs: tuple[dict, ...] = ()  # params dicts; Current arm only
     extra: dict = field(default_factory=dict)
@@ -205,6 +209,21 @@ def load_checkpoint(checkpoint_dir) -> Checkpoint:
             f"{path}: incumbent_is_inherited_control must be a boolean"
         )
 
+    items = data.get("items", {})
+    if not isinstance(items, dict):
+        raise ValueError(f"{path}: items must be an object")
+    baseline = items.get("task_baseline")
+    if baseline is not None:
+        if not isinstance(baseline, dict):
+            raise ValueError(f"{path}: items.task_baseline must be an object")
+        if baseline.get("kind") != "observed_metric":
+            raise ValueError(
+                f"{path}: items.task_baseline.kind must be 'observed_metric'"
+            )
+        _finite_number(
+            baseline.get("value"), f"{path}: items.task_baseline.value"
+        )
+
     history_raw = _require(data, "history")
     if not isinstance(history_raw, list):
         raise ValueError(f"{path}: history must be a list")
@@ -236,6 +255,7 @@ def load_checkpoint(checkpoint_dir) -> Checkpoint:
         task=task,
         incumbent=incumbent,
         incumbent_is_inherited_control=inherited,
+        items=dict(items),
         history=history,
         deferred_configs=tuple(deferred),
         extra=extra,
@@ -273,11 +293,21 @@ def _task_spec(path: Path, raw) -> TaskSpec:
     project = raw.get("project")
     if project is not None and (not isinstance(project, str) or not project):
         raise ValueError(f"{path}: task.project must be a non-empty string or null")
+    target = raw.get("relative_improvement_over_baseline")
+    if target is not None:
+        target = _finite_number(
+            target, f"{path}: task.relative_improvement_over_baseline"
+        )
+        if not 0 <= target < 1:
+            raise ValueError(
+                f"{path}: task.relative_improvement_over_baseline must be in [0, 1)"
+            )
     return TaskSpec(
         score_fn=score_fn,
         preflight_fn=preflight_fn,
         per_runtime_limit=limit,
         project=project,
+        relative_improvement_over_baseline=target,
     )
 
 

@@ -38,6 +38,9 @@ resource_probe_fn = "resource_probe_config"
 metric = "val_bpb"
 required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
 
+[goal]
+relative_improvement_over_baseline = 0.075
+
 [constraints]
 editable_files = ["train.py"]
 readonly_files = ["prepare.py"]

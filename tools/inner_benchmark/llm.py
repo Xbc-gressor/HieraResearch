@@ -33,7 +33,7 @@ SDK-free.
 Extras-key contract (invocation context ``extra`` values are strings):
 
 - First call of a bout: the keys produced by ``first_message_blocks`` —
-  ``search_space``, ``candidate``, ``incumbent``, ``history``,
+  ``task``, ``items``, ``search_space``, ``candidate``, ``incumbent``, ``history``,
   ``protocol``, ``budget``, plus ``evidence`` when provided.
 - Later calls: arm-specific incremental blocks. Standardized keys:
   ``outcome`` (``outcome_message`` after each evaluation) and
@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -90,8 +91,9 @@ if TYPE_CHECKING:  # annotations only; keeps runtime imports stdlib-only
 EVENTS_FILENAME = "driver_events.jsonl"
 
 # Standardized extras keys (see module docstring).
-BLOCK_KEYS = ("search_space", "candidate", "incumbent", "history",
+BLOCK_KEYS = ("task", "items", "search_space", "candidate", "incumbent", "history",
               "protocol", "budget")
+TASK_KEY = "task"
 EVIDENCE_KEY = "evidence"
 OUTCOME_KEY = "outcome"
 FEASIBLE_SET_KEY = "feasible_set"
@@ -503,6 +505,80 @@ def format_history(
     return "\n".join(lines)
 
 
+def _markdown_section(path: Path, heading: str) -> str | None:
+    """Body of ``## <heading>`` up to the next ``## `` heading; None when the
+    file or the section is missing."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    marker = f"## {heading}"
+    start = next(
+        (i for i, line in enumerate(lines) if line.strip() == marker), None
+    )
+    if start is None:
+        return None
+    body = []
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    return "\n".join(body).strip() or None
+
+
+def _toml_description(path: Path) -> str | None:
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    description = data.get("description")
+    if isinstance(description, str) and description.strip():
+        return description.strip()
+    return None
+
+
+def _task_card(project: str | None) -> str:
+    """The one prose channel in the tuning context: the task's own
+    ``## Goal`` section from ``tasks/<task>/TASK.md`` — what the score means,
+    the improvement target, and fixed constraints such as the training-time
+    budget. Verbatim from the task package so it cannot drift from what the
+    generation layer reads. Falls back to the task.toml one-line
+    description, then to an honest placeholder."""
+    name = project.rsplit("/", 1)[-1] if project else ""
+    header = f"task: {name or 'unknown'}"
+    if name:
+        goal = _markdown_section(_REPO_ROOT / "tasks" / name / "TASK.md", "Goal")
+        if goal:
+            return f"{header} — the task's own goal statement:\n{goal}"
+        description = _toml_description(_REPO_ROOT / "tasks" / name / "task.toml")
+        if description:
+            return f"{header} — task.toml description: {description}"
+    return f"{header} (no TASK.md goal statement available)"
+
+
+def _experiment_items(checkpoint: "_checkpoint.Checkpoint") -> str:
+    baseline = checkpoint.items.get("task_baseline")
+    if not isinstance(baseline, dict):
+        return "task_baseline: unavailable"
+    metric = baseline.get("metric", "score")
+    value = float(baseline["value"])
+    lines = [
+        "Frozen run-global observations (read-only):",
+        f"task_baseline.metric: {metric}",
+        f"task_baseline.value: {value}",
+        f"task_baseline.direction: {baseline.get('direction', 'minimize')}",
+    ]
+    relative = checkpoint.task.relative_improvement_over_baseline
+    if relative is not None:
+        target = value * (1.0 - relative)
+        lines.extend([
+            f"required_relative_improvement: {relative}",
+            f"required_target_score: {target}",
+        ])
+    return "\n".join(lines)
+
+
 def first_message_blocks(
     checkpoint: "_checkpoint.Checkpoint",
     contract: "_space.CandidateContract",
@@ -516,7 +592,9 @@ def first_message_blocks(
 ) -> dict:
     """Assemble the §四 first-call checklist as invocation extras (str values).
 
-    Keys: search_space (+ parameter semantics via PARAM_SCHEMA), candidate
+    Keys: task (the task's own ``## Goal`` statement — the one prose
+    channel), items (frozen run-global observations and derived target),
+    search_space (+ parameter semantics via PARAM_SCHEMA), candidate
     (kind fresh/improve/crossover/provided-baseline when known, regime/
     stratum, inherited-control flag), incumbent (params + score), history
     (executed trials; defaults to the checkpoint's history), protocol (the
@@ -563,6 +641,8 @@ def first_message_blocks(
         f"score: {incumbent_score}",
     ])
     blocks = {
+        "task": _task_card(checkpoint.task.project),
+        "items": _experiment_items(checkpoint),
         "search_space": format_search_space(contract),
         "candidate": candidate,
         "incumbent": incumbent,
@@ -630,6 +710,7 @@ __all__ = [
     "FEASIBLE_SET_KEY",
     "LLMConfig",
     "OUTCOME_KEY",
+    "TASK_KEY",
     "WORKING_COPY_KEY",
     "detect_sdk_version",
     "first_message_blocks",

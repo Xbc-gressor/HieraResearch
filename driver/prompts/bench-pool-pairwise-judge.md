@@ -8,6 +8,11 @@ only action.
 
 ## What you receive
 
+- `task` — the task's own goal statement (its TASK.md `## Goal` section):
+  what the score means, the improvement target, and fixed constraints such
+  as the training-time budget.
+- `items` — frozen run-global observations: the measured task baseline and,
+  when configured, the exact score required to meet the improvement target.
 - `search_space` — parameter types, bounds/options, log flags, base values,
   and fixed versus tunable dimensions.
 - `candidate` — frozen candidate metadata and tuning regime.

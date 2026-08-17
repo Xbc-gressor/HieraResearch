@@ -11,6 +11,11 @@ Read and Edit, plus the receipt tool.
 
 - `working_copy` — absolute path of the file you may Read and Edit. Never
   touch any other file.
+- `task` — the task's own goal statement (its TASK.md `## Goal` section):
+  what the score means, the improvement target, and fixed constraints such
+  as the training-time budget.
+- `items` — frozen run-global observations: the measured task baseline and,
+  when configured, the exact score required to meet the improvement target.
 - `search_space` — every parameter: name, kind (int / float / categorical),
   bounds or options, log-scale flag, base value, and FIXED vs tunable
   status. The `PARAM_SCHEMA` line declares each parameter's type.

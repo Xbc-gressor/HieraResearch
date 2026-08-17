@@ -77,7 +77,7 @@ def _tune_flag(run_dir: Path, run_id: str) -> bool:
 
 
 def _scheduler_stopped(run_dir: Path) -> bool:
-    """True when the v3.2 scheduler's latest decision is a terminal STOP.
+    """True when a stored scheduler's latest decision is a terminal STOP.
 
     STOP is absorbing: it requires both no affordable bout and no budget
     for another generation round, and the remaining budget only shrinks.
@@ -660,6 +660,7 @@ def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
          "--semantic-point", semantic / "point.json",
          "--policy-receipt", semantic / "policy.json",
          "--candidate-name-hint", "provided_baseline",
+         "--role", "task_provided_baseline",
          "--route-provenance", route_provenance,
          "--description", f"Task-provided baseline: {entrypoint}"], repo_root)
     cmd(["python", "tools/new_candidate.py", task, tag, "000",

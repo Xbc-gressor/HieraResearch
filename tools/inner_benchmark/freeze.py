@@ -231,12 +231,45 @@ def _task_block(run_dir: Path, framework_cfg: dict) -> dict:
             f"framework_cfg per_runtime_limit must be a finite number or null, "
             f"got {limit!r}"
         )
+    relative_target = task_toml.get("goal", {}).get(
+        "relative_improvement_over_baseline"
+    )
+    if relative_target is not None:
+        if (
+            isinstance(relative_target, bool)
+            or not tune_tools._is_finite_score(relative_target)
+            or not 0 <= float(relative_target) < 1
+        ):
+            raise ValueError(
+                f"{toml_path}: [goal].relative_improvement_over_baseline "
+                "must be a finite number in [0, 1)"
+            )
     return {
         "score_fn": score_fn,
         "preflight_fn": preflight_fn,
         "per_runtime_limit": float(limit) if limit is not None else None,
         "project": project,
+        "relative_improvement_over_baseline": (
+            float(relative_target) if relative_target is not None else None
+        ),
     }
+
+
+def _run_items(run_dir: Path, task: dict) -> dict:
+    """Freeze run-global observations needed by benchmark policies."""
+    ledger = _load_json_object(Path(run_dir) / "ledger.json", "ledger.json")
+    items = ledger.get("items")
+    if not isinstance(items, dict):
+        raise ValueError("ledger.json: items must be an object")
+    baseline = items.get("task_baseline")
+    if task.get("relative_improvement_over_baseline") is not None and not isinstance(
+        baseline, dict
+    ):
+        raise ValueError(
+            "ledger.json: configured baseline-relative goal requires "
+            "items.task_baseline"
+        )
+    return {"task_baseline": dict(baseline)} if isinstance(baseline, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +884,7 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
     if run_metadata is not None:
         source["run_metadata"] = run_metadata
 
+    task_block = _task_block(run_dir, framework_cfg)
     checkpoint = {
         "schema_version": SCHEMA_VERSION,
         "checkpoint_id": f"{run_dir.name}-{candidate_id}-b{bouts}",
@@ -858,7 +892,8 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
         "stratum": stratum,
         "source": source,
         "candidate_relpath": "candidate",
-        "task": _task_block(run_dir, framework_cfg),
+        "task": task_block,
+        "items": _run_items(run_dir, task_block),
         "incumbent": {
             "params": dict(incumbent_row["params"]),
             "score": float(incumbent_row["score"]),

@@ -86,12 +86,21 @@ def make_checkpoint(tmp_path: Path, source=None) -> checkpoint_mod.Checkpoint:
         candidate_path=tmp_path / "candidate" / "train.py",
         task=checkpoint_mod.TaskSpec(score_fn="evaluate_config",
                                      preflight_fn="preflight_config",
-                                     per_runtime_limit=None),
+                                     per_runtime_limit=None,
+                                     relative_improvement_over_baseline=0.075),
         incumbent=checkpoint_mod.Incumbent(
             params={"depth": 4, "lr": 0.001, "mode": "fast", "seed": 7},
             score=3.0,
         ),
         incumbent_is_inherited_control=False,
+        items={
+            "task_baseline": {
+                "kind": "observed_metric",
+                "metric": "val_bpb",
+                "value": 4.0,
+                "direction": "minimize",
+            }
+        },
         history=(
             checkpoint_mod.HistoryRow(
                 params={"depth": 2, "lr": 0.01, "mode": "fast", "seed": 7},
@@ -447,6 +456,9 @@ def test_first_message_blocks_cover_the_checklist(tmp_path) -> None:
         protocol="POLL PROTOCOL TEXT", budget_remaining=7)
     assert set(blocks) == set(llm.BLOCK_KEYS)
     assert llm.EVIDENCE_KEY not in blocks
+
+    assert "task_baseline.value: 4.0" in blocks["items"]
+    assert "required_target_score: 3.7" in blocks["items"]
 
     search_space = blocks["search_space"]
     assert "lower-is-better" in search_space

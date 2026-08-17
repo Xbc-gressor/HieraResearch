@@ -19,6 +19,7 @@ Shape:
       "task": "tabular-model-search",
       "tag": "agent-main-smoke",
       "metric": "mean_test_accuracy",
+      "items": {"task_baseline": {...}}, # immutable run-global observations
       "direct_comparator_capability": { ... },  # explicit unavailable runtime gate
       "search_space": { ... },           # exact catalog + background revision
       "search_space_state": { ... },     # append-only P2 runtime eligibility overlay
@@ -90,6 +91,10 @@ from semantic_evidence import (
 from validate_tasks import ROOT, parse_task_toml
 
 
+TASK_BASELINE_ITEM_KEY = "task_baseline"
+TASK_BASELINE_ROLE = "task_provided_baseline"
+
+
 # ---------- task config ----------
 
 
@@ -119,6 +124,9 @@ def _load_ledger(path: Path) -> dict:
         with open(path) as f:
             data = json.load(f)
         data.setdefault("records", [])
+        data.setdefault("items", {})
+        if not isinstance(data["items"], dict):
+            raise ValueError(f"{path}: items must be an object")
         if data["records"] and not isinstance(data.get("search_space_state"), dict):
             raise ValueError(
                 f"{path}: record-bearing ledger requires search_space_state; "
@@ -130,6 +138,7 @@ def _load_ledger(path: Path) -> dict:
         "tag": None,
         "metric": None,
         "records": [],
+        "items": {},
         "lineage_snapshots": [],
         DIRECT_COMPARATOR_CAPABILITY_KEY: copy.deepcopy(
             DIRECT_COMPARATOR_CAPABILITY
@@ -208,6 +217,7 @@ def cmd_add_record(args) -> int:
                 semantic_point_path=Path(args.semantic_point),
                 policy_receipt_path=Path(args.policy_receipt),
                 candidate_name_hint=args.candidate_name_hint,
+                role=getattr(args, "role", None),
                 description=args.description,
                 route_provenance_path=(
                     Path(args.route_provenance) if args.route_provenance else None
@@ -496,12 +506,53 @@ def record_run(
     # with this finite result; a later Phase-C close uses a different path and
     # cannot rewrite the observation.
     _capture_attempt_observation(data, record)
+    _capture_task_baseline_item(data, record)
     after_graph_value = (record.get("status"), record.get("final_best_score"))
     if after_graph_value != before_graph_value:
         _touch_dag_record(data, record)
     _save_ledger(ledger_path, data)
     _write_loop_state(ledger_path, data, config)
     return record
+
+
+def _capture_task_baseline_item(data: dict, record: dict) -> None:
+    """Freeze the task-provided control's screening score as a run-global item.
+
+    ``record_run`` is the only call site: at this boundary the score is the
+    observed step-0+1 control, before any later tuning can lower candidate
+    000's mutable ``final_best_score``.  The first finite value wins.
+    """
+    if record.get("role") != TASK_BASELINE_ROLE:
+        return
+    score = record.get("final_best_score")
+    if (
+        record.get("status") == "crash"
+        or isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+    ):
+        return
+    item = {
+        "schema_version": 1,
+        "kind": "observed_metric",
+        "metric": data.get("metric"),
+        "value": float(score),
+        "direction": "minimize",
+        "source": {
+            "role": TASK_BASELINE_ROLE,
+            "run_id": str(record.get("run_id")),
+            "stage": "screening",
+        },
+    }
+    items = data.setdefault("items", {})
+    existing = items.get(TASK_BASELINE_ITEM_KEY)
+    if existing is None:
+        items[TASK_BASELINE_ITEM_KEY] = item
+    elif existing != item:
+        raise ValueError(
+            "task_baseline is immutable once observed; existing item does not "
+            "match this screening result"
+        )
 
 
 def resolve_unevaluated(
@@ -925,6 +976,11 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--policy-receipt", required=True, type=Path,
                      help="semantic acquisition receipt JSON kept separate from observations")
     add.add_argument("--candidate-name-hint", required=True)
+    add.add_argument(
+        "--role",
+        choices=[TASK_BASELINE_ROLE],
+        help="explicit experiment role; only the provided task control uses one",
+    )
     add.add_argument("--description")
     add.add_argument("--route-provenance", type=Path,
                      help="planned route sketches, preference order, and chosen route; "

@@ -324,6 +324,8 @@ class ExperimentTests(unittest.TestCase):
                        repo_root=self.repo, cmd=cmd)
         ledger = cmd._ledger()
         self.assertEqual(ledger["records"][0]["run_id"], "000")
+        add_call = next(call for call in cmd.calls if "add-record" in call)
+        self.assertIn("--role task_provided_baseline", add_call)
         roles = [name for name, _ in runner.calls]
         self.assertNotIn("idea-generator", roles)
 

@@ -11,6 +11,13 @@ under both `autoresearch-experiment` (tuner loop) and `autoresearch-hillclimb`
 
 Minimize `val_bpb`. Lower is better.
 
+**Improvement target**: the minimum requirement is a **7.5% relative
+improvement over the baseline** — the unmodified provided `train.py` with its
+original `DEFAULT_PARAMS`, scored through the same `evaluate_config` surface.
+A final result only meets the bar if
+`(baseline_val_bpb - val_bpb) / baseline_val_bpb >= 0.075`, i.e.
+`val_bpb <= 0.925 * baseline_val_bpb`.
+
 The training script runs for a fixed 5-minute training budget, excluding startup
 and compilation. VRAM is a soft constraint: some increase is acceptable for a
 meaningful `val_bpb` gain, but it should not blow up dramatically.

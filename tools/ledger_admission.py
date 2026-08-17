@@ -73,6 +73,7 @@ class AdmissionRequest:
     semantic_point_path: Path
     policy_receipt_path: Path
     candidate_name_hint: str
+    role: str | None = None
     description: str | None = None
     route_provenance_path: Path | None = None
     task_config: dict | None = None
@@ -336,6 +337,7 @@ def admit_record(data: dict, request: AdmissionRequest) -> dict:
         # Recomputed against the pre-admission ledger, so the memory the
         # generator was shown is exactly the memory validated here.
         route_provenance=_validate_route_provenance(data, request, semantic_point),
+        role=request.role,
         candidate_name=request.candidate_name_hint,
         description=request.description or request.idea,
         metric=data["metric"],

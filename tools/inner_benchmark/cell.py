@@ -183,7 +183,10 @@ def execute_cell(
         seed=seed,
         budget=budget,
         model=llm.LLMConfig(model=model).to_manifest(),
-        manifest_extra={"machine": _machine_record(machine)},
+        manifest_extra={
+            "machine": _machine_record(machine),
+            "items": dict(frozen.items),
+        },
         extras={"session_factory": factory},
     )
 
