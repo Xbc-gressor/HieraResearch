@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
             "localtr8-hebo10-hebo10-v1",
             "selfrank8-hebo10-hebo10",
             "mixup24-turbo20-v1",
+            "hebo24-turbo20-v1",
             "legacy",
         ],
         help="regime-conditioned inner-tuner policy; new runs default to "

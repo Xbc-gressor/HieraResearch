@@ -3,13 +3,14 @@
 
 HEBO serves the CONTINUE regime of inner policy
 deferred-random8-hebo10-spsa10-v1; CONTINUE and DEEP under
-localtr8-hebo10-hebo10-v1 and selfrank8-hebo10-hebo10. The thin
-selfrank_search and mixup_search replace the pool policy; turbo_search uses
-the same factual-history/evaluation adapter without creating an LLM session.
+localtr8-hebo10-hebo10-v1 and selfrank8-hebo10-hebo10; and the 24-slot
+INITIAL bout under hebo24-turbo20-v1. The thin selfrank_search and
+mixup_search replace the pool policy; turbo_search uses the same
+factual-history/evaluation adapter without creating an LLM session.
 
-A HEBO bout is 10 objective evaluations of the inner-benchmark
-``pool_hebo_mace`` protocol (PLAN §6.4), ported onto the production
-Phase-C stage machinery:
+A HEBO bout runs the policy-supplied objective budget (10 normally, 24 for
+``hebo24-turbo20-v1`` INITIAL) using the inner-benchmark ``pool_hebo_mace``
+protocol (PLAN §6.4), ported onto the production Phase-C stage machinery:
 
 - one bout-scoped ``bench-pool-proposer`` session (prompt-v2:
   ``HISTORY_READING_NOTES`` noise ~0.003 / ~0.005 plus the
@@ -157,6 +158,63 @@ def _configured_score_fn(candidate_path: Path) -> str:
 def _configured_preflight_fn(candidate_path: Path) -> str | None:
     name = _task_section(candidate_path, "evaluation").get("preflight_fn")
     return name if isinstance(name, str) and name else None
+
+
+def _configured_relative_improvement(candidate_path: Path) -> float | None:
+    value = _task_section(candidate_path, "goal").get(
+        "relative_improvement_over_baseline"
+    )
+    if value is None:
+        return None
+    if not is_finite_score(value) or not 0 <= float(value) < 1:
+        raise ValueError(
+            "task.toml [goal].relative_improvement_over_baseline must be "
+            "a finite number in [0, 1)"
+        )
+    return float(value)
+
+
+def _run_global_items(
+    candidate_path: Path, relative_improvement: float | None
+) -> dict:
+    """Read the immutable run-global observations exposed to LLM arms."""
+    run_dir = find_run_dir(candidate_path)
+    if run_dir is None:
+        if relative_improvement is not None:
+            raise ValueError(
+                f"{candidate_path} is not inside a run directory; cannot "
+                "resolve the configured baseline-relative goal"
+            )
+        return {}
+    ledger_path = run_dir / "ledger.json"
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable ledger.json: {exc}") from exc
+    if not isinstance(ledger, dict):
+        raise ValueError(f"{ledger_path}: expected a JSON object")
+    items = ledger.get("items", {})
+    if not isinstance(items, dict):
+        raise ValueError(f"{ledger_path}: items must be an object")
+    baseline = items.get("task_baseline")
+    if baseline is None:
+        if relative_improvement is not None:
+            raise ValueError(
+                f"{ledger_path}: configured baseline-relative goal requires "
+                "items.task_baseline"
+            )
+        return {}
+    if not isinstance(baseline, dict):
+        raise ValueError(f"{ledger_path}: items.task_baseline must be an object")
+    if baseline.get("kind") != "observed_metric":
+        raise ValueError(
+            f"{ledger_path}: items.task_baseline.kind must be 'observed_metric'"
+        )
+    if not is_finite_score(baseline.get("value")):
+        raise ValueError(
+            f"{ledger_path}: items.task_baseline.value must be finite"
+        )
+    return {"task_baseline": dict(baseline)}
 
 
 def _read_run_model(candidate_path: Path) -> str:
@@ -350,11 +408,11 @@ def _build_checkpoint(
 ) -> checkpoint_mod.Checkpoint:
     incumbent_params, incumbent_score = incumbent
     incumbent_identity = contract.params_identity(incumbent_params)
+    relative_improvement = _configured_relative_improvement(candidate_path)
     # The arm is regime-agnostic, but the checkpoint's regime/stratum is
     # read-only context the proposer session sees: report the bout's real
     # regime. Under localtr8-hebo10-hebo10-v1 this kernel also serves DEEP
-    # bouts (bout_index >= 2), and under selfrank8-hebo10-hebo10 it serves
-    # the FIRST bout (bout_index 0) as well.
+    # bouts (bout_index >= 2); under hebo24-turbo20-v1 it also serves FIRST.
     regime, stratum = _CHECKPOINT_REGIME[inner_policy.regime_for_bout_index(bout_index)]
     return checkpoint_mod.Checkpoint(
         checkpoint_id=candidate_path.parent.name,
@@ -369,11 +427,13 @@ def _build_checkpoint(
             preflight_fn=_configured_preflight_fn(candidate_path) or "preflight_config",
             per_runtime_limit=read_runtime_limit(candidate_path),
             project=_task_section(candidate_path, "env").get("project"),
+            relative_improvement_over_baseline=relative_improvement,
         ),
         incumbent=checkpoint_mod.Incumbent(
             params=dict(incumbent_params), score=float(incumbent_score)
         ),
         incumbent_is_inherited_control=False,
+        items=_run_global_items(candidate_path, relative_improvement),
         history=tuple(_history_rows(report, incumbent_identity, contract)),
         extra={"remaining_budget": remaining},
     )
@@ -701,11 +761,11 @@ def main() -> int:
 
     gen = None
     try:
-        # FIRST self-rank follows the regime-policy contract: deferred warm
-        # configs consume slots inside B_FIRST before the arm proposes. HEBO
-        # only serves later regimes, so it has no deferred backlog.
+        # Every LLM-pool FIRST kernel follows the regime-policy contract:
+        # deferred warm configs consume slots inside the bout before the arm
+        # proposes. Later HEBO bouts have no deferred backlog.
         if (
-            METHOD in ("selfrank", "mixup")
+            METHOD in ("selfrank", "mixup", "hebo")
             and inner_policy.regime_for_bout_index(bout_index) == inner_policy.FIRST
         ):
             deferred_in_space, n_deferred_projected, deferred_dropped = (

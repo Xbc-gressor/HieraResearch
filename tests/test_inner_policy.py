@@ -118,7 +118,7 @@ def _fixture(
     if policy_id is not None:
         tuner = {"inner_policy": policy_id}
         config = {"tuner": tuner}
-        if policy_id == inner_policy.MIXUP_TURBO_POLICY_ID:
+        if policy_id in inner_policy.INITIAL24_TURBO_POLICY_IDS:
             config["max_evaluations"] = 100
             tuner.update(
                 {
@@ -171,6 +171,15 @@ class InnerPolicyUnitTest(unittest.TestCase):
             [
                 inner_policy.expected_bout_trials(
                     inner_policy.MIXUP_TURBO_POLICY_ID, index, 10
+                )
+                for index in range(3)
+            ],
+            [24, 10, 10],
+        )
+        self.assertEqual(
+            [
+                inner_policy.expected_bout_trials(
+                    inner_policy.HEBO_TURBO_POLICY_ID, index, 10
                 )
                 for index in range(3)
             ],
@@ -247,6 +256,15 @@ class InnerPolicyUnitTest(unittest.TestCase):
                 for index in range(3)
             ],
             [["mixup"], ["turbo"], ["turbo"]],
+        )
+        self.assertEqual(
+            [
+                inner_policy.method_chain_for_bout(
+                    inner_policy.HEBO_TURBO_POLICY_ID, index, FLOAT3
+                )
+                for index in range(3)
+            ],
+            [["hebo"], ["turbo"], ["turbo"]],
         )
         with self.assertRaisesRegex(ValueError, "exactly 3 bouts"):
             inner_policy.method_chain_for_bout(
@@ -340,6 +358,17 @@ class InnerPolicyUnitTest(unittest.TestCase):
             ),
             1,
         )
+        self.assertFalse(
+            inner_policy.deep_requires_movable_continuous(
+                inner_policy.HEBO_TURBO_POLICY_ID
+            )
+        )
+        self.assertEqual(
+            inner_policy.numeric_required_from_bout_index(
+                inner_policy.HEBO_TURBO_POLICY_ID
+            ),
+            1,
+        )
 
     def test_has_movable_continuous(self):
         self.assertTrue(inner_policy.has_movable_continuous(FLOAT3))
@@ -363,55 +392,76 @@ class InnerPolicyUnitTest(unittest.TestCase):
 
 
 class PhaseCActionRegimeTest(unittest.TestCase):
-    def test_mixup24_then_two_turbo10_bouts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            candidate, report_path = _fixture(
-                Path(tmp),
-                space=FLOAT3,
-                base=BASE3,
-                inner_policy_id=inner_policy.MIXUP_TURBO_POLICY_ID,
-            )
-            report = json.loads(report_path.read_text())
-            first = phase_c_action(report, candidate)
-            self.assertEqual(
-                (
-                    first["method"],
-                    first["bout_trials"],
-                    first["method_chain"],
-                ),
-                ("mixup", 24, ["mixup"]),
-            )
+    def test_24_slot_initial_then_two_turbo10_bouts(self):
+        cases = (
+            (inner_policy.MIXUP_TURBO_POLICY_ID, "mixup"),
+            (inner_policy.HEBO_TURBO_POLICY_ID, "hebo"),
+        )
+        for policy_id, initial_method in cases:
+            with self.subTest(policy_id=policy_id):
+                with tempfile.TemporaryDirectory() as tmp:
+                    candidate, report_path = _fixture(
+                        Path(tmp),
+                        space=FLOAT3,
+                        base=BASE3,
+                        inner_policy_id=policy_id,
+                    )
+                    self._assert_24_plus_10_plus_10(
+                        candidate, report_path, initial_method
+                    )
 
-            report["phase_c"] = {
-                "stages": [
-                    {
-                        "method": "mixup",
-                        "status": "ok",
-                        "trials": [{"params": dict(BASE3), "score": 1.0}],
-                    }
-                ]
-            }
-            _finalize_bout(report, candidate, best=1.0)
-            second = phase_c_action(report, candidate)
-            self.assertEqual(
-                (second["method"], second["bout_trials"], second["bout_regime"]),
-                ("turbo", 10, "CONTINUE"),
-            )
+    def _assert_24_plus_10_plus_10(
+        self, candidate: Path, report_path: Path, initial_method: str
+    ) -> None:
+        report = json.loads(report_path.read_text())
+        first = phase_c_action(report, candidate)
+        self.assertEqual(
+            (
+                first["method"],
+                first["bout_trials"],
+                first["method_chain"],
+            ),
+            (initial_method, 24, [initial_method]),
+        )
 
-            report["phase_c"]["stages"].append(
+        report["phase_c"] = {
+            "stages": [
                 {
-                    "method": "turbo",
-                    "bout_index": 1,
+                    "method": initial_method,
                     "status": "ok",
                     "trials": [{"params": dict(BASE3), "score": 1.0}],
                 }
-            )
-            _finalize_bout(report, candidate, best=1.0)
-            third = phase_c_action(report, candidate)
-            self.assertEqual(
-                (third["method"], third["bout_trials"], third["bout_regime"]),
-                ("turbo", 10, "DEEP"),
-            )
+            ]
+        }
+        _finalize_bout(report, candidate, best=1.0)
+        second = phase_c_action(report, candidate)
+        self.assertEqual(
+            (
+                second["method"],
+                second["bout_trials"],
+                second["bout_regime"],
+            ),
+            ("turbo", 10, "CONTINUE"),
+        )
+
+        report["phase_c"]["stages"].append(
+            {
+                "method": "turbo",
+                "bout_index": 1,
+                "status": "ok",
+                "trials": [{"params": dict(BASE3), "score": 1.0}],
+            }
+        )
+        _finalize_bout(report, candidate, best=1.0)
+        third = phase_c_action(report, candidate)
+        self.assertEqual(
+            (
+                third["method"],
+                third["bout_trials"],
+                third["bout_regime"],
+            ),
+            ("turbo", 10, "DEEP"),
+        )
 
     def test_first_bout_is_random_bo8(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1168,6 +1218,79 @@ class HeboSearchTest(unittest.TestCase):
             extras = runner.calls[0][1].extra
             self.assertIn("~0.005", extras["history"])
             self.assertIn("genuinely different regions", extras["protocol"])
+
+    def test_hebo24_first_bout_gets_baseline_target_and_deferred_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "autoresearch-baseline" / "r1"
+            candidate, report_path = _fixture(
+                run_dir,
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=inner_policy.HEBO_TURBO_POLICY_ID,
+            )
+            (run_dir / "ledger.json").write_text(
+                json.dumps(
+                    {
+                        "items": {
+                            "task_baseline": {
+                                "kind": "observed_metric",
+                                "metric": "val_bpb",
+                                "value": 4.0,
+                                "direction": "minimize",
+                            }
+                        }
+                    }
+                )
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_a"]["deferred_configs"] = [
+                {"params": {"a": 0.7, "b": 0.02, "c": 0.2}}
+            ]
+            report_path.write_text(json.dumps(report))
+
+            runner = FakeSessionRunner(
+                [{"receipt": self._pool_receipt(0.0)}]
+            )
+            hebo_search._TEST_SESSION_RUNNER = runner
+            try:
+                with mock.patch(
+                    "hebo_search.timed_preflight", return_value={"status": "ok"}
+                ), mock.patch(
+                    "hebo_search.timed_eval", side_effect=[0.9, 0.8]
+                ) as eval_mock, mock.patch(
+                    "hebo_search.write_json"
+                ) as write_result, mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "hebo_search.py",
+                        "--candidate-path",
+                        str(candidate),
+                        "--tune-report-json",
+                        str(report_path),
+                        "--n-evals",
+                        "2",
+                    ],
+                ):
+                    self.assertEqual(hebo_main(), 0)
+            finally:
+                hebo_search._TEST_SESSION_RUNNER = None
+
+            receipt = write_result.call_args.args[0]
+            self.assertEqual(receipt["method"], "hebo")
+            self.assertEqual(receipt["deferred_evaluated"], 1)
+            self.assertEqual(eval_mock.call_count, 2)
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][-1]
+            self.assertEqual(
+                [row["source"] for row in stage["trials"]],
+                ["deferred", "pool_hebo_mace"],
+            )
+            extras = runner.calls[0][1].extra
+            self.assertIn("7.5% relative", extras["task"])
+            self.assertIn("task_baseline.value: 4.0", extras["items"])
+            self.assertIn("required_relative_improvement: 0.075", extras["items"])
+            self.assertIn("required_target_score: 3.7", extras["items"])
+            self.assertIn("score: 0.9", extras["incumbent"])
 
     def test_first_selfrank_consumes_deferred_inside_eight_slot_bout(self):
         with tempfile.TemporaryDirectory() as tmp:

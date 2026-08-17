@@ -114,6 +114,12 @@ continuation/deep with finite unique local history < WARMUP -> INVALID (§七:
 an INVALID checkpoint still loads (the incumbent keeps its last finite value)
 so tooling can inspect it.
 
+Operator same-machine attestation: ``remeasure --mark-same-machine LABEL``
+records that the source run itself executed on this machine — the frozen
+scores are already native, so re-measurement is skipped entirely (the same
+field shape is written, with ``mode: same-machine``; it refuses checkpoints
+already holding real re-measurement data).
+
 stdlib + numpy only at import time.
 """
 
@@ -255,13 +261,54 @@ def _task_block(run_dir: Path, framework_cfg: dict) -> dict:
     }
 
 
+def _legacy_task_baseline(ledger: dict) -> dict | None:
+    """Derive the task_baseline item from a pre-items ledger.
+
+    Runs recorded before the ledger items schema never persisted ``items``;
+    their step-0+1 control observation lives in the provided-baseline
+    record's ``best_warm_score`` — the screening score before any later
+    tuning could lower the mutable ``final_best_score`` (same observation
+    boundary and "first finite value wins" rule as
+    ledger._capture_task_baseline_item). Returns the same item shape plus a
+    ``derived_from`` provenance marker.
+    """
+    for record in ledger.get("records") or []:
+        if not isinstance(record, dict):
+            continue
+        if record.get("candidate_name") != "provided_baseline":
+            continue
+        score = record.get("best_warm_score")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+        ):
+            continue
+        return {
+            "schema_version": 1,
+            "kind": "observed_metric",
+            "metric": ledger.get("metric"),
+            "value": float(score),
+            "direction": "minimize",
+            "source": {
+                "role": "task_provided_baseline",  # ledger.TASK_BASELINE_ROLE
+                "run_id": str(record.get("run_id")),
+                "stage": "screening",
+            },
+            "derived_from": "legacy ledger records[].best_warm_score",
+        }
+    return None
+
+
 def _run_items(run_dir: Path, task: dict) -> dict:
     """Freeze run-global observations needed by benchmark policies."""
     ledger = _load_json_object(Path(run_dir) / "ledger.json", "ledger.json")
     items = ledger.get("items")
-    if not isinstance(items, dict):
+    if items is not None and not isinstance(items, dict):
         raise ValueError("ledger.json: items must be an object")
-    baseline = items.get("task_baseline")
+    baseline = (items or {}).get("task_baseline")
+    if baseline is None and items is None:
+        baseline = _legacy_task_baseline(ledger)
     if task.get("relative_improvement_over_baseline") is not None and not isinstance(
         baseline, dict
     ):
@@ -968,7 +1015,61 @@ def _write_checkpoint_json(checkpoint_dir: Path, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def remeasure_checkpoint(checkpoint_dir, *, eval_fn=None, eval_limit=None) -> dict:
+def _mark_same_machine(directory: Path, data: dict, ckpt, contract, *, label: str) -> dict:
+    """Operator attestation: the source run executed on THIS machine, so the
+    frozen scores are already native and re-measurement would only re-noise
+    them (PLAN §七 同机可比性 is satisfied by provenance, not by
+    re-evaluation). Writes the same extra.remeasure field shape the real
+    remeasure writes, plus provenance. Refuses to overwrite a checkpoint
+    that already holds real re-measurement data."""
+    extra = data.setdefault("extra", {})
+    state = extra.setdefault("remeasure", {})
+    if state.get("remeasured_identities"):
+        raise ValueError(
+            f"{directory}: checkpoint already holds re-measurement data; "
+            "refusing to overwrite it with a same-machine mark"
+        )
+    if not tune_tools._is_finite_score(data["incumbent"].get("score")):
+        raise ValueError(f"{directory}: incumbent score is not finite")
+    finite_unique = len(ckpt.finite_unique_history(contract))
+    if ckpt.regime != "first" and finite_unique < WARMUP:
+        raise ValueError(
+            f"{directory}: finite unique history {finite_unique} < WARMUP="
+            f"{WARMUP} — INVALID regardless of machine (PLAN §七)"
+        )
+    state.update(
+        {
+            "mode": "same-machine",
+            "machine": label,
+            "remeasured_identities": [],
+            "incumbent_local": True,
+            "complete": True,
+            "valid": True,
+            "finite_unique_local": finite_unique,
+            "evaluations": 0,
+            "note": (
+                "operator attestation: the source run executed on this "
+                "machine; source scores are native and re-measurement was "
+                "skipped, so no re-evaluation consumed objective budget"
+            ),
+        }
+    )
+    state.pop("invalid_reason", None)
+    _write_checkpoint_json(directory, data)
+    return {
+        "checkpoint": str(directory),
+        "mode": "same-machine",
+        "machine": label,
+        "evaluated": 0,
+        "complete": True,
+        "incumbent_after": data["incumbent"]["score"],
+        "finite_unique_local": finite_unique,
+        "verdict": "ok",
+        "invalid_reason": None,
+    }
+
+
+def remeasure_checkpoint(checkpoint_dir, *, eval_fn=None, eval_limit=None, mark_same_machine=None) -> dict:
     """Re-measure every unique frozen config on THIS machine (PLAN §七).
 
     ``eval_fn(params) -> objective.EvalOutcome-compatible`` is the injection
@@ -983,6 +1084,10 @@ def remeasure_checkpoint(checkpoint_dir, *, eval_fn=None, eval_limit=None) -> di
     contract = space_mod.read_contract(ckpt.candidate_path)
     identity = contract.params_identity
     data = _load_json_object(directory / CHECKPOINT_FILENAME, "checkpoint.json")
+    if mark_same_machine is not None:
+        return _mark_same_machine(
+            directory, data, ckpt, contract, label=mark_same_machine
+        )
     extra = data.setdefault("extra", {})
     state = extra.setdefault("remeasure", {})
     done = {str(item) for item in state.get("remeasured_identities", [])}
@@ -1148,6 +1253,13 @@ def main(argv=None) -> int:
     p_remeasure = sub.add_parser("remeasure", help="re-measure scores locally")
     p_remeasure.add_argument("--checkpoint", required=True, type=Path)
     p_remeasure.add_argument("--eval-limit", type=int, default=None)
+    p_remeasure.add_argument(
+        "--mark-same-machine",
+        metavar="LABEL",
+        default=None,
+        help="skip re-evaluation: attest the source run executed on THIS "
+        "machine (LABEL names it), so frozen scores are already native",
+    )
 
     args = parser.parse_args(argv)
     try:
@@ -1157,7 +1269,13 @@ def main(argv=None) -> int:
             summary = create_checkpoint(args.run_dir, args.candidate, args.bouts, args.out)
             print(json.dumps(summary, ensure_ascii=False, indent=2, default=_to_native))
         else:
-            summary = remeasure_checkpoint(args.checkpoint, eval_limit=args.eval_limit)
+            if args.mark_same_machine is not None and args.eval_limit is not None:
+                raise SystemExit("--mark-same-machine and --eval-limit are mutually exclusive")
+            summary = remeasure_checkpoint(
+                args.checkpoint,
+                eval_limit=args.eval_limit,
+                mark_same_machine=args.mark_same_machine,
+            )
             print(json.dumps(summary, ensure_ascii=False, indent=2, default=_to_native))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(str(exc)) from None

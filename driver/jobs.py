@@ -232,7 +232,7 @@ def build_driver_job(
     if not isinstance(tuner_cfg, dict):
         raise DriverJobError("framework_cfg tuner section must be an object")
     # phase-c-action computes the exact policy-aware size from the candidate's
-    # bout index (normally 8/10/10; mixup24-turbo20-v1 is 24/10/10). The
+    # bout index (normally 8/10/10; the *24-turbo20 policies are 24/10/10). The
     # legacy inner policy keeps tuner.bout_trials.
     bout_trials = _positive_int(
         action.get("bout_trials"), "phase-c-action.bout_trials"

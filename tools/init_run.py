@@ -62,6 +62,7 @@ INNER_POLICIES = (
     "localtr8-hebo10-hebo10-v1",
     "selfrank8-hebo10-hebo10",
     "mixup24-turbo20-v1",
+    "hebo24-turbo20-v1",
     "legacy",
 )
 
@@ -259,11 +260,11 @@ def initialize_run(
         "scheduler_policy", DEFAULT_SCHEDULER_POLICY
     )
     if (
-        inner_policy == "mixup24-turbo20-v1"
+        inner_policy in ("mixup24-turbo20-v1", "hebo24-turbo20-v1")
         and effective_scheduler != "anchor_challenger_v1"
     ):
         raise ValueError(
-            "mixup24-turbo20-v1 requires scheduler_policy "
+            f"{inner_policy} requires scheduler_policy "
             "anchor_challenger_v1"
         )
 
@@ -411,7 +412,7 @@ def initialize_run(
             updates.append(f"inner_policy={inner_policy}")
         else:
             print(f"Inner tuner policy already set to {inner_policy}.")
-        if inner_policy == "mixup24-turbo20-v1":
+        if inner_policy in ("mixup24-turbo20-v1", "hebo24-turbo20-v1"):
             section = config.get("tuner", {})
             current_cap = int(section.get("deep_tune_per_candidate_cap", 40))
             if current_cap < 44:

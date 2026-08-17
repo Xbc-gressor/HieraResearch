@@ -115,6 +115,25 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 44,
             )
 
+            hebo_run_dir = initialize_run(
+                repo_root,
+                "toy",
+                "hebo-turbo",
+                scheduler_policy="anchor_challenger_v1",
+                inner_policy="hebo24-turbo20-v1",
+            )
+            hebo_config = json.loads(
+                (hebo_run_dir / "framework_cfg.json").read_text()
+            )
+            self.assertEqual(
+                hebo_config["tuner"]["inner_policy"],
+                "hebo24-turbo20-v1",
+            )
+            self.assertEqual(
+                hebo_config["tuner"]["deep_tune_per_candidate_cap"],
+                44,
+            )
+
             with self.assertRaisesRegex(
                 ValueError, "requires scheduler_policy anchor_challenger_v1"
             ):

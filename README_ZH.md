@@ -523,7 +523,7 @@ runs/<task>/<tag>/framework_cfg.json
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
 - **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；新 run 默认使用 `coverage_attempt`。`coverage`、`coverage_experience` 等对照臂可通过 `--semantic-policy` 显式选择
 - **`tuner.scheduler_policy`**：新 run 默认 `v3_2`；旧 percentile/alternation 调度器通过 `--scheduler-policy legacy` 显式选择
-- **`tuner.inner_policy`**：新 run 默认 `deferred-random8-hebo10-spsa10-v1`；对照臂 `localtr8-hebo10-spsa10-v1`（FIRST=`local_tr`）、`localtr8-hebo10-hebo10-v1`（FIRST=`local_tr`，其余 bout 全是 HEBO）、`selfrank8-hebo10-hebo10`（FIRST=`selfrank` 8 槽，后续全是 HEBO）和 `legacy` 通过 `--inner-tuner-policy` 显式选择
+- **`tuner.inner_policy`**：新 run 默认 `deferred-random8-hebo10-spsa10-v1`；对照臂可通过 `--inner-tuner-policy` 显式选择，包括 `hebo24-turbo20-v1`（24 槽 LLM pool + official HEBO MACE rerank，随后两段 TuRBO-10；无纯 HEBO/LHS warmup）、`mixup24-turbo20-v1`、`localtr8-hebo10-spsa10-v1`、`localtr8-hebo10-hebo10-v1`、`selfrank8-hebo10-hebo10` 和 `legacy`
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）。其中 `tuner.K`（每个候选提出的热启动配置数，默认 5）和 `tuner.K_eval`（step 0+1 实际评估的条数，默认 2）分别通过 `--k-warm` / `--k-eval` 暴露；deferred 配置数 = K − K_eval，两者都在 run 产物生成后冻结
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

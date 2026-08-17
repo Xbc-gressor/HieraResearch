@@ -11,7 +11,8 @@ executes ONE config:
   ``ctx.state.finite_unique_history()`` (checkpoint history + this cell's own
   outcomes, growing over the cell) is below ``WARMUP=8``, the proposer's
   rank-1 config is executed with ``ranker_fallback=true`` — an engineering
-  fallback expected never to trigger on continuation/deep checkpoints.
+  fallback used by the initial observations of a FIRST-bout deployment and
+  expected never to trigger on continuation/deep checkpoints.
 - Otherwise the pool is scored by HEBO MACE through the rank_fn seam
   (``ctx.extras['hebo_rank_fn']`` when injected — the test seam; otherwise
   the subprocess above). Seam signature:

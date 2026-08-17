@@ -165,6 +165,7 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "localtr8-hebo10-hebo10-v1",
             "selfrank8-hebo10-hebo10",
             "mixup24-turbo20-v1",
+            "hebo24-turbo20-v1",
             "legacy",
         )
         value = tuner["inner_policy"]
@@ -174,12 +175,12 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
                 f"{path}: tuner.inner_policy must be {allowed}"
             )
         if (
-            value == "mixup24-turbo20-v1"
+            value in ("mixup24-turbo20-v1", "hebo24-turbo20-v1")
             and tuner.get("scheduler_policy", "v3_2")
             != "anchor_challenger_v1"
         ):
             raise RunConfigError(
-                f"{path}: tuner.inner_policy 'mixup24-turbo20-v1' requires "
+                f"{path}: tuner.inner_policy {value!r} requires "
                 "tuner.scheduler_policy 'anchor_challenger_v1'"
             )
 
