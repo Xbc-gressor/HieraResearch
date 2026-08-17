@@ -15,6 +15,9 @@ dependencies = [
     # inner-tuner dependency. HEBO requires numpy<1.25, which in turn pins the
     # root runtime to CPython 3.11.
     "gpy==1.13.2",
+    # TuRBO benchmark arm fits its local exact GP directly with gpytorch.
+    # HEBO currently brings this transitively, but the arm owns the dependency.
+    "gpytorch==1.15.2",
     "hebo",
     "optuna>=3.6.0",
     "scikit-learn>=1.5",
