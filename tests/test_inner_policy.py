@@ -118,7 +118,7 @@ def _fixture(
     if policy_id is not None:
         tuner = {"inner_policy": policy_id}
         config = {"tuner": tuner}
-        if policy_id in inner_policy.INITIAL24_TURBO_POLICY_IDS:
+        if policy_id in inner_policy.INITIAL24_POLICY_IDS:
             config["max_evaluations"] = 100
             tuner.update(
                 {
@@ -180,6 +180,15 @@ class InnerPolicyUnitTest(unittest.TestCase):
             [
                 inner_policy.expected_bout_trials(
                     inner_policy.HEBO_TURBO_POLICY_ID, index, 10
+                )
+                for index in range(3)
+            ],
+            [24, 10, 10],
+        )
+        self.assertEqual(
+            [
+                inner_policy.expected_bout_trials(
+                    inner_policy.HEBO_HEBO_POLICY_ID, index, 10
                 )
                 for index in range(3)
             ],
@@ -265,6 +274,15 @@ class InnerPolicyUnitTest(unittest.TestCase):
                 for index in range(3)
             ],
             [["hebo"], ["turbo"], ["turbo"]],
+        )
+        self.assertEqual(
+            [
+                inner_policy.method_chain_for_bout(
+                    inner_policy.HEBO_HEBO_POLICY_ID, index, FLOAT3
+                )
+                for index in range(3)
+            ],
+            [["hebo"], ["hebo"], ["hebo"]],
         )
         with self.assertRaisesRegex(ValueError, "exactly 3 bouts"):
             inner_policy.method_chain_for_bout(
@@ -369,6 +387,16 @@ class InnerPolicyUnitTest(unittest.TestCase):
             ),
             1,
         )
+        self.assertFalse(
+            inner_policy.deep_requires_movable_continuous(
+                inner_policy.HEBO_HEBO_POLICY_ID
+            )
+        )
+        self.assertIsNone(
+            inner_policy.numeric_required_from_bout_index(
+                inner_policy.HEBO_HEBO_POLICY_ID
+            )
+        )
 
     def test_has_movable_continuous(self):
         self.assertTrue(inner_policy.has_movable_continuous(FLOAT3))
@@ -392,12 +420,13 @@ class InnerPolicyUnitTest(unittest.TestCase):
 
 
 class PhaseCActionRegimeTest(unittest.TestCase):
-    def test_24_slot_initial_then_two_turbo10_bouts(self):
+    def test_24_plus_10_plus_10_policy_methods(self):
         cases = (
-            (inner_policy.MIXUP_TURBO_POLICY_ID, "mixup"),
-            (inner_policy.HEBO_TURBO_POLICY_ID, "hebo"),
+            (inner_policy.MIXUP_TURBO_POLICY_ID, "mixup", "turbo"),
+            (inner_policy.HEBO_TURBO_POLICY_ID, "hebo", "turbo"),
+            (inner_policy.HEBO_HEBO_POLICY_ID, "hebo", "hebo"),
         )
-        for policy_id, initial_method in cases:
+        for policy_id, initial_method, later_method in cases:
             with self.subTest(policy_id=policy_id):
                 with tempfile.TemporaryDirectory() as tmp:
                     candidate, report_path = _fixture(
@@ -407,11 +436,15 @@ class PhaseCActionRegimeTest(unittest.TestCase):
                         inner_policy_id=policy_id,
                     )
                     self._assert_24_plus_10_plus_10(
-                        candidate, report_path, initial_method
+                        candidate, report_path, initial_method, later_method
                     )
 
     def _assert_24_plus_10_plus_10(
-        self, candidate: Path, report_path: Path, initial_method: str
+        self,
+        candidate: Path,
+        report_path: Path,
+        initial_method: str,
+        later_method: str,
     ) -> None:
         report = json.loads(report_path.read_text())
         first = phase_c_action(report, candidate)
@@ -441,12 +474,12 @@ class PhaseCActionRegimeTest(unittest.TestCase):
                 second["bout_trials"],
                 second["bout_regime"],
             ),
-            ("turbo", 10, "CONTINUE"),
+            (later_method, 10, "CONTINUE"),
         )
 
         report["phase_c"]["stages"].append(
             {
-                "method": "turbo",
+                "method": later_method,
                 "bout_index": 1,
                 "status": "ok",
                 "trials": [{"params": dict(BASE3), "score": 1.0}],
@@ -460,7 +493,7 @@ class PhaseCActionRegimeTest(unittest.TestCase):
                 third["bout_trials"],
                 third["bout_regime"],
             ),
-            ("turbo", 10, "DEEP"),
+            (later_method, 10, "DEEP"),
         )
 
     def test_first_bout_is_random_bo8(self):

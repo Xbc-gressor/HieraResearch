@@ -164,6 +164,27 @@ def read_contract(candidate_path) -> CandidateContract:
     )
 
 
+def with_search_space(
+    contract: CandidateContract, search_space: dict
+) -> CandidateContract:
+    """Rebind a contract to a (clamped) search space, rebuilding dimensions.
+
+    Production engines shrink the box with clamp_search_space_to_preflight
+    before searching; the arm-visible contract must show the same bounds —
+    bounds checks, the codec, and the proposer's rendered search space all
+    read them from the contract.
+    """
+    return CandidateContract(
+        path=contract.path,
+        param_schema=contract.param_schema,
+        search_space=search_space,
+        base_params=contract.base_params,
+        dimensions=tuple(
+            _dimension(name, entry) for name, entry in search_space.items()
+        ),
+    )
+
+
 def _dimension(name: str, entry) -> Dimension:
     """Build a Dimension from a lint-validated SEARCH_SPACE entry."""
     kind = entry[0]

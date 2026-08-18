@@ -4,12 +4,13 @@
 HEBO serves the CONTINUE regime of inner policy
 deferred-random8-hebo10-spsa10-v1; CONTINUE and DEEP under
 localtr8-hebo10-hebo10-v1 and selfrank8-hebo10-hebo10; and the 24-slot
-INITIAL bout under hebo24-turbo20-v1. The thin selfrank_search and
+INITIAL bout under hebo24-turbo20-v1. It serves every bout under
+hebo24-hebo20. The thin selfrank_search and
 mixup_search replace the pool policy; turbo_search uses the same
 factual-history/evaluation adapter without creating an LLM session.
 
 A HEBO bout runs the policy-supplied objective budget (10 normally, 24 for
-``hebo24-turbo20-v1`` INITIAL) using the inner-benchmark ``pool_hebo_mace``
+the ``hebo24-*`` INITIAL bouts) using the inner-benchmark ``pool_hebo_mace``
 protocol (PLAN §6.4), ported onto the production Phase-C stage machinery:
 
 - one bout-scoped ``bench-pool-proposer`` session (prompt-v2:
@@ -60,6 +61,7 @@ from _common import (  # noqa: E402
     append_trial,
     attempted_config_identities,
     cast_params_to_search_space,
+    clamp_search_space_to_preflight,
     deep_tune_stage_elapsed,
     deep_tune_time_budget,
     is_config_infeasible_error,
@@ -412,7 +414,7 @@ def _build_checkpoint(
     # The arm is regime-agnostic, but the checkpoint's regime/stratum is
     # read-only context the proposer session sees: report the bout's real
     # regime. Under localtr8-hebo10-hebo10-v1 this kernel also serves DEEP
-    # bouts (bout_index >= 2); under hebo24-turbo20-v1 it also serves FIRST.
+    # bouts (bout_index >= 2); under the hebo24 policies it also serves FIRST.
     regime, stratum = _CHECKPOINT_REGIME[inner_policy.regime_for_bout_index(bout_index)]
     return checkpoint_mod.Checkpoint(
         checkpoint_id=candidate_path.parent.name,
@@ -457,8 +459,21 @@ def main() -> int:
     base_params = _read_literal_mapping(args.candidate_path, "BASE_PARAMS")
     if not isinstance(base_params, dict):
         raise ValueError(f"{METHOD} requires BASE_PARAMS (the applied incumbent)")
+    # Same pre-search clamp as the other production engines (cmaes/bo/grid/
+    # spsa): shrink the box to the preflight-feasible region before the arm
+    # searches it, so the surrogate/proposer never see the VRAM-infeasible
+    # corner. No-op without task preflight or VRAM telemetry.
+    search_space = clamp_search_space_to_preflight(
+        search_space,
+        base_params,
+        args.candidate_path,
+        args.tune_report_json,
+        expected_execution_revision=time_budget["candidate_execution_revision"],
+    )
 
-    contract = space_mod.read_contract(args.candidate_path)
+    contract = space_mod.with_search_space(
+        space_mod.read_contract(args.candidate_path), search_space
+    )
     varying = contract.varying_dimensions
     if METHOD == "turbo":
         varying = tuple(

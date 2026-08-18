@@ -9,10 +9,11 @@ comparison arms `localtr8-hebo10-spsa10-v1`, `localtr8-hebo10-hebo10-v1`,
 and `selfrank8-hebo10-hebo10`
 keep the same sizes):
 **FIRST = 8** (0 completed bouts), **CONTINUE = 10** (1), **DEEP = 10** (2–3).
-The production experiment policies `mixup24-turbo20-v1` and
-`hebo24-turbo20-v1` are the explicit exceptions: **INITIAL/FIRST = 24**,
-followed by two **TuRBO = 10** segments; each has exactly three bouts and a
-44-attempt candidate lifetime.
+The production experiment policies `mixup24-turbo20-v1`,
+`hebo24-turbo20-v1`, and `hebo24-hebo20` are the explicit exceptions:
+**INITIAL/FIRST = 24**, followed by two 10-slot bouts; each has exactly three
+bouts and a 44-attempt candidate lifetime. The first two use TuRBO for their
+later bouts; `hebo24-hebo20` uses HEBO MACE throughout.
 A first bout deep-tunes a promising untuned candidate; a continuation bout
 resumes a tuned candidate that responded to its last bout; a DEEP bout is a
 late bout on a twice-responding candidate. After each bout the candidate is
@@ -132,7 +133,7 @@ challenger/later-bout reserve, initializes the best remaining challenger, then
 spends exactly two later bouts. A positive first later-bout gain continues the
 same candidate; zero gain switches to the other initialized candidate. Its
 receipt records the current phase, reserve, and admission cap under
-`scheduler.evidence_mode`. With either 24+20 policy, the full hard reserve is
+`scheduler.evidence_mode`. With any 24+20 policy, the full hard reserve is
 `2×24 + 10 + 10 = 68` objective calls.
 
 - **`run_id` is `null`** → no candidate is eligible this round (below
@@ -246,6 +247,8 @@ or the report yourself.
      eight finite unique history points exist it executes the proposer's own
      rank-1 point; afterward official HEBO MACE reranks the pool. It never runs
      a pure-HEBO or LHS warmup. Deferred warm configs occupy slots inside 24.
+     `hebo24-hebo20` uses this same `pool_hebo_mace` arm for INITIAL and both
+     later bouts.
    - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official
@@ -265,6 +268,9 @@ or the report yourself.
      while fitting on the complete factual history. If the scheduler switches
      candidates after zero gain, the other candidate starts its own TuRBO
      trajectory.
+     Under `hebo24-hebo20`, bout indexes 1 and 2 are both `hebo`, each with 10
+     evaluations; all factual history from earlier bouts is supplied to the
+     same LLM-pool + official HEBO MACE protocol.
 2. The returned method's search script takes these **default trial-cap args, which
    you MAY override**:
    - `grid` → `--resolution 5 --max-trials 100 --patience 6`
@@ -272,8 +278,8 @@ or the report yourself.
      (benchmark-tuned; patience=6 suppressed HPO). `--patience N` forces a fixed value.
    - `cmaes` → `--popsize 8 --max-evals 64 --patience 20`
    - `spsa` → `--n-evals 10` (5 pairs; no patience — the schedule is fixed)
-   - `hebo` → `--n-evals 10`, or 24 for `hebo24-turbo20-v1` INITIAL as returned
-     by `phase-c-action` (prompt-v2 LLM pool + official HEBO MACE; no patience)
+   - `hebo` → `--n-evals 10`, or 24 for a `hebo24-*` INITIAL as returned by
+     `phase-c-action` (prompt-v2 LLM pool + official HEBO MACE; no patience)
    - `local_tr` → `--n-evals 8` (FIRST-bout trust-region local search; no patience)
    - `selfrank` → `--n-evals 8` (FIRST-bout LLM pool self-rank; no patience)
    - `mixup` → `--n-evals 24` (INITIAL LLM-seeded official HEBO; no patience)

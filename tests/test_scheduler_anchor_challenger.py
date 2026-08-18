@@ -245,6 +245,15 @@ class TournamentSessionTest(unittest.TestCase):
             self.assertEqual(hebo_contract.lifetime_cost(), 44)
             self.assertEqual(hebo_contract.numeric_required_from_bout_index, 1)
 
+            config["tuner"]["inner_policy"] = "hebo24-hebo20"
+            config_path.write_text(json.dumps(config))
+            hebo_only_contract = contract_for(ledger)
+            self.assertEqual(hebo_only_contract.bout_cost_schedule, (24, 10, 10))
+            self.assertEqual(hebo_only_contract.lifetime_cost(), 44)
+            self.assertIsNone(
+                hebo_only_contract.numeric_required_from_bout_index
+            )
+
     def test_live_session_routes_to_tournament_without_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

@@ -36,6 +36,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("selfrank8-hebo10-hebo10", result.stdout)
         self.assertIn("mixup24-turbo20-v1", result.stdout)
         self.assertIn("hebo24-turbo20-v1", result.stdout)
+        self.assertIn("hebo24-hebo20", result.stdout)
         self.assertIn("anchor_challenger_v1", result.stdout)
 
     def test_warm_config_count_knobs_are_exposed(self) -> None:

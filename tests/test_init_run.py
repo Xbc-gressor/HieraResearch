@@ -88,7 +88,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 "selfrank8-hebo10-hebo10",
             )
 
-    def test_mixup_turbo_policy_sets_its_scheduler_and_lifetime_cap(self) -> None:
+    def test_24_plus_20_policies_set_scheduler_and_lifetime_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._repo(repo_root)
@@ -131,6 +131,25 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             )
             self.assertEqual(
                 hebo_config["tuner"]["deep_tune_per_candidate_cap"],
+                44,
+            )
+
+            hebo_only_run_dir = initialize_run(
+                repo_root,
+                "toy",
+                "hebo-only",
+                scheduler_policy="anchor_challenger_v1",
+                inner_policy="hebo24-hebo20",
+            )
+            hebo_only_config = json.loads(
+                (hebo_only_run_dir / "framework_cfg.json").read_text()
+            )
+            self.assertEqual(
+                hebo_only_config["tuner"]["inner_policy"],
+                "hebo24-hebo20",
+            )
+            self.assertEqual(
+                hebo_only_config["tuner"]["deep_tune_per_candidate_cap"],
                 44,
             )
 

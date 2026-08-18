@@ -192,6 +192,14 @@ class RunConfigTunerValidationTests(unittest.TestCase):
                 "hebo24-turbo20-v1",
             )
 
+            hebo_only = json.loads(json.dumps(base))
+            hebo_only["tuner"]["inner_policy"] = "hebo24-hebo20"
+            path.write_text(json.dumps(hebo_only))
+            self.assertEqual(
+                read_framework_cfg(path)["tuner"]["inner_policy"],
+                "hebo24-hebo20",
+            )
+
             bad_scheduler = json.loads(json.dumps(base))
             bad_scheduler["tuner"]["scheduler_policy"] = "v3_2"
             path.write_text(json.dumps(bad_scheduler))

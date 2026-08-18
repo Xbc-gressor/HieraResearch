@@ -122,7 +122,11 @@ def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
                 "deep_tune_per_candidate_cap",
                 44
                 if tuner.get("inner_policy")
-                in ("mixup24-turbo20-v1", "hebo24-turbo20-v1")
+                in (
+                    "mixup24-turbo20-v1",
+                    "hebo24-turbo20-v1",
+                    "hebo24-hebo20",
+                )
                 else 40,
             )
         ),

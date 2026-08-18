@@ -43,19 +43,22 @@ The ``selfrank8-hebo10-hebo10`` comparison policy instead runs the
 inner-benchmark LLM-pool self-rank arm for FIRST, then HEBO for every later
 bout. Deferred warm configs still occupy slots inside FIRST's eight spends.
 
-The production experiment policies ``mixup24-turbo20-v1`` and
-``hebo24-turbo20-v1`` are three-bout contracts for the anchor/challenger
-scheduler::
+The production experiment policies ``mixup24-turbo20-v1``,
+``hebo24-turbo20-v1``, and ``hebo24-hebo20`` are three-bout contracts for
+the anchor/challenger scheduler::
 
     0 completed bouts -> 24-slot mixup_pool_hebo INITIAL
                          OR 24-slot pool_hebo_mace INITIAL
     1 completed bout  -> 10-slot hot-start TuRBO segment 1
+                         OR 10-slot pool_hebo_mace CONTINUE
     2 completed bouts -> 10-slot hot-start TuRBO segment 2
+                         OR 10-slot pool_hebo_mace DEEP
 
-The two TuRBO segments share state when they run on the same candidate. If
-the scheduler switches candidates after a zero-gain first segment, the other
-candidate starts its own TuRBO trajectory. Deferred warm configs occupy slots
-inside the 24-slot INITIAL bout.
+``hebo24-hebo20`` uses ``pool_hebo_mace`` for all three bouts. The two TuRBO
+segments in the other policies share state when they run on the same
+candidate. If the scheduler switches candidates after a zero-gain first
+segment, the other candidate starts its own TuRBO trajectory. Deferred warm
+configs occupy slots inside the 24-slot INITIAL bout.
 
 Under every regime-conditioned policy a bout's deferred-warm backlog
 occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
@@ -65,8 +68,9 @@ The switch is per-run: ``framework_cfg.json`` ``tuner.inner_policy`` —
 ``deferred-random8-hebo10-spsa10-v1`` (default),
 ``localtr8-hebo10-spsa10-v1``, ``localtr8-hebo10-hebo10-v1``,
 ``selfrank8-hebo10-hebo10``, ``mixup24-turbo20-v1``,
-``hebo24-turbo20-v1``, or ``legacy`` (the pre-policy uniform behavior: every
-bout runs the CONTINUE rule at ``tuner.bout_trials``).
+``hebo24-turbo20-v1``, ``hebo24-hebo20``, or ``legacy`` (the pre-policy
+uniform behavior: every bout runs the CONTINUE rule at
+``tuner.bout_trials``).
 Stdlib-only at module level so both ``tune_tools`` and ``_common`` can
 import it without cycles.
 """
@@ -79,17 +83,22 @@ LOCAL_TR_HEBO_POLICY_ID = "localtr8-hebo10-hebo10-v1"
 SELF_RANK_HEBO_POLICY_ID = "selfrank8-hebo10-hebo10"
 MIXUP_TURBO_POLICY_ID = "mixup24-turbo20-v1"
 HEBO_TURBO_POLICY_ID = "hebo24-turbo20-v1"
+HEBO_HEBO_POLICY_ID = "hebo24-hebo20"
 LEGACY_POLICY_ID = "legacy"
 INITIAL24_TURBO_POLICY_IDS = (
     MIXUP_TURBO_POLICY_ID,
     HEBO_TURBO_POLICY_ID,
+)
+INITIAL24_POLICY_IDS = (
+    *INITIAL24_TURBO_POLICY_IDS,
+    HEBO_HEBO_POLICY_ID,
 )
 REGIME_POLICY_IDS = (
     POLICY_ID,
     LOCAL_TR_POLICY_ID,
     LOCAL_TR_HEBO_POLICY_ID,
     SELF_RANK_HEBO_POLICY_ID,
-    *INITIAL24_TURBO_POLICY_IDS,
+    *INITIAL24_POLICY_IDS,
 )
 #: Regime policies whose FIRST bout is the inner-benchmark ``local_tr`` arm.
 LOCAL_TR_FIRST_POLICY_IDS = (LOCAL_TR_POLICY_ID, LOCAL_TR_HEBO_POLICY_ID)
@@ -103,7 +112,7 @@ B_FIRST = 8
 B_CONTINUE = 10
 B_DEEP = 10
 INITIAL24_BOUT_SIZE = 24
-INITIAL24_TURBO_MAX_BOUTS = 3
+INITIAL24_MAX_BOUTS = 3
 MAX_BOUTS_PER_CANDIDATE = 4
 
 _REGIME_BOUT_SIZES = {FIRST: B_FIRST, CONTINUE: B_CONTINUE, DEEP: B_DEEP}
@@ -147,10 +156,10 @@ def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: in
     """
     if not is_regime_policy(policy_id):
         return int(legacy_bout_trials)
-    if policy_id in INITIAL24_TURBO_POLICY_IDS:
-        if not 0 <= bout_index < INITIAL24_TURBO_MAX_BOUTS:
+    if policy_id in INITIAL24_POLICY_IDS:
+        if not 0 <= bout_index < INITIAL24_MAX_BOUTS:
             raise ValueError(
-                f"{policy_id} has exactly {INITIAL24_TURBO_MAX_BOUTS} bouts; "
+                f"{policy_id} has exactly {INITIAL24_MAX_BOUTS} bouts; "
                 f"got bout_index={bout_index}"
             )
         if bout_index == 0:
@@ -163,7 +172,8 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
 
     ``mixup24-turbo20-v1`` is ["mixup"] for bout 0, while
     ``hebo24-turbo20-v1`` is ["hebo"] for bout 0; both use ["turbo"] for
-    bouts 1 and 2. Default FIRST -> ["bo"] (explicit RandomSampler; see
+    bouts 1 and 2. ``hebo24-hebo20`` is ["hebo"] for all three bouts.
+    Default FIRST -> ["bo"] (explicit RandomSampler; see
     :func:`bo_sampler_for_bout`). ``localtr8-hebo10-spsa10-v1`` and
     ``localtr8-hebo10-hebo10-v1`` FIRST -> ["local_tr"], while
     ``selfrank8-hebo10-hebo10`` FIRST -> ["selfrank"]. CONTINUE ->
@@ -177,12 +187,14 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
     legacy = [selected["method"], *selected["fallback"]]
     if not is_regime_policy(policy_id):
         return legacy
-    if policy_id in INITIAL24_TURBO_POLICY_IDS:
-        if not 0 <= bout_index < INITIAL24_TURBO_MAX_BOUTS:
+    if policy_id in INITIAL24_POLICY_IDS:
+        if not 0 <= bout_index < INITIAL24_MAX_BOUTS:
             raise ValueError(
-                f"{policy_id} has exactly {INITIAL24_TURBO_MAX_BOUTS} bouts; "
+                f"{policy_id} has exactly {INITIAL24_MAX_BOUTS} bouts; "
                 f"got bout_index={bout_index}"
             )
+        if policy_id == HEBO_HEBO_POLICY_ID:
+            return ["hebo"]
         if bout_index > 0:
             return ["turbo"]
         return ["mixup"] if policy_id == MIXUP_TURBO_POLICY_ID else ["hebo"]
@@ -209,7 +221,7 @@ def deep_requires_movable_continuous(policy_id: str) -> bool:
     return is_regime_policy(policy_id) and policy_id not in (
         LOCAL_TR_HEBO_POLICY_ID,
         SELF_RANK_HEBO_POLICY_ID,
-        *INITIAL24_TURBO_POLICY_IDS,
+        *INITIAL24_POLICY_IDS,
     )
 
 
