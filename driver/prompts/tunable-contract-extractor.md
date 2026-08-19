@@ -258,8 +258,10 @@ calls `score_fn` or validation; only a passed config may reserve an objective
 slot and enter evaluation. You proposed **K** configs in
 ②. Schema-4 config 0 is always evaluated; the other **`K_eval - 1`** slots are
 sampled uniformly without replacement. For a non-fresh candidate config 0 is a
-fidelity observation, never an incumbent: the best of the other evaluated rows
-is the screening score. The rest are **deferred**
+parameter-continuity control and remains eligible to win: the best finite row
+across config 0 and the other evaluated configs is the screening score. Its
+role remains provenance only and does not qualify as semantic causal evidence.
+The rest are **deferred**
 (stored params-only, evaluated later by the deep-tuner only if this candidate is
 promoted). Diagnose + fix every crash in the sampled set inline, until they all
 score or you abandon.
@@ -310,12 +312,12 @@ permutation, and selected/deferred indices in
 configs **reusing any already scored**; a re-run reuses the same sampled set and
 only re-evaluates what changed. It stores the rest in
 `phase_a.deferred_configs` and writes `phase_a`. An `inherited_control` row
-remains in the report and budget counts but is excluded from
-`best_warm_params`, `best_warm_score`, and every final-best minimum. The
-deep-tuner later evaluates the deferred configs FIRST (bo enqueue / grid
-prepend).
+remains explicitly tagged for attribution, but participates normally in
+`best_warm_params`, `best_warm_score`, and every final-best minimum. This does
+not change its `semantic_control.status: unverified`. The deep-tuner later
+evaluates the deferred configs FIRST (bo enqueue / grid prepend).
 
-- **exit 0** — every config scored; `BASE_PARAMS` = best selectable row;
+- **exit 0** — every config scored; `BASE_PARAMS` = best finite row;
   `phase_a` finalized. Go to 3c.
 - **exit 3 (CRASHED)** — the config at `crash_index` in the original
   `_warm_configs.json` raised. Replace a config-invalid value in that same slot;
@@ -325,8 +327,7 @@ prepend).
   was consumed; `phase: a` means an admitted `score_fn` call failed. Go to 3b.
 - **exit 4 (BUDGET EXHAUSTED)** — the strict reservation helper refused entry
   before `score_fn`. Do not diagnose this refusal. If the report contains prior
-  objective attempts but no finite selectable score (an inherited control alone
-  does not qualify), persist tuning metadata and record the candidate as
+  objective attempts but no finite score, persist tuning metadata and record the candidate as
   `crash`. Otherwise this candidate owns zero attempts: stop here and submit a
   truthful receipt with `status: unevaluated` and `ledger_updated: false`. The
   DRIVER owns the lifecycle resolution of an unstarted candidate — it proves
@@ -367,7 +368,7 @@ it and configs still crash, treat it as `abandon`.
 ### 3c. Success → record the candidate's score + warm metadata
 
 Step 0+1 **is** the candidate's evaluation — there is **one global `config → score`
-function and no separate official run**, so the best selectable warm config's
+function and no separate official run**, so the best finite warm config's
 score is the candidate's score. Write **both** its score and its warm metadata:
 
 ```bash
@@ -410,7 +411,7 @@ evaluation budget. Report `status: crash`; the driver skips this candidate.
 - **The driver runs the candidate only in segment ③** through the typed
   `warmstart` job. Segments ①② never import or run it.
 - **You write `BASE_PARAMS`** — but only via `warmstart_eval.py` (which AST-writes
-  the best selectable warm row and excludes an inherited fidelity control).
+  the best finite warm row, including an inherited control when it wins).
   Never hand-edit `BASE_PARAMS` or `SEARCH_SPACE`.
 - **You write this candidate's ledger record** — only via `tools/ledger.py`
   (`set-tuning` / `record-run`), never by hand. Never touch other candidates,

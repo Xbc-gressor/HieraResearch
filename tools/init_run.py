@@ -64,6 +64,7 @@ INNER_POLICIES = (
     "mixup24-turbo20-v1",
     "hebo24-turbo20-v1",
     "hebo24-hebo20",
+    "baseline-hebo-full-v1",
     "legacy",
 )
 
@@ -71,8 +72,8 @@ INNER_POLICIES = (
 # these keys keep their historical runtime fallbacks; init_run never rewrites
 # an existing run merely because the defaults changed.
 DEFAULT_SEMANTIC_POLICY = "coverage_attempt"
-DEFAULT_SCHEDULER_POLICY = "v3_2"
-DEFAULT_INNER_POLICY = "deferred-random8-hebo10-spsa10-v1"
+DEFAULT_SCHEDULER_POLICY = "anchor_challenger_v1"
+DEFAULT_INNER_POLICY = "hebo24-hebo20"
 DEFAULT_MAX_EVALUATIONS = 200
 
 
@@ -205,7 +206,7 @@ def initialize_run(
     ):
         raise ValueError(
             "k_eval must be an integer of at least 2 so a non-fresh candidate "
-            "has one selectable row beyond its fidelity control"
+            "evaluates its inherited control plus at least one alternative"
         )
     if (
         k_warm is not None
@@ -272,6 +273,18 @@ def initialize_run(
             f"{inner_policy} requires scheduler_policy "
             "anchor_challenger_v1"
         )
+    if inner_policy == "baseline-hebo-full-v1":
+        if effective_scheduler != "legacy":
+            raise ValueError(
+                "baseline-hebo-full-v1 requires scheduler_policy legacy: "
+                "the baseline-tune loop runs one full-budget bout with no "
+                "scheduler"
+            )
+        if max_evaluations is None and config.get("max_evaluations") is None:
+            raise ValueError(
+                "baseline-hebo-full-v1 requires max_evaluations: the single "
+                "HEBO bout spans the whole run budget"
+            )
 
     # Frozen-value guard. It protects a choice this run already recorded, so it
     # only applies once framework_cfg.json exists. A run dir pre-seeded from
@@ -430,6 +443,25 @@ def initialize_run(
                     "deep_tune_per_candidate_cap": 44,
                 }
                 updates.append("deep_tune_per_candidate_cap=44")
+        if inner_policy == "baseline-hebo-full-v1":
+            # The single bout spends the whole run budget on one candidate;
+            # the per-candidate cap must not truncate it. Re-checked on every
+            # init call so a raised max_evaluations on resume raises the cap.
+            effective_max = (
+                max_evaluations
+                if max_evaluations is not None
+                else config.get("max_evaluations")
+            )
+            section = config.get("tuner", {})
+            current_cap = int(section.get("deep_tune_per_candidate_cap", 40))
+            if effective_max is not None and current_cap < int(effective_max):
+                config["tuner"] = {
+                    **section,
+                    "deep_tune_per_candidate_cap": int(effective_max),
+                }
+                updates.append(
+                    f"deep_tune_per_candidate_cap={int(effective_max)}"
+                )
 
     if k_warm is not None:
         section = config.get("tuner", {})

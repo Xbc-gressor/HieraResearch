@@ -58,7 +58,7 @@ class RunConfigTunerValidationTests(unittest.TestCase):
                 ):
                     self._read({"n_min": value})
 
-    def test_k_eval_reserves_a_selectable_row_beyond_the_control(self) -> None:
+    def test_k_eval_reserves_an_alternative_beside_the_control(self) -> None:
         with self.assertRaisesRegex(
             run_cfg.RunConfigError,
             "tuner.K_eval must be at least 2",

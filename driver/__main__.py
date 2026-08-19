@@ -23,7 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run one experiment or hillclimb loop")
     run.add_argument("task")
     run.add_argument("tag")
-    run.add_argument("--loop", choices=["experiment", "hillclimb"], required=True)
+    run.add_argument("--loop", choices=["experiment", "hillclimb",
+                                         "baseline-tune"], required=True)
     run.add_argument("--model", help="resolved model id; required for a new run, "
                                      "ignored on resume (run_metadata.json wins)")
     run.add_argument("--max-evaluations", type=int)
@@ -40,7 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--scheduler-policy",
         choices=["legacy", "legacy_wide", "v3_2", "anchor_challenger_v1"],
-        help="tuner scheduler policy; new runs default to v3_2",
+        help="tuner scheduler policy; new experiment runs default to "
+             "anchor_challenger_v1. Ignored by --loop baseline-tune, which "
+             "runs without a scheduler",
     )
     run.add_argument(
         "--inner-tuner-policy",
@@ -54,8 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
             "hebo24-hebo20",
             "legacy",
         ],
-        help="regime-conditioned inner-tuner policy; new runs default to "
-             "deferred-random8-hebo10-spsa10-v1",
+        help="regime-conditioned inner-tuner policy; new experiment runs "
+             "default to hebo24-hebo20. Ignored by --loop baseline-tune, "
+             "which freezes baseline-hebo-full-v1",
     )
     run.add_argument(
         "--k-warm",
@@ -101,6 +105,18 @@ def main(argv: list[str] | None = None) -> int:
             status = run_hillclimb(
                 args.task, args.tag, runner=runner, model=model,
                 max_evaluations=args.max_evaluations, timeout=args.timeout,
+                cli_path=args.cli_path,
+            )
+            print(json.dumps(status, indent=2, sort_keys=True))
+            return exit_code_for(status, args.loop)
+        if args.loop == "baseline-tune":
+            from driver.loops.baseline_tune import run_baseline_tune
+            runner = SDKSessionRunner(model=model, events=EventsLog(run_dir),
+                                      cli_path=args.cli_path)
+            status = run_baseline_tune(
+                args.task, args.tag, runner=runner, model=model,
+                max_evaluations=args.max_evaluations, timeout=args.timeout,
+                k_warm=args.k_warm, k_eval=args.k_eval,
                 cli_path=args.cli_path,
             )
             print(json.dumps(status, indent=2, sort_keys=True))

@@ -105,7 +105,7 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
     ):
         raise RunConfigError(
             f"{path}: tuner.K_eval must be at least 2 so a non-fresh "
-            "candidate has one selectable row beyond its fidelity control"
+            "candidate evaluates its inherited control plus an alternative"
         )
 
     # These consumers call int(value) whenever the key is present, so an
@@ -167,6 +167,7 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "mixup24-turbo20-v1",
             "hebo24-turbo20-v1",
             "hebo24-hebo20",
+            "baseline-hebo-full-v1",
             "legacy",
         )
         value = tuner["inner_policy"]
@@ -187,6 +188,15 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             raise RunConfigError(
                 f"{path}: tuner.inner_policy {value!r} requires "
                 "tuner.scheduler_policy 'anchor_challenger_v1'"
+            )
+        if (
+            value == "baseline-hebo-full-v1"
+            and tuner.get("scheduler_policy", "v3_2") != "legacy"
+        ):
+            raise RunConfigError(
+                f"{path}: tuner.inner_policy {value!r} is the "
+                "baseline-tune loop's single full-budget bout and requires "
+                "tuner.scheduler_policy 'legacy' (no scheduler)"
             )
 
     for key in ("scheduler_scenarios", "max_bouts_per_candidate"):

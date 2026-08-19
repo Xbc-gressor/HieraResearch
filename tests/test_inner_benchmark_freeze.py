@@ -92,8 +92,8 @@ def _rejected_trial(params):
 def make_report(*, control_score=1.00, bout0_scores=None, bout1_scores=None):
     """Two-bout tune_report mirroring the production shapes (0805+ era).
 
-    Defaults: control 1.00 < warm A 1.20 < warm B 1.10 excluded from the
-    production incumbent; bout 0 improves (0.90 < 1.10), bout 1 improves
+    Defaults: control 1.00 < warm A 1.20 < warm B 1.10, so the inherited
+    control is the Phase-A incumbent; bout 0 improves (0.90 < 1.00), bout 1 improves
     (0.88 < 0.90). bout_trials=4, two deferred extras attempted in bout 0, so
     bout 0's nominal size is 6 and bout 1's is 4.
     """
@@ -112,8 +112,7 @@ def make_report(*, control_score=1.00, bout0_scores=None, bout1_scores=None):
         _warm_row(WARM_A, 1.20),
         _warm_row(WARM_B, 1.10),
     ]
-    selectable = [r for r in warm_rows if r.get("role") != "inherited_control"]
-    best_warm = min(selectable, key=lambda r: r["score"])
+    best_warm = min(warm_rows, key=lambda r: r["score"])
     bout0_trials = [
         _trial(DEFERRED_1, bout0_scores["d1"]),
         _trial(DEFERRED_2, bout0_scores["d2"]),
@@ -129,8 +128,8 @@ def make_report(*, control_score=1.00, bout0_scores=None, bout1_scores=None):
         _trial(F3, bout1_scores["f3"]),
         _trial(F4, bout1_scores["f4"]),
     ]
-    # The production close fields must equal the global best over the phase-a
-    # best selectable row plus every finite trial (production incumbent口径).
+    # The production close fields must equal the global best over every finite
+    # warm and Phase-C row, regardless of provenance role.
     candidates = [(best_warm["params"], best_warm["score"])] + [
         (t["params"], t["score"])
         for t in bout0_trials + bout1_trials
@@ -282,18 +281,17 @@ def test_create_first_regime(two_bout_run, tmp_path):
     assert set(origins(ckpt.history)) == {"phase_a"}
     roles = {row.role for row in ckpt.history}
     assert roles == {"inherited_control", None}
-    # BASE_PARAMS = phase-a best SELECTABLE row (WARM_B 1.10), not the control
-    # row (1.00) even though it scored lower.
-    assert read_base_params(ckpt.candidate_path) == WARM_B
-    assert summary["base_params_restored"] == WARM_B
+    # BASE_PARAMS = phase-a best finite row, including the control when it wins.
+    assert read_base_params(ckpt.candidate_path) == CONTROL
+    assert summary["base_params_restored"] == CONTROL
     # deferred carried as recorded (no bouts included).
     assert [dict(d) for d in ckpt.deferred_configs] == [DEFERRED_1, DEFERRED_2]
-    # Benchmark incumbent includes the control row: control 1.00 wins.
+    # The checkpoint incumbent matches production: control 1.00 wins.
     assert ckpt.incumbent.params == CONTROL
     assert ckpt.incumbent_is_inherited_control is True
     # Provisional source scores; nothing re-measured yet.
     assert ckpt.extra["remeasure"]["remeasured_identities"] == []
-    assert ckpt.extra["incumbents"]["production"]["params"] == WARM_B
+    assert ckpt.extra["incumbents"]["production"]["params"] == CONTROL
     # Task wiring from the repo task.toml + source framework_cfg.
     assert ckpt.task.score_fn == "evaluate_config"
     assert ckpt.task.preflight_fn == "preflight_config"
@@ -356,14 +354,15 @@ def test_create_inherited_control_incumbent(tmp_path):
     assert ckpt.incumbent.score == pytest.approx(0.80)
     assert ckpt.incumbent_is_inherited_control is True
     assert "inherited_control_excluded" not in ckpt.extra
-    # Production incumbent (BASE_PARAMS restore target) still excludes it.
-    assert read_base_params(ckpt.candidate_path) == WARM_B
+    assert read_base_params(ckpt.candidate_path) == CONTROL
 
 
 def test_create_inherited_control_out_of_space_is_excluded(tmp_path):
     control_oob = dict(CONTROL, depth=99)  # outside ("int", 1, 8)
     report = make_report(control_score=0.80)
     report["phase_a"]["warm_start_configs"][0]["params"] = control_oob
+    report["phase_a"]["best_warm_params"] = control_oob
+    report["final_best_params"] = control_oob
     run_dir = make_run(tmp_path, report=report, base_params=F2)
 
     out = tmp_path / "ckpt"

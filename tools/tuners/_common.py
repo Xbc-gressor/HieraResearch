@@ -1295,9 +1295,9 @@ def prior_patience_state(
 
     Only Phase-C rows of the scoped bout increment the streak. Warm screening
     is a deliberate spread over distinct numeric regimes, not a stalled
-    optimizer. The inherited config-0 fidelity control is not an incumbent, so
-    it cannot set ``best`` or reset patience; a Phase-C duplicate of its exact
-    params counts as a spent non-improving trial.
+    optimizer. Provenance roles do not alter the optimization bar: an inherited
+    config-0 control may set ``best`` just like any other finite child-code
+    observation.
     """
     report = read_tune_report(report_path)
     phase_a = report.get("phase_a", {})
@@ -1306,14 +1306,7 @@ def prior_patience_state(
         bout_index = max((stage_bout_index(s) for s in stages), default=0)
 
     best: float | None = None
-    inherited_param_ids: set[str] = set()
     for trial in phase_a.get("warm_start_configs", []):
-        if (
-            trial.get("role") == "inherited_control"
-            and isinstance(trial.get("params"), dict)
-        ):
-            inherited_param_ids.add(params_identity(trial["params"]))
-            continue
         score = trial.get("score")
         if is_finite_score(score) and (best is None or float(score) < best):
             best = float(score)
@@ -1321,14 +1314,9 @@ def prior_patience_state(
     def absorbs(trial: dict) -> bool:
         """Whether the trial improves the running best (reset) or not."""
         nonlocal best
-        is_inherited_duplicate = (
-            isinstance(trial.get("params"), dict)
-            and params_identity(trial["params"]) in inherited_param_ids
-        )
         score = trial.get("score")
         if (
-            not is_inherited_duplicate
-            and is_finite_score(score)
+            is_finite_score(score)
             and (best is None or float(score) < best)
         ):
             best = float(score)

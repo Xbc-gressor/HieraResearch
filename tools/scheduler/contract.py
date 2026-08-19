@@ -34,8 +34,7 @@ DEEP_MIN_BOUTS = 2
 
 #: Objective calls one generation round reserves per admitted candidate.
 #: Mirrors ``got_select.cmd_decide``'s ``k_eval`` floor: a non-fresh
-#: candidate spends one slot on its inherited fidelity control and needs at
-#: least one more for a selectable row.
+#: candidate scores its inherited control and at least one alternative.
 DEFAULT_K_EVAL = 2
 
 

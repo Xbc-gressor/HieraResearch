@@ -895,7 +895,7 @@ class FailureArtifactTests(unittest.TestCase):
                 [{"params": {"depth": 3}, "score": 0.4}],
             )
 
-    def test_inherited_control_is_counted_but_cannot_become_the_best(self) -> None:
+    def test_inherited_control_and_later_duplicate_can_become_the_best(self) -> None:
         report = {
             "phase_a": {
                 "status": "ok",
@@ -907,8 +907,8 @@ class FailureArtifactTests(unittest.TestCase):
                     },
                     {"params": {"depth": 2}, "score": 0.4},
                 ],
-                "best_warm_params": {"depth": 2},
-                "best_warm_score": 0.4,
+                "best_warm_params": {"depth": 1},
+                "best_warm_score": 0.1,
                 "trials_attempted": 2,
             },
             "phase_c": {
@@ -924,7 +924,7 @@ class FailureArtifactTests(unittest.TestCase):
             },
         }
 
-        self.assertEqual(select_best(report)["best_score"], 0.3)
+        self.assertEqual(select_best(report)["best_score"], 0.05)
         self.assertEqual(summarize(report)["trials_completed"], 4)
 
     def test_candidate_selection_can_tune_ancestor_after_terminal_unbound_child(

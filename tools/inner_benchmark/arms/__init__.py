@@ -22,11 +22,13 @@ ARM_MODULES = {
     "pool_gp_ei": "arms.pool_gp_ei",
     "pool_tpe": "arms.pool_tpe",
     "pool_hebo_mace": "arms.pool_hebo_mace",
+    "pool3_hebo_mace": "arms.pool3_hebo_mace",
     "pool7_hebo_mace": "arms.pool7_hebo_mace",
     "hebo_only": "arms.hebo_only",
     "mixup_pool_hebo": "arms.mixup_pool_hebo",
     "alt_pool_hebo": "arms.alt_pool_hebo",
     "softalt": "arms.softalt",
+    "bernsalt": "arms.bernsalt",
     "turbo": "arms.turbo",
 }
 

@@ -1,4 +1,4 @@
-"""Regime-conditioned inner-tuner policy (deferred-random8-hebo10-spsa10-v1).
+"""Regime-conditioned inner-tuner policy tests.
 
 Covers the policy module itself and its wiring through phase-c-action, stage
 admission, validate-proposals, select-candidate, the driver job builder, and

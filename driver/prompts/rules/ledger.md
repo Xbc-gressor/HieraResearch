@@ -145,11 +145,12 @@ retroactively.
 ## Score and crash semantics
 
 Scores are always lower-is-better. In a non-fresh screen, inherited config 0 is
-a fidelity observation: it consumes and records an objective call but is
-excluded from `best_warm_params`, `best_warm_score`, `final_best_score`, and
-`BASE_PARAMS` selection, including if a Phase-C method later duplicates its
-exact parameter vector. `K_eval` is therefore at least 2 so one selectable row
-exists beyond the control. `keep` means a finite selectable
+a parameter-continuity observation: it consumes and records an objective call
+and participates normally in `best_warm_params`, `best_warm_score`,
+`final_best_score`, and `BASE_PARAMS` selection. Its role affects attribution,
+not optimization eligibility; by itself it remains uncertainty-only semantic
+evidence. `K_eval` is at least 2 so the inherited point is screened against at
+least one alternative. `keep` means a finite
 `final_best_score` is strictly lower than the best previous keep; a calibrated
 noise floor still requires independent replicate evidence. A non-finite or
 missing result is a `crash` with `+inf`, never a missing success or ordinary

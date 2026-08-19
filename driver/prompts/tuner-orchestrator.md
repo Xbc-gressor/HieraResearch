@@ -4,16 +4,14 @@ You are the **decoupled tuning step** of the loop (design §15, progressive).
 Once per round you pick **one** candidate from the whole population and run
 **one tuning bout** on it in place: a fixed slice of objective attempts whose
 size is set by the bout's regime under the run's inner tuner policy
-(`tuner.inner_policy`, default `deferred-random8-hebo10-spsa10-v1`;
-comparison arms `localtr8-hebo10-spsa10-v1`, `localtr8-hebo10-hebo10-v1`,
-and `selfrank8-hebo10-hebo10`
-keep the same sizes):
-**FIRST = 8** (0 completed bouts), **CONTINUE = 10** (1), **DEEP = 10** (2–3).
-The production experiment policies `mixup24-turbo20-v1`,
-`hebo24-turbo20-v1`, and `hebo24-hebo20` are the explicit exceptions:
-**INITIAL/FIRST = 24**, followed by two 10-slot bouts; each has exactly three
-bouts and a 44-attempt candidate lifetime. The first two use TuRBO for their
-later bouts; `hebo24-hebo20` uses HEBO MACE throughout.
+(`tuner.inner_policy`, default `hebo24-hebo20`): **INITIAL/FIRST = 24**,
+followed by two 10-slot bouts, for exactly three bouts and a 44-attempt
+candidate lifetime. The default uses HEBO MACE throughout. The comparison
+policies `mixup24-turbo20-v1` and `hebo24-turbo20-v1` keep the same sizes but
+use TuRBO for their later bouts. The older regime policies
+`deferred-random8-hebo10-spsa10-v1`, `localtr8-hebo10-spsa10-v1`,
+`localtr8-hebo10-hebo10-v1`, and `selfrank8-hebo10-hebo10` instead use
+**FIRST = 8**, **CONTINUE = 10**, **DEEP = 10**.
 A first bout deep-tunes a promising untuned candidate; a continuation bout
 resumes a tuned candidate that responded to its last bout; a DEEP bout is a
 late bout on a twice-responding candidate. After each bout the candidate is
@@ -25,8 +23,9 @@ bout** (often zero — a valid no-op).
 **Warm-start is already done** — step 0 (`tunable-contract-extractor`) proposed K
 configs and step 1 (eval-K) evaluated them, writing each candidate's `phase_a`
 (warm trials + `best_warm_score`) into its `tune_report.json` and the ledger, and
-`BASE_PARAMS = best selectable warm row`; an inherited config-0 fidelity
-control remains an observation, never the incumbent. You read that; you never
+`BASE_PARAMS = best finite warm row`; an inherited config-0 control remains
+explicitly tagged for attribution and may be the operational incumbent. Its
+receipt remains unverified semantic evidence. You read that; you never
 re-evaluate warm configs.
 All evaluation goes through the **one global `config → score` function** via the
 tuner scripts (Phase C search) — there is no separate official surface and no
@@ -228,7 +227,7 @@ or the report yourself.
    "start_new_bout"}` — that is how the NEXT invocation recognizes a
    continuation.
    The regime-conditioned inner policy fixes which method a bout opens with:
-   - **FIRST** (bout_index 0, 8 trials) — default `deferred-random8-hebo10-spsa10-v1`
+   - **FIRST** (bout_index 0, 8 trials) — `deferred-random8-hebo10-spsa10-v1`
      uses `bo` driven by an explicit Optuna `RandomSampler` (`--sampler random`);
      its `model_driven_trials` is always 0. Comparison arms
      `localtr8-hebo10-spsa10-v1` and `localtr8-hebo10-hebo10-v1` use
@@ -247,8 +246,8 @@ or the report yourself.
      eight finite unique history points exist it executes the proposer's own
      rank-1 point; afterward official HEBO MACE reranks the pool. It never runs
      a pure-HEBO or LHS warmup. Deferred warm configs occupy slots inside 24.
-     `hebo24-hebo20` uses this same `pool_hebo_mace` arm for INITIAL and both
-     later bouts.
+     The default `hebo24-hebo20` uses this same `pool_hebo_mace` arm for
+     INITIAL and both later bouts.
    - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official

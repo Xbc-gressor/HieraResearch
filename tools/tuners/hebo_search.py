@@ -314,6 +314,25 @@ def _history_rows(report: dict, incumbent_identity: str, contract) -> list:
     return rows
 
 
+def _incumbent_is_inherited_control(
+    report: dict, incumbent_identity: str, contract
+) -> bool:
+    """Whether the incumbent parameter identity came from inherited config 0."""
+    for trial in report.get("phase_a", {}).get("warm_start_configs", []):
+        if (
+            not isinstance(trial, dict)
+            or trial.get("role") != "inherited_control"
+            or not isinstance(trial.get("params"), dict)
+        ):
+            continue
+        try:
+            if contract.params_identity(trial["params"]) == incumbent_identity:
+                return True
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return False
+
+
 def _stage_spent(stage: dict) -> int:
     spent = 0
     for row in stage.get("trials", []) if isinstance(stage, dict) else []:
@@ -434,7 +453,9 @@ def _build_checkpoint(
         incumbent=checkpoint_mod.Incumbent(
             params=dict(incumbent_params), score=float(incumbent_score)
         ),
-        incumbent_is_inherited_control=False,
+        incumbent_is_inherited_control=_incumbent_is_inherited_control(
+            report, incumbent_identity, contract
+        ),
         items=_run_global_items(candidate_path, relative_improvement),
         history=tuple(_history_rows(report, incumbent_identity, contract)),
         extra={"remaining_budget": remaining},

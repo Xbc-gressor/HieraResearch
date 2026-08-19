@@ -16,9 +16,9 @@ Subcommands:
 - phase-c-action  : candidate + tune_report -> deterministic resume action
                     (run method, finalize, or stop on exhausted allocation)
 - select-best     : tune_report.json -> global best (minimum)
-                    {best_params, best_score, source} over selectable
-                    warm+phase_c trials; fidelity controls are observations,
-                    never incumbents
+                    {best_params, best_score, source} over every finite
+                    warm+phase_c trial; provenance roles never disqualify an
+                    objectively evaluated configuration
 - validate-params : a params dict's keys/bounds vs the candidate SEARCH_SPACE
                     -> {ok, violations}; exit 1 on any violation
 - summarize       : tune_report.json -> stored tuning summary {best_warm_score,
@@ -924,9 +924,11 @@ def lint_schema(train_path: Path) -> dict:
 def finite_warm_incumbent_rows(rows) -> list[dict]:
     """Return finite warm rows that may become the candidate incumbent.
 
-    ``inherited_control`` is a fidelity observation on child code. Letting that
-    row win would turn reproduction/evaluation variance into a semantic
-    candidate improvement and corrupt the lineage base.
+    ``inherited_control`` remains an attribution/provenance role, not an
+    optimization exclusion.  Its score was produced by the same child code and
+    objective as every other warm row, so it is eligible to become BASE_PARAMS
+    and the candidate incumbent.  Semantic evidence independently keeps the
+    transfer receipt ``unverified`` unless a qualified paired control exists.
     """
     if not isinstance(rows, list):
         return []
@@ -934,61 +936,21 @@ def finite_warm_incumbent_rows(rows) -> list[dict]:
         row
         for row in rows
         if isinstance(row, dict)
-        and row.get("role") != "inherited_control"
         and isinstance(row.get("params"), dict)
         and _is_finite_score(row.get("score"))
     ]
 
 
-def _iter_trials(report: dict, *, include_fidelity_controls: bool = False):
-    """Yield selectable trials, optionally including scored fidelity controls.
-
-    The inclusive view is accounting-only. Incumbent/final selection always
-    uses the default view, which excludes inherited config 0 and any Phase-C
-    duplicate of that exact parameter vector.
-    """
+def _iter_trials(report: dict):
+    """Yield every finite objectively evaluated warm and Phase-C trial."""
     phase_a = report.get("phase_a", {})
-    inherited_params_sha256: set[str] = set()
     for warm in phase_a.get("warm_start_configs", []):
-        if (
-            isinstance(warm, dict)
-            and warm.get("role") == "inherited_control"
-            and isinstance(warm.get("params"), dict)
-        ):
-            try:
-                inherited_params_sha256.add(_json_sha256(warm["params"]))
-            except (OverflowError, TypeError, ValueError):
-                pass
-        if (
-            _is_finite_score(warm.get("score"))
-            and (
-                include_fidelity_controls
-                or warm.get("role") != "inherited_control"
-            )
-        ):
+        if _is_finite_score(warm.get("score")):
             yield ("warm_start", warm["params"], float(warm["score"]))
     for stage in report.get("phase_c", {}).get("stages", []):
         method = stage.get("method", "phase_c")
         for trial in stage.get("trials", []):
-            is_inherited_duplicate = False
-            if (
-                inherited_params_sha256
-                and isinstance(trial.get("params"), dict)
-            ):
-                try:
-                    is_inherited_duplicate = (
-                        _json_sha256(trial["params"])
-                        in inherited_params_sha256
-                    )
-                except (OverflowError, TypeError, ValueError):
-                    pass
-            if (
-                _is_finite_score(trial.get("score"))
-                and (
-                    include_fidelity_controls
-                    or not is_inherited_duplicate
-                )
-            ):
+            if _is_finite_score(trial.get("score")):
                 yield (method, trial["params"], float(trial["score"]))
 
 
@@ -1023,7 +985,7 @@ def validated_phase_a_incumbent(report: dict) -> dict:
         raise ValueError("phase_a.warm_start_configs must be a list")
     finite_warm = finite_warm_incumbent_rows(warm_rows)
     if not finite_warm:
-        raise ValueError("phase_a has no finite selectable warm observation")
+        raise ValueError("phase_a has no finite warm observation")
     warm_best = min(finite_warm, key=lambda row: float(row["score"]))
     if phase_a.get("best_warm_params") != warm_best["params"]:
         raise ValueError(
@@ -1090,7 +1052,7 @@ def _phase_a_finalization_evidence(
         else None
     )
     if warm_best is None:
-        errors.append("phase_a has no finite selectable warm observation")
+        errors.append("phase_a has no finite warm observation")
         return phase_a, None
 
     if phase_a.get("best_warm_params") != warm_best["params"]:
@@ -1507,6 +1469,25 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
     legacy_bout_trials = int(
         load_run_cfg(candidate_path, "tuner").get("bout_trials", DEFAULT_BOUT_TRIALS)
     )
+    if policy_id == inner_policy.BASELINE_HEBO_POLICY_ID:
+        # The baseline bout IS the run budget: one HEBO bout spanning the
+        # whole max_evaluations. Read it live (not from tuner.bout_trials)
+        # so a budget change on resume still applies to the unfinished bout.
+        cfg_path = find_framework_cfg(candidate_path)
+        max_evaluations = (
+            read_framework_cfg(cfg_path).get("max_evaluations")
+            if cfg_path is not None
+            else None
+        )
+        if (
+            not isinstance(max_evaluations, int)
+            or isinstance(max_evaluations, bool)
+            or max_evaluations <= 0
+        ):
+            raise ValueError(
+                "baseline-hebo-full-v1 requires a finite max_evaluations"
+            )
+        legacy_bout_trials = max_evaluations
 
     def chain_for(bout: int) -> list:
         return inner_policy.method_chain_for_bout(policy_id, bout, search_space)
@@ -2757,9 +2738,7 @@ def summarize(report: dict) -> dict:
         trial.get("status") == "preflight_rejected"
         for trial in phase_c_trials
     )
-    trials_completed = sum(
-        1 for _ in _iter_trials(report, include_fidelity_controls=True)
-    )
+    trials_completed = sum(1 for _ in _iter_trials(report))
     trials_attempted = max(
         phase_a_attempted + phase_c_attempted,
         trials_completed,
@@ -3329,8 +3308,8 @@ def lineage_evidence(run_dir: Path, source_run_ids: list) -> dict:
 
 # step-2 is decoupled from idea proposal: every idea stops at step 0+1, and the
 # tuner picks ONE candidate from the whole population to deep-tune per round.
-# Selection is greedy on `best_warm_score` (the step-1 selectable screening
-# score; inherited fidelity controls are excluded) behind a promotion gate.
+# Selection is greedy on `best_warm_score` (the step-1 operational screening
+# incumbent, including an inherited control when it wins) behind a promotion gate.
 # NO headroom/spread term: warm-start
 # configs are referenced from heterogeneous historical tasks, so their spread
 # reflects the reference quality, not the landscape — it is not comparable across

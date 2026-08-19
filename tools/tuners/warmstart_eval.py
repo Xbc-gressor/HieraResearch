@@ -22,8 +22,8 @@ time without re-evaluating what already passed:
    traceback) and STOP — exit `3` (CRASHED). The caller diagnoses it
    (config-invalid → edit that slot in `_warm_configs.json`; code-incompatible →
    edit `train.py`), then re-runs this to resume.
-3. When every selected config has a score (no crash), pick the best selectable
-   warm row, excluding an inherited config-0 fidelity control, write it into
+3. When every selected config has a score (no crash), pick the best finite warm
+   row, including an inherited config-0 control when it wins, write it into
    `BASE_PARAMS`, finalize `phase_a` (warm_start_configs +
    best_warm_score + best_warm_params + search_space), exit `0`.
 
@@ -408,8 +408,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tune-report-json", required=True, type=Path)
     parser.add_argument("--k-eval", type=int, default=None,
                         help="uniformly sample k-eval configs without replacement for "
-                             "evaluation now (best selectable row = screening score; "
-                             "an inherited control is observation-only); the rest are "
+                             "evaluation now (best finite row = screening score, "
+                             "including an inherited control when it wins); the rest are "
                              "DEFERRED — stored params-only and evaluated later by the deep-tuner "
                              "(BO enqueue / grid prepend) only if this candidate is selected. "
                              "The sampled permutation is persisted for resume. Default = all "
@@ -602,8 +602,8 @@ def _prepare_run(
     )
     if parameter_transfer is not None and k_eval < 2:
         parser.error(
-            "schema-4 non-fresh candidates require k_eval>=2: inherited "
-            "config 0 is a fidelity observation and cannot be the incumbent"
+            "schema-4 non-fresh candidates require k_eval>=2 to evaluate the "
+            "inherited config 0 plus at least one alternative warm config"
         )
     previous_report = read_tune_report(args.tune_report_json)
     previous_phase_a = previous_report.get("phase_a", {})
@@ -894,12 +894,7 @@ def _finish_budget_exhausted(
         {
             "phase": "a",
             "status": "budget_exhausted",
-            "reason": (
-                f"{error}; no finite selectable warm observation beyond "
-                "the inherited fidelity control"
-                if recovered
-                else str(error)
-            ),
+            "reason": f"{error}; no finite warm observation" if recovered else str(error),
             "objective_slot_consumed": False,
         }
     )
@@ -954,13 +949,10 @@ def _record_objective_failure(
 
 
 def _finish_phase_a(run: WarmstartRun) -> int:
-    """Apply the best selectable row and persist the successful Phase A."""
+    """Apply the best finite row and persist the successful Phase A."""
     selectable = finite_warm_incumbent_rows(run.warm_rows)
     if not selectable:
-        raise RuntimeError(
-            "warm evaluation produced no finite selectable row beyond the "
-            "inherited fidelity control"
-        )
+        raise RuntimeError("warm evaluation produced no finite warm row")
     best_params, best_warm_score = min(
         ((trial["params"], trial["score"]) for trial in selectable),
         key=lambda item: item[1],

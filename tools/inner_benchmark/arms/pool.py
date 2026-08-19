@@ -216,6 +216,12 @@ class PoolDriver:
         driver's own receipt corrections."""
         self._pending_messages.append(f"correction: {message}")
 
+    def announce(self, message: str) -> None:
+        """Queue an arm-originated informational note on the next ask (e.g.
+        bernsalt's per-round type), WITHOUT the ``correction:`` prefix that
+        push_correction adds."""
+        self._pending_messages.append(message)
+
     def ask_pool(self) -> dict:
         """Return {"pool": filtered configs in proposer rank order,
         "pool_ranked": pre-filter configs in proposer rank order,

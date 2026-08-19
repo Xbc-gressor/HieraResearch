@@ -15,6 +15,9 @@ uv run python -m driver run <task> <tag> --loop experiment \
 ```
 
 `--loop hillclimb` is the comparison baseline and starts the same way.
+`--loop baseline-tune` is the strong tuning baseline: the task-provided
+baseline plus ONE HEBO MACE bout spanning the whole `--max-evaluations`
+budget (requires `[seed].provided`; no ideation, no scheduler).
 `--model` is required for a new run and ignored on resume — the run's
 `run_metadata.json` wins. `--max-evaluations` and `--timeout` persist as
 `max_evaluations` and `per_runtime_limit` in the run's `framework_cfg.json`
@@ -35,7 +38,8 @@ Always read these in this order before doing experiment work:
    and machine-readable contract for whichever task is in scope. The task
    contract is authoritative for environment, preparation, editable files,
    dependency permission, timeout, and metric details.
-2. `driver/loops/experiment.py` and `driver/loops/hillclimb.py` — the
+2. `driver/loops/experiment.py`, `driver/loops/hillclimb.py`, and
+   `driver/loops/baseline_tune.py` — the
    canonical loop protocols, now deterministic Python. Role behavior lives in
    `driver/prompts/*.md`; each role's own prompt is authoritative for its
    contract. There is no separate protocol document — the repo-root
@@ -49,7 +53,8 @@ Always read these in this order before doing experiment work:
 ```text
 driver/                          the sole runtime: deterministic loops
                                  sequencing Claude Agent SDK role sessions
-driver/loops/                    experiment.py and hillclimb.py protocols
+driver/loops/                    experiment.py, hillclimb.py, and
+                                 baseline_tune.py protocols
 driver/prompts/                  role prompts (+ rules/ledger.md)
 driver/session.py                one role invocation = one SDK session +
                                  verify-repair loop

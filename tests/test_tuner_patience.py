@@ -138,7 +138,7 @@ class PriorPatienceStateTest(unittest.TestCase):
         self.assertIsNone(best)
         self.assertEqual(streak, 3)
 
-    def test_fidelity_control_cannot_set_or_reset_patience_best(self):
+    def test_inherited_control_sets_patience_best_and_duplicate_can_reset(self):
         write_tune_report(
             self.report_path,
             {
@@ -165,7 +165,7 @@ class PriorPatienceStateTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(prior_patience_state(self.report_path), (0.3, 1))
+        self.assertEqual(prior_patience_state(self.report_path), (0.05, 0))
 
 
 class BoutPatienceTest(unittest.TestCase):

@@ -210,8 +210,12 @@ def build_driver_job(
 
     if kind != "phase_c":
         raise DriverJobError(f"unsupported driver job kind: {kind!r}")
-    if role_name != "tuner-orchestrator":
-        raise DriverJobError("Phase-C jobs belong to tuner-orchestrator")
+    # "driver" is the baseline-tune loop, which deterministically owns its
+    # single full-budget bout and has no tuner-orchestrator session.
+    if role_name not in ("tuner-orchestrator", "driver"):
+        raise DriverJobError(
+            "Phase-C jobs belong to tuner-orchestrator or the driver loop"
+        )
     if not report_path.is_file():
         raise DriverJobError(f"tune report does not exist: {report_path}")
     method = request.get("method")

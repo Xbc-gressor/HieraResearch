@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 import warmstart_eval  # noqa: E402
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
+    _read_literal_mapping,
     _read_param_schema,
     authoritative_parent_incumbent,
     materialize_parameter_transfer,
@@ -544,7 +545,7 @@ class ParameterInheritanceTests(unittest.TestCase):
         )
         self.assertEqual(record["trials_attempted"], 1)
 
-    def test_warm_evaluator_scores_and_persists_the_mandatory_control(self) -> None:
+    def test_warm_evaluator_can_apply_the_mandatory_control(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _, child, configs_path = self._fixture(Path(tmp))
             child.write_text(
@@ -565,7 +566,7 @@ def make_model""",
                 """
 def evaluate_config(make_model, params):
     make_model(params)
-    return float(params["same"])
+    return -float(params["same"])
 """.lstrip()
             )
             receipt = materialize_parameter_transfer(child, configs_path)
@@ -607,7 +608,7 @@ def evaluate_config(make_model, params):
                 phase_a["warm_start_configs"][0],
                 {
                     "params": receipt["projection"]["params"],
-                    "score": 7.0,
+                    "score": -7.0,
                     "proposed_index": 0,
                     "role": "inherited_control",
                     "parameter_transfer_receipt_sha256": receipt[
@@ -617,10 +618,16 @@ def evaluate_config(make_model, params):
                 },
             )
             self.assertEqual(len(phase_a["warm_start_configs"]), 2)
-            self.assertEqual(phase_a["best_warm_params"]["same"], 4)
-            self.assertEqual(phase_a["best_warm_score"], 4.0)
+            self.assertEqual(
+                phase_a["best_warm_params"], receipt["projection"]["params"]
+            )
+            self.assertEqual(phase_a["best_warm_score"], -7.0)
+            self.assertEqual(
+                _read_literal_mapping(child, "BASE_PARAMS"),
+                receipt["projection"]["params"],
+            )
 
-    def test_nonfresh_control_only_screen_is_rejected_before_scoring(self) -> None:
+    def test_nonfresh_screen_still_requires_an_alternative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _, child, configs_path = self._fixture(Path(tmp))
             child.write_text(

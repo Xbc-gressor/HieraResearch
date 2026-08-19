@@ -1,6 +1,6 @@
-"""Regime-conditioned inner-tuner policy (scheduler v3.2 design §2.1).
+"""Regime-conditioned inner-tuner policies.
 
-The frozen production contract::
+The historical scheduler-v3.2 contract::
 
     inner_tuner_policy_id = deferred-random8-hebo10-spsa10-v1
 
@@ -43,9 +43,15 @@ The ``selfrank8-hebo10-hebo10`` comparison policy instead runs the
 inner-benchmark LLM-pool self-rank arm for FIRST, then HEBO for every later
 bout. Deferred warm configs still occupy slots inside FIRST's eight spends.
 
-The production experiment policies ``mixup24-turbo20-v1``,
-``hebo24-turbo20-v1``, and ``hebo24-hebo20`` are three-bout contracts for
-the anchor/challenger scheduler::
+The ``baseline-hebo-full-v1`` policy is the strong-baseline control arm used
+by the ``baseline-tune`` driver loop: ONE INITIAL bout of the prompt-v2 HEBO
+MACE kernel whose size is the run's whole ``max_evaluations`` budget — the
+experiment protocol's INITIAL bout stretched over the entire run, with no
+scheduler and no semantic generation. Its bout budget therefore comes from
+the run configuration, not from the regime table.
+
+The anchor/challenger policies ``mixup24-turbo20-v1``,
+``hebo24-turbo20-v1``, and ``hebo24-hebo20`` are three-bout contracts::
 
     0 completed bouts -> 24-slot mixup_pool_hebo INITIAL
                          OR 24-slot pool_hebo_mace INITIAL
@@ -54,7 +60,8 @@ the anchor/challenger scheduler::
     2 completed bouts -> 10-slot hot-start TuRBO segment 2
                          OR 10-slot pool_hebo_mace DEEP
 
-``hebo24-hebo20`` uses ``pool_hebo_mace`` for all three bouts. The two TuRBO
+``hebo24-hebo20`` is the new-experiment default and uses ``pool_hebo_mace``
+for all three bouts. The two TuRBO
 segments in the other policies share state when they run on the same
 candidate. If the scheduler switches candidates after a zero-gain first
 segment, the other candidate starts its own TuRBO trajectory. Deferred warm
@@ -65,11 +72,13 @@ occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
 them as extra trials on top of the bout budget.
 
 The switch is per-run: ``framework_cfg.json`` ``tuner.inner_policy`` —
-``deferred-random8-hebo10-spsa10-v1`` (default),
+``hebo24-hebo20`` (new-experiment default),
+``deferred-random8-hebo10-spsa10-v1`` (historical missing-key fallback),
 ``localtr8-hebo10-spsa10-v1``, ``localtr8-hebo10-hebo10-v1``,
 ``selfrank8-hebo10-hebo10``, ``mixup24-turbo20-v1``,
-``hebo24-turbo20-v1``, ``hebo24-hebo20``, or ``legacy`` (the pre-policy
-uniform behavior: every bout runs the CONTINUE rule at
+``hebo24-turbo20-v1``, ``hebo24-hebo20``,
+``baseline-hebo-full-v1`` (baseline-tune loop only), or ``legacy`` (the
+pre-policy uniform behavior: every bout runs the CONTINUE rule at
 ``tuner.bout_trials``).
 Stdlib-only at module level so both ``tune_tools`` and ``_common`` can
 import it without cycles.
@@ -77,6 +86,8 @@ import it without cycles.
 
 from __future__ import annotations
 
+# Historical missing-key fallback. New runs persist ``hebo24-hebo20``
+# explicitly through init_run, so changing defaults does not mutate old runs.
 POLICY_ID = "deferred-random8-hebo10-spsa10-v1"
 LOCAL_TR_POLICY_ID = "localtr8-hebo10-spsa10-v1"
 LOCAL_TR_HEBO_POLICY_ID = "localtr8-hebo10-hebo10-v1"
@@ -84,6 +95,7 @@ SELF_RANK_HEBO_POLICY_ID = "selfrank8-hebo10-hebo10"
 MIXUP_TURBO_POLICY_ID = "mixup24-turbo20-v1"
 HEBO_TURBO_POLICY_ID = "hebo24-turbo20-v1"
 HEBO_HEBO_POLICY_ID = "hebo24-hebo20"
+BASELINE_HEBO_POLICY_ID = "baseline-hebo-full-v1"
 LEGACY_POLICY_ID = "legacy"
 INITIAL24_TURBO_POLICY_IDS = (
     MIXUP_TURBO_POLICY_ID,
@@ -99,6 +111,7 @@ REGIME_POLICY_IDS = (
     LOCAL_TR_HEBO_POLICY_ID,
     SELF_RANK_HEBO_POLICY_ID,
     *INITIAL24_POLICY_IDS,
+    BASELINE_HEBO_POLICY_ID,
 )
 #: Regime policies whose FIRST bout is the inner-benchmark ``local_tr`` arm.
 LOCAL_TR_FIRST_POLICY_IDS = (LOCAL_TR_POLICY_ID, LOCAL_TR_HEBO_POLICY_ID)
@@ -153,8 +166,18 @@ def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: in
     """The bout's full trial budget under the policy.
 
     The legacy policy sizes every bout by the run's ``tuner.bout_trials``.
+    The baseline policy is a single bout sized by the run's
+    ``max_evaluations``, which ``phase_c_action`` passes in through
+    ``legacy_bout_trials``.
     """
     if not is_regime_policy(policy_id):
+        return int(legacy_bout_trials)
+    if policy_id == BASELINE_HEBO_POLICY_ID:
+        if bout_index != 0:
+            raise ValueError(
+                f"{policy_id} is a single-bout contract; "
+                f"got bout_index={bout_index}"
+            )
         return int(legacy_bout_trials)
     if policy_id in INITIAL24_POLICY_IDS:
         if not 0 <= bout_index < INITIAL24_MAX_BOUTS:
@@ -187,6 +210,13 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
     legacy = [selected["method"], *selected["fallback"]]
     if not is_regime_policy(policy_id):
         return legacy
+    if policy_id == BASELINE_HEBO_POLICY_ID:
+        if bout_index != 0:
+            raise ValueError(
+                f"{policy_id} is a single-bout contract; "
+                f"got bout_index={bout_index}"
+            )
+        return ["hebo"]
     if policy_id in INITIAL24_POLICY_IDS:
         if not 0 <= bout_index < INITIAL24_MAX_BOUTS:
             raise ValueError(
@@ -221,6 +251,7 @@ def deep_requires_movable_continuous(policy_id: str) -> bool:
     return is_regime_policy(policy_id) and policy_id not in (
         LOCAL_TR_HEBO_POLICY_ID,
         SELF_RANK_HEBO_POLICY_ID,
+        BASELINE_HEBO_POLICY_ID,
         *INITIAL24_POLICY_IDS,
     )
 

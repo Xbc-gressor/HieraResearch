@@ -8,9 +8,8 @@ Three subcommands (same names as the library entry points):
 
 - ``inspect --run-dir <dir>`` — per-candidate summary table for checkpoint
   selection (§七 stratification aid): source kind, phase-a status, completed
-  bout count, per-bout best score + strict-improvement flags (production口径:
-  the incumbent excludes inherited_control), finite unique config counts at
-  each boundary, eligible regimes. Read-only.
+  bout count, per-bout best score + strict-improvement flags, finite unique
+  config counts at each boundary, eligible regimes. Read-only.
 - ``create --run-dir <dir> --candidate <id> --bouts <N> --out <dir>`` — freeze
   the boundary after N completed bouts (N=0 -> regime "first", N=1 ->
   "continuation", N>=2 -> "deep").
@@ -53,15 +52,14 @@ in it; that following bout must exist and be complete, with no fallback.
 Boundary-time BASE_PARAMS
 -------------------------
 
-The copied candidate's BASE_PARAMS is restored to the PRODUCTION incumbent at
+The copied candidate's BASE_PARAMS is restored to the production incumbent at
 the boundary — not left at the source file's value, which may reflect LATER
 bouts (finalize_tuning.py rewrites BASE_PARAMS to the global best after every
-bout). The value is recomputed from report rows via tune_tools._iter_trials
-on the bout-truncated report: Phase-A best selectable row for N=0, global
-best over rows up to bout N-1 for N>=1, always excluding inherited_control
-rows (and their Phase-C duplicates) — production incumbent口径. The rewrite
-goes through production apply_base_params.apply and is verified by re-reading
-the train.py literals afterwards.
+bout). The value is recomputed as the global best finite row up to that
+boundary, including an inherited control when it wins. Historical controls
+outside the frozen SEARCH_SPACE remain in history but cannot be materialized
+as BASE_PARAMS. The rewrite goes through production apply_base_params.apply
+and is verified by re-reading the train.py literals afterwards.
 
 Frozen content
 --------------
@@ -78,8 +76,8 @@ status: "crash"}``; preflight_rejected rows are excluded entirely.
 ``deferred_configs`` = phase_a.deferred_configs minus configs already
 attempted (by production cast + params identity) in the included bouts.
 
-Incumbent (benchmark口径, PLAN §5.2): argmin over finite history INCLUDING
-inherited_control rows, with the guard that a control config participates only
+Incumbent (PLAN §5.2): argmin over finite history INCLUDING inherited_control
+rows, with the guard that a control config participates only
 when representable in the frozen SEARCH_SPACE (tune_tools._bounds_violations);
 an excluded control is recorded in ``extra.inherited_control_excluded``.
 Create-time scores are SOURCE scores (provisional); ``remeasure`` recomputes.
@@ -365,8 +363,8 @@ def _improvement_flags(phase_a: dict, bouts: list[list[dict]]) -> list[dict]:
 
     Mirrors tune_tools._last_bout_improved generalized to every bout: the
     starting incumbent is phase_a.best_warm_score (production's Phase-A best,
-    which excludes inherited_control), tightened by each earlier bout's finite
-    trial rows; a bout improves iff its best finite trial is strictly lower.
+    including inherited_control when it wins), tightened by each earlier bout's
+    finite trial rows; a bout improves iff its best finite trial is strictly lower.
     """
     warm_best = phase_a.get("best_warm_score")
     prior = float(warm_best) if tune_tools._is_finite_score(warm_best) else None
@@ -547,13 +545,6 @@ def _finite_unique_count(rows: list[dict], identity) -> int:
     return len(
         {identity(row["params"]) for row in rows if row.get("status") == "ok"}
     )
-
-
-def _truncated_report(phase_a: dict, bouts: list[list[dict]], n_bouts: int) -> dict:
-    """Report view holding only the stages up to the boundary, for
-    tune_tools._iter_trials (production incumbent selection口径)."""
-    stages = [stage for bout in bouts[:n_bouts] for stage in bout]
-    return {"phase_a": phase_a, "phase_c": {"stages": stages}}
 
 
 # ---------------------------------------------------------------------------
@@ -760,21 +751,7 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
                 + "; ".join(info["incomplete_reasons"])
             )
 
-    # Boundary-time production incumbent: recomputed from report rows via
-    # production _iter_trials (excludes inherited_control rows and their
-    # Phase-C duplicates) on the bout-truncated report. For N=0 this is the
-    # Phase-A best selectable row (== argmin over finite_warm_incumbent_rows).
-    trials = list(tune_tools._iter_trials(_truncated_report(phase_a, bout_list, bouts)))
-    if not trials:
-        raise ValueError(
-            f"candidate {candidate_id}: no finite selectable observation at the "
-            "boundary (production incumbent口径 excludes inherited_control)"
-        )
-    _, prod_params, prod_score = min(trials, key=lambda item: item[2])
-    prod_params = dict(prod_params)
-    prod_score = float(prod_score)
-
-    # History, deferred configs, benchmark口径 incumbent — all computed BEFORE
+    # History, deferred configs, and incumbent — all computed BEFORE
     # any output write so a failure never leaves a partial checkpoint.
     history = _history_rows(phase_a, bout_list, bouts)
     attempted = {
@@ -795,6 +772,8 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
         raise ValueError(
             f"candidate {candidate_id}: no finite history row can serve as incumbent"
         )
+    prod_params = dict(incumbent_row["params"])
+    prod_score = float(incumbent_row["score"])
     regime = _regime(bouts)
     if regime != "first":
         finite_unique = _finite_unique_count(history, identity)

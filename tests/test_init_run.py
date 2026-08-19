@@ -44,11 +44,15 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 config["semantic_search"]["policy"],
                 "coverage_attempt",
             )
-            self.assertEqual(config["tuner"]["scheduler_policy"], "v3_2")
+            self.assertEqual(
+                config["tuner"]["scheduler_policy"],
+                "anchor_challenger_v1",
+            )
             self.assertEqual(
                 config["tuner"]["inner_policy"],
-                "deferred-random8-hebo10-spsa10-v1",
+                "hebo24-hebo20",
             )
+            self.assertEqual(config["tuner"]["deep_tune_per_candidate_cap"], 44)
 
     def test_policy_comparison_arms_are_persisted_from_explicit_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,6 +164,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                     repo_root,
                     "toy",
                     "mixup-wrong-scheduler",
+                    scheduler_policy="v3_2",
                     inner_policy="mixup24-turbo20-v1",
                 )
 
@@ -177,7 +182,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
 
             self.assertEqual(json.loads(config_path.read_text()), original)
 
-    def test_new_scheduler_default_has_budget_without_template(self) -> None:
+    def test_new_production_defaults_have_budget_without_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             (repo_root / "tasks").mkdir()
@@ -186,11 +191,15 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
 
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["max_evaluations"], 200)
-            self.assertEqual(config["tuner"]["scheduler_policy"], "v3_2")
+            self.assertEqual(
+                config["tuner"]["scheduler_policy"],
+                "anchor_challenger_v1",
+            )
             self.assertEqual(
                 config["tuner"]["inner_policy"],
-                "deferred-random8-hebo10-spsa10-v1",
+                "hebo24-hebo20",
             )
+            self.assertEqual(config["tuner"]["deep_tune_per_candidate_cap"], 44)
 
     def test_explicit_induced_strategy_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
