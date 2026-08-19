@@ -7,6 +7,8 @@ project = "tasks/autoresearch-ddp"
 
 [resources]
 accelerator = "cuda"
+# Whole devices leased per evaluation; matches prepare.WORLD_SIZE (default 4).
+devices = 4
 
 [run]
 working_dir = "tasks/autoresearch-ddp"

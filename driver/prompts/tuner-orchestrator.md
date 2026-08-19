@@ -332,7 +332,8 @@ or the report yourself.
    method arguments, launches the child in the foreground, and waits with no
    outer timeout. It resumes this same session with `driver_job_result` only
    after the child exits. No next round or other candidate runs concurrently.
-   CUDA tasks hold the host-local objective lease for the entire job.
+   CUDA tasks hold a per-device objective lease (whole GPUs,
+   `CUDA_VISIBLE_DEVICES` pinned to them) for the entire job.
 
    On resume, `driver_job_result` carries `returncode`, the durable log path,
    and a bounded `log_tail`. Let the script's own `per_runtime_limit` bound

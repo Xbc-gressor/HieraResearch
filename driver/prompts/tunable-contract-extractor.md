@@ -295,7 +295,8 @@ above. The driver validates all paths, launches the evaluator in the task uv
 environment, waits synchronously with no outer timeout, and resumes this same
 session with `driver_job_result`. No candidate generation, tuning bout, or
 other driver work runs while the evaluator owns the process. CUDA tasks also
-hold the host-local objective lease for the entire job.
+hold a per-device objective lease (whole GPUs, `CUDA_VISIBLE_DEVICES` pinned
+to them) for the entire job.
 
 On resume, read `driver_job_result`: its `returncode`, durable `log`, and
 `log_tail` are the evaluator result. The evaluator is resumable, so after a
