@@ -26,6 +26,7 @@ ARM_MODULES = {
     "hebo_only": "arms.hebo_only",
     "mixup_pool_hebo": "arms.mixup_pool_hebo",
     "alt_pool_hebo": "arms.alt_pool_hebo",
+    "softalt": "arms.softalt",
     "turbo": "arms.turbo",
 }
 

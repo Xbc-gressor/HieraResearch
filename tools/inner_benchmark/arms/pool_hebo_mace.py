@@ -71,24 +71,12 @@ class PoolHeboMace:
                     "pool_attempts": result["attempts"],
                     **pool_persistence_state(result),
                 }
-                if len(history) < arm_api.WARMUP:
+                chosen_index, selection_state = select_pool(
+                    rank_fn, ctx, history, pool
+                )
+                arm_state.update(selection_state)
+                if arm_state["ranker_fallback"]:
                     ranker_fallback_count += 1
-                    chosen_index = 0
-                    arm_state["ranker_fallback"] = True
-                else:
-                    values = _rank(rank_fn, ctx, history, pool)
-                    front = _first_pareto_front(values)
-                    if len(front) == 1:
-                        chosen_index = front[0]
-                    else:
-                        chosen_index = front[int(ctx.np_rng.integers(len(front)))]
-                    arm_state.update(
-                        {
-                            "ranker_fallback": False,
-                            "acquisition_values": values.tolist(),
-                            "pareto_front": [int(index) for index in front],
-                        }
-                    )
                 chosen = pool[chosen_index]
                 arm_state["chosen_index"] = int(chosen_index)
                 # Capture before yield: the runner advances the incumbent
@@ -106,6 +94,28 @@ class PoolHeboMace:
             ctx.emit(
                 {**driver.totals(), "ranker_fallback_count": ranker_fallback_count}
             )
+
+
+def select_pool(rank_fn, ctx, history, pool) -> tuple[int, dict]:
+    """Apply the arm's live-history warmup gate and HEBO-MACE selection.
+
+    Kept as the single selection path shared by ``pool_hebo_mace`` and arms
+    that interleave this selector with another policy.
+    """
+    if len(history) < arm_api.WARMUP:
+        return 0, {"ranker_fallback": True}
+
+    values = _rank(rank_fn, ctx, history, pool)
+    front = _first_pareto_front(values)
+    if len(front) == 1:
+        chosen_index = front[0]
+    else:
+        chosen_index = front[int(ctx.np_rng.integers(len(front)))]
+    return chosen_index, {
+        "ranker_fallback": False,
+        "acquisition_values": values.tolist(),
+        "pareto_front": [int(index) for index in front],
+    }
 
 
 def _subprocess_rank_fn(*, search_space, history, pool, seed):
