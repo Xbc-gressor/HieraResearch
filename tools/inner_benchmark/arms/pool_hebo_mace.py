@@ -52,12 +52,13 @@ class PoolHeboMace:
     """arm_api protocol object; per-cell state lives in run()'s locals."""
 
     name = "pool_hebo_mace"
+    pool_size = arm_api.POOL
 
     def active_dimensions(self, contract) -> int:
         return len(contract.varying_dimensions)
 
     def run(self, ctx):
-        driver = PoolDriver(ctx)
+        driver = PoolDriver(ctx, pool_size=self.pool_size)
         rank_fn = ctx.extras.get("hebo_rank_fn") or _subprocess_rank_fn
         ranker_fallback_count = 0
         try:
@@ -96,7 +97,7 @@ class PoolHeboMace:
                 incumbent_before = ctx.state.incumbent_score
                 feedback = yield arm_api.Proposal(
                     params=chosen,
-                    source="pool_hebo_mace",
+                    source=self.name,
                     rationale=result["rationale"],
                     arm_state=arm_state,
                 )

@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "tools" / "inner_benchmark"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import runner  # noqa: E402
-from arms import pool_hebo_mace  # noqa: E402
+from arms import pool7_hebo_mace, pool_hebo_mace  # noqa: E402
 from ib_support import (  # noqa: E402
     BASE,
     cfg,
@@ -59,6 +59,33 @@ def pool_receipt(lr_base, *, depths=(1, 2, 3, 4, 5), order=None):
         "order": order if order is not None else [0, 1, 2, 3, 4],
         "rationale": "scripted pool",
     }
+
+
+def test_pool7_variant_requests_and_executes_a_seven_member_pool(tmp_path) -> None:
+    ckpt = continuation_checkpoint(tmp_path)
+    receipt = pool_receipt(0.005, depths=(1, 2, 3, 4, 5, 6, 7))
+    receipt["order"] = list(range(7))
+    values = [[float(index)] * 3 for index in range(7)]
+
+    result = runner.run_cell(
+        arm=pool7_hebo_mace.ARM,
+        checkpoint_dir=ckpt,
+        out_dir=tmp_path / "out",
+        seed=1,
+        budget=1,
+        eval_fn=fake_eval_from([("ok", 50.0)]),
+        preflight_fn=ok_preflight,
+        extras={
+            "session_factory": fake_session_factory([receipt]),
+            "hebo_rank_fn": scripted_rank_fn([values]),
+        },
+    )
+
+    assert result["status"] == "ok"
+    (event,) = evaluation_events(tmp_path / "out")
+    assert event["source"] == "pool7_hebo_mace"
+    assert event["arm_state"]["pool_size"] == 7
+    assert event["arm_state"]["chosen_index"] == 6
 
 
 def continuation_checkpoint(base_dir, name="ckpt"):

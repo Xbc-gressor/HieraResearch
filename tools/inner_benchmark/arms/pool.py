@@ -2,9 +2,9 @@
 mixup/alt HEBO arms (PLAN-inner-arms-mixup-alt §3/§4).
 
 One bout-scoped ``bench-pool-proposer`` session per cell; each step asks for
-POOL=5 unique configs + the proposer's self-ranking in ONE call. This module
-owns the arm-side obligations the bench roles deliberately do NOT enforce
-(arm_api author checklist #10):
+the driver's configured number of unique configs (POOL=5 by default) + the
+proposer's self-ranking in ONE call. This module owns the arm-side obligations
+the bench roles deliberately do NOT enforce (arm_api author checklist #10):
 
 - receipt semantics: exactly POOL config dicts, each contract-shaped
   (exact key set, castable, in-bounds), mutually distinct, and ``order`` a
@@ -39,17 +39,23 @@ import tune_tools  # noqa: E402
 ROLE = "bench-pool-proposer"
 MAX_CONSECUTIVE_FAILED_ATTEMPTS = 3
 
-POOL_PROTOCOL = (
-    "LLM pool protocol (PLAN §6.4): each step you generate exactly POOL=5 "
-    "complete, mutually distinct candidate configs in one call, ranked by "
-    "your own judgment (order[0] is the config you most want executed). A "
-    "deterministic selector then executes exactly ONE config from the pool "
-    "and appends its authoritative outcome. Unexecuted pool members are not "
-    "outcome evidence; every step asks for a fresh pool. If recent evidence "
-    "shows the incumbent region is converged, build the pool to cover "
-    "genuinely different regions rather than near-duplicates of the "
-    "incumbent — five near-identical configs waste the selector's choice."
-)
+def pool_protocol(pool_size: int) -> str:
+    count_word = "five" if pool_size == 5 else str(pool_size)
+    return (
+        "LLM pool protocol (PLAN §6.4): each step you generate exactly "
+        f"POOL={pool_size} complete, mutually distinct candidate configs in "
+        "one call, ranked by your own judgment (order[0] is the config you "
+        "most want executed). A deterministic selector then executes exactly "
+        "ONE config from the pool and appends its authoritative outcome. "
+        "Unexecuted pool members are not outcome evidence; every step asks "
+        "for a fresh pool. If recent evidence shows the incumbent region is "
+        "converged, build the pool to cover genuinely different regions "
+        "rather than near-duplicates of the incumbent — "
+        f"{count_word} near-identical configs waste the selector's choice."
+    )
+
+
+POOL_PROTOCOL = pool_protocol(arm_api.POOL)
 
 _EXECUTED = ("ok", "crash")
 
@@ -83,6 +89,7 @@ class PoolDriver:
         ctx,
         *,
         protocol: str | None = None,
+        pool_size: int = arm_api.POOL,
         first_trials=None,
         first_live_incumbent=None,
     ) -> None:
@@ -90,12 +97,15 @@ class PoolDriver:
         factory = ctx.extras["session_factory"]
         self._ctx = ctx
         self._contract = ctx.contract
+        self._pool_size = pool_size
         self._session = factory(
             ROLE,
             first_extras=llm.first_message_blocks(
                 ctx.checkpoint,
                 ctx.contract,
-                protocol=protocol if protocol is not None else POOL_PROTOCOL,
+                protocol=(
+                    protocol if protocol is not None else pool_protocol(pool_size)
+                ),
                 budget_remaining=ctx.state.budget_remaining,
                 trials=first_trials,
                 live_incumbent=first_live_incumbent,
@@ -239,7 +249,8 @@ class PoolDriver:
                 self._pending_messages.append(
                     "correction: your last pool was rejected — "
                     + "; ".join(problems)
-                    + ". Generate a fresh pool of exactly 5 configs fixing "
+                    + f". Generate a fresh pool of exactly {self._pool_size} "
+                    "configs fixing "
                     "exactly these problems."
                 )
                 self._fail("; ".join(problems))
@@ -287,8 +298,8 @@ class PoolDriver:
             return [f"receipt is not an object: {type(receipt).__name__}"]
         configs = receipt.get("configs")
         order = receipt.get("order")
-        if not isinstance(configs, list) or len(configs) != arm_api.POOL:
-            return [f"configs must be a list of exactly {arm_api.POOL} dicts"]
+        if not isinstance(configs, list) or len(configs) != self._pool_size:
+            return [f"configs must be a list of exactly {self._pool_size} dicts"]
         problems: list[str] = []
         names = [dim.name for dim in self._contract.dimensions]
         identities: set[str] = set()
@@ -322,14 +333,14 @@ class PoolDriver:
             return problems
         if (
             not isinstance(order, list)
-            or len(order) != arm_api.POOL
+            or len(order) != self._pool_size
             # Type check must precede sorted(): mixed-type items raise
             # TypeError there and would escape the correction channel.
             or any(isinstance(item, bool) or not isinstance(item, int) for item in order)
-            or sorted(order) != list(range(arm_api.POOL))
+            or sorted(order) != list(range(self._pool_size))
         ):
             problems.append(
-                f"order must be a permutation of 0..{arm_api.POOL - 1}, got {order!r}"
+                f"order must be a permutation of 0..{self._pool_size - 1}, got {order!r}"
             )
         return problems
 
@@ -370,4 +381,9 @@ def _compact(params: dict) -> str:
     return json.dumps(params, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
-__all__ = ["POOL_PROTOCOL", "PoolDriver", "pool_persistence_state"]
+__all__ = [
+    "POOL_PROTOCOL",
+    "PoolDriver",
+    "pool_persistence_state",
+    "pool_protocol",
+]
