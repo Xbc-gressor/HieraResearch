@@ -66,7 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/ for ru
 from failure_artifacts import render_failure
 from evaluation_budget import budget_status, find_run_dir  # noqa: E402
 import inner_policy  # noqa: E402
-from run_cfg import read_framework_cfg  # noqa: E402
+from run_cfg import find_framework_cfg, read_framework_cfg  # noqa: E402
 from semantic_evidence import unbound_primary_descendants  # noqa: E402
 
 

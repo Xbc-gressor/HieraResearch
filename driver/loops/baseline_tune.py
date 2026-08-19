@@ -44,14 +44,15 @@ BASELINE_INNER_POLICY = "baseline-hebo-full-v1"
 
 
 def _phase_c_action(run_dir: Path, candidate_path: Path, report_path: Path,
-                    repo_root, cmd) -> dict:
+                    repo_root, cmd, events) -> dict:
     try:
         out = cmd(["python", "tools/tuners/tune_tools.py", "phase-c-action",
                    "--candidate-path", candidate_path,
                    "--tune-report-json", report_path], repo_root)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or str(exc)).strip()
-        raise RunBlocked(f"phase-c-action failed: {detail}")
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"phase-c-action failed: {detail}")
     return json.loads(out.stdout)
 
 
@@ -71,7 +72,7 @@ def _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
     invocation_id = 0
     while True:
         action = _phase_c_action(run_dir, candidate_path, report_path,
-                                 repo_root, cmd)
+                                 repo_root, cmd, events)
         kind = action.get("action")
         if kind == "run":
             method = action.get("method")
@@ -104,7 +105,7 @@ def _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
                           f"baseline hebo job failed: {exc}")
             if int(result.get("returncode", 1)) != 0:
                 recheck = _phase_c_action(run_dir, candidate_path, report_path,
-                                          repo_root, cmd)
+                                          repo_root, cmd, events)
                 if recheck.get("action") == "run":
                     # Still resumable: leave the stage running and let the
                     # next driver launch retry instead of hot-looping here.

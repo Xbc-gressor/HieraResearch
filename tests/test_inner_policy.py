@@ -147,6 +147,30 @@ INT_BASE = {"n": 2}
 
 
 class InnerPolicyUnitTest(unittest.TestCase):
+    def test_baseline_hebo_uses_the_full_run_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = _write_candidate(
+                root / "candidates" / "000" / "train.py",
+                space=INT_ONLY,
+                base=INT_BASE,
+            )
+            (root / "framework_cfg.json").write_text(json.dumps({
+                "max_evaluations": 125,
+                "tuner": {
+                    "inner_policy": inner_policy.BASELINE_HEBO_POLICY_ID,
+                    "scheduler_policy": "legacy",
+                },
+            }))
+            report = _fresh_report(candidate, INT_ONLY, INT_BASE)
+            report["inner_policy"] = inner_policy.BASELINE_HEBO_POLICY_ID
+
+            action = phase_c_action(report, candidate)
+
+            self.assertEqual(action["action"], "run")
+            self.assertEqual(action["method"], "hebo")
+            self.assertEqual(action["bout_trials"], 125)
+
     def test_regime_and_bout_size(self):
         self.assertEqual(
             [inner_policy.regime_for_bout_index(i) for i in range(4)],
