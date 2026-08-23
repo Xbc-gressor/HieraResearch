@@ -1,5 +1,9 @@
 """Exact mechanical state of one scheduler decision (design §3, §4.1, §8).
 
+This state is shared by the current deterministic INITIAL/DEEP tournament and
+the historical v3.2 rollout comparison; predictive classes mentioned below
+belong only to v3.2.
+
 The state is built from authoritative run artifacts — the ledger, the
 strict attempt log, and each candidate's tuning report — never from a role
 receipt. It carries two kinds of field, and the distinction is the whole
@@ -148,8 +152,8 @@ class SchedulerState:
                     best_score=candidate.best_score - improvement,
                     bouts_used=candidate.bouts_used + 1,
                     previous_gain=float(gain),
-                    # A first bout's deferred-warm supply is consumed
-                    # inside that bout; later bouts have none.
+                    # An initialization segment's deferred-warm supply is
+                    # consumed inside it; subsequent DEEP segments have none.
                     deferred_warm_backlog=0,
                 )
             )

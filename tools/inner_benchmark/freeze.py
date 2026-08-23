@@ -11,8 +11,8 @@ Three subcommands (same names as the library entry points):
   bout count, per-bout best score + strict-improvement flags, finite unique
   config counts at each boundary, eligible regimes. Read-only.
 - ``create --run-dir <dir> --candidate <id> --bouts <N> --out <dir>`` — freeze
-  the boundary after N completed bouts (N=0 -> regime "first", N=1 ->
-  "continuation", N>=2 -> "deep").
+  the boundary after N completed segments (N=0 -> regime "initial", N>=1 ->
+  "deep").
 - ``remeasure --checkpoint <dir> [--eval-limit K]`` — re-evaluate every unique
   frozen config on THIS machine via the Task-2 objective path and rewrite the
   checkpoint with local scores (§七 one-machine comparability rule).
@@ -45,9 +45,10 @@ priors afterwards, so each matches at most one bout); a deferred config that
 was enqueued and then preflight-rejected is undercounted, which only affects
 the descriptive field.
 
-Continuation stratification (PLAN §七) reads the bout AFTER the boundary — the
-already-observed Current cell on this checkpoint — not the last bout included
-in it; that following bout must exist and be complete, with no fallback.
+The source run's historical inner-policy id is retained only as factual
+provenance. It does not choose the benchmark taxonomy: current checkpoints are
+always INITIAL or DEEP, even when their history came from an older
+FIRST/CONTINUE/DEEP production policy.
 
 Boundary-time BASE_PARAMS
 -------------------------
@@ -82,18 +83,15 @@ when representable in the frozen SEARCH_SPACE (tune_tools._bounds_violations);
 an excluded control is recorded in ``extra.inherited_control_excluded``.
 Create-time scores are SOURCE scores (provisional); ``remeasure`` recomputes.
 
-Stratification: "first" for N=0; for N=1 "cont_improved" /
-"cont_not_improved" by whether the last included bout strictly improved its
-starting incumbent under production口径 (mirrors
-tune_tools._last_bout_improved). For N>=2 the loader couples regime "deep" to
-stratum "deep", so the last-bout evidence is recorded in ``extra.last_bout``
-instead; ``extra.incumbents`` carries both the production口径 and
-benchmark口径 incumbents so the benchmark口径 recompute is trivial.
+Stratification: "initial" for N=0 and "deep" for N>=1. For a DEEP checkpoint,
+the last included segment's evidence is recorded in ``extra.last_bout``;
+``extra.incumbents`` carries both the production口径 and benchmark口径
+incumbents so the benchmark口径 recompute is trivial.
 
-WARMUP: continuation/deep checkpoints require >= WARMUP=8 finite unique
+WARMUP: DEEP checkpoints require >= WARMUP=8 finite unique
 history rows (arm_api.WARMUP; §七 hard condition) — enforced at create with
-source scores and re-checked by remeasure with local scores. First regime has
-no WARMUP guard.
+source scores and re-checked by remeasure with local scores. INITIAL has no
+WARMUP guard.
 
 Re-measurement
 --------------
@@ -107,7 +105,7 @@ local result (``extra.remeasure.remeasured_identities``) are skipped, and
 checkpoint.json is rewritten atomically (tmp + rename) after EVERY
 evaluation; ``--eval-limit K`` caps new evaluations per invocation. Guards
 fire once re-measurement is complete: no finite re-measured config -> INVALID;
-continuation/deep with finite unique local history < WARMUP -> INVALID (§七:
+DEEP with finite unique local history < WARMUP -> INVALID (§七:
 作废换实例). The verdict is printed and persisted under ``extra.remeasure``;
 an INVALID checkpoint still loads (the incumbent keeps its last finite value)
 so tooling can inspect it.
@@ -591,7 +589,11 @@ def _candidate_kind(candidate_dir: Path, records: dict) -> str:
     return "unknown"
 
 
-def _inspect_candidate(candidate_dir: Path, records: dict, bout_trials: int) -> dict:
+def _inspect_candidate(
+    candidate_dir: Path,
+    records: dict,
+    bout_trials: int,
+) -> dict:
     row = {
         "candidate_id": candidate_dir.name,
         "kind": _candidate_kind(candidate_dir, records),
@@ -637,10 +639,8 @@ def _inspect_candidate(candidate_dir: Path, records: dict, bout_trials: int) -> 
         _finite_unique_count(_history_rows(phase_a, bouts, n), identity)
         for n in range(completed + 1)
     ]
-    eligible = ["first"]
+    eligible = ["initial"]
     if completed >= 1:
-        eligible.append("continuation")
-    if completed >= 2:
         eligible.append("deep")
     row["eligible_regimes"] = eligible
     return row
@@ -653,7 +653,8 @@ def inspect_run(run_dir) -> list[dict]:
     candidates_dir = run_dir / "candidates"
     if not candidates_dir.is_dir():
         raise ValueError(f"no candidates directory: {candidates_dir}")
-    bout_trials = _bout_trials(_framework_cfg(run_dir))
+    framework_cfg = _framework_cfg(run_dir)
+    bout_trials = _bout_trials(framework_cfg)
     records = _ledger_records(run_dir)
     return [
         _inspect_candidate(candidate_dir, records, bout_trials)
@@ -699,7 +700,7 @@ def _format_inspect_table(rows: list[dict]) -> str:
 
 
 def _regime(n_bouts: int) -> str:
-    return "first" if n_bouts == 0 else "continuation" if n_bouts == 1 else "deep"
+    return "initial" if n_bouts == 0 else "deep"
 
 
 def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
@@ -736,6 +737,13 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
     identity = contract.params_identity
     framework_cfg = _framework_cfg(run_dir)
     bout_trials = _bout_trials(framework_cfg)
+    tuner_cfg = framework_cfg.get("tuner", {})
+    source_policy_id = (
+        tuner_cfg.get("inner_policy")
+        if isinstance(tuner_cfg, dict)
+        and isinstance(tuner_cfg.get("inner_policy"), str)
+        else None
+    )
     analysis, bout_list = _analyze_bouts(report, bout_trials=bout_trials, identity=identity)
 
     if bouts > len(bout_list):
@@ -775,7 +783,7 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
     prod_params = dict(incumbent_row["params"])
     prod_score = float(incumbent_row["score"])
     regime = _regime(bouts)
-    if regime != "first":
+    if not checkpoint_mod.is_initial_regime(regime):
         finite_unique = _finite_unique_count(history, identity)
         if finite_unique < WARMUP:
             raise ValueError(
@@ -784,46 +792,9 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
                 f"got {finite_unique} (PLAN §七 hard condition)"
             )
 
-    if bouts == 0:
-        stratum = "first"
-    elif bouts == 1:
-        # PLAN §七 defines "no improvement" by the COMPLETE bout that FOLLOWS
-        # the boundary — that bout is Current's already-observed cell on this
-        # checkpoint. analysis[bouts - 1] is the bout included IN the
-        # checkpoint, which answers a different question; using it inverted the
-        # label on every real cont_not_improved instance in the corpus (5/5).
-        # No fallback to the earlier bout: a checkpoint whose following bout is
-        # missing or incomplete carries no evidence for this stratum.
-        if len(analysis) <= bouts or not analysis[bouts]["complete"]:
-            raise ValueError(
-                f"candidate {candidate_id}: continuation stratification needs a "
-                f"complete bout {bouts} AFTER the boundary (PLAN §七), but "
-                + (
-                    f"only {len(analysis)} bout(s) exist"
-                    if len(analysis) <= bouts
-                    else "it is not complete: "
-                    + "; ".join(analysis[bouts]["incomplete_reasons"])
-                )
-            )
-        # A following bout with no finite score at all is an infrastructure
-        # failure, not evidence that Current could not improve. In the corpus
-        # one such bout (every trial preflight_rejected on a kernel-trust
-        # error) reached this branch, and it would have been 1 of only 3
-        # members of the scarcest stratum.
-        if analysis[bouts]["best_score"] is None:
-            raise ValueError(
-                f"candidate {candidate_id}: the bout {bouts} after the boundary "
-                f"produced no finite objective score "
-                f"({analysis[bouts]['objective_rows']} row(s), all crashed or "
-                "preflight-rejected) — it carries no improvement evidence"
-            )
-        stratum = (
-            "cont_improved" if analysis[bouts]["improved"] else "cont_not_improved"
-        )
-    else:
-        # checkpoint.py couples regime "deep" to stratum "deep"; the last-bout
-        # improvement evidence lives in extra.last_bout.
-        stratum = "deep"
+    # The current benchmark taxonomy is binary. Improvement evidence remains
+    # factual metadata and never creates a third regime/stratum.
+    stratum = regime
 
     extra = {
         "incumbents": {
@@ -854,10 +825,8 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
                 float(prior_best["score"]) if prior_best is not None else None
             ),
         }
-        # Both sides of the boundary, so a disagreement between "the last bout
-        # inside the checkpoint improved" and "the bout after it improved" (the
-        # one stratification actually uses) is visible in the artifact rather
-        # than hidden behind one flag.
+        # Keep the following source segment as factual trajectory context; it
+        # does not affect the INITIAL/DEEP classification.
         following = analysis[bouts] if len(analysis) > bouts else None
         extra["bout_after_boundary"] = (
             {
@@ -897,14 +866,9 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
         "kind": _candidate_kind(candidate_dir, _ledger_records(run_dir)),
         "bouts_included": bouts,
         # Factual provenance / sensitivity covariate (PLAN-inner-arms-mixup-alt
-        # §6): the production inner-tuner policy id whose FIRST/CONTINUE
-        # kernels produced the rows before this boundary. Null when the
-        # source run did not set one.
-        "tuner_inner_policy": (
-            tuner_cfg.get("inner_policy")
-            if isinstance((tuner_cfg := framework_cfg.get("tuner")), dict)
-            else None
-        ),
+        # §6): the production inner-tuner policy id whose kernels produced the
+        # rows before this boundary. Null when the source run did not set one.
+        "tuner_inner_policy": source_policy_id,
         "train_sha256": "sha256:" + hashlib.sha256(train_src.read_bytes()).hexdigest(),
     }
     if run_metadata is not None:
@@ -1011,7 +975,7 @@ def _mark_same_machine(directory: Path, data: dict, ckpt, contract, *, label: st
     if not tune_tools._is_finite_score(data["incumbent"].get("score")):
         raise ValueError(f"{directory}: incumbent score is not finite")
     finite_unique = len(ckpt.finite_unique_history(contract))
-    if ckpt.regime != "first" and finite_unique < WARMUP:
+    if not checkpoint_mod.is_initial_regime(ckpt.regime) and finite_unique < WARMUP:
         raise ValueError(
             f"{directory}: finite unique history {finite_unique} < WARMUP="
             f"{WARMUP} — INVALID regardless of machine (PLAN §七)"
@@ -1161,7 +1125,10 @@ def remeasure_checkpoint(checkpoint_dir, *, eval_fn=None, eval_limit=None, mark_
                 "no finite configuration survived re-measurement; the incumbent "
                 "on file keeps its pre-remeasure score"
             )
-        elif ckpt.regime != "first" and finite_unique < WARMUP:
+        elif (
+            not checkpoint_mod.is_initial_regime(ckpt.regime)
+            and finite_unique < WARMUP
+        ):
             valid = False
             invalid_reason = (
                 f"finite unique re-measured history {finite_unique} < "

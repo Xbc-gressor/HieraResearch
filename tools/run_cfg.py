@@ -303,7 +303,7 @@ def _validate_scheduler_v3_2(config: dict, tuner: dict, path: Path) -> None:
 
 
 def _validate_anchor_challenger(config: dict, tuner: dict, path: Path) -> None:
-    """Validate the deterministic two-initial / two-later tournament."""
+    """Validate the deterministic two-INITIAL / two-DEEP tournament."""
     max_evaluations = config.get("max_evaluations")
     if max_evaluations is None:
         raise RunConfigError(
@@ -325,7 +325,7 @@ def _validate_anchor_challenger(config: dict, tuner: dict, path: Path) -> None:
         expected_bout_trials(inner_policy_id, index, legacy_bout_trials)
         for index in range(3)
     )
-    # The second later bout is index 2 when it stays with a responder, but
+    # The second DEEP segment is index 2 when it stays with a responder, but
     # index 1 when zero gain switches to the other initialized candidate.
     tournament_total = 2 * schedule[0] + schedule[1] + max(schedule[1:])
     if int(max_evaluations) < tournament_total:

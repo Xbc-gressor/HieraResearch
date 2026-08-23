@@ -170,16 +170,22 @@ class InnerPolicyUnitTest(unittest.TestCase):
             self.assertEqual(action["action"], "run")
             self.assertEqual(action["method"], "hebo")
             self.assertEqual(action["bout_trials"], 125)
+            self.assertEqual(action["bout_regime"], "INITIAL")
 
-    def test_regime_and_bout_size(self):
+    def test_regime_taxonomy(self):
         self.assertEqual(
-            [inner_policy.regime_for_bout_index(i) for i in range(4)],
+            [inner_policy.regime_for_bout(POLICY, i) for i in range(4)],
             ["FIRST", "CONTINUE", "DEEP", "DEEP"],
         )
-        self.assertEqual(
-            [inner_policy.bout_size(r) for r in ("FIRST", "CONTINUE", "DEEP")],
-            [8, 10, 10],
-        )
+        for policy_id in inner_policy.INITIAL24_POLICY_IDS:
+            self.assertEqual(
+                [inner_policy.regime_for_bout(policy_id, i) for i in range(3)],
+                ["INITIAL", "DEEP", "DEEP"],
+            )
+        with self.assertRaisesRegex(ValueError, "exactly 3 bouts"):
+            inner_policy.regime_for_bout(inner_policy.HEBO_HEBO_POLICY_ID, 3)
+        with self.assertRaisesRegex(ValueError, "single-bout"):
+            inner_policy.regime_for_bout(inner_policy.BASELINE_HEBO_POLICY_ID, 1)
 
     def test_expected_bout_trials(self):
         self.assertEqual(
@@ -476,9 +482,10 @@ class PhaseCActionRegimeTest(unittest.TestCase):
             (
                 first["method"],
                 first["bout_trials"],
+                first["bout_regime"],
                 first["method_chain"],
             ),
-            (initial_method, 24, [initial_method]),
+            (initial_method, 24, "INITIAL", [initial_method]),
         )
 
         report["phase_c"] = {
@@ -498,7 +505,7 @@ class PhaseCActionRegimeTest(unittest.TestCase):
                 second["bout_trials"],
                 second["bout_regime"],
             ),
-            (later_method, 10, "CONTINUE"),
+            (later_method, 10, "DEEP"),
         )
 
         report["phase_c"]["stages"].append(
@@ -1348,6 +1355,8 @@ class HeboSearchTest(unittest.TestCase):
             self.assertIn("required_relative_improvement: 0.075", extras["items"])
             self.assertIn("required_target_score: 3.7", extras["items"])
             self.assertIn("score: 0.9", extras["incumbent"])
+            self.assertIn("regime: initial", extras["candidate"])
+            self.assertIn("stratum: initial", extras["candidate"])
 
     def test_first_selfrank_consumes_deferred_inside_eight_slot_bout(self):
         with tempfile.TemporaryDirectory() as tmp:

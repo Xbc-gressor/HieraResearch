@@ -45,7 +45,8 @@ Other mutations remain:
   terminal Phase C for the current bout, applies the global best (warm plus
   every Phase-C trial across all bouts), and writes score/status/tuning
   metadata (`tuning_bouts`, `last_bout_improved`, graded `evaluation_depth`)
-  together. A finalized candidate stays eligible for later bouts.
+  together. Under the current policy, a finalized candidate stays eligible
+  for another DEEP segment.
   `set-tuning --mark-tuned` is disabled, so there is no second close path;
 - `record-run` for the lower-is-better score and keep/discard/crash state;
 - `set-experience` for a complete validated derived snapshot;

@@ -538,8 +538,9 @@ def _deep_tune_time_budget_locked(
     stage = None
     # A terminal bout continues its own chain for every method except the
     # NEXT bout's chain head (e.g. a rejected primary still falls back inside
-    # its bout); each bout's chain is regime-conditioned (FIRST/CONTINUE/DEEP
-    # differ under the regime-conditioned inner policy).
+    # its segment); each new segment's chain follows the active policy's
+    # regime (INITIAL/DEEP currently; historical comparison policies retain
+    # FIRST/CONTINUE/DEEP).
     new_bout_chain = chain_for(len(bouts)) if current_terminal else None
     opens_new_bout = current_terminal and method == new_bout_chain[0]
     if opens_new_bout:
@@ -1134,17 +1135,17 @@ def read_prior_infeasible_trials(report_path: Path) -> list[dict]:
 def read_deferred_configs(report_path: Path) -> list[dict]:
     """Warm configs the extractor PROPOSED but did NOT evaluate at step 0+1
     (the K − K_eval deferred ones). They carry `params` only (no score) and are
-    evaluated by the deep-tuner FIRST if this candidate is selected — BO enqueues
-    them as initial trials, grid evaluates them before its sweep. Returns the list
-    of param dicts (empty when none)."""
+    evaluated at the start of the initialization segment if this candidate is
+    selected — BO enqueues them as initial trials, grid evaluates them before
+    its sweep. Returns the list of param dicts (empty when none)."""
     phase_a = read_tune_report(report_path).get("phase_a", {})
     return [c["params"] for c in phase_a.get("deferred_configs", []) if c.get("params")]
 
 
 def read_pending_proposals(report_path: Path) -> list[dict]:
     """LLM re-warm configs admitted by `tune_tools.py validate-proposals` for a
-    continuation bout. Search scripts attempt them FIRST (before deferred
-    configs); they consume the bout's trial budget like any other trial.
+    legacy continuation bout. Search scripts attempt them before deferred
+    configs; they consume the bout's trial budget like any other trial.
 
     Lifecycle: validate-proposals writes the list wholesale together with a
     `pending_proposals_bout_index` tag naming the bout it targets, before the
@@ -1452,10 +1453,11 @@ def project_configs_into_space(
 
     In-space configs pass through unchanged. Out-of-space configs are
     projected onto the bounds instead of skipped: the clamp moved the box
-    *after* these configs were proposed, and dropping them silently strips a
-    FIRST bout of its whole deferred-warm queue, degrading it to pure random
-    sampling (observed: a device_batch_size clamp voided all deferred configs
-    at once). Only configs clamping cannot repair are dropped.
+    *after* these configs were proposed, and dropping them silently strips an
+    initialization segment (current INITIAL; historical FIRST) of its whole
+    deferred-warm queue, degrading it to pure random sampling (observed: a
+    device_batch_size clamp voided all deferred configs at once). Only configs
+    clamping cannot repair are dropped.
 
     Returns (executable configs in original order, n_projected, dropped).
     """

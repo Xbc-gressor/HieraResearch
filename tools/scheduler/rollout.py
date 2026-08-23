@@ -1,4 +1,6 @@
-"""Full-remaining-budget paired rollout (design §7).
+"""Historical v3.2 comparison scheduler's paired rollout (design §7).
+
+The current ``anchor_challenger_v1`` scheduler does not use this model.
 
 Every root action is simulated under a frozen reference policy until the
 state is terminal, and scored by the raw global improvement it reaches:

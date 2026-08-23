@@ -1,4 +1,4 @@
-"""Read-only calibration over one run's scheduler artifacts (design §9).
+"""Read-only calibration for historical v3.2 scheduler artifacts (design §9).
 
     python tools/scheduler/calibrate.py --ledger runs/<task>/<tag>/ledger.json
 

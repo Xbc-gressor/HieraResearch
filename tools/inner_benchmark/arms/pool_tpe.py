@@ -28,7 +28,7 @@ WARMUP gate (PLAN §5.1/§6.4): while the LIVE finite/unique/executed
 observation count is below WARMUP=8 the arm executes the proposer's rank-1
 config (pool[0] after duplicate filtering) with ``ranker_fallback=true`` and
 counts it under ``ranker_fallback_count`` — an engineering fallback that
-continuation/deep checkpoints are not expected to trigger.
+DEEP checkpoints are not expected to trigger.
 """
 
 from __future__ import annotations

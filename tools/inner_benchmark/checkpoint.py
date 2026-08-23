@@ -18,8 +18,11 @@ Schema (required unless noted)::
     {
       "schema_version": 2,
       "checkpoint_id": "string",
-      "regime": "first" | "continuation" | "deep",
-      "stratum": "first" | "cont_improved" | "cont_not_improved" | "deep",
+      "regime": "initial" | "deep",                    # current inner-v2
+                | "first" | "continuation",             # historical inner-v1
+      "stratum": "initial" | "deep",                   # current inner-v2
+                 | "first" | "cont_improved" |
+                   "cont_not_improved",                  # historical inner-v1
       "source": {"...": "opaque provenance dict"},        # default {}
       "candidate_relpath": "candidate",
       "task": {"score_fn": "evaluate_config",
@@ -38,11 +41,12 @@ Schema (required unless noted)::
       "extra": {}                                          # default {}
     }
 
-regime/stratum consistency is validated: first<->first,
-continuation<->cont_improved|cont_not_improved, deep<->deep.
+regime/stratum consistency is validated. Current checkpoints use
+initial<->initial or deep<->deep. The first/continuation spellings remain only
+for frozen inner-v1 comparison checkpoints.
 
-``deferred_configs`` is reserved for the Current arm (PLAN §6.0 / §七); other
-arms must not read it.
+``deferred_configs`` is reserved for the historical inner-v1 Current arm
+(completed PLAN §6.0 / §七); other arms must not read it.
 
 ``task.project`` (repo-root-relative uv project path, e.g.
 ``tasks/autoresearch-baseline``) selects the interpreter that runs the
@@ -62,13 +66,23 @@ from pathlib import Path
 SCHEMA_VERSION = 2
 CHECKPOINT_FILENAME = "checkpoint.json"
 
-REGIMES = ("first", "continuation", "deep")
-STRATA = ("first", "cont_improved", "cont_not_improved", "deep")
+REGIMES = ("initial", "deep", "first", "continuation")
+STRATA = ("initial", "deep", "first", "cont_improved", "cont_not_improved")
 _REGIME_STRATA = {
+    "initial": ("initial",),
+    "deep": ("deep",),
     "first": ("first",),
     "continuation": ("cont_improved", "cont_not_improved"),
-    "deep": ("deep",),
 }
+
+
+def is_initial_regime(regime: str) -> bool:
+    """Whether a checkpoint is at the pre-tuning boundary.
+
+    ``first`` is the historical inner-v1 spelling; current checkpoints use
+    ``initial``.
+    """
+    return regime in ("initial", "first")
 
 
 @dataclass(frozen=True)

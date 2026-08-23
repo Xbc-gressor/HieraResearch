@@ -1,7 +1,7 @@
-"""Random-search arm — pure-random baseline over the production search
-distributions (ablation for Current's startup phase).
+"""Historical inner-v1 random-search arm — pure-random baseline over the
+older production search distributions (ablation for Current's startup phase).
 
-The experimental record shows that in first bouts the Current arm's entire
+The archived experimental record shows that in first bouts the Current arm's entire
 gain comes from its startup phase: with 1-2 frozen priors against
 ``n_startup_trials=8``, the first 6-7 of the 10 evaluations are plain
 ``RandomSampler`` draws that Optuna's TPESampler falls back to before the

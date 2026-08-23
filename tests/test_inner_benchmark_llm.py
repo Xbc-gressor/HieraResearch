@@ -159,6 +159,7 @@ EXPECTED_SCHEMAS = {
         "winner": ("enum", "A", "B"),
         "reasoning": "?str",
     },
+    "bench-tiebreak-judge": {"choice": "int", "rationale": "?str"},
     "bench-hillclimb-editor": {"edited": "bool", "summary": "str"},
 }
 
@@ -197,6 +198,7 @@ def test_pure_proposal_roles_carry_no_tools() -> None:
         "bench-active-set",
         "bench-pool-proposer",
         "bench-pool-pairwise-judge",
+        "bench-tiebreak-judge",
     ):
         assert llm.BENCH_ROLES[name].tools == (), name
     assert llm.BENCH_ROLES["bench-hillclimb-editor"].tools == ("Read", "Edit")

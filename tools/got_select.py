@@ -252,7 +252,7 @@ def cmd_decide(args) -> int:
             # The tournament's reserve must constrain the real admission
             # prefix, not merely the later scheduler decision.  Otherwise a
             # multi-action generation can consume budget already promised to
-            # the late challenger and its two later bouts.
+            # the late challenger and its two DEEP segments.
             from scheduler.session import contract_for
             from scheduler.state import build_state
             from scheduler.tournament import (

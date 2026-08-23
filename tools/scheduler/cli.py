@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Scheduler v3.2 CLI: one decision, plus replay and calibration views.
+"""Run-global scheduler CLI: decision, replay, and calibration views.
+
+Decision/replay dispatch to the run's persisted policy: current
+``anchor_challenger_v1`` or the historical ``v3_2`` comparison.
 
     python tools/scheduler/cli.py decide  --ledger <run_dir>/ledger.json
     python tools/scheduler/cli.py record  --ledger ... --decision-id ... \

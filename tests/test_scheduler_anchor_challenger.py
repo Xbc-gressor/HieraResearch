@@ -112,7 +112,7 @@ class TournamentPolicyTest(unittest.TestCase):
         )
         self.assertEqual((decision.action, decision.run_id), ("TUNE", "001"))
 
-    def test_later_bout_stays_with_responder(self) -> None:
+    def test_deep_segment_stays_with_responder(self) -> None:
         decision = decide(
             state(
                 candidate("000", 1.01, bouts=2, gain=0.01),
@@ -121,11 +121,14 @@ class TournamentPolicyTest(unittest.TestCase):
             )
         )
         self.assertEqual((decision.action, decision.run_id), ("TUNE", "000"))
+        self.assertEqual(decision.evidence_mode["phase"], "deep_segments")
+        self.assertEqual(decision.evidence_mode["deep_segments_spent"], 1)
+        self.assertNotIn("later_bouts_spent", decision.evidence_mode)
 
     def test_ineligible_responder_switches_instead_of_stopping(self) -> None:
         # A positive-gain responder whose next bout is an SPSA DEEP bout
-        # without a movable continuous dimension: the reserved second later
-        # bout must switch to the other initialized candidate, not STOP.
+        # without a movable continuous dimension: the reserved second DEEP
+        # segment must switch to the other initialized candidate, not STOP.
         decision = decide(
             state(
                 CandidateView(
@@ -141,7 +144,7 @@ class TournamentPolicyTest(unittest.TestCase):
         )
         self.assertEqual((decision.action, decision.run_id), ("TUNE", "001"))
 
-    def test_later_bout_switches_after_zero_gain(self) -> None:
+    def test_deep_segment_switches_after_zero_gain(self) -> None:
         decision = decide(
             state(
                 candidate("000", 1.01, bouts=2, gain=0.0),
@@ -151,7 +154,7 @@ class TournamentPolicyTest(unittest.TestCase):
         )
         self.assertEqual((decision.action, decision.run_id), ("TUNE", "001"))
 
-    def test_two_later_bouts_complete_the_tournament(self) -> None:
+    def test_two_deep_segments_complete_the_tournament(self) -> None:
         decision = decide(
             state(
                 candidate("000", 1.01, bouts=2, gain=0.0),
@@ -229,6 +232,9 @@ class TournamentSessionTest(unittest.TestCase):
             self.assertEqual(contract.lifetime_cost(), 44)
             self.assertEqual(contract.numeric_required_from_bout_index, 1)
             selection = _scheduler_selection(ledger, None)
+            self.assertEqual(selection["bout_regime"], "INITIAL")
+            self.assertFalse(selection["is_deep"])
+            self.assertNotIn("is_continuation", selection)
             self.assertEqual(
                 selection["budget_allocation"]["trial_cap"], 24
             )

@@ -1,4 +1,7 @@
-"""Current arm (PLAN §6.0) — reproduction of the production tuner pipeline.
+"""Historical inner-v1 Current arm (completed PLAN §6.0).
+
+This reproduces the older production pipeline with Phase-R rewarm behavior;
+it is not the current ``hebo24-hebo20`` INITIAL/DEEP policy.
 
 This is the baseline arm: it runs the production ``tune_tools`` /
 ``bo_search`` / ``grid_search`` logic against the frozen checkpoint, adapted
@@ -18,7 +21,7 @@ made by the production functions:
   ``bo_search._inject_prior_trials`` (production warm-trials semantics:
   COMPLETE injected trials count toward ``n_startup_trials``, so with >= 8
   finite priors the very first TPE draw is surrogate-driven);
-- rewarm (production Phase R): continuation/deep bouts only, one
+- rewarm (historical production Phase R): continuation/deep bouts only, one
   ``bench-rewarm-proposer`` call, up to ``rewarm_proposals=3`` configs,
   validated with production ``validate_proposals`` semantics (in-space via
   ``tune_tools._bounds_violations``, schema via ``_schema_accepts_value``,
@@ -82,7 +85,7 @@ the §四 standard structured view (``llm.first_message_blocks``:
 search_space / candidate / incumbent / history; ``tools=()``, no
 ``tune_report.json`` and no validate-proposals tool surface), while the
 validation strength is unchanged (done in-arm with the production
-``tune_tools`` primitives). First bouts never rewarm: no session is
+``tune_tools`` primitives). Historical first bouts never rewarm: no session is
 created and zero LLM calls are made. ``session.totals()`` are emitted in
 ``finally``; rewarm proposals this arm itself recognizes as duplicates of
 executed history (dropped before yielding) are counted under
@@ -102,6 +105,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "tuners"))
 
 import arm_api  # noqa: E402
+import checkpoint as checkpoint_mod  # noqa: E402
 import llm  # noqa: E402
 import tune_tools  # noqa: E402
 import bo_search  # noqa: E402
@@ -217,16 +221,16 @@ class Current:
         ]
         attempted = _attempted_identities(attempted_rows, search_space)
 
-        # --- Phase R: rewarm proposals (continuation/deep bouts only) ------
+        # --- Phase R: rewarm proposals (post-initial checkpoints only) -----
         session = None
         rewarm_configs: list[dict] = []
         rewarm_rationale = None
         internal_duplicates = 0
-        if checkpoint.regime != "first":
+        if not checkpoint_mod.is_initial_regime(checkpoint.regime):
             factory = ctx.extras.get("session_factory")
             if factory is None:
                 raise arm_api.ArmError(
-                    "current: continuation/deep bouts require "
+                    "current: post-initial bouts require "
                     "ctx.extras['session_factory'] for the rewarm proposer"
                 )
             session = factory(

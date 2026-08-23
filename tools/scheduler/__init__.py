@@ -1,4 +1,4 @@
-"""Scheduler policies and v3.2 implementation.
+"""Run-global scheduler policies.
 
 The package keeps each policy isolated. New experiment runs persist the
 deterministic ``tuner.scheduler_policy = "anchor_challenger_v1"`` during

@@ -30,7 +30,7 @@ but replaces FIRST with the inner-benchmark ``local_tr`` arm::
     inner_tuner_policy_id = localtr8-hebo10-spsa10-v1
 
 A second comparison arm keeps that ``local_tr`` FIRST bout and runs the
-prompt-v2 HEBO kernel for EVERY later bout — DEEP is HEBO, not SPSA::
+prompt-v2 HEBO kernel for every historical later regime — DEEP is HEBO, not SPSA::
 
     inner_tuner_policy_id = localtr8-hebo10-hebo10-v1
 
@@ -40,8 +40,8 @@ HEBO proposes over the whole space, so an integer/categorical-only
 candidate still has a DEEP action.
 
 The ``selfrank8-hebo10-hebo10`` comparison policy instead runs the
-inner-benchmark LLM-pool self-rank arm for FIRST, then HEBO for every later
-bout. Deferred warm configs still occupy slots inside FIRST's eight spends.
+inner-benchmark LLM-pool self-rank arm for FIRST, then HEBO for every remaining
+historical segment. Deferred warm configs still occupy slots inside FIRST's eight spends.
 
 The ``baseline-hebo-full-v1`` policy is the strong-baseline control arm used
 by the ``baseline-tune`` driver loop: ONE INITIAL bout of the prompt-v2 HEBO
@@ -51,21 +51,22 @@ scheduler and no semantic generation. Its bout budget therefore comes from
 the run configuration, not from the regime table.
 
 The anchor/challenger policies ``mixup24-turbo20-v1``,
-``hebo24-turbo20-v1``, and ``hebo24-hebo20`` are three-bout contracts::
+``hebo24-turbo20-v1``, and ``hebo24-hebo20`` have two semantic regimes
+implemented as three scheduler-admitted segments::
 
     0 completed bouts -> 24-slot mixup_pool_hebo INITIAL
                          OR 24-slot pool_hebo_mace INITIAL
-    1 completed bout  -> 10-slot hot-start TuRBO segment 1
-                         OR 10-slot pool_hebo_mace CONTINUE
-    2 completed bouts -> 10-slot hot-start TuRBO segment 2
-                         OR 10-slot pool_hebo_mace DEEP
+    1 completed bout  -> first 10-slot DEEP segment (TuRBO or HEBO)
+    2 completed bouts -> second 10-slot DEEP segment (TuRBO or HEBO)
 
 ``hebo24-hebo20`` is the new-experiment default and uses ``pool_hebo_mace``
-for all three bouts. The two TuRBO
-segments in the other policies share state when they run on the same
-candidate. If the scheduler switches candidates after a zero-gain first
-segment, the other candidate starts its own TuRBO trajectory. Deferred warm
-configs occupy slots inside the 24-slot INITIAL bout.
+for INITIAL and both DEEP segments. The scheduler boundary between the two
+later 10-slot segments is an admission/rescheduling boundary, not a separate
+CONTINUE regime. The two TuRBO segments in the other policies share state when
+they run on the same candidate. If the scheduler switches candidates after a
+zero-gain first DEEP segment, the other candidate starts its own TuRBO
+trajectory. Deferred warm configs occupy slots inside the 24-slot INITIAL
+bout.
 
 Under every regime-conditioned policy a bout's deferred-warm backlog
 occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
@@ -117,7 +118,8 @@ REGIME_POLICY_IDS = (
 LOCAL_TR_FIRST_POLICY_IDS = (LOCAL_TR_POLICY_ID, LOCAL_TR_HEBO_POLICY_ID)
 KNOWN_POLICY_IDS = (*REGIME_POLICY_IDS, LEGACY_POLICY_ID)
 
-FIRST = "FIRST"
+INITIAL = "INITIAL"
+FIRST = "FIRST"  # historical 8/10/10 comparison policies only
 CONTINUE = "CONTINUE"
 DEEP = "DEEP"
 
@@ -128,11 +130,15 @@ INITIAL24_BOUT_SIZE = 24
 INITIAL24_MAX_BOUTS = 3
 MAX_BOUTS_PER_CANDIDATE = 4
 
-_REGIME_BOUT_SIZES = {FIRST: B_FIRST, CONTINUE: B_CONTINUE, DEEP: B_DEEP}
+_HISTORICAL_REGIME_BOUT_SIZES = {
+    FIRST: B_FIRST,
+    CONTINUE: B_CONTINUE,
+    DEEP: B_DEEP,
+}
 
 
 def is_regime_policy(policy_id: str) -> bool:
-    """Whether ``policy_id`` is a FIRST/CONTINUE/DEEP regime contract."""
+    """Whether ``policy_id`` has an explicit bout-regime contract."""
     return policy_id in REGIME_POLICY_IDS
 
 
@@ -149,8 +155,8 @@ def load_policy_id(ref_path) -> str:
     return policy_id
 
 
-def regime_for_bout_index(bout_index: int) -> str:
-    """Regime of the bout ABOUT TO RUN (0-based)."""
+def _historical_regime_for_bout_index(bout_index: int) -> str:
+    """Regime used by the historical 8/10/10 comparison policies."""
     if bout_index <= 0:
         return FIRST
     if bout_index == 1:
@@ -158,8 +164,32 @@ def regime_for_bout_index(bout_index: int) -> str:
     return DEEP
 
 
-def bout_size(regime: str) -> int:
-    return _REGIME_BOUT_SIZES[regime]
+def regime_for_bout(policy_id: str, bout_index: int) -> str:
+    """Semantic regime of the bout ABOUT TO RUN (0-based).
+
+    Current 24+20 policies are deliberately binary: one INITIAL bout followed
+    by up to two scheduler-admitted DEEP segments. FIRST/CONTINUE/DEEP remains
+    only for the explicitly retained historical comparison policies.
+    """
+    if policy_id == BASELINE_HEBO_POLICY_ID:
+        if bout_index != 0:
+            raise ValueError(
+                f"{policy_id} is a single-bout contract; "
+                f"got bout_index={bout_index}"
+            )
+        return INITIAL
+    if policy_id in INITIAL24_POLICY_IDS:
+        if not 0 <= bout_index < INITIAL24_MAX_BOUTS:
+            raise ValueError(
+                f"{policy_id} has exactly {INITIAL24_MAX_BOUTS} bouts; "
+                f"got bout_index={bout_index}"
+            )
+        return INITIAL if bout_index == 0 else DEEP
+    return _historical_regime_for_bout_index(bout_index)
+
+
+def _historical_bout_size(regime: str) -> int:
+    return _HISTORICAL_REGIME_BOUT_SIZES[regime]
 
 
 def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: int) -> int:
@@ -187,7 +217,7 @@ def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: in
             )
         if bout_index == 0:
             return INITIAL24_BOUT_SIZE
-    return bout_size(regime_for_bout_index(bout_index))
+    return _historical_bout_size(_historical_regime_for_bout_index(bout_index))
 
 
 def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -> list:
@@ -228,7 +258,7 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
         if bout_index > 0:
             return ["turbo"]
         return ["mixup"] if policy_id == MIXUP_TURBO_POLICY_ID else ["hebo"]
-    regime = regime_for_bout_index(bout_index)
+    regime = _historical_regime_for_bout_index(bout_index)
     if regime == FIRST:
         if policy_id == SELF_RANK_HEBO_POLICY_ID:
             return ["selfrank"]
@@ -270,7 +300,10 @@ def bo_sampler_for_bout(policy_id: str, bout_index: int) -> str:
     """Which Optuna sampler drives a ``bo`` stage: default-policy FIRST
     bouts are explicit random draws; every other bo stage keeps
     multivariate TPE."""
-    if policy_id == POLICY_ID and regime_for_bout_index(bout_index) == FIRST:
+    if (
+        policy_id == POLICY_ID
+        and _historical_regime_for_bout_index(bout_index) == FIRST
+    ):
         return "random"
     return "tpe"
 

@@ -1,4 +1,7 @@
-"""Frozen mechanical resource contract for scheduler v3.2 (design §2).
+"""Mechanical resource contract shared by current and comparison schedulers.
+
+An exact ``bout_cost_schedule`` carries the current INITIAL/DEEP policy. The
+unscheduled B_FIRST/B defaults below encode the historical v3.2 comparison.
 
 `B = 10` objective evaluations per tuning bout and `MAX_BOUTS_PER_CANDIDATE
 = 4` are the new policy invariant, replacing the legacy per-candidate
@@ -128,14 +131,14 @@ class CandidateView:
     previous_gain: float | None = None
     has_unresolved_descendant: bool = False
     crashed: bool = False
-    #: FIRST bouts consume step-0+1 configs that were proposed but never
+    #: Initialization segments consume step-0+1 configs that were proposed
     #: evaluated. They occupy trial slots inside B; they never add cost
-    #: beyond it. Carried so a simulated FIRST bout costs what a real one
-    #: costs.
+    #: beyond it. Carried so a simulated initialization segment costs what a
+    #: real one costs.
     deferred_warm_backlog: int = 0
-    #: DEEP bouts are two-sided SPSA, which needs a non-degenerate
+    #: Historical SPSA DEEP bouts need a non-degenerate
     #: continuous dimension to perturb. Without one the candidate has no
-    #: DEEP action (design §2.1) — it is done after its CONTINUE bout.
+    #: DEEP action (design §2.1).
     has_movable_continuous: bool = True
     #: TuRBO can move float and integer dimensions, but not a categorical-only
     #: space. Used only when the active resource contract requests it.

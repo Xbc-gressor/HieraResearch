@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Production adapter for inner-benchmark arms: HEBO MACE by default.
 
-HEBO serves the CONTINUE regime of inner policy
-deferred-random8-hebo10-spsa10-v1; CONTINUE and DEEP under
-localtr8-hebo10-hebo10-v1 and selfrank8-hebo10-hebo10; and the 24-slot
-INITIAL bout under hebo24-turbo20-v1. It serves every bout under
-hebo24-hebo20. The thin selfrank_search and
+Under the current ``hebo24-hebo20`` policy, HEBO serves the 24-slot INITIAL
+and both 10-slot DEEP segments. It also serves INITIAL under
+``hebo24-turbo20-v1``. In the historical comparison policies it serves
+CONTINUE, and sometimes DEEP. The thin selfrank_search and
 mixup_search replace the pool policy; turbo_search uses the same
 factual-history/evaluation adapter without creating an LLM session.
 
@@ -20,9 +19,9 @@ protocol (PLAN §6.4), ported onto the production Phase-C stage machinery:
   (installed by the repository-root ``uv sync``) ranks the
   duplicate-filtered pool; the unique first-Pareto member (or an
   RNG-among-ties draw) is executed;
-- WARMUP=8 is an engineering fallback expected never to fire on a
-  continuation checkpoint (FIRST already spent 8 slots). Ranker
-  failure is fail-fast, never an invented approximate HEBO.
+- WARMUP=8 is an engineering fallback: it can fire during INITIAL, but a DEEP
+  checkpoint should already have enough history. Ranker failure is fail-fast,
+  never an invented approximate HEBO.
 
 The search process itself runs in the repo-root env (SDK + HEBO
 ranker). The candidate is never imported here: SEARCH_SPACE /
@@ -102,6 +101,7 @@ MAX_CONSECUTIVE_PREFLIGHT_REJECTS = 5
 
 #: Inner-policy regime -> the frozen checkpoint's (regime, stratum) vocabulary.
 _CHECKPOINT_REGIME = {
+    inner_policy.INITIAL: ("initial", "initial"),
     inner_policy.FIRST: ("first", "first"),
     inner_policy.CONTINUE: ("continuation", "cont_improved"),
     inner_policy.DEEP: ("deep", "deep"),
@@ -425,6 +425,7 @@ def _build_checkpoint(
     incumbent: tuple[dict, float],
     contract,
     remaining: int,
+    policy_id: str,
     bout_index: int,
 ) -> checkpoint_mod.Checkpoint:
     incumbent_params, incumbent_score = incumbent
@@ -432,9 +433,11 @@ def _build_checkpoint(
     relative_improvement = _configured_relative_improvement(candidate_path)
     # The arm is regime-agnostic, but the checkpoint's regime/stratum is
     # read-only context the proposer session sees: report the bout's real
-    # regime. Under localtr8-hebo10-hebo10-v1 this kernel also serves DEEP
-    # bouts (bout_index >= 2); under the hebo24 policies it also serves FIRST.
-    regime, stratum = _CHECKPOINT_REGIME[inner_policy.regime_for_bout_index(bout_index)]
+    # regime. Historical comparison policies may expose FIRST/CONTINUE/DEEP;
+    # current 24+20 policies expose INITIAL/DEEP only.
+    regime, stratum = _CHECKPOINT_REGIME[
+        inner_policy.regime_for_bout(policy_id, bout_index)
+    ]
     return checkpoint_mod.Checkpoint(
         checkpoint_id=candidate_path.parent.name,
         regime=regime,
@@ -476,6 +479,7 @@ def main() -> int:
         METHOD,
     )
     bout_index = time_budget["bout_index"]
+    policy_id = inner_policy.load_policy_id(args.candidate_path)
     search_space = _read_literal_mapping(args.candidate_path, "SEARCH_SPACE")
     base_params = _read_literal_mapping(args.candidate_path, "BASE_PARAMS")
     if not isinstance(base_params, dict):
@@ -566,6 +570,7 @@ def main() -> int:
         incumbent=incumbent,
         contract=contract,
         remaining=remaining,
+        policy_id=policy_id,
         bout_index=bout_index,
     )
     codec = codec_mod.Codec(contract)
@@ -797,12 +802,13 @@ def main() -> int:
 
     gen = None
     try:
-        # Every LLM-pool FIRST kernel follows the regime-policy contract:
+        # Every LLM-pool initialization kernel follows the policy contract:
         # deferred warm configs consume slots inside the bout before the arm
         # proposes. Later HEBO bouts have no deferred backlog.
         if (
             METHOD in ("selfrank", "mixup", "hebo")
-            and inner_policy.regime_for_bout_index(bout_index) == inner_policy.FIRST
+            and inner_policy.regime_for_bout(policy_id, bout_index)
+            in (inner_policy.INITIAL, inner_policy.FIRST)
         ):
             deferred_in_space, n_deferred_projected, deferred_dropped = (
                 project_configs_into_space(
@@ -842,6 +848,7 @@ def main() -> int:
                 incumbent=refreshed_incumbent,
                 contract=contract,
                 remaining=cell_state.budget_remaining,
+                policy_id=policy_id,
                 bout_index=bout_index,
             )
 

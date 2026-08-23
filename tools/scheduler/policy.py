@@ -1,4 +1,7 @@
-"""The scheduler decision: seed-set gate, then rollout (§6, §7).
+"""Historical v3.2 comparison scheduler: seed-set gate, then rollout (§6, §7).
+
+New runs use ``anchor_challenger_v1`` in ``tournament.py``; this module does
+not define the current scheduler or its INITIAL/DEEP taxonomy.
 
 One decision runs three stages:
 

@@ -88,8 +88,8 @@ def contract_for(ledger_path: Path) -> ResourceContract:
                 numeric_required_from_bout_index(inner_policy_id)
             ),
         )
-    # Under the legacy inner policy every bout costs bout_trials; the frozen
-    # regime-conditioned policy charges B_FIRST for first bouts (design §2).
+    # Under the legacy inner policy every bout costs bout_trials; historical
+    # regime policies use B_FIRST for initialization when no exact schedule is supplied.
     legacy_inner = str(tuner.get("inner_policy", "")) == "legacy"
     return ResourceContract(
         bout_trials=bout_trials,

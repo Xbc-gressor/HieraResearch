@@ -4,8 +4,9 @@ Discovers per-cell artifacts (``manifest.json`` + ``result.json`` pairs,
 as written by cell.py / runner.run_cell), attaches each cell's checkpoint
 stratum from the frozen checkpoints, and builds the comparison report:
 
-- stratification: ``first`` / ``cont_improved`` / ``cont_not_improved``
-  reported separately (§九: never assume an arm must win both regimes);
+- current stratification: ``initial`` / ``deep`` reported separately;
+  archived inner-v1 checkpoints with ``first`` / ``cont_improved`` /
+  ``cont_not_improved`` remain loadable and retain their historical labels;
 - the per-checkpoint unit first: per (stratum, arm, checkpoint) medians
   over seeds, THEN across-checkpoint median/mean/min/max — different
   candidates' raw difficulties are never averaged together (their

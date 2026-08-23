@@ -1,12 +1,12 @@
 """Deterministic early-anchor / late-challenger scheduler.
 
 This policy is intentionally free of a learned transition model.  It buys two
-complete first bouts: one immediately after the reserved seed roots are
+complete INITIAL bouts: one immediately after the reserved seed roots are
 visible so tuned parameters can transfer into later improve/crossover nodes,
 and one at the end of generation as a late challenger.  It then spends exactly
-two later bouts.  The first goes to the better initialized candidate; the
+two DEEP segments.  The first goes to the better initialized candidate; the
 second stays with a responder and switches to the other initialized candidate
-after a zero-gain first later bout.
+after a zero-gain first DEEP segment.
 
 The policy is generic over the active inner tuner's three-bout cost schedule.
 For the planned mixup policy that schedule is (24, 10, 10), hence the full
@@ -26,24 +26,24 @@ from .state import SchedulerState
 POLICY_ID = "anchor_challenger_v1"
 POLICY_VERSION = "scheduler-anchor-challenger-v1"
 INITIALIZED_CANDIDATES = 2
-LATER_BOUTS = 2
+DEEP_SEGMENTS = 2
 
 
 @dataclass(frozen=True)
 class TournamentStatus:
     initialized: tuple[CandidateView, ...]
     uninitialized: tuple[CandidateView, ...]
-    later_bouts_spent: int
+    deep_segments_spent: int
 
     @property
     def phase(self) -> str:
         if not self.initialized:
             return "early_anchor"
-        if self.later_bouts_spent:
-            return "later_bouts" if self.later_bouts_spent < LATER_BOUTS else "complete"
+        if self.deep_segments_spent:
+            return "deep_segments" if self.deep_segments_spent < DEEP_SEGMENTS else "complete"
         if len(self.initialized) < INITIALIZED_CANDIDATES:
             return "generation_then_challenger"
-        return "later_bouts"
+        return "deep_segments"
 
 
 def status(state: SchedulerState) -> TournamentStatus:
@@ -52,19 +52,19 @@ def status(state: SchedulerState) -> TournamentStatus:
     return TournamentStatus(
         initialized=initialized,
         uninitialized=tuple(candidate for candidate in live if candidate.bouts_used == 0),
-        later_bouts_spent=sum(
+        deep_segments_spent=sum(
             max(0, candidate.bouts_used - 1) for candidate in initialized
         ),
     )
 
 
 def full_tuning_reserve(contract: ResourceContract) -> int:
-    """Two first bouts plus exactly two later bouts."""
-    second_later = max(contract.bout_cost(1), contract.bout_cost(2))
+    """Two INITIAL bouts plus exactly two DEEP segments."""
+    second_deep = max(contract.bout_cost(1), contract.bout_cost(2))
     return (
         2 * contract.bout_cost(0)
         + contract.bout_cost(1)
-        + second_later
+        + second_deep
     )
 
 
@@ -74,35 +74,35 @@ def generation_reserve(state: SchedulerState) -> int:
     if current.phase == "early_anchor":
         return full_tuning_reserve(state.contract)
     if current.phase == "generation_then_challenger":
-        second_later = max(
+        second_deep = max(
             state.contract.bout_cost(1), state.contract.bout_cost(2)
         )
         return (
             state.contract.bout_cost(0)
             + state.contract.bout_cost(1)
-            + second_later
+            + second_deep
         )
-    if current.phase == "later_bouts":
-        remaining_later = LATER_BOUTS - current.later_bouts_spent
-        # A switched second later bout is still bout index 1 for the other
-        # initialized candidate.  The planned policy has equal later costs;
+    if current.phase == "deep_segments":
+        remaining_deep = DEEP_SEGMENTS - current.deep_segments_spent
+        # A switched second DEEP segment is still bout index 1 for the other
+        # initialized candidate.  The planned policy has equal DEEP costs;
         # max keeps the reserve sound for a generic three-cost schedule.
-        later_cost = max(
+        deep_cost = max(
             state.contract.bout_cost(1), state.contract.bout_cost(2)
         )
-        return remaining_later * later_cost
+        return remaining_deep * deep_cost
     return 0
 
 
 def generation_admission_cap(state: SchedulerState) -> int:
     """Maximum new candidates that preserve the tournament reserve.
 
-    Generation ends permanently once the challenger has completed its first
-    bout or any later bout has begun.  Before then, admission uses the same
+    Generation ends permanently once the challenger has completed its INITIAL
+    bout or any DEEP segment has begun.  Before then, admission uses the same
     ``K_eval`` cost as got_select and leaves the appropriate hard reserve.
     """
     current = status(state)
-    if current.phase in {"later_bouts", "complete"}:
+    if current.phase in {"deep_segments", "complete"}:
         return 0
     spendable = max(0, state.remaining_budget - generation_reserve(state))
     return spendable // state.contract.k_eval
@@ -123,7 +123,7 @@ def decide(state: SchedulerState) -> Decision:
         "mode": "deterministic_tournament",
         "phase": current.phase,
         "initialized_run_ids": [candidate.run_id for candidate in current.initialized],
-        "later_bouts_spent": current.later_bouts_spent,
+        "deep_segments_spent": current.deep_segments_spent,
         "generation_reserve": generation_reserve(state),
         "generation_admission_cap": generation_admission_cap(state),
         "n_roots": state.n_roots,
@@ -170,14 +170,14 @@ def decide(state: SchedulerState) -> Decision:
             return Decision(
                 "DEFER",
                 None,
-                "continue generation while preserving challenger + later reserve",
+                "continue generation while preserving challenger + DEEP reserve",
                 evidence_mode=mode,
             )
         target = _best(state, current.uninitialized)
         if target is None:
             # A short or failure-heavy run may never produce a second usable
             # candidate.  Preserve useful work by letting the anchor consume
-            # the later budget rather than spinning forever.
+            # the DEEP budget rather than spinning forever.
             target = _best(state, current.initialized)
             reason = "no eligible late challenger; continue the early anchor"
         else:
@@ -186,10 +186,10 @@ def decide(state: SchedulerState) -> Decision:
             return Decision("STOP", None, "no eligible tournament candidate", evidence_mode=mode)
         return Decision("TUNE", target.run_id, reason, evidence_mode=mode)
 
-    # Two candidates have first-bout evidence.  Spend exactly two later bouts.
-    if current.later_bouts_spent == 0:
+    # Two candidates have INITIAL evidence. Spend exactly two DEEP segments.
+    if current.deep_segments_spent == 0:
         target = _best(state, current.initialized)
-        reason = "first later bout goes to the better initialized candidate"
+        reason = "first DEEP segment goes to the better INITIAL candidate"
     else:
         prior = next(
             (candidate for candidate in current.initialized if candidate.bouts_used > 1),
@@ -202,11 +202,11 @@ def decide(state: SchedulerState) -> Decision:
         )
         if prior is not None and (prior.previous_gain or 0.0) > 0.0:
             target = _best(state, (prior,))
-            reason = "first later bout improved; continue the responder"
+            reason = "first DEEP segment improved; continue the responder"
             if target is None:
                 # The responder can be ineligible for its own next bout (e.g.
                 # an SPSA DEEP bout without a movable continuous dimension).
-                # Switch rather than abandon the reserved second later bout.
+                # Switch rather than abandon the reserved second DEEP segment.
                 target = _best(state, alternatives)
                 reason = (
                     "responder ineligible for its next bout; "
@@ -216,9 +216,9 @@ def decide(state: SchedulerState) -> Decision:
             target = _best(state, alternatives) or (
                 _best(state, (prior,)) if prior is not None else None
             )
-            reason = "first later bout had zero gain; switch initialized candidate"
+            reason = "first DEEP segment had zero gain; switch INITIAL candidate"
     if target is None:
-        return Decision("STOP", None, "no eligible later-bout candidate", evidence_mode=mode)
+        return Decision("STOP", None, "no eligible DEEP candidate", evidence_mode=mode)
     return Decision("TUNE", target.run_id, reason, evidence_mode=mode)
 
 

@@ -1,4 +1,7 @@
-"""Predictive models: frozen design prior, then current-run exact class.
+"""Historical v3.2 predictive models: frozen prior, then run-exact class.
+
+The current ``anchor_challenger_v1`` scheduler does not use FIRST/LATER
+prediction classes; its active inner-policy taxonomy is INITIAL/DEEP.
 
 Two deliberately coarse models:
 

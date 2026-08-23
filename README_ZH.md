@@ -37,7 +37,7 @@
 
 ### 3.2 运行实验
 
-先在仓库根同步框架环境；这一次同步同时安装 CONTINUE policy 所需的
+先在仓库根同步框架环境；这一次同步同时安装 HEBO policy 所需的
 HEBO MACE 与 CPU-only torch，不需要再为 HEBO 单独执行 `uv sync`：
 
 ```bash
@@ -153,8 +153,8 @@ step 0+1: tunable-contract-extractor
   深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
 
 - **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
-  - 默认 scheduler `anchor_challenger_v1`：seed roots 到齐后立即给当时最优候选一个 INITIAL bout，在保留 challenger 与两个 later bout 硬预算的前提下继续生成，然后初始化 late challenger 并花两个 later bout。第一个 later bout 有正收益则继续同一候选，否则切换到另一个已初始化候选。`v3_2` 和 legacy percentile/alternation 调度器作为显式对照臂保留。
-  - 默认 inner policy `hebo24-hebo20`：INITIAL=24、CONTINUE=10、DEEP=10，三段都调用同一个 `pool_hebo_mace` 协议（LLM pool POOL=5 + 官方 HEBO MACE），以全部历史 trial 为先验，无 TuRBO 数值维门槛。`deferred-random8-hebo10-spsa10-v1`、local-TR 和 TuRBO 等策略作为显式对照臂保留。
+  - 默认 scheduler `anchor_challenger_v1`：seed roots 到齐后立即给当时最优候选一个 INITIAL bout，在保留 challenger 与两个 DEEP segment 硬预算的前提下继续生成，然后初始化 late challenger 并花两个 DEEP segment。第一段 DEEP 有正收益则继续同一候选，否则切换到另一个已初始化候选。`v3_2` 和 legacy percentile/alternation 调度器作为显式对照臂保留。
+  - 默认 inner policy `hebo24-hebo20`：INITIAL=24，之后至多两个 DEEP=10 segment；三段都调用同一个 `pool_hebo_mace` 协议（LLM pool POOL=5 + 官方 HEBO MACE），以全部历史 trial 为先验，无 TuRBO 数值维门槛。当前 policy 没有 CONTINUE regime；两个 DEEP segment 的边界只供 scheduler 重新准入或换 candidate。`deferred-random8-hebo10-spsa10-v1`、local-TR 和 TuRBO 等策略作为显式对照臂保留。
   - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后在 warm incumbent 与**所有 bout 的全部 trial** 上取全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与分级 `evaluation_depth`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
   详见 §5.7。
 
@@ -252,9 +252,9 @@ Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运�
 
 流程：
 
-1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`，并严格执行返回的 exact target 和 complete-bout 预算。默认 `anchor_challenger_v1` 按 early anchor → 保留硬预算继续生成 → late challenger → 两个 later bout 的确定性赛程选择；`v3_2` 用全剩余预算 rollout 在 TUNE/DEFER 间决策。仅 legacy/legacy_wide 使用 `N_min` + `best_warm_score` 百分位门控与 FIRST/CONTINUE 交替规则。
-2. Phase R：冻结策略下从不接受 orchestrator 再热提案（FIRST 消耗 step 0+1 的 deferred 配置；HEBO bout 自生成 pool，`hebo_bout_has_no_rewarm`；SPSA DEEP bout 拒绝提案，`deep_bout_has_no_rewarm`——pair 必须完整）。仅 `tuner.inner_policy=legacy` 的 CONTINUE bout 仍走旧的至多 `tuner.rewarm_proposals`（默认 3）条提案路径
-3. Phase C：按 bout regime 选方法（默认 `hebo24-hebo20`：INITIAL=hebo 24 槽 / CONTINUE=hebo 10 槽 / DEEP=hebo 10 槽；`deferred-random8-hebo10-spsa10-v1` 为 bo+RandomSampler 8 / hebo 10 / spsa 10 的对照臂；其他策略见 `tools/tuners/inner_policy.py`），以全部历史 trial 为先验续搜
+1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`，并严格执行返回的 exact target 和 complete-bout 预算。默认 `anchor_challenger_v1` 按 early anchor → 保留硬预算继续生成 → late challenger → 两个 DEEP segment 的确定性赛程选择；`v3_2` 用全剩余预算 rollout 在 TUNE/DEFER 间决策。仅 legacy/legacy_wide 使用 `N_min` + `best_warm_score` 百分位门控与 FIRST/CONTINUE 交替规则。
+2. Phase R：冻结策略下从不接受 orchestrator 再热提案（INITIAL 消耗 step 0+1 的 deferred 配置；HEBO bout 自生成 pool，`hebo_bout_has_no_rewarm`；SPSA DEEP bout 拒绝提案，`deep_bout_has_no_rewarm`——pair 必须完整）。仅 `tuner.inner_policy=legacy` 的 continuation action 仍走旧的至多 `tuner.rewarm_proposals`（默认 3）条提案路径
+3. Phase C：按 bout regime 选方法（默认 `hebo24-hebo20`：INITIAL=hebo 24 槽，之后两个 DEEP=hebo 10 槽 segment；没有 CONTINUE regime。`deferred-random8-hebo10-spsa10-v1` 为历史 FIRST/CONTINUE/DEEP 三段的 bo+RandomSampler 8 / hebo 10 / spsa 10 对照臂；其他策略见 `tools/tuners/inner_policy.py`），以全部历史 trial 为先验续搜
 4. Finalize：运行 `tools/finalize_tuning.py`；它验证当前 bout 的 Phase C 已终止，在 warm  incumbent 与**所有 bout 的全部 trial** 上取全局最佳、写回 `BASE_PARAMS`、关闭 report，并一次性更新 ledger（`tuning_bouts`、`last_bout_improved`、分级 `evaluation_depth`；**无重新运行**；可按 bout 安全重试）。若搜索进程被杀死或 report 非终态，则不应用参数且不更新 ledger。
 
 当当前 scheduler 返回 DEFER/STOP，或 legacy 臂没有合格候选时，`run_id` 为 `none`——这是有效的无操作。
@@ -375,11 +375,11 @@ python tools/validate_tasks.py
 
 - `_common.py`：共享加载、搜索空间、试验读取逻辑
 - `tune_tools.py`：调优编排的确定性 CLI——`select-candidate`（解耦深度调优的候选选择门控：种群 ≥ N_min 且前 20% 中的最佳未调优候选）、`select-method`（基于维度的 grid/bo/cmaes 选择，即 legacy CONTINUE 规则）、`select-best`（全局最佳试验）、`lineage-evidence`、`check-search-space`（校验 + 按 outlier/贴边 margin 扩箱）等。
-- `inner_policy.py`：regime 条件内层策略（含 `hebo24-hebo20` 24+10+10 全 HEBO 臂）——FIRST/CONTINUE/DEEP 的 bout 大小、方法链、sampler 与 rewarm 规则的唯一来源。
+- `inner_policy.py`：regime 条件内层策略（当前 `hebo24-hebo20` 为 INITIAL/DEEP 二分、24+10+10 全 HEBO；历史对照臂保留 FIRST/CONTINUE/DEEP）——bout 大小、方法链、sampler 与 rewarm 规则的唯一来源。
 - `warmstart_eval.py`：顺序评估热配置（恢复 / 崩溃时停止），构建 `BASE_PARAMS` + 写 `phase_a`
 - `grid_search.py`：低维搜索空间
 - `bo_search.py`：使用贝叶斯优化（通过 Optuna 的多元 TPE）的中维搜索空间；`--sampler random` 时为 FIRST bout 的显式 RandomSampler 内核
-- `hebo_search.py`：CONTINUE bout 的 prompt-v2 HEBO（LLM pool + 官方 HEBO MACE；在仓库根环境跑搜索，评估仍走任务 uv 项目）
+- `hebo_search.py`：prompt-v2 HEBO（当前 policy 的 INITIAL/DEEP，以及历史对照臂的 CONTINUE/HEBO-DEEP；LLM pool + 官方 HEBO MACE；在仓库根环境跑搜索，评估仍走任务 uv 项目）
 - `spsa_search.py`：DEEP bout 的两侧 SPSA（5 个完整扰动 pair，pair 状态持久化可精确续跑）
 - `local_tr_search.py`：对照臂 `localtr8-hebo10-spsa10-v1` / `localtr8-hebo10-hebo10-v1` 的 FIRST bout（inner-benchmark `local_tr`；deferred 热配置占 8 槽内的前几个）
 - `cmaes_search.py`：使用 CMA-ES 的高维搜索空间

@@ -1,8 +1,8 @@
 """LLM bout-session layer for the inner-tuner benchmark (PLAN §四).
 
-This module is the session/context infrastructure consumed by the four
+This module is the session/context infrastructure consumed by the
 LLM-using arms (Current's rewarm step, LLM hillclimb, active-set, pool
-proposer). It owns:
+proposer, tiebreak judge). It owns:
 
 - ``LLMConfig`` — the manifest record for every LLM call in a cell
   (PLAN §5.3: one pinned model id; production exposes NO decoding knobs,
@@ -40,6 +40,8 @@ Extras-key contract (invocation context ``extra`` values are strings):
   ``feasible_set`` (active-set's filtered (parameter, step) joint set,
   formatted by that arm). ``bench-hillclimb-editor`` additionally
   receives ``working_copy`` (absolute path of the file it may Read/Edit).
+  ``bench-tiebreak-judge`` receives ``front`` (the tied Pareto-front
+  members, in display order) and ``correction`` on re-asks.
 
 ``evidence`` policy (PLAN §四): today only same-candidate history may be
 attached as read-only text blocks; cross-candidate (parent/sibling)
@@ -190,6 +192,17 @@ BENCH_ROLES: dict[str, RoleDefinition] = {
             "winner": ("enum", "A", "B"),
             "reasoning": "?str",
         },
+    ),
+    # Pareto break-tie judge (pool_hebo_mace_llmtie): one fresh, tool-free
+    # session per tie event picks one front member by display index and is
+    # then discarded. Display order is a per-tie permutation, so the index
+    # carries no proposer-rank information.
+    "bench-tiebreak-judge": RoleDefinition(
+        name="bench-tiebreak-judge",
+        prompt_file="bench-tiebreak-judge.md",
+        tools=(),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={"choice": "int", "rationale": "?str"},
     ),
     # Param-only hillclimb editor (production hillclimb-editor narrowed to
     # SEARCH_SPACE parameter values; one change per invocation).
@@ -619,7 +632,8 @@ def first_message_blocks(
     )
     candidate = "\n".join([
         f"checkpoint_id: {checkpoint.checkpoint_id}",
-        f"regime: {checkpoint.regime} (first | continuation | deep)",
+        f"regime: {checkpoint.regime} (current: initial | deep; "
+        "historical inner-v1: first | continuation | deep)",
         f"stratum: {checkpoint.stratum}",
         f"candidate kind: {kind} (fresh | improve | crossover | "
         "provided-baseline; 'unknown' = not recorded at freeze time)",

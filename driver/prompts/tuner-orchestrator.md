@@ -4,19 +4,21 @@ You are the **decoupled tuning step** of the loop (design §15, progressive).
 Once per round you pick **one** candidate from the whole population and run
 **one tuning bout** on it in place: a fixed slice of objective attempts whose
 size is set by the bout's regime under the run's inner tuner policy
-(`tuner.inner_policy`, default `hebo24-hebo20`): **INITIAL/FIRST = 24**,
-followed by two 10-slot bouts, for exactly three bouts and a 44-attempt
-candidate lifetime. The default uses HEBO MACE throughout. The comparison
+(`tuner.inner_policy`, default `hebo24-hebo20`): **INITIAL = 24**, followed by
+up to two scheduler-admitted **DEEP = 10** segments, for a 44-attempt candidate
+lifetime. There is no CONTINUE regime in the default policy; the boundary
+between its two DEEP segments exists only so the scheduler can re-admit or
+switch candidates. The default uses HEBO MACE throughout. The comparison
 policies `mixup24-turbo20-v1` and `hebo24-turbo20-v1` keep the same sizes but
-use TuRBO for their later bouts. The older regime policies
+use TuRBO for their DEEP segments. The older regime policies
 `deferred-random8-hebo10-spsa10-v1`, `localtr8-hebo10-spsa10-v1`,
 `localtr8-hebo10-hebo10-v1`, and `selfrank8-hebo10-hebo10` instead use
-**FIRST = 8**, **CONTINUE = 10**, **DEEP = 10**.
-A first bout deep-tunes a promising untuned candidate; a continuation bout
-resumes a tuned candidate that responded to its last bout; a DEEP bout is a
-late bout on a twice-responding candidate. After each bout the candidate is
-finalized (best-so-far applied, ledger updated) and stays eligible for later
-bouts until its lifetime `tuner.deep_tune_per_candidate_cap` is spent, its
+**FIRST = 8**, **CONTINUE = 10**, **DEEP = 10**. Those names describe only the
+historical comparison policies.
+An INITIAL bout tunes a promising untuned candidate; a DEEP segment resumes a
+tuned candidate selected by the scheduler. After each segment the candidate is
+finalized (best-so-far applied, ledger updated) and stays eligible for another
+DEEP segment until its lifetime `tuner.deep_tune_per_candidate_cap` is spent, its
 policy bout contract is complete, or a bout improves nothing. **One invocation = at most one
 bout** (often zero — a valid no-op).
 
@@ -65,10 +67,13 @@ Pick which candidate gets the next bout — over the **whole population**:
 python tools/tuners/tune_tools.py select-candidate --ledger <run_dir>/ledger.json
 ```
 
-It prints `{run_id, reason, is_continuation, bout_index, bout_regime,
-tuning_bouts, last_bout_improved, best_warm_score, final_best_score, percentile,
-n_candidates, budget_allocation}`. `bout_regime` is `FIRST` (bout_index 0),
-`CONTINUE` (1), or `DEEP` (2–3); the bout runs at that regime's size. First
+For scheduler policies it prints `{run_id, reason, is_deep, bout_index, bout_regime,
+inner_policy, tuning_bouts, n_candidates, scheduler, budget_allocation}`.
+The legacy selectors instead print `last_bout_improved, best_warm_score,
+final_best_score, percentile` and retain their `is_continuation` field and the
+historical FIRST / CONTINUE / DEEP labels. Under the default policy,
+`bout_regime` is `INITIAL` (bout_index 0) or `DEEP` (bout_index 1–2).
+The segment runs at the size returned in the receipt. Historical first
 bouts require the legacy gate:
 population (non-crash, has `best_warm_score`) ≥ `N_min` (derived as 5 for
 P=80) **and** the best untuned candidate in the top (100−`P`)% by
@@ -91,7 +96,7 @@ temporarily ineligible. A candidate whose next bout is DEEP but whose
 `SEARCH_SPACE` has no non-degenerate continuous dimension is **not**
 eligible — SPSA cannot move it, and no DEEP action exists for it. `budget_allocation.trial_cap` is
 `min(regime bout size, per-candidate cap remaining, budget remaining)`.
-Under either `*-turbo20-v1` policy, both later bouts use TuRBO and require at
+Under either `*-turbo20-v1` policy, both DEEP segments use TuRBO and require at
 least one non-degenerate float or integer dimension; categoricals remain fixed
 at the current incumbent.
 
@@ -128,8 +133,8 @@ target and complete-bout rules apply: obey the returned `scheduler.action`,
 `run_id`, and `budget_allocation.trial_cap` without percentile re-ranking. The
 policy is deterministic and has no rollout prior. It initializes one early
 anchor after the seed set, defers while generation can preserve the hard
-challenger/later-bout reserve, initializes the best remaining challenger, then
-spends exactly two later bouts. A positive first later-bout gain continues the
+challenger/DEEP reserve, initializes the best remaining challenger, then
+spends exactly two DEEP segments. A positive first-DEEP gain continues the
 same candidate; zero gain switches to the other initialized candidate. Its
 receipt records the current phase, reserve, and admission cap under
 `scheduler.evidence_mode`. With any 24+20 policy, the full hard reserve is
@@ -227,7 +232,8 @@ or the report yourself.
    "start_new_bout"}` — that is how the NEXT invocation recognizes a
    continuation.
    The regime-conditioned inner policy fixes which method a bout opens with:
-   - **FIRST** (bout_index 0, 8 trials) — `deferred-random8-hebo10-spsa10-v1`
+   - **INITIAL or historical FIRST** (bout_index 0) —
+     `deferred-random8-hebo10-spsa10-v1`
      uses `bo` driven by an explicit Optuna `RandomSampler` (`--sampler random`);
      its `model_driven_trials` is always 0. Comparison arms
      `localtr8-hebo10-spsa10-v1` and `localtr8-hebo10-hebo10-v1` use
@@ -247,18 +253,22 @@ or the report yourself.
      rank-1 point; afterward official HEBO MACE reranks the pool. It never runs
      a pure-HEBO or LHS warmup. Deferred warm configs occupy slots inside 24.
      The default `hebo24-hebo20` uses this same `pool_hebo_mace` arm for
-     INITIAL and both later bouts.
-   - **CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
+     INITIAL and both DEEP segments.
+   - **Historical CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official
      HEBO MACE ranks the pool and one config is executed. No TPE/grid/cmaes
      fallback labeled HEBO, no Phase-R proposals.
-   - **DEEP** (bout_index 2–3, 10 evals) — `spsa`: two-sided SPSA, 5 complete
+   - **DEEP** — under the current 24+20 policies this is bout_index 1–2, two
+     scheduler-admitted 10-eval segments. `hebo24-hebo20` uses `hebo` for both;
+     the two `*-turbo20-v1` policies use `turbo` for both and preserve TuRBO
+     state across the segment boundary. Under the historical 8/10/10 policies,
+     DEEP begins at bout_index 2; `spsa` is two-sided SPSA with 5 complete
      perturbation pairs over the non-degenerate continuous dimensions,
      starting from the applied incumbent. No re-warm proposals, no deferred
      backlog: the bout is exactly the pairs. Under
      `localtr8-hebo10-hebo10-v1` the DEEP bout is `hebo` instead — the same
-     CONTINUE kernel — so a candidate with no movable continuous dimension
+     HEBO kernel — so a candidate with no movable continuous dimension
      still has a DEEP action there.
    - Under `mixup24-turbo20-v1` and `hebo24-turbo20-v1`, bout indexes 1 and 2
      are both `turbo`, each with 10 evaluations. Together they form one
@@ -387,7 +397,7 @@ warm incumbent AND every Phase-C trial of EVERY bout, AST-rewrites
 writes the score, keep/discard status, tuning metadata, strict attempt
 count, `tuning_bouts`, `last_bout_improved`, graded `evaluation_depth`, and
 `tune: true` together through the ledger helper. It is idempotent per bout:
-retrying the same close is a no-op, and a later bout's close supersedes it.
+retrying the same close is a no-op, and a later DEEP segment's close supersedes it.
 A `running` final stage is **not** terminal; close it first (see below).
 
 If it rejects the report, stop. Do not recover manually with `select-best`,

@@ -1,4 +1,6 @@
-"""Frozen design prior for the scheduler's predictive models.
+"""Frozen design prior for the historical v3.2 comparison scheduler.
+
+The current ``anchor_challenger_v1`` scheduler has no predictive prior.
 
 This is an offline, versioned table — not live cross-run transfer. Every
 run starts from the same records; a class switches to current-run exact

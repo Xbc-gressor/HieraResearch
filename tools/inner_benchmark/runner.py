@@ -529,7 +529,7 @@ def _validate_checkpoint_for_run(checkpoint, contract) -> None:
 
     - re-measurement must have completed and been valid (otherwise history
       scores came from a different machine than the arm's own scores);
-    - non-``first`` regimes need >= WARMUP finite unique observations, else
+    - DEEP regimes need >= WARMUP finite unique observations, else
       the three numerical-ranker arms silently degenerate into
       llm_pool_self_rank and the experiment's central contrast collapses.
     """
@@ -540,7 +540,7 @@ def _validate_checkpoint_for_run(checkpoint, contract) -> None:
             f"re-measurement (extra.remeasure={remeasure!r}); run "
             f"`freeze.py remeasure` before running cells on it"
         )
-    if checkpoint.regime != "first":
+    if not checkpoint_mod.is_initial_regime(checkpoint.regime):
         finite = checkpoint.finite_unique_history(contract)
         if len(finite) < WARMUP:
             raise ValueError(

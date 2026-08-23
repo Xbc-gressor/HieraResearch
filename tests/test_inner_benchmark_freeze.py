@@ -176,7 +176,15 @@ def make_report(*, control_score=1.00, bout0_scores=None, bout1_scores=None):
     }
 
 
-def make_run(tmp_path, *, report, base_params, candidate_id="007", records=None):
+def make_run(
+    tmp_path,
+    *,
+    report,
+    base_params,
+    candidate_id="007",
+    records=None,
+    inner_policy_id=None,
+):
     """Fake source run dir under runs/<task>/<tag>/ with production layout."""
     run_dir = tmp_path / "runs" / "autoresearch-baseline" / "0000-toy-1"
     candidate_dir = run_dir / "candidates" / candidate_id
@@ -187,8 +195,11 @@ def make_run(tmp_path, *, report, base_params, candidate_id="007", records=None)
     (candidate_dir / "_candidate_brief.json").write_text(
         json.dumps({"run_id": candidate_id, "op": "improve"})
     )
+    tuner = {"bout_trials": 4}
+    if inner_policy_id is not None:
+        tuner["inner_policy"] = inner_policy_id
     (run_dir / "framework_cfg.json").write_text(
-        json.dumps({"tuner": {"bout_trials": 4}, "per_runtime_limit": 60})
+        json.dumps({"tuner": tuner, "per_runtime_limit": 60})
     )
     if records is None:
         records = [
@@ -246,7 +257,7 @@ def test_inspect_two_bout_candidate(two_bout_run):
     assert row["bouts"][0]["nominal"] == 6  # 4 bout_trials + 2 deferred extras
     assert row["bouts"][1]["nominal"] == 4
     assert row["finite_unique_by_boundary"] == [3, 8, 12]
-    assert row["eligible_regimes"] == ["first", "continuation", "deep"]
+    assert row["eligible_regimes"] == ["initial", "deep"]
 
 
 def test_inspect_provided_baseline_kind(tmp_path):
@@ -264,18 +275,40 @@ def test_inspect_provided_baseline_kind(tmp_path):
 def test_inspect_cli_prints_table(two_bout_run, capsys):
     assert freeze.main(["inspect", "--run-dir", str(two_bout_run)]) == 0
     out = capsys.readouterr().out
-    assert "007" in out and "first,continuation,deep" in out
+    assert "007" in out and "initial,deep" in out
 
 
-# --- 2. create N=0 (first regime) ----------------------------------------------
+def test_source_policy_does_not_change_initial_deep_taxonomy(tmp_path):
+    run_dir = make_run(
+        tmp_path,
+        report=make_report(),
+        base_params=F2,
+        inner_policy_id="hebo24-hebo20",
+    )
+
+    (row,) = freeze.inspect_run(run_dir)
+    assert row["eligible_regimes"] == ["initial", "deep"]
+
+    initial_out = tmp_path / "ckpt-initial"
+    deep_out = tmp_path / "ckpt-deep"
+    freeze.create_checkpoint(run_dir, "007", 0, initial_out)
+    freeze.create_checkpoint(run_dir, "007", 1, deep_out)
+
+    initial = checkpoint_mod.load_checkpoint(initial_out)
+    deep = checkpoint_mod.load_checkpoint(deep_out)
+    assert (initial.regime, initial.stratum) == ("initial", "initial")
+    assert (deep.regime, deep.stratum) == ("deep", "deep")
 
 
-def test_create_first_regime(two_bout_run, tmp_path):
-    out = tmp_path / "ckpt-first"
+# --- 2. create N=0 (INITIAL regime) --------------------------------------------
+
+
+def test_create_initial_regime(two_bout_run, tmp_path):
+    out = tmp_path / "ckpt-initial"
     summary = freeze.create_checkpoint(two_bout_run, "007", 0, out)
 
     ckpt = checkpoint_mod.load_checkpoint(out)  # loads cleanly (schema v2)
-    assert ckpt.regime == "first" and ckpt.stratum == "first"
+    assert ckpt.regime == "initial" and ckpt.stratum == "initial"
     # History = phase_a evaluated rows only, control role tag preserved.
     assert len(ckpt.history) == 3
     assert set(origins(ckpt.history)) == {"phase_a"}
@@ -310,12 +343,12 @@ def test_create_first_regime(two_bout_run, tmp_path):
 # --- 3. create N=1 on a 2-bout source -------------------------------------------
 
 
-def test_create_continuation_restores_boundary_base_params(two_bout_run, tmp_path):
-    out = tmp_path / "ckpt-cont"
+def test_create_deep_restores_boundary_base_params(two_bout_run, tmp_path):
+    out = tmp_path / "ckpt-deep"
     freeze.create_checkpoint(two_bout_run, "007", 1, out)
 
     ckpt = checkpoint_mod.load_checkpoint(out)
-    assert ckpt.regime == "continuation"
+    assert ckpt.regime == "deep" and ckpt.stratum == "deep"
     # BASE_PARAMS restored to the bout-1 applied value (global best after bout
     # 0 = DEFERRED_2 at 0.90), NOT the source file's bout-2 value (F2 0.88).
     assert read_base_params(two_bout_run / "candidates" / "007" / "train.py") == F2
@@ -382,28 +415,25 @@ def test_create_inherited_control_out_of_space_is_excluded(tmp_path):
 # --- 5. stratum -------------------------------------------------------------------
 
 
-def test_create_stratum_reads_the_bout_after_the_boundary(tmp_path):
-    # PLAN §七 stratifies by the bout FOLLOWING the boundary. At bouts=1 that
-    # is bout 1, which improves by default (0.88 < 0.90) — while bout 0, the
-    # one included in the checkpoint, also improved. Both flags are recorded.
+def test_deep_classification_does_not_depend_on_following_segment(tmp_path):
+    # At bouts=1, bout 0 is inside the checkpoint and bout 1 is only factual
+    # future context. Its outcome must not create a CONTINUE subtype.
     improved_run = make_run(tmp_path / "a", report=make_report(), base_params=F2)
     ckpt = checkpoint_mod.load_checkpoint(
         freeze.create_checkpoint(improved_run, "007", 1, tmp_path / "a" / "ckpt")["out"]
     )
-    assert ckpt.stratum == "cont_improved"
+    assert (ckpt.regime, ckpt.stratum) == ("deep", "deep")
     assert ckpt.extra["last_bout"]["improved_production"] is True
     assert ckpt.extra["bout_after_boundary"]["bout_index"] == 1
     assert ckpt.extra["bout_after_boundary"]["improved_production"] is True
 
     # Variant: bout 0 improves but bout 1 never beats it (all rows >= 0.90).
-    # Under the old (wrong) reading this was cont_improved; the stratum must
-    # follow bout 1.
     report = make_report(bout1_scores={"f1": 0.95, "f2": 0.99, "f3": 1.00, "f4": 0.90})
     flat_run = make_run(tmp_path / "b", report=report, base_params=DEFERRED_2)
     ckpt = checkpoint_mod.load_checkpoint(
         freeze.create_checkpoint(flat_run, "007", 1, tmp_path / "b" / "ckpt")["out"]
     )
-    assert ckpt.stratum == "cont_not_improved"
+    assert (ckpt.regime, ckpt.stratum) == ("deep", "deep")
     assert ckpt.extra["last_bout"]["improved_production"] is True  # bout 0 did
     after = ckpt.extra["bout_after_boundary"]
     assert after["improved_production"] is False
@@ -413,9 +443,8 @@ def test_create_stratum_reads_the_bout_after_the_boundary(tmp_path):
     assert read_base_params(ckpt.candidate_path) == DEFERRED_2
 
 
-def test_create_refuses_continuation_without_a_following_bout(tmp_path):
-    # One-bout run: bouts=1 has no bout to stratify on, and falling back to the
-    # included bout is exactly the defect. Refuse instead.
+def test_create_deep_needs_no_following_segment(tmp_path):
+    # One-bout run: the boundary after INITIAL is already a valid DEEP start.
     report = make_report()
     report["phase_c"]["stages"] = report["phase_c"]["stages"][:1]
     report["last_finalized_stage_index"] = 0
@@ -424,10 +453,11 @@ def test_create_refuses_continuation_without_a_following_bout(tmp_path):
     report["final_best_score"] = 0.90
     run_dir = make_run(tmp_path, report=report, base_params=DEFERRED_2)
 
-    with pytest.raises(ValueError, match="complete bout 1 AFTER the boundary"):
-        freeze.create_checkpoint(run_dir, "007", 1, tmp_path / "ckpt")
-    # The first-regime boundary needs no following bout.
-    freeze.create_checkpoint(run_dir, "007", 0, tmp_path / "ckpt-first")
+    deep = checkpoint_mod.load_checkpoint(
+        freeze.create_checkpoint(run_dir, "007", 1, tmp_path / "ckpt")["out"]
+    )
+    assert (deep.regime, deep.stratum) == ("deep", "deep")
+    freeze.create_checkpoint(run_dir, "007", 0, tmp_path / "ckpt-initial")
 
 
 def test_create_deep_regime(two_bout_run, tmp_path):
@@ -472,7 +502,7 @@ def test_create_refuses_nonempty_out_dir(two_bout_run, tmp_path):
         freeze.create_checkpoint(two_bout_run, "007", 0, out)
 
 
-def test_create_refuses_continuation_below_warmup(tmp_path):
+def test_create_refuses_deep_below_warmup(tmp_path):
     report = make_report()
     # Crash four of six bout-0 rows: 3 warm + e4 = 4 finite unique < WARMUP=8.
     trials = report["phase_c"]["stages"][0]["trials"]
@@ -482,8 +512,8 @@ def test_create_refuses_continuation_below_warmup(tmp_path):
 
     with pytest.raises(ValueError, match="WARMUP"):
         freeze.create_checkpoint(run_dir, "007", 1, tmp_path / "ckpt")
-    # First regime has no WARMUP guard.
-    freeze.create_checkpoint(run_dir, "007", 0, tmp_path / "ckpt-first")
+    # INITIAL has no WARMUP guard.
+    freeze.create_checkpoint(run_dir, "007", 0, tmp_path / "ckpt-initial")
 
 
 # --- 7. remeasure -----------------------------------------------------------------
@@ -584,7 +614,7 @@ def test_remeasure_eval_limit_stops_and_resumes(two_bout_run, tmp_path):
     assert second["verdict"] == "ok"
 
 
-def test_remeasure_warmup_guard_invalidates_continuation(two_bout_run, tmp_path):
+def test_remeasure_warmup_guard_invalidates_deep(two_bout_run, tmp_path):
     out = tmp_path / "ckpt"
     freeze.create_checkpoint(two_bout_run, "007", 1, out)
     # Crash three configs locally: finite unique drops to 6 < WARMUP=8.
@@ -600,13 +630,13 @@ def test_remeasure_warmup_guard_invalidates_continuation(two_bout_run, tmp_path)
     assert ckpt.incumbent.score == pytest.approx(2.0)  # local, finite
 
 
-def test_remeasure_first_regime_has_no_warmup_guard(two_bout_run, tmp_path):
+def test_remeasure_initial_regime_has_no_warmup_guard(two_bout_run, tmp_path):
     out = tmp_path / "ckpt"
     freeze.create_checkpoint(two_bout_run, "007", 0, out)
     summary = freeze.remeasure_checkpoint(out, eval_fn=_fake_eval(_local_scores()))
 
     assert summary["finite_unique_local"] == 3  # below WARMUP...
-    assert summary["verdict"] == "ok"  # ...but first regime has no guard
+    assert summary["verdict"] == "ok"  # ...but INITIAL has no guard
 
 
 def test_remeasure_default_eval_fn_runs_objective(two_bout_run, tmp_path):

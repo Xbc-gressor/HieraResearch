@@ -1494,7 +1494,7 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
 
     def extras(bout: int, method) -> dict:
         return {
-            "bout_regime": inner_policy.regime_for_bout_index(bout),
+            "bout_regime": inner_policy.regime_for_bout(policy_id, bout),
             "bout_trials": inner_policy.expected_bout_trials(
                 policy_id, bout, legacy_bout_trials
             ),
@@ -1526,7 +1526,8 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             }
         if (
             inner_policy.deep_requires_movable_continuous(policy_id)
-            and inner_policy.regime_for_bout_index(next_bout) == inner_policy.DEEP
+            and inner_policy.regime_for_bout(policy_id, next_bout)
+            == inner_policy.DEEP
             and not inner_policy.has_movable_continuous(search_space)
         ):
             # The candidate has no DEEP action (design §2.1): no continuous
@@ -3081,14 +3082,14 @@ def validate_proposals(
     report_path: Path,
     proposals: list,
 ) -> dict:
-    """Validate LLM re-warm proposals for a continuation tuning bout.
+    """Validate LLM re-warm proposals for a legacy continuation tuning bout.
 
     Continuation-only (spec §6): proposals re-warm the NEXT bout, which
     exists only after an earlier bout closed applied. When the report has no
     finalized bout yet, every proposal is rejected with reason
-    ``first_bout_has_no_rewarm`` and nothing is written. Under the frozen
-    policy, CONTINUE (HEBO) and DEEP (SPSA) also reject proposals
-    (``hebo_bout_has_no_rewarm`` / ``deep_bout_has_no_rewarm``). An
+    ``first_bout_has_no_rewarm`` and nothing is written. Explicit regime
+    policies—current INITIAL/DEEP and historical FIRST/CONTINUE/DEEP—reject
+    proposals (``hebo_bout_has_no_rewarm`` / ``deep_bout_has_no_rewarm``). An
     inconsistent close makes ``has_applied_close`` raise ValueError; that
     propagates (fail closed).
 
@@ -3134,7 +3135,7 @@ def validate_proposals(
         else max(0, len(bouts) - 1)
     )
     if not inner_policy.rewarm_allowed(policy_id, target_bout):
-        regime = inner_policy.regime_for_bout_index(target_bout)
+        regime = inner_policy.regime_for_bout(policy_id, target_bout)
         method = inner_policy.method_chain_for_bout(
             policy_id, target_bout, _read_search_space(candidate_path)
         )[0]
@@ -3602,7 +3603,10 @@ def _partition_candidates(
         if not inner_policy.deep_requires_movable_continuous(policy_id):
             return False
         next_bout = int(record.get("tuning_bouts") or (1 if record.get("tune") else 0))
-        if inner_policy.regime_for_bout_index(next_bout) != inner_policy.DEEP:
+        if (
+            inner_policy.regime_for_bout(policy_id, next_bout)
+            != inner_policy.DEEP
+        ):
             return False
         return movable.get(str(record.get("run_id")), True) is False
 
@@ -3768,7 +3772,7 @@ def _selected_candidate_result(
         selected.get("tuning_bouts")
         or (1 if selected.get("tune") else 0)
     )
-    bout_regime = inner_policy.regime_for_bout_index(tuning_bouts)
+    bout_regime = inner_policy.regime_for_bout(policy_id, tuning_bouts)
     if inner_policy.is_regime_policy(policy_id):
         bout_size = inner_policy.expected_bout_trials(
             policy_id,
@@ -4152,17 +4156,19 @@ def _scheduler_selection(ledger_path: Path, scenarios: int | None) -> dict:
         if selected and candidate is not None
         else None
     )
+    policy_id = inner_policy.load_policy_id(ledger_path)
+    bout_regime = (
+        inner_policy.regime_for_bout(policy_id, candidate.bouts_used)
+        if candidate
+        else None
+    )
     return {
         "run_id": view["run_id"] if selected else None,
         "reason": view["reason"],
-        "is_continuation": bool(candidate and candidate.bouts_used > 0),
+        "is_deep": bout_regime == inner_policy.DEEP,
         "bout_index": candidate.bouts_used if candidate else 0,
-        "bout_regime": (
-            inner_policy.regime_for_bout_index(candidate.bouts_used)
-            if candidate
-            else None
-        ),
-        "inner_policy": inner_policy.load_policy_id(ledger_path),
+        "bout_regime": bout_regime,
+        "inner_policy": policy_id,
         "tuning_bouts": candidate.bouts_used if candidate else 0,
         "n_candidates": len(state.candidates),
         "scheduler": {

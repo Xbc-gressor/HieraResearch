@@ -11,8 +11,8 @@ executes ONE config:
   ``ctx.state.finite_unique_history()`` (checkpoint history + this cell's own
   outcomes, growing over the cell) is below ``WARMUP=8``, the proposer's
   rank-1 config is executed with ``ranker_fallback=true`` — an engineering
-  fallback used by the initial observations of a FIRST-bout deployment and
-  expected never to trigger on continuation/deep checkpoints.
+  fallback used by the initial observations of an INITIAL deployment and
+  expected never to trigger on DEEP checkpoints.
 - Otherwise the pool is scored by HEBO MACE through the rank_fn seam
   (``ctx.extras['hebo_rank_fn']`` when injected — the test seam; otherwise
   the subprocess above). Seam signature:
@@ -57,6 +57,12 @@ class PoolHeboMace:
     def active_dimensions(self, contract) -> int:
         return len(contract.varying_dimensions)
 
+    @staticmethod
+    def select_pool(rank_fn, ctx, history, pool) -> tuple[int, dict]:
+        """Selection seam: subclasses may override (pool_hebo_mace_llmtie);
+        the module-level select_pool remains the rng-tiebreak baseline."""
+        return select_pool(rank_fn, ctx, history, pool)
+
     def run(self, ctx):
         driver = PoolDriver(ctx, pool_size=self.pool_size)
         rank_fn = ctx.extras.get("hebo_rank_fn") or _subprocess_rank_fn
@@ -71,7 +77,7 @@ class PoolHeboMace:
                     "pool_attempts": result["attempts"],
                     **pool_persistence_state(result),
                 }
-                chosen_index, selection_state = select_pool(
+                chosen_index, selection_state = self.select_pool(
                     rank_fn, ctx, history, pool
                 )
                 arm_state.update(selection_state)

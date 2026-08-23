@@ -4,8 +4,7 @@ Each step the proposer generates POOL=5 configs and ranks them in the same
 call (arms/pool.py driver); this arm executes the proposer's rank-1 config
 verbatim — that IS the arm's selection strategy, not a fallback, and is never
 recorded as one. No second LLM judge, no numerical ranker fit. This arm is
-the direct control for the three numerical pool-rankers in
-continuation/deep bouts.
+the direct control for the numerical pool-rankers in INITIAL/DEEP cells.
 """
 
 from __future__ import annotations
