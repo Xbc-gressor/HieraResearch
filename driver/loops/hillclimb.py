@@ -294,12 +294,23 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 break
         needs_editor = True  # a fresh idea next round starts from best.py
 
-        if _preflight(task, run_dir, repo_root, cmd, task_toml).returncode != 0:
+        proc = _preflight(task, run_dir, repo_root, cmd, task_toml)
+        if proc.returncode != 0:
             # Preflight failures consume no slot; one diagnosis cycle, else
-            # abandon the idea (restore best) and move on.
-            evidence = "candidate preflight failed after editor session"
-            verdict = common.crash_diagnose(runner, store, task, tag, run_dir,
-                                            evidence)["verdict"]
+            # abandon the idea (restore best) and move on. The diagnosis is a
+            # fresh session — hand it the preflight output it cannot recover.
+            evidence = (
+                "candidate preflight failed after editor session. "
+                "preflight stderr tail:\n" + (proc.stderr or "")[-3000:]
+                + "\npreflight stdout tail:\n" + (proc.stdout or "")[-1000:]
+            )
+            try:
+                verdict = common.crash_diagnose(
+                    runner, store, task, tag, run_dir, evidence)["verdict"]
+            except InvocationFailed as exc:
+                events.emit("crash_diagnosis_failed", stage="preflight",
+                            problems=exc.problems)
+                verdict = "abandon"
             if verdict == "abandon":
                 _revert(run_dir)
                 continue
@@ -326,16 +337,24 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _record(run_dir, step, math.inf, "crash", "run produced no metric")
             repaired = False
             for _ in range(crash_repairs):
-                verdict = common.crash_diagnose(
-                    runner, store, task, tag, run_dir,
-                    common.tail(log))["verdict"]
+                # Give the fresh diagnosis session the log path (it can Read
+                # the full file) plus the tail as a starting point.
+                evidence = (f"run log: {log}\n\nlast 80 lines:\n"
+                            + common.tail(log))
+                try:
+                    verdict = common.crash_diagnose(
+                        runner, store, task, tag, run_dir, evidence)["verdict"]
+                except InvocationFailed as exc:
+                    events.emit("crash_diagnosis_failed", stage="eval",
+                                problems=exc.problems)
+                    break
                 if verdict == "abandon":
                     break
                 try:
                     last_editor = _editor_session(
                         runner, store, task, tag, run_dir,
                         extra={"diagnosis_verdict": verdict,
-                               "failure_evidence": common.tail(log)},
+                               "failure_evidence": evidence},
                         resume_from=last_editor)
                 except InvocationFailed:
                     break

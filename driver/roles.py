@@ -66,6 +66,11 @@ class RoleDefinition:
     receipt_schema: dict
     postconditions: tuple[Postcondition, ...] = ()
     corrective_attempts: int = 3
+    # Hard per-session turn cap (SDK max_turns). None = unbounded. A role
+    # whose job is bounded judgment (e.g. read-only diagnosis) gets one so a
+    # model that keeps "confirming" instead of submitting a receipt is cut
+    # off and surfaces as InvocationFailed to the caller.
+    max_turns: int | None = None
     # When non-empty, Bash calls must start with one of these prefixes
     # (enforced by the PreToolUse hook in session.py).
     bash_patterns: tuple[str, ...] = ()
@@ -276,6 +281,9 @@ ROLES: dict[str, RoleDefinition] = {
         },
         # the diagnosis methodology needs exactly one Bash command family
         bash_patterns=("python tools/tuners/tune_tools.py render-failure",),
+        # observed unbounded "confirm the bug" loops at 55-301 turns; a
+        # bounded read-only diagnosis needs far fewer
+        max_turns=40,
     ),
     "hillclimb-editor": RoleDefinition(
         name="hillclimb-editor",

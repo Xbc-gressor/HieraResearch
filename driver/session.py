@@ -139,6 +139,8 @@ class SDKSessionRunner:
             kwargs["cli_path"] = self.cli_path
         if ctx.resume_session_id:
             kwargs["resume"] = ctx.resume_session_id
+        if role.max_turns is not None:
+            kwargs["max_turns"] = role.max_turns
         return ClaudeAgentOptions(
             system_prompt=self._system_prompt(role, ctx),
             cwd=REPO_ROOT,
@@ -157,10 +159,14 @@ class SDKSessionRunner:
         )
 
     async def _drain(self, client, role: RoleDefinition, ctx: InvocationContext,
-                     store: ReceiptStore, accepted: list[dict]) -> None:
+                     store: ReceiptStore, accepted: list[dict]) -> dict | None:
         from claude_agent_sdk import ResultMessage, SystemMessage
 
         interrupted = False
+        # {"is_error", "subtype"} of the session's ResultMessage, so the caller
+        # can tell an error-terminated session (e.g. error_max_turns) apart
+        # from an ordinary no-receipt turn.
+        result_info = None
         # Receipts accepted by EARLIER drains (e.g. the one whose postcondition
         # failure triggered this corrective turn) must not interrupt this
         # drain — only a NEW acceptance ends this turn's useful work.
@@ -173,6 +179,7 @@ class SDKSessionRunner:
                     # resume this exact conversation via resume=<session_id>.
                     store.persist_session_id(role.name, ctx.invocation_id, session_id)
             elif isinstance(msg, ResultMessage):
+                result_info = {"is_error": msg.is_error, "subtype": msg.subtype}
                 self.events.emit(
                     "session_end",
                     role=role.name,
@@ -195,6 +202,10 @@ class SDKSessionRunner:
                 if session_id:
                     store.persist_session_id(role.name, ctx.invocation_id, session_id)
             elif hasattr(msg, "num_turns"):
+                result_info = {
+                    "is_error": msg.is_error,
+                    "subtype": getattr(msg, "subtype", None),
+                }
                 self.events.emit(
                     "session_end",
                     role=role.name,
@@ -227,6 +238,7 @@ class SDKSessionRunner:
                         # The receipt is already persisted; a failed
                         # interrupt must not fail the invocation.
                         pass
+        return result_info
 
     @staticmethod
     def _latest_receipt(store: ReceiptStore, role: RoleDefinition,
@@ -283,17 +295,28 @@ class SDKSessionRunner:
                          resume=bool(ctx.resume_session_id))
         async with factory(options) as client:
             await client.query(ctx.user_message())
-            await self._drain(client, role, ctx, store, accepted)
+            result = await self._drain(client, role, ctx, store, accepted)
             receipt = self._latest_receipt(store, role, ctx, accepted)
             problems = self._problems(role, ctx, receipt)
             attempts = 0
             while problems and attempts < role.corrective_attempts:
+                if result and result["is_error"]:
+                    # The session ended on an error result (e.g.
+                    # error_max_turns from a role's max_turns cap): the CLI
+                    # process may be dead, and a corrective turn cannot
+                    # produce the receipt anyway. Fail directly instead of
+                    # querying a spent session, so callers' InvocationFailed
+                    # handlers see every bounded-role cutoff.
+                    problems.append(
+                        f"session ended with error result: {result['subtype']}"
+                    )
+                    break
                 attempts += 1
                 self.events.emit("corrective_followup", role=role.name,
                                  invocation_id=ctx.invocation_id,
                                  attempt=attempts, problems=problems)
                 await client.query(self._corrective_message(problems))
-                await self._drain(client, role, ctx, store, accepted)
+                result = await self._drain(client, role, ctx, store, accepted)
                 receipt = self._latest_receipt(store, role, ctx, accepted)
                 problems = self._problems(role, ctx, receipt)
         if problems:

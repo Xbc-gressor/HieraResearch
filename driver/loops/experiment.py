@@ -350,8 +350,13 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
     # 2. actual failure receipt → crash diagnosis
     evidence = _failure_evidence(candidate_dir)
     if evidence:
-        verdict = common.crash_diagnose(
-            runner, store, task, tag, run_dir, evidence)["verdict"]
+        try:
+            verdict = common.crash_diagnose(
+                runner, store, task, tag, run_dir, evidence)["verdict"]
+        except InvocationFailed as exc:
+            events.emit("crash_diagnosis_failed", run_id=run_id,
+                        problems=exc.problems)
+            verdict = "abandon"
         if verdict == "abandon":
             _record_crash(run_dir, run_id, repo_root, cmd)
             return
@@ -698,8 +703,13 @@ def _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
     except InvocationFailed:
         evidence = _failure_evidence(candidate_dir)
         if evidence:
-            verdict = common.crash_diagnose(
-                runner, store, task, tag, run_dir, evidence)["verdict"]
+            try:
+                verdict = common.crash_diagnose(
+                    runner, store, task, tag, run_dir, evidence)["verdict"]
+            except InvocationFailed as exc:
+                events.emit("crash_diagnosis_failed", run_id=run_id,
+                            problems=exc.problems)
+                verdict = "abandon"
             if verdict != "abandon":
                 try:
                     _invoke_with_driver_jobs(

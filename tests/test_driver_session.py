@@ -147,9 +147,10 @@ class FakeSystemMessage:
 
 
 class FakeResultMessage:
-    def __init__(self):
+    def __init__(self, *, is_error: bool = False, subtype: str | None = None):
         self.session_id = "sess-fake"
-        self.is_error = False
+        self.is_error = is_error
+        self.subtype = subtype
         self.num_turns = 1
         self.total_cost_usd = 0.01
         self.usage = {"input_tokens": 10}
@@ -283,7 +284,10 @@ class FakeClient:
             self.store.persist_receipt(
                 "hillclimb-editor", self.invocation_id,
                 {"edited": True, "summary": "ok"})
-        yield FakeResultMessage()
+        if outcome.get("error"):
+            yield FakeResultMessage(is_error=True, subtype="error_max_turns")
+        else:
+            yield FakeResultMessage()
 
 
 def make_runner(run_dir: Path, behavior: list[dict]) -> SDKSessionRunner:
@@ -323,6 +327,24 @@ class VerifyRepairTests(unittest.TestCase):
                 runner.run(SIMPLE_ROLE, make_ctx(run_dir))
             self.assertEqual(cm.exception.role, "hillclimb-editor")
             self.assertTrue(cm.exception.problems)
+
+    def test_error_result_fails_without_corrective_loop(self) -> None:
+        # A session that ends on an error result (e.g. error_max_turns from a
+        # role's max_turns cap) must raise InvocationFailed directly: the CLI
+        # process may be dead, and more turns cannot produce the receipt.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = make_runner(run_dir, [{"error": True}])
+            with self.assertRaises(InvocationFailed) as cm:
+                runner.run(SIMPLE_ROLE, make_ctx(run_dir))
+            self.assertIn("error_max_turns", str(cm.exception.problems))
+            rows = [json.loads(line)
+                    for line in (run_dir / "driver_events.jsonl")
+                    .read_text().splitlines()]
+            self.assertEqual(
+                [r for r in rows if r.get("kind") == "corrective_followup"],
+                [],
+            )
 
 
 class FakeSessionRunnerTests(unittest.TestCase):
