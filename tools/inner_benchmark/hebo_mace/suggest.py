@@ -161,8 +161,13 @@ def compute(payload: dict) -> dict:
         raise ValueError(f"quasi_index must be >= 0, got {quasi_index}")
     extra = payload.get("initial_suggest_extra") or []
 
-    # Official default (hebo.py:57): rand_sample = 1 + num_paras.
-    rand_sample = 1 + space.num_paras
+    # Official default (hebo.py:57): rand_sample = 1 + num_paras. Standalone
+    # benchmark callers may replace HEBO's initial design with a shared one;
+    # they pass its counted size here, while existing callers retain the
+    # official default byte-for-byte.
+    rand_sample = int(payload.get("rand_sample", 1 + space.num_paras))
+    if rand_sample < 1:
+        raise ValueError(f"rand_sample must be >= 1, got {rand_sample}")
 
     def quasi_sample(start: int, n: int) -> "pd.DataFrame":
         """n points of the trajectory Sobol sequence from ``start`` on —

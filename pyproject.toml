@@ -10,7 +10,7 @@ dependencies = [
     # for the numerical arms. Evaluation subprocesses run in the task project
     # env instead (objective.python_cmd_for_project).
     "cma>=3.3.0",
-    # The production CONTINUE policy uses official HEBO MACE. Keep it in the
+    # The production INITIAL/DEEP policy uses official HEBO MACE. Keep it in the
     # root runtime environment so one root `uv sync` installs every driver and
     # inner-tuner dependency. HEBO requires numpy<1.25, which in turn pins the
     # root runtime to CPython 3.11.
@@ -22,6 +22,9 @@ dependencies = [
     "optuna>=3.6.0",
     "scikit-learn>=1.5",
     "torch",
+    # Standalone public HPO benchmark adapter (surrogate data is supplied
+    # separately and pinned/validated as yahpo_data v1.0.2 at runtime).
+    "yahpo-gym==1.0.2",
 ]
 
 [dependency-groups]
