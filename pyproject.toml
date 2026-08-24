@@ -22,9 +22,6 @@ dependencies = [
     "optuna>=3.6.0",
     "scikit-learn>=1.5",
     "torch",
-    # Standalone public HPO benchmark adapter (surrogate data is supplied
-    # separately and pinned/validated as yahpo_data v1.0.2 at runtime).
-    "yahpo-gym==1.0.2",
 ]
 
 [dependency-groups]
