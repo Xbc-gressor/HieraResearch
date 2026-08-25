@@ -24,10 +24,11 @@ module docstring for the sign convention and the HEBO API path). Any failure
 prints `{"error": ...}` and exits nonzero; the arm maps every failure mode to
 `ArmError` (fail-fast per PLAN §6.4 — no invented "approximate HEBO").
 
-## suggest.py (PLAN-inner-arms-mixup-alt §1)
+## suggest.py (PLAN-inner-arms-mixup-alt §1, union mode DESIGN-inner-arm-hands §3)
 
-The sibling mirror of official `HEBO.suggest` itself, invoked by the three
-HEBO-family arms (`hebo_only` / `mixup_pool_hebo` / `alt_pool_hebo`):
+The sibling mirror of official `HEBO.suggest` itself, invoked by the
+HEBO-family arms (`hebo_only` / `mixup_pool_hebo` / `alt_pool_hebo` /
+`hands`):
 
 ```bash
 <root .venv python> tools/inner_benchmark/hebo_mace/suggest.py
@@ -37,9 +38,18 @@ stdin: `search_space` / `history` / `seed` (per-step seed for all non-Sobol
 stochasticity) / `scramble_seed` (trajectory-level Sobol scramble, fixed per
 cell) / `quasi_index` (warmup Sobol points already consumed) /
 `initial_suggest_extra` (optional; prepended to `best_x` as EvolutionOpt's
-initial population). stdout: `{"suggestion", "mode": "quasi"|"surrogate",
-"quasi_consumed", "front_size"?}` or `{"error": ...}` + nonzero exit. The
-sequential Sobol state of the official long-lived instance is reproduced by
-position (fresh scrambled engine drawn to `quasi_index + n`), verified
-point-by-point against the official HEBO in
-`tests/test_inner_benchmark_hebo_suggest.py`.
+initial population) / `pool` (optional; union mode, mutually exclusive with
+a non-empty `initial_suggest_extra`). stdout:
+`{"suggestion", "mode": "quasi"|"surrogate", "quasi_consumed", "front_size"?}`
+or `{"error": ...}` + nonzero exit. The sequential Sobol state of the
+official long-lived instance is reproduced by position (fresh scrambled
+engine drawn to `quasi_index + n`), verified point-by-point against the
+official HEBO in `tests/test_inner_benchmark_hebo_suggest.py`.
+
+Union mode (`hands`): the official pipeline runs with `initial_suggest=best_x`
+ONLY (no LLM seeds in the population), then the official hebo.py:182 pick is
+replaced by the first Pareto front of (final generation ∪ pool) scored by the
+SAME fitted MACE acquisition (maximize convention `[-lcb, logEI, logPI]`, as
+rank.py), uniform within the front — not an official HEBO behavior. The
+answer additionally carries `chosen_from` (`"pool"`|`"front"`) /
+`chosen_pool_index` / `union_front_size` / `pool_survivor_indices`.

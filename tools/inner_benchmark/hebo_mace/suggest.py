@@ -1,9 +1,9 @@
 """Official-HEBO suggest mirror for the inner-tuner benchmark
-(PLAN-inner-arms-mixup-alt §1).
+(PLAN-inner-arms-mixup-alt §1; union mode: DESIGN-inner-arm-hands §3).
 
 Runs in a fresh subprocess of the repository-root uv environment; invoked by
-the three HEBO-family arms (``hebo_only`` / ``mixup_pool_hebo`` /
-``alt_pool_hebo``) as::
+the HEBO-family arms (``hebo_only`` / ``mixup_pool_hebo`` /
+``alt_pool_hebo`` / ``hands``) as::
 
     <root .venv python> tools/inner_benchmark/hebo_mace/suggest.py
 
@@ -20,8 +20,18 @@ stdin (one JSON object)::
                                // once from the cell seed, fixed for the whole cell
       "quasi_index":  <int>,   // official warmup Sobol points already consumed
                                // by this trajectory (0-based position)
-      "initial_suggest_extra": [{"params"...}, ...]  // optional, default [];
+      "initial_suggest_extra": [{"params"...}, ...], // optional, default [];
                                // prepended to best_x as EvolutionOpt's initial_suggest
+      "pool": [{"params"...}, ...]  // optional, default []; union mode
+                               // (DESIGN-inner-arm-hands §3). Mutually
+                               // exclusive with a non-empty
+                               // initial_suggest_extra. The official pipeline
+                               // runs with initial_suggest=best_x ONLY (no LLM
+                               // seeds in the population); the final pick is
+                               // then replaced by the first Pareto front of
+                               // (final generation ∪ pool) under the SAME
+                               // fitted MACE acquisition, uniform within the
+                               // front. Ignored in the warmup branch.
     }
 
 stdout (one JSON object)::
@@ -32,8 +42,14 @@ stdout (one JSON object)::
                               // trajectory sequence (1 for quasi mode; the
                               // surrogate branch's uniqueness top-up count,
                               // usually 0)
-     "front_size": <int>}      // surrogate mode only: final-generation size
+     "front_size": <int>,      // surrogate mode only: final-generation size
                               // after drop_duplicates + history-uniqueness
+     // union mode (non-empty pool) only:
+     "chosen_from": "pool" | "front",   // provenance of the executed point
+     "chosen_pool_index": <int>|null,   // index into the payload pool,
+                                        // "pool" provenance only
+     "union_front_size": <int>,
+     "pool_survivor_indices": [<int>]}  // pool members ON the first front
     // or
     {"error": "<what failed>"} // nonzero exit code as well
 
@@ -62,9 +78,18 @@ Step-by-step correspondence with official ``suggest`` (hebo.py:119-194):
 4. final-generation ``drop_duplicates`` -> ``check_unique`` against history
    (hebo.py:196-197) -> uniqueness top-up from the SAME trajectory Sobol
    sequence (hebo.py:169-180, cnt>3 tolerance) -> ``np.random.choice`` of 1
-   (hebo.py:182). The ``n_suggestions > 2`` directed-override block
+   (hebo.py:182: a uniform draw over the WHOLE final generation, not a
+   nondominated front). The ``n_suggestions > 2`` directed-override block
    (hebo.py:187-192) is dead code at n_suggestions=1 and consumes no RNG, so
    it is not reproduced.
+
+   UNION MODE ONLY: steps 1-4 run byte-identical (with empty extra), but the
+   hebo.py:182 pick is replaced by the hands selector: pool rows duplicating
+   history or the final generation are dropped, the SAME fitted MACE scores
+   the union (``acq.eval``, maximize convention ``[-lcb, logEI, logPI]`` as
+   in rank.py), and one point is drawn uniformly from the first Pareto front
+   (maximization, the same nondominated rule as arms/pool_hebo_mace). This is
+   NOT an official HEBO behavior; it is the hands arm's selection contract.
 
 All non-Sobol stochasticity (torch GP init + pSGLD fitting + MACE's noise
 perturbation, ``space.sample(100)`` initial population, pymoo NSGA-II,
@@ -160,6 +185,11 @@ def compute(payload: dict) -> dict:
     if quasi_index < 0:
         raise ValueError(f"quasi_index must be >= 0, got {quasi_index}")
     extra = payload.get("initial_suggest_extra") or []
+    pool = payload.get("pool") or []
+    if pool and extra:
+        raise ValueError(
+            "pool (union mode) and initial_suggest_extra are mutually exclusive"
+        )
 
     # Official default (hebo.py:57): rand_sample = 1 + num_paras.
     rand_sample = 1 + space.num_paras
@@ -186,6 +216,25 @@ def compute(payload: dict) -> dict:
         return (
             (~pd.concat([X, rec], axis=0).duplicated().tail(rec.shape[0]).values).tolist()
         )
+
+    def first_pareto_front(values) -> list:
+        """Nondominated (first Pareto front) indices, MAXIMIZATION — the same
+        O(n^2) pairwise rule as arms/pool_hebo_mace.py::_first_pareto_front;
+        duplicated here because this subprocess layer must not import the arm
+        layer (keep the two in sync). Union mode only.
+        """
+        n = values.shape[0]
+        front = []
+        for i in range(n):
+            dominated = any(
+                i != j
+                and np.all(values[j] >= values[i])
+                and np.any(values[j] > values[i])
+                for j in range(n)
+            )
+            if not dominated:
+                front.append(i)
+        return front
 
     df_X = pd.DataFrame([row["params"] for row in history])
 
@@ -262,13 +311,54 @@ def compute(payload: dict) -> dict:
     # The n_suggestions > 2 directed overrides (hebo.py:187-192) never fire at
     # n_suggestions=1; their mu/sig predictions consume no RNG, so omitting
     # them leaves the stream bit-identical.
-    select_id = np.random.choice(rec.shape[0], 1, replace=False).tolist()
-    rec_selected = rec.iloc[select_id].copy()
+    if not pool:
+        select_id = np.random.choice(rec.shape[0], 1, replace=False).tolist()
+        rec_selected = rec.iloc[select_id].copy()
+        return {
+            "suggestion": _row_to_params(rec_selected.iloc[0], payload["search_space"]),
+            "mode": "surrogate",
+            "quasi_consumed": quasi_consumed,
+            "front_size": front_size,
+        }
+
+    # --- union mode (DESIGN-inner-arm-hands §3) -----------------------------
+    # Steps 1-4 above ran byte-identical with initial_suggest=best_x only; the
+    # official pick is replaced by the hands selector: first Pareto front of
+    # (final generation ∪ pool) under the SAME fitted MACE acquisition,
+    # uniform within the front. NOT an official HEBO behavior.
+    pool_df = pd.DataFrame(pool)
+    pool_mask = check_unique(
+        pd.concat([df_X, rec], axis=0, ignore_index=True), pool_df
+    )
+    kept_pool_indices = [index for index, keep in enumerate(pool_mask) if keep]
+    pool_df = pool_df.loc[pool_mask].reset_index(drop=True)
+    union = pd.concat([rec, pool_df], axis=0, ignore_index=True)
+    xu, xeu = space.transform(union)
+    with torch.no_grad():
+        # maximize convention [-lcb, logEI, logPI], exactly as rank.py.
+        values = (-acq.eval(xu, xeu)).detach().numpy()
+    front = first_pareto_front(values)
+    selected = int(front[int(np.random.choice(len(front), 1, replace=False)[0])])
+    n_rec = int(rec.shape[0])
+    if selected < n_rec:
+        chosen_from = "front"
+        chosen_pool_index = None
+    else:
+        chosen_from = "pool"
+        chosen_pool_index = int(kept_pool_indices[selected - n_rec])
     return {
-        "suggestion": _row_to_params(rec_selected.iloc[0], payload["search_space"]),
+        "suggestion": _row_to_params(union.iloc[selected], payload["search_space"]),
         "mode": "surrogate",
         "quasi_consumed": quasi_consumed,
         "front_size": front_size,
+        "chosen_from": chosen_from,
+        "chosen_pool_index": chosen_pool_index,
+        "union_front_size": len(front),
+        "pool_survivor_indices": [
+            int(kept_pool_indices[index - n_rec])
+            for index in front
+            if index >= n_rec
+        ],
     }
 
 

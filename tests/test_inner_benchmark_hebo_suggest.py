@@ -199,3 +199,86 @@ def test_surrogate_with_initial_suggest_extra_matches_extended_official() -> Non
     )
     assert sub["mode"] == "surrogate"
     assert sub["suggestion"] == _official_params(official_rec.iloc[0])
+
+
+# --- union mode (hands, DESIGN-inner-arm-hands §3) ---------------------------
+
+UNION_POOL = [
+    {"depth": 7, "lr": 0.005, "mode": "fast"},
+    {"depth": 2, "lr": 0.02, "mode": "slow"},
+    {"depth": 6, "lr": 0.0003, "mode": "fast"},
+]
+
+
+def _union_payload(pool, seed=7, scramble_seed=999):
+    return {
+        "search_space": SPACE,
+        "history": SURROGATE_HISTORY,
+        "seed": seed,
+        "scramble_seed": scramble_seed,
+        "quasi_index": 0,
+        "pool": pool,
+    }
+
+
+def test_union_mode_provenance_contract_and_determinism() -> None:
+    sub = _run_subprocess(_union_payload(UNION_POOL))
+    assert sub["mode"] == "surrogate"
+    assert sub["quasi_consumed"] == 0
+    assert sub["front_size"] >= 1
+    assert sub["chosen_from"] in ("pool", "front")
+    assert sub["union_front_size"] >= 1
+    survivors = sub["pool_survivor_indices"]
+    assert all(index in range(len(UNION_POOL)) for index in survivors)
+    if sub["chosen_from"] == "pool":
+        index = sub["chosen_pool_index"]
+        assert index in range(len(UNION_POOL)) and index in survivors
+        # Pool provenance is a LITERAL pool member.
+        assert sub["suggestion"] == UNION_POOL[index]
+    else:
+        assert sub["chosen_pool_index"] is None
+        assert sorted(sub["suggestion"]) == sorted(SPACE)
+    # Same payload -> bit-identical answer (fit + evolution + pick).
+    assert _run_subprocess(_union_payload(UNION_POOL)) == sub
+
+
+def test_union_mode_final_generation_matches_poolless_call() -> None:
+    """The union pipeline runs the official steps 1-4 byte-identical with
+    initial_suggest=best_x only: the final-generation size (and thus the
+    rec frame) equals the poolless call at the same seed."""
+    union = _run_subprocess(_union_payload(UNION_POOL))
+    poolless = _run_subprocess(
+        {
+            "search_space": SPACE,
+            "history": SURROGATE_HISTORY,
+            "seed": 7,
+            "scramble_seed": 999,
+            "quasi_index": 0,
+        }
+    )
+    assert union["front_size"] == poolless["front_size"]
+
+
+def test_union_mode_drops_history_duplicates_from_pool() -> None:
+    # The first pool member literally duplicates a history row: it can never
+    # be chosen, never survive into the front, and the pool shrinks to the
+    # two real candidates.
+    dup_pool = [dict(SURROGATE_HISTORY[0]["params"]), *UNION_POOL[1:]]
+    sub = _run_subprocess(_union_payload(dup_pool))
+    assert 0 not in sub["pool_survivor_indices"]
+    if sub["chosen_from"] == "pool":
+        assert sub["chosen_pool_index"] != 0
+        assert sub["suggestion"] == dup_pool[sub["chosen_pool_index"]]
+
+
+def test_union_mode_rejects_initial_suggest_extra_combo() -> None:
+    payload = _union_payload(UNION_POOL)
+    payload["initial_suggest_extra"] = [dict(UNION_POOL[0])]
+    proc = subprocess.run(
+        [sys.executable, str(SUGGEST_PY)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "mutually exclusive" in proc.stdout

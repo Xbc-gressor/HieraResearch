@@ -1,6 +1,6 @@
-"""Shared official-HEBO suggest plumbing for the three HEBO-family arms
-(PLAN-inner-arms-mixup-alt §1): ``hebo_only`` / ``mixup_pool_hebo`` /
-``alt_pool_hebo``.
+"""Shared official-HEBO suggest plumbing for the HEBO-family arms
+(PLAN-inner-arms-mixup-alt §1; union mode: DESIGN-inner-arm-hands §3):
+``hebo_only`` / ``mixup_pool_hebo`` / ``alt_pool_hebo`` / ``hands``.
 
 - ``live_hebo_history(ctx)`` — the SINGLE input surface of all three arms:
   ``ctx.state.finite_unique_history()`` rows as suggest-payload dicts. The
@@ -24,6 +24,16 @@
   injected by tests, otherwise the ``hebo_mace/suggest.py`` subprocess
   (same shape as pool_hebo_mace's ``hebo_rank_fn`` seam). Any failure ->
   ``ArmError`` (fail-fast, never an invented fallback).
+
+  Union mode (``hands``, DESIGN §3): the optional ``pool`` keyword carries
+  the filtered LLM pool and is MUTUALLY EXCLUSIVE with a non-empty
+  ``initial_suggest_extra`` (checked here, before the seam). It is passed to
+  the seam ONLY when non-empty, so seams written for the pre-union arms
+  (no ``pool`` parameter) keep working unchanged. In union mode the answer
+  must carry the provenance fields (``chosen_from`` /
+  ``chosen_pool_index`` / ``union_front_size`` /
+  ``pool_survivor_indices``); a pool-provenance suggestion is additionally
+  checked to be LITERALLY the named pool member.
 """
 
 from __future__ import annotations
@@ -77,15 +87,24 @@ def call_suggest(
     scramble_seed: int,
     quasi_index: int,
     initial_suggest_extra: list,
+    pool: list | None = None,
 ) -> dict:
     """Invoke the suggest seam and validate its answer into the arm contract.
 
     Returns the seam's dict (``suggestion`` / ``mode`` / ``quasi_consumed``,
-    optional ``front_size``). A raising seam or a malformed answer is an
-    ``ArmError`` — same fail-fast stance as pool_hebo_mace's rank_fn.
+    optional ``front_size``; union mode adds ``chosen_from`` /
+    ``chosen_pool_index`` / ``union_front_size`` / ``pool_survivor_indices``).
+    A raising seam or a malformed answer is an ``ArmError`` — same fail-fast
+    stance as pool_hebo_mace's rank_fn.
     """
+    pool = list(pool or [])
+    if pool and initial_suggest_extra:
+        raise arm_api.ArmError(
+            "hebo suggest: pool (union mode) and initial_suggest_extra are "
+            "mutually exclusive"
+        )
     try:
-        result = suggest_fn(
+        kwargs = dict(
             search_space=ctx.contract.search_space,
             history=history,
             seed=seed,
@@ -93,6 +112,11 @@ def call_suggest(
             quasi_index=quasi_index,
             initial_suggest_extra=list(initial_suggest_extra),
         )
+        # Only union-mode callers hand the seam a pool; pre-union seams may
+        # legitimately lack the parameter.
+        if pool:
+            kwargs["pool"] = pool
+        result = suggest_fn(**kwargs)
     except arm_api.ArmError:
         raise
     except Exception as exc:
@@ -110,11 +134,61 @@ def call_suggest(
         raise arm_api.ArmError(f"hebo suggest returned bad quasi_consumed: {consumed!r}")
     if result["mode"] == "quasi" and consumed < 1:
         raise arm_api.ArmError("hebo suggest quasi mode must consume >= 1 Sobol point")
+    if pool and result["mode"] == "surrogate":
+        _validate_union_provenance(ctx, result, pool)
     return result
 
 
+def _validate_union_provenance(ctx, result: dict, pool: list) -> None:
+    """Union-mode answer contract (DESIGN-inner-arm-hands §3.1)."""
+    chosen_from = result.get("chosen_from")
+    if chosen_from not in ("pool", "front"):
+        raise arm_api.ArmError(f"hebo suggest returned bad chosen_from: {chosen_from!r}")
+    union_front_size = result.get("union_front_size")
+    if isinstance(union_front_size, bool) or not isinstance(union_front_size, int) \
+            or union_front_size < 1:
+        raise arm_api.ArmError(
+            f"hebo suggest returned bad union_front_size: {union_front_size!r}"
+        )
+    survivors = result.get("pool_survivor_indices")
+    if not isinstance(survivors, list) or any(
+        isinstance(index, bool) or not isinstance(index, int)
+        or not 0 <= index < len(pool)
+        for index in survivors
+    ):
+        raise arm_api.ArmError(
+            f"hebo suggest returned bad pool_survivor_indices: {survivors!r}"
+        )
+    chosen_pool_index = result.get("chosen_pool_index")
+    if chosen_from == "pool":
+        if isinstance(chosen_pool_index, bool) or not isinstance(chosen_pool_index, int) \
+                or not 0 <= chosen_pool_index < len(pool):
+            raise arm_api.ArmError(
+                f"hebo suggest pool choice needs a valid chosen_pool_index, "
+                f"got: {chosen_pool_index!r}"
+            )
+        if chosen_pool_index not in survivors:
+            raise arm_api.ArmError(
+                "hebo suggest chose a pool member outside the union front"
+            )
+        # Pool provenance means the executed config is LITERALLY that pool
+        # member — the hands feedback channel depends on it.
+        if ctx.contract.params_identity(result["suggestion"]) != ctx.contract.params_identity(
+            pool[chosen_pool_index]
+        ):
+            raise arm_api.ArmError(
+                "hebo suggest pool choice does not match the named pool member"
+            )
+    elif chosen_pool_index is not None:
+        raise arm_api.ArmError(
+            f"hebo suggest front choice must have chosen_pool_index null, "
+            f"got: {chosen_pool_index!r}"
+        )
+
+
 def subprocess_suggest_fn(
-    *, search_space, history, seed, scramble_seed, quasi_index, initial_suggest_extra
+    *, search_space, history, seed, scramble_seed, quasi_index,
+    initial_suggest_extra, pool=None,
 ):
     """Default suggest_fn: root-env hebo_mace/suggest.py over JSON stdin/stdout."""
     payload = json.dumps(
@@ -125,6 +199,7 @@ def subprocess_suggest_fn(
             "scramble_seed": scramble_seed,
             "quasi_index": quasi_index,
             "initial_suggest_extra": initial_suggest_extra,
+            "pool": list(pool or []),
         }
     )
     proc = subprocess.run(
