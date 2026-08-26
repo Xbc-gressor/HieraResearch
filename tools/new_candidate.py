@@ -109,6 +109,22 @@ def _primary_parent_receipt(
     }
 
 
+def _primary_parent_tuning(data: dict, parent_run_id: str) -> dict | None:
+    """The parent's ledger-recorded tuning state at inheritance time.
+
+    Inherited parameters came from the parent's current revision; when that
+    parent was already tuned, its incumbent is often near-optimal for the
+    child implementation too, which changes the child's tuning potential.
+    """
+    for record in data.get("records", []):
+        if isinstance(record, dict) and record.get("run_id") == parent_run_id:
+            return {
+                "tune": bool(record.get("tune")),
+                "evaluation_depth": record.get("evaluation_depth"),
+            }
+    return None
+
+
 def resolve_source_candidate(
     template: str,
     task_name: str,
@@ -177,6 +193,11 @@ def candidate_brief(
                 "policy_receipt": record.get("policy_receipt"),
                 "candidate_name": record.get("candidate_name"),
                 "primary_parent": primary_parent,
+                "primary_parent_tuning": (
+                    _primary_parent_tuning(data, primary_parent["run_id"])
+                    if primary_parent is not None
+                    else None
+                ),
                 "implementation_source": (
                     implementation_source
                     or (

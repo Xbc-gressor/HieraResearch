@@ -930,13 +930,13 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     receipt_version = (
         receipt.get("schema_version") if isinstance(receipt, dict) else None
     )
-    if receipt_version == 2:
+    if receipt_version in {2, 3}:
         expected_receipt_fields.add("semantic_control")
     if not isinstance(receipt, dict) or set(receipt) != expected_receipt_fields:
         return errors + [
             f"record {run_id}.parameter_transfer.receipt has an invalid shape"
         ]
-    if receipt.get("schema_version") not in {1, 2} or receipt.get("kind") != (
+    if receipt.get("schema_version") not in {1, 2, 3} or receipt.get("kind") != (
         "primary_parent_parameter_transfer"
     ):
         errors.append(
@@ -994,6 +994,10 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         "incumbent_params",
         "param_schema",
     }
+    if receipt_version == 3:
+        # Provenance mark: how deeply the parent was tuned when the child
+        # inherited its incumbent parameters.
+        primary_fields.add("parent_tuning_depth")
     if not isinstance(primary, dict) or set(primary) != primary_fields:
         errors.append(
             f"record {run_id}.parameter_transfer.receipt.primary_parent has an invalid shape"
@@ -1012,6 +1016,15 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     }:
         errors.append(
             f"record {run_id}.parameter_transfer primary incumbent source is invalid"
+        )
+    if receipt_version == 3 and primary.get("parent_tuning_depth") not in {
+        "screening",
+        "tuned_lightly",
+        "tuned",
+    }:
+        errors.append(
+            f"record {run_id}.parameter_transfer parent_tuning_depth must be a "
+            "recognized evaluation depth"
         )
     parent_score = _finite_score(primary.get("incumbent_score"))
     if parent_score is None:
@@ -1550,7 +1563,7 @@ def matched_inherited_control(
     semantic_control = transfer_receipt.get("semantic_control")
     changes = receipt.get("changes")
     if (
-        transfer_receipt.get("schema_version") != 2
+        transfer_receipt.get("schema_version") not in {2, 3}
         or not isinstance(semantic_control, dict)
         or semantic_control.get("status") != "paired"
         or not isinstance(changes, list)

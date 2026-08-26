@@ -152,6 +152,8 @@ class ParameterInheritanceTests(unittest.TestCase):
                         {
                             "run_id": "001",
                             "final_best_score": 0.5,
+                            "tune": True,
+                            "evaluation_depth": "screening",
                             "applied_incumbent": _applied_snapshot(
                                 parent,
                                 report_path,
@@ -591,6 +593,12 @@ def evaluate_config(make_model, params):
 
             report = json.loads(report_path.read_text())
             phase_a = report["phase_a"]
+            self.assertEqual(receipt["schema_version"], 3)
+            # Provenance mark: the receipt records how deeply the parent was
+            # tuned when the child inherited its incumbent parameters.
+            self.assertEqual(
+                receipt["primary_parent"]["parent_tuning_depth"], "screening"
+            )
             self.assertEqual(
                 phase_a["warm_config_selection"]["mandatory_indices"],
                 [0],

@@ -2394,6 +2394,10 @@ def authoritative_parent_incumbent(
         "tune_report_sha256": pinned_report_hash,
         "ledger_path": ledger_path,
         "ledger_record_sha256": _json_sha256(ledger_record),
+        # Provenance of the inherited incumbent: how deeply the parent was
+        # tuned when the child transfers its parameters.  A tuned parent's
+        # incumbent is often near-optimal for the child implementation too.
+        "parent_tuning_depth": ledger_record.get("evaluation_depth"),
     }
 
 
@@ -2488,7 +2492,7 @@ def build_parameter_transfer(
         label="projected inherited control",
     )
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "primary_parent_parameter_transfer",
         "candidate": {
             "run_id": brief.get("run_id"),
@@ -2511,6 +2515,7 @@ def build_parameter_transfer(
             "incumbent_score": incumbent["score"],
             "incumbent_params": parent_params,
             "param_schema": _json_native(parent_schema),
+            "parent_tuning_depth": incumbent["parent_tuning_depth"],
         },
         "projection": {
             "params": projected,
@@ -2593,7 +2598,7 @@ def materialize_parameter_transfer(
             )
         previous_candidate = previous.get("candidate")
         if (
-            previous.get("schema_version") != 2
+            previous.get("schema_version") not in {2, 3}
             or previous.get("kind") != "primary_parent_parameter_transfer"
             or not isinstance(previous_candidate, dict)
             or not isinstance(previous_candidate.get("defaults"), dict)
