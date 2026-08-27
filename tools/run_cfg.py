@@ -149,10 +149,12 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "legacy_wide",
             "v3_2",
             "anchor_challenger_v1",
+            "anchor_transfer_challenger_v1",
         ):
             raise RunConfigError(
                 f"{path}: tuner.scheduler_policy must be 'legacy', "
-                "'legacy_wide', 'v3_2', or 'anchor_challenger_v1'"
+                "'legacy_wide', 'v3_2', 'anchor_challenger_v1', or "
+                "'anchor_transfer_challenger_v1'"
             )
 
     if "inner_policy" in tuner:
@@ -167,10 +169,10 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "mixup24-turbo20-v1",
             "hebo24-turbo20-v1",
             "hebo24-hebo20",
-            # Validation layer only: the transfer pair stays unfrozen until its
-            # scheduler half (anchor_transfer_challenger_v1) and the init_run /
-            # driver CLI wiring land; no scheduler pairing rule yet because
-            # that scheduler id is not yet a legal value.
+            # The transfer pair validates here but stays unfrozen until the
+            # init_run / driver CLI wiring lands; the two transfer policies
+            # pair only with each other (checked below and in
+            # _validate_anchor_transfer_challenger).
             "hebo24-transfer10-hebo10",
             "baseline-hebo-full-v1",
             "legacy",
@@ -193,6 +195,15 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             raise RunConfigError(
                 f"{path}: tuner.inner_policy {value!r} requires "
                 "tuner.scheduler_policy 'anchor_challenger_v1'"
+            )
+        if (
+            value == "hebo24-transfer10-hebo10"
+            and tuner.get("scheduler_policy", "v3_2")
+            != "anchor_transfer_challenger_v1"
+        ):
+            raise RunConfigError(
+                f"{path}: tuner.inner_policy {value!r} requires "
+                "tuner.scheduler_policy 'anchor_transfer_challenger_v1'"
             )
         if (
             value == "baseline-hebo-full-v1"
@@ -351,6 +362,71 @@ def _validate_anchor_challenger(config: dict, tuner: dict, path: Path) -> None:
         )
 
 
+def _validate_anchor_transfer_challenger(config: dict, tuner: dict, path: Path) -> None:
+    """Validate the anchor + donor-transfer challenger pair (design §2).
+
+    The scheduler reserves 10-eval segments the inner tuner must actually
+    price (and vice versa), so the two transfer policies pair only with each
+    other. The reserve is one ordinary INITIAL plus two post-anchor segments
+    (24 + 10 + 10 = 44 under ``hebo24-transfer10-hebo10``); the per-candidate
+    cap must keep the full ordinary three-bout lifetime.
+    """
+    if str(tuner.get("inner_policy", "")) != "hebo24-transfer10-hebo10":
+        raise RunConfigError(
+            f"{path}: tuner.scheduler_policy 'anchor_transfer_challenger_v1' "
+            "requires tuner.inner_policy 'hebo24-transfer10-hebo10' (the "
+            "transfer policies pair only with each other)"
+        )
+    max_evaluations = config.get("max_evaluations")
+    if max_evaluations is None:
+        raise RunConfigError(
+            f"{path}: tuner.scheduler_policy 'anchor_transfer_challenger_v1' "
+            "requires max_evaluations"
+        )
+    if tuner.get("deep_tune_budget_fraction") is not None:
+        raise RunConfigError(
+            f"{path}: tuner.deep_tune_budget_fraction is incompatible with "
+            "tuner.scheduler_policy 'anchor_transfer_challenger_v1'; its hard "
+            "transfer tournament reserve is the only Phase-C ceiling"
+        )
+    if (
+        tuner.get("K_eval") is not None
+        and int(tuner["K_eval"]) < 3
+    ):
+        raise RunConfigError(
+            f"{path}: tuner.K_eval must be at least 3 under "
+            "'anchor_transfer_challenger_v1'; the mandatory lineage and "
+            "donor roles need three screening slots"
+        )
+
+    from tuners.inner_policy import expected_bout_trials
+
+    legacy_bout_trials = int(tuner.get("bout_trials", 10))
+    schedule = tuple(
+        expected_bout_trials("hebo24-transfer10-hebo10", index, legacy_bout_trials)
+        for index in range(3)
+    )
+    # The post-anchor segments are the challenger's TRANSFERRED bout or an
+    # anchor DEEP continuation; both price at the 10-eval later-bout cost.
+    tournament_total = schedule[0] + 2 * max(schedule[1:])
+    if int(max_evaluations) < tournament_total:
+        raise RunConfigError(
+            f"{path}: max_evaluations ({max_evaluations}) is below the full "
+            f"anchor/transfer-challenger tournament reserve ({tournament_total})"
+        )
+    candidate_lifetime = sum(schedule)
+    per_candidate_cap = int(
+        tuner.get("deep_tune_per_candidate_cap", max(40, candidate_lifetime))
+    )
+    if per_candidate_cap < candidate_lifetime:
+        raise RunConfigError(
+            f"{path}: tuner.deep_tune_per_candidate_cap ({per_candidate_cap}) "
+            f"is below one candidate's three-bout schedule "
+            f"({schedule[0]} + {schedule[1]} + {schedule[2]} = "
+            f"{candidate_lifetime})"
+        )
+
+
 def _validate_judged_slate_config(judged_slate: dict, path: Path) -> None:
     """Validate the judged-slate listwise-judge arm's pool configuration."""
     unknown = sorted(set(judged_slate) - {"pool_size"})
@@ -391,6 +467,8 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
         _validate_scheduler_v3_2(config, tuner, path)
     elif tuner.get("scheduler_policy") == "anchor_challenger_v1":
         _validate_anchor_challenger(config, tuner, path)
+    elif tuner.get("scheduler_policy") == "anchor_transfer_challenger_v1":
+        _validate_anchor_transfer_challenger(config, tuner, path)
 
 
 def read_framework_cfg(path: Any) -> dict:

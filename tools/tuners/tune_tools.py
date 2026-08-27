@@ -77,9 +77,9 @@ from semantic_evidence import unbound_primary_descendants  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PARAMETER_TRANSFER_FILENAME = "_parameter_transfer.json"
 # Global-donor injection (judged-slate x transfer scheduler, design §3.2/§4.1).
-# The policy pair is deliberately NOT registered in run_cfg's whitelists yet;
-# the helper probes the raw framework_cfg.json for exactly this pair and is
-# inactive everywhere else.
+# The policy pair is registered in run_cfg's validation layer but deliberately
+# NOT selectable through init_run / driver CLI yet; the helper probes the raw
+# framework_cfg.json for exactly this pair and is inactive everywhere else.
 GLOBAL_DONOR_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
 GLOBAL_DONOR_INNER_POLICY = "hebo24-transfer10-hebo10"
 GLOBAL_DONOR_TRANSFER_FILENAME = "_global_donor_transfer.json"
@@ -2692,9 +2692,9 @@ def validate_parameter_transfer(
 def _global_donor_policy_active(candidate_path: Path) -> bool:
     """Whether the run froze the global-donor policy pair.
 
-    Reads the nearest framework_cfg.json as raw JSON on purpose: the pair is
-    not registered in run_cfg's whitelists yet, so the validated loader would
-    reject exactly the configs this helper exists for.
+    Reads the nearest framework_cfg.json as raw JSON on purpose: this helper
+    probes only the pair and must not impose whole-config validation on the
+    run that calls it.
     """
     cfg_path = find_framework_cfg(candidate_path)
     if cfg_path is None:
@@ -4222,6 +4222,19 @@ def _selected_candidate_result(
 ) -> dict:
     selected = choice.selected
     assert selected is not None
+    if policy_id == inner_policy.HEBO_TRANSFER_HEBO_POLICY_ID:
+        # Fail closed: this legacy path computes regime/cost without the
+        # candidate's Phase-A initialization_mode, which the transfer policy
+        # makes load-bearing (a global_donor bout 0 is the 10-eval
+        # TRANSFERRED segment, not a 24-eval INITIAL). Under the required
+        # anchor_transfer_challenger_v1 pairing select-candidate routes to
+        # the scheduler; reaching here means a hand-frozen config bypassed
+        # validation.
+        raise ValueError(
+            f"inner policy {policy_id!r} requires the "
+            "anchor_transfer_challenger_v1 scheduler route; the legacy "
+            "selection path is not initialization-mode aware"
+        )
     tuning_bouts = int(
         selected.get("tuning_bouts")
         or (1 if selected.get("tune") else 0)
@@ -4669,7 +4682,11 @@ def cmd_select_candidate(args) -> int:
     ledger = json.loads(led.read_text())
     rc = _run_cfg(led, "tuner")  # explicit flag wins; else framework_cfg.json; else module default
     scheduler_policy = str(rc.get("scheduler_policy", "legacy"))
-    if scheduler_policy in ("v3_2", "anchor_challenger_v1"):
+    if scheduler_policy in (
+        "v3_2",
+        "anchor_challenger_v1",
+        "anchor_transfer_challenger_v1",
+    ):
         print(json.dumps(_scheduler_selection(led, rc.get("scheduler_scenarios")), indent=2))
         return 0
     top_p = args.top_percentile if args.top_percentile is not None else float(rc.get("top_percentile", DEFAULT_TOP_PERCENTILE))

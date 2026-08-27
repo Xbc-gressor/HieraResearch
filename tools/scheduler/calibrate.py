@@ -43,6 +43,7 @@ sys.path.insert(0, str(TOOLS / "tuners"))
 if __package__ in (None, ""):  # direct script invocation
     sys.path.insert(0, str(TOOLS.parent))
     from tools.scheduler import tournament  # noqa: E402
+    from tools.scheduler import transfer_tournament  # noqa: E402
     from tools.scheduler.evidence import FIRST, LATER, TuningModel  # noqa: E402
     from tools.scheduler.policy import PolicyConfig, decide  # noqa: E402
     from tools.scheduler.rollout import RolloutConfig  # noqa: E402
@@ -51,6 +52,7 @@ if __package__ in (None, ""):  # direct script invocation
     from tools.scheduler.store import SchedulerStore  # noqa: E402
 else:  # pragma: no cover - imported as a package
     from . import tournament
+    from . import transfer_tournament
     from .evidence import FIRST, LATER, TuningModel
     from .policy import PolicyConfig, decide
     from .rollout import RolloutConfig
@@ -150,6 +152,8 @@ def replay_all(store: SchedulerStore) -> dict:
             # The tournament is a pure function of the snapshot; replaying it
             # through the v3.2 rollout policy would report false divergences.
             replayed = tournament.decide(state)
+        elif row.get("policy_version") == transfer_tournament.POLICY_VERSION:
+            replayed = transfer_tournament.decide(state)
         else:
             tuning, arrival = models_for(store, cursor=row.get("evidence_cursor"))
             config = PolicyConfig(

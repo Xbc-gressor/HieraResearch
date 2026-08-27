@@ -221,6 +221,96 @@ class RunConfigTunerValidationTests(unittest.TestCase):
                 read_framework_cfg(path)
 
 
+class AnchorTransferChallengerConfigTests(unittest.TestCase):
+    """§2 constraints for the anchor_transfer_challenger_v1 pair."""
+
+    def _base(self) -> dict:
+        return {
+            "max_evaluations": 200,
+            "tuner": {
+                "scheduler_policy": "anchor_transfer_challenger_v1",
+                "inner_policy": "hebo24-transfer10-hebo10",
+                "deep_tune_budget_fraction": None,
+                "deep_tune_per_candidate_cap": 44,
+                "K_eval": 3,
+            },
+        }
+
+    def _check(self, config: dict) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "framework_cfg.json"
+            path.write_text(json.dumps(config))
+            return read_framework_cfg(path)
+
+    def test_valid_pair_is_accepted(self) -> None:
+        config = self._base()
+        self.assertEqual(
+            self._check(config)["tuner"]["scheduler_policy"],
+            "anchor_transfer_challenger_v1",
+        )
+        # K_eval may be omitted: the default 3 already satisfies the floor.
+        minimal = self._base()
+        del minimal["tuner"]["K_eval"]
+        self._check(minimal)
+
+    def test_transfer_policies_pair_only_with_each_other(self) -> None:
+        wrong_inner = self._base()
+        wrong_inner["tuner"]["inner_policy"] = "hebo24-hebo20"
+        # The existing inner-policy guard fires first here; either way the
+        # mismatched pair is rejected before the run freezes.
+        with self.assertRaisesRegex(
+            RunConfigError, "requires tuner.scheduler_policy"
+        ):
+            self._check(wrong_inner)
+
+        wrong_scheduler = self._base()
+        wrong_scheduler["tuner"]["scheduler_policy"] = "anchor_challenger_v1"
+        with self.assertRaisesRegex(
+            RunConfigError, "anchor_transfer_challenger_v1"
+        ):
+            self._check(wrong_scheduler)
+
+        missing_scheduler = self._base()
+        del missing_scheduler["tuner"]["scheduler_policy"]
+        with self.assertRaisesRegex(
+            RunConfigError, "anchor_transfer_challenger_v1"
+        ):
+            self._check(missing_scheduler)
+
+    def test_max_evaluations_must_cover_the_44_reserve(self) -> None:
+        missing = self._base()
+        del missing["max_evaluations"]
+        with self.assertRaisesRegex(RunConfigError, "max_evaluations"):
+            self._check(missing)
+
+        short = self._base()
+        short["max_evaluations"] = 43
+        with self.assertRaisesRegex(RunConfigError, "tournament reserve"):
+            self._check(short)
+
+        exact = self._base()
+        exact["max_evaluations"] = 44
+        self._check(exact)
+
+    def test_deep_tune_budget_fraction_must_be_null(self) -> None:
+        config = self._base()
+        config["tuner"]["deep_tune_budget_fraction"] = 0.4
+        with self.assertRaisesRegex(RunConfigError, "deep_tune_budget_fraction"):
+            self._check(config)
+
+    def test_per_candidate_cap_keeps_the_full_lifetime(self) -> None:
+        config = self._base()
+        config["tuner"]["deep_tune_per_candidate_cap"] = 43
+        with self.assertRaisesRegex(RunConfigError, "three-bout schedule"):
+            self._check(config)
+
+    def test_k_eval_needs_three_screening_slots(self) -> None:
+        config = self._base()
+        config["tuner"]["K_eval"] = 2
+        with self.assertRaisesRegex(RunConfigError, "tuner.K_eval must be at least 3"):
+            self._check(config)
+
+
 class ProgressiveTunerKnobsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

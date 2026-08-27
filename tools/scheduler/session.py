@@ -28,6 +28,7 @@ from .rollout import RolloutConfig
 from .state import SchedulerState, load_state
 from .store import SchedulerStore
 from . import tournament
+from . import transfer_tournament
 
 
 def config_from_scenarios(scenarios: int | None) -> PolicyConfig:
@@ -84,6 +85,37 @@ def contract_for(ledger_path: Path) -> ResourceContract:
             k_eval=max(2, int(tuner.get("K_eval", ResourceContract.k_eval))),
             first_bout_trials=schedule[0],
             bout_cost_schedule=schedule,
+            numeric_required_from_bout_index=(
+                numeric_required_from_bout_index(inner_policy_id)
+            ),
+        )
+    if scheduler_policy == transfer_tournament.POLICY_ID:
+        # Same inner-policy-derived schedule as the anchor/challenger branch,
+        # plus the candidate-aware TRANSFERRED first-bout price so the
+        # scheduler's accounting matches what the driver executes (§5.2).
+        from tuners.inner_policy import (
+            HEBO_TRANSFER_HEBO_POLICY_ID,
+            INITIALIZATION_GLOBAL_DONOR,
+            expected_bout_trials,
+            numeric_required_from_bout_index,
+        )
+
+        inner_policy_id = str(
+            tuner.get("inner_policy", HEBO_TRANSFER_HEBO_POLICY_ID)
+        )
+        schedule = tuple(
+            expected_bout_trials(inner_policy_id, index, bout_trials)
+            for index in range(3)
+        )
+        return ResourceContract(
+            bout_trials=schedule[1],
+            max_bouts=3,
+            k_eval=max(2, int(tuner.get("K_eval", ResourceContract.k_eval))),
+            first_bout_trials=schedule[0],
+            bout_cost_schedule=schedule,
+            transferred_first_bout_trials=expected_bout_trials(
+                inner_policy_id, 0, bout_trials, INITIALIZATION_GLOBAL_DONOR
+            ),
             numeric_required_from_bout_index=(
                 numeric_required_from_bout_index(inner_policy_id)
             ),
@@ -145,6 +177,8 @@ def decide_for_run(
     tuning = arrival = None
     if scheduler_policy == tournament.POLICY_ID:
         decision = tournament.decide(state)
+    elif scheduler_policy == transfer_tournament.POLICY_ID:
+        decision = transfer_tournament.decide(state)
     else:
         tuning, arrival = models_for(store)
         decision = decide_policy(
@@ -157,6 +191,14 @@ def decide_for_run(
     decision_id = store.next_decision_id()
     if scheduler_policy == tournament.POLICY_ID:
         receipt = tournament.receipt(
+            decision,
+            state=state,
+            evidence_cursor=cursor,
+            snapshot_id=snapshot_id,
+            decision_id=decision_id,
+        )
+    elif scheduler_policy == transfer_tournament.POLICY_ID:
+        receipt = transfer_tournament.receipt(
             decision,
             state=state,
             evidence_cursor=cursor,

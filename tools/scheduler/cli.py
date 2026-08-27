@@ -34,6 +34,7 @@ if __package__ in (None, ""):  # direct script invocation
     sys.path.insert(0, str(TOOLS.parent))
     from tools.scheduler import evidence as evidence_mod  # noqa: E402
     from tools.scheduler import tournament  # noqa: E402
+    from tools.scheduler import transfer_tournament  # noqa: E402
     from tools.scheduler.policy import (  # noqa: E402
         PolicyConfig,
         decide as decide_policy,
@@ -48,6 +49,7 @@ if __package__ in (None, ""):  # direct script invocation
 else:  # pragma: no cover - imported as a package
     from . import evidence as evidence_mod
     from . import tournament
+    from . import transfer_tournament
     from .policy import PolicyConfig, decide as decide_policy
     from .rollout import RolloutConfig
     from .session import decide_for_run, models_for
@@ -107,10 +109,13 @@ def cmd_replay(args) -> int:
         raise SystemExit(f"no decision {args.decision_id}")
 
     state = state_from_snapshot(store.get_snapshot(receipt["state_snapshot_id"]))
-    # Replay must use the policy that produced the receipt: the tournament
-    # is a pure function of the snapshot, while v3.2 also needs its models.
+    # Replay must use the policy that produced the receipt: the deterministic
+    # tournaments are pure functions of the snapshot, while v3.2 also needs
+    # its models.
     if receipt.get("policy_version") == tournament.POLICY_VERSION:
         replayed = tournament.decide(state)
+    elif receipt.get("policy_version") == transfer_tournament.POLICY_VERSION:
+        replayed = transfer_tournament.decide(state)
     else:
         tuning, arrival = models_for(store, cursor=receipt.get("evidence_cursor"))
         config = PolicyConfig(

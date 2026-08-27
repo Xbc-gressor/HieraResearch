@@ -268,6 +268,7 @@ def build_driver_job(
     if tuner_cfg.get("scheduler_policy") in (
         "v3_2",
         "anchor_challenger_v1",
+        "anchor_transfer_challenger_v1",
     ) and trial_cap != bout_trials:
         raise DriverJobError(
             "complete-bout scheduler requires one complete bout: "

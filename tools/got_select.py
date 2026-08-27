@@ -339,35 +339,51 @@ def cmd_decide(args) -> int:
             remaining,
             allow_terminal_degrade=True,
         )
-        if tuner_cfg.get("scheduler_policy") == "anchor_challenger_v1":
+        scheduler_policy = tuner_cfg.get("scheduler_policy")
+        if scheduler_policy in (
+            "anchor_challenger_v1",
+            "anchor_transfer_challenger_v1",
+        ):
             # The tournament's reserve must constrain the real admission
             # prefix, not merely the later scheduler decision.  Otherwise a
             # multi-action generation can consume budget already promised to
             # the late challenger and its two DEEP segments.
             from scheduler.session import contract_for
-            from scheduler.state import build_state
-            from scheduler.tournament import (
-                generation_admission_cap,
-                generation_candidate_reservation,
-                generation_reserve,
-            )
+            from scheduler.state import build_state, initialization_facts
+
+            if scheduler_policy == "anchor_transfer_challenger_v1":
+                from scheduler import transfer_tournament as reserve_policy
+            else:
+                from scheduler import tournament as reserve_policy
 
             # Build from the ledger already in hand: the round-1 bootstrap
             # above admits a missing ledger as an empty run, and the cap
             # needs only bouts_used/crash facts plus the remaining budget.
+            # The transfer policy's phases additionally read each candidate's
+            # stamped initialization mode (ordinary vs global_donor) from the
+            # authoritative tune reports.
             tournament_state = build_state(
                 data,
                 remaining_budget=remaining,
                 contract=contract_for(path),
+                initialization_facts=(
+                    initialization_facts(path.parent, data)
+                    if scheduler_policy == "anchor_transfer_challenger_v1"
+                    else None
+                ),
             )
-            reserve_cap = generation_admission_cap(tournament_state)
+            reserve_cap = reserve_policy.generation_admission_cap(
+                tournament_state
+            )
             admission_cap = min(admission_cap, reserve_cap)
             if admission_cap > 0:
-                candidate_reservation = generation_candidate_reservation(
-                    tournament_state
+                candidate_reservation = (
+                    reserve_policy.generation_candidate_reservation(
+                        tournament_state
+                    )
                 )
             tournament["tournament_generation_reserve"] = (
-                generation_reserve(tournament_state)
+                reserve_policy.generation_reserve(tournament_state)
             )
             tournament["tournament_admission_cap"] = reserve_cap
     if getattr(args, "mode", "actions") == "lanes":

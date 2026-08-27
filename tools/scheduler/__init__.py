@@ -28,4 +28,9 @@ statistical model coarse*:
                realized outcomes.
 ``donor``      run-global donor frontier selection and its content-addressed
                immutable snapshots (anchor_transfer_challenger_v1).
+``transfer_tournament``
+               the deterministic anchor + donor-transfer challenger policy
+               (anchor_transfer_challenger_v1 x hebo24-transfer10-hebo10);
+               registered at the validation layer, not yet selectable through
+               init_run / driver CLI.
 """

@@ -138,7 +138,13 @@ def _fixture(
             config["max_evaluations"] = 100
             tuner.update(
                 {
-                    "scheduler_policy": "anchor_challenger_v1",
+                    # §2: the transfer inner policy pairs only with its own
+                    # scheduler half.
+                    "scheduler_policy": (
+                        "anchor_transfer_challenger_v1"
+                        if policy_id == inner_policy.HEBO_TRANSFER_HEBO_POLICY_ID
+                        else "anchor_challenger_v1"
+                    ),
                     "deep_tune_budget_fraction": None,
                     "deep_tune_per_candidate_cap": 44,
                 }
@@ -2545,7 +2551,9 @@ class TransferredCheckpointTest(unittest.TestCase):
                         "max_evaluations": 200,
                         "tuner": {
                             "inner_policy": TRANSFER_POLICY,
-                            "scheduler_policy": "anchor_challenger_v1",
+                            # §2: the transfer inner policy pairs only with
+                            # its scheduler half.
+                            "scheduler_policy": "anchor_transfer_challenger_v1",
                             "deep_tune_budget_fraction": None,
                         },
                     }
