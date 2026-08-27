@@ -26,4 +26,6 @@ statistical model coarse*:
                frozen tie rule. No sample-seeking coverage.
 ``store``      append-only artifact store for snapshots, decisions, and
                realized outcomes.
+``donor``      run-global donor frontier selection and its content-addressed
+               immutable snapshots (anchor_transfer_challenger_v1).
 """

@@ -39,6 +39,11 @@ Subcommands:
 - build-inheritance : replace warm config 0 with the primary parent's applied
                     incumbent projected exactly onto the child's compatible
                     schema, and persist a stale-detecting transfer receipt.
+- inject-global-donor : append the generation-bound global donor incumbent
+                    (projected onto the candidate's schema) to the warm configs
+                    and persist the candidate-local receipt; inactive unless the
+                    run froze the anchor_transfer_challenger_v1 x
+                    hebo24-transfer10-hebo10 policy pair.
 - render-failure  : frozen receipt by default; exact full/ranged traceback only
                     when explicitly requested.
 
@@ -71,6 +76,14 @@ from semantic_evidence import unbound_primary_descendants  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PARAMETER_TRANSFER_FILENAME = "_parameter_transfer.json"
+# Global-donor injection (judged-slate x transfer scheduler, design §3.2/§4.1).
+# The policy pair is deliberately NOT registered in run_cfg's whitelists yet;
+# the helper probes the raw framework_cfg.json for exactly this pair and is
+# inactive everywhere else.
+GLOBAL_DONOR_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
+GLOBAL_DONOR_INNER_POLICY = "hebo24-transfer10-hebo10"
+GLOBAL_DONOR_TRANSFER_FILENAME = "_global_donor_transfer.json"
+GLOBAL_DONOR_TRANSFER_KIND = "global_donor_transfer"
 
 
 # =============================================================================
@@ -2664,6 +2677,457 @@ def validate_parameter_transfer(
 
 
 # =============================================================================
+# Global-donor injection (anchor_transfer_challenger_v1 x hebo24-transfer10-hebo10)
+# =============================================================================
+
+
+def _global_donor_policy_active(candidate_path: Path) -> bool:
+    """Whether the run froze the global-donor policy pair.
+
+    Reads the nearest framework_cfg.json as raw JSON on purpose: the pair is
+    not registered in run_cfg's whitelists yet, so the validated loader would
+    reject exactly the configs this helper exists for.
+    """
+    cfg_path = find_framework_cfg(candidate_path)
+    if cfg_path is None:
+        return False
+    try:
+        raw = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read framework config {cfg_path}: {exc}") from exc
+    tuner = raw.get("tuner") if isinstance(raw, dict) else None
+    if not isinstance(tuner, dict):
+        return False
+    return (
+        tuner.get("scheduler_policy") == GLOBAL_DONOR_SCHEDULER_POLICY
+        and tuner.get("inner_policy") == GLOBAL_DONOR_INNER_POLICY
+    )
+
+
+def _project_global_donor(
+    donor_params: dict,
+    donor_schema: dict,
+    recipient_schema: dict,
+    recipient_defaults: dict,
+) -> dict:
+    """Project the donor's applied params onto the recipient's PARAM_SCHEMA.
+
+    Same per-key compatibility judgment as the primary-parent projection in
+    build_parameter_transfer: exact copy when kinds match and the recipient
+    schema accepts the donor value, otherwise the recipient default with a
+    structured reason; donor-only keys are dropped.
+    """
+    projected: dict = {}
+    copied: list[dict] = []
+    reset: list[dict] = []
+    new: list[dict] = []
+    dropped: list[dict] = []
+    for key in recipient_schema:
+        if key not in donor_schema:
+            projected[key] = recipient_defaults[key]
+            new.append(
+                {"key": key, "value": recipient_defaults[key], "reason": "recipient_only"}
+            )
+            continue
+        donor_value = donor_params[key]
+        recipient_kind = _schema_kind(recipient_schema[key])
+        donor_kind = _schema_kind(donor_schema[key])
+        reason = None
+        if recipient_kind != donor_kind:
+            reason = "kind_changed"
+        elif not _schema_accepts_value(recipient_schema[key], donor_value):
+            reason = (
+                "categorical_value_removed"
+                if recipient_kind == "categorical"
+                else "donor_value_incompatible"
+            )
+        if reason is None:
+            projected[key] = donor_value
+            copied.append({"key": key, "value": donor_value})
+        else:
+            projected[key] = recipient_defaults[key]
+            reset.append(
+                {
+                    "key": key,
+                    "donor_value": donor_value,
+                    "recipient_value": recipient_defaults[key],
+                    "reason": reason,
+                }
+            )
+    for key in donor_schema:
+        if key not in recipient_schema:
+            dropped.append(
+                {"key": key, "value": donor_params[key], "reason": "donor_only"}
+            )
+    _validate_schema_values(
+        projected,
+        recipient_schema,
+        label="projected global-donor row",
+    )
+    return {
+        "params": projected,
+        "copied": copied,
+        "reset": reset,
+        "new": new,
+        "dropped": dropped,
+    }
+
+
+def _validate_global_donor_receipt(receipt: dict, run_id: str, candidate_path: Path) -> None:
+    """Contract and identity checks for an existing candidate-local receipt."""
+    candidate = receipt.get("candidate") if isinstance(receipt, dict) else None
+    donor = receipt.get("donor") if isinstance(receipt, dict) else None
+    projection = receipt.get("projection") if isinstance(receipt, dict) else None
+    status = receipt.get("status") if isinstance(receipt, dict) else None
+    index = receipt.get("warm_config_index") if isinstance(receipt, dict) else None
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema_version") != 1
+        or receipt.get("kind") != GLOBAL_DONOR_TRANSFER_KIND
+        or status not in ("ok", "donor_incompatible")
+        or not isinstance(receipt.get("deduplicated"), bool)
+        or not isinstance(candidate, dict)
+        or not isinstance(donor, dict)
+        or not isinstance(donor.get("snapshot_id"), str)
+        or not isinstance(projection, dict)
+        or not isinstance(projection.get("params"), dict)
+        or (status == "ok" and (not isinstance(index, int) or isinstance(index, bool) or index < 0))
+        or (status == "donor_incompatible" and index is not None)
+    ):
+        raise ValueError("existing global-donor receipt has an invalid contract")
+    if (
+        candidate.get("run_id") != run_id
+        or candidate.get("path") != _display_path(candidate_path)
+    ):
+        raise ValueError(
+            "existing global-donor receipt belongs to a different candidate identity"
+        )
+
+
+def inject_global_donor(
+    candidate_path: Path,
+    configs_path: Path,
+    donor_snapshot_path: Path | None = None,
+    receipt_path: Path | None = None,
+) -> dict:
+    """Inject the generation-bound global donor into a candidate's warm configs.
+
+    Inactive unless the run froze the global-donor policy pair.  When active,
+    the donor's applied params are projected onto the candidate's finalized
+    PARAM_SCHEMA, deduplicated against the ordinary configs (including the
+    lineage control), appended when new, and checked against the finalized
+    SEARCH_SPACE — an out-of-bounds row is a ``donor_incompatible`` transfer
+    observation, never a clamp and never a space edit.  Writes are
+    receipt-first, configs-second, mirroring materialize_parameter_transfer,
+    so an interrupted run resumes from the receipt.  Once a receipt exists the
+    donor snapshot binding is frozen: refreshes rebuild the projection from
+    the same snapshot only, and once warm selection is recorded in
+    tune_report.json every population/index/snapshot change is refused.
+    """
+    candidate_path = Path(candidate_path).resolve()
+    configs_path = Path(configs_path).resolve()
+    if receipt_path is None:
+        receipt_path = candidate_path.parent / GLOBAL_DONOR_TRANSFER_FILENAME
+    receipt_path = Path(receipt_path).resolve()
+
+    if not _global_donor_policy_active(candidate_path):
+        return {
+            "status": "inactive",
+            "reason": "run tuner policies are not the global-donor pair",
+        }
+
+    configs_tmp = configs_path.with_suffix(configs_path.suffix + ".tmp")
+    receipt_tmp = receipt_path.with_suffix(receipt_path.suffix + ".tmp")
+    all_paths = {
+        candidate_path,
+        configs_path,
+        receipt_path,
+        configs_tmp.resolve(),
+        receipt_tmp.resolve(),
+    }
+    if len(all_paths) != 5:
+        raise ValueError(
+            "candidate, configs, receipt, and their temporary paths must all "
+            "be distinct"
+        )
+
+    brief_path, brief = _read_candidate_brief(candidate_path)
+    if brief.get("schema_version") != 4:
+        raise ValueError("global-donor injection requires a schema-4 candidate brief")
+    run_id = candidate_path.parent.name
+    if brief.get("run_id") != run_id:
+        raise ValueError("candidate brief run_id does not match its directory")
+    source_run_ids = brief.get("source_run_ids")
+    if not isinstance(source_run_ids, list) or any(
+        not isinstance(value, str) for value in source_run_ids
+    ):
+        raise ValueError("candidate brief source_run_ids must be a list of run ids")
+    fresh = not source_run_ids
+
+    report_path = candidate_path.parent / "tune_report.json"
+    warm_selection_recorded = False
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"cannot read candidate tune report {report_path}: {exc}"
+            ) from exc
+        phase_a = report.get("phase_a") if isinstance(report, dict) else None
+        warm_selection_recorded = isinstance(phase_a, dict) and isinstance(
+            phase_a.get("warm_config_selection"), dict
+        )
+
+    previous = None
+    previous_path = receipt_path
+    if not previous_path.exists() and receipt_tmp.exists():
+        # Recover the safe half of an interrupted receipt-first write.
+        previous_path = receipt_tmp
+    if previous_path.exists():
+        try:
+            previous = json.loads(previous_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"cannot trust existing global-donor receipt {previous_path}: {exc}"
+            ) from exc
+        _validate_global_donor_receipt(previous, run_id, candidate_path)
+
+    if donor_snapshot_path is None:
+        if previous is not None:
+            raise ValueError(
+                "this candidate already has a global-donor receipt; a refresh "
+                "requires the same --donor-snapshot it is bound to"
+            )
+        # The generation binding carries no donor (the normal pre-anchor
+        # state, design §8); the candidate keeps its ordinary warm pool.
+        return {"status": "no_donor", "run_id": run_id}
+    donor_snapshot_path = Path(donor_snapshot_path).resolve()
+    from scheduler import donor as donor_snapshots  # noqa: PLC0415
+
+    # A missing or corrupt generation binding blocks the run; it must not
+    # silently degrade into an ordinary warm pool (design §8).
+    snapshot = donor_snapshots.load_donor_snapshot(donor_snapshot_path)
+    if previous is not None:
+        bound = previous["donor"]["snapshot_id"]
+        if bound != snapshot["snapshot_id"]:
+            raise ValueError(
+                f"global-donor receipt is frozen to snapshot {bound}; "
+                f"refusing snapshot {snapshot['snapshot_id']}"
+            )
+
+    child_schema = _read_literal_mapping(candidate_path, "PARAM_SCHEMA")
+    search_space = _read_literal_mapping(candidate_path, "SEARCH_SPACE")
+    try:
+        configs = json.loads(configs_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read warm configs {configs_path}: {exc}") from exc
+    if (
+        not isinstance(configs, list)
+        or not configs
+        or any(not isinstance(config, dict) for config in configs)
+    ):
+        raise ValueError("warm configs must be a non-empty list of objects")
+
+    # Split the ordinary population from an already-materialized donor row.
+    previous_status = previous.get("status") if previous else None
+    previous_index = previous.get("warm_config_index") if previous else None
+    previous_deduplicated = previous.get("deduplicated") if previous else False
+    previous_projection = (
+        previous["projection"]["params"] if previous is not None else None
+    )
+    if previous is None:
+        ordinary_configs = list(configs)
+    else:
+        ordinary_count = previous.get("ordinary_config_count")
+        if (
+            not isinstance(ordinary_count, int)
+            or isinstance(ordinary_count, bool)
+            or ordinary_count < 1
+        ):
+            raise ValueError(
+                "existing global-donor receipt has an invalid ordinary_config_count"
+            )
+        if previous_status == "ok" and not previous_deduplicated:
+            if previous_index != ordinary_count:
+                raise ValueError(
+                    "existing global-donor receipt has an invalid warm_config_index"
+                )
+            if len(configs) == ordinary_count + 1:
+                if warm_selection_recorded and _canonical_json(
+                    configs[previous_index]
+                ) != _canonical_json(previous_projection):
+                    raise ValueError(
+                        "warm configs no longer match the existing global-donor receipt"
+                    )
+                # The donor row is helper-owned: before warm selection a
+                # refresh rebuilds it from the frozen snapshot (a schema
+                # repair legitimately leaves the persisted row stale).
+                ordinary_configs = list(configs[:ordinary_count])
+            elif len(configs) == ordinary_count:
+                # Interrupted between the receipt and configs replaces.
+                ordinary_configs = list(configs)
+            else:
+                raise ValueError(
+                    "warm configs no longer match the existing global-donor receipt"
+                )
+        else:
+            # donor_incompatible and deduplicated receipts never append a row.
+            if len(configs) != ordinary_count:
+                raise ValueError(
+                    "warm configs no longer match the existing global-donor receipt"
+                )
+            ordinary_configs = list(configs)
+
+    if fresh:
+        child_defaults = ordinary_configs[0]
+    else:
+        # Non-fresh config 0 is the lineage control by now; the child's own
+        # pre-projection defaults live in the inheritance receipt.
+        transfer_path = candidate_path.parent / PARAMETER_TRANSFER_FILENAME
+        try:
+            transfer = json.loads(transfer_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "non-fresh candidate requires its parameter-transfer receipt "
+                f"for pre-projection defaults ({transfer_path}): {exc}"
+            ) from exc
+        transfer_candidate = transfer.get("candidate") if isinstance(transfer, dict) else None
+        if not isinstance(transfer_candidate, dict) or not isinstance(
+            transfer_candidate.get("defaults"), dict
+        ):
+            raise ValueError("parameter-transfer receipt lacks candidate defaults")
+        child_defaults = transfer_candidate["defaults"]
+    _validate_schema_values(
+        child_defaults,
+        child_schema,
+        label="recipient pre-projection defaults",
+    )
+
+    selected = snapshot["selected"]
+    projection = _project_global_donor(
+        selected["params"],
+        selected["param_schema"],
+        child_schema,
+        child_defaults,
+    )
+    violations = _bounds_violations(projection["params"], search_space)
+
+    warm_config_index = None
+    deduplicated = False
+    dedup_ordinary_index = None
+    if not violations:
+        projected_payload = _canonical_json(projection["params"])
+        for index, config in enumerate(ordinary_configs):
+            if _canonical_json(config) == projected_payload:
+                warm_config_index = index
+                deduplicated = True
+                dedup_ordinary_index = index
+                break
+        if warm_config_index is None:
+            warm_config_index = len(ordinary_configs)
+
+    if warm_selection_recorded:
+        if previous is None:
+            raise ValueError(
+                "warm selection is already recorded; injecting a donor now "
+                "would change the selected population"
+            )
+        status = "donor_incompatible" if violations else "ok"
+        expected_configs = len(ordinary_configs) + (
+            0 if (violations or deduplicated) else 1
+        )
+        if (
+            status != previous_status
+            or _canonical_json(projection["params"])
+            != _canonical_json(previous_projection)
+            or warm_config_index != previous_index
+            or deduplicated != previous_deduplicated
+            or len(configs) != expected_configs
+        ):
+            raise ValueError(
+                "warm selection is already recorded; refusing any donor "
+                "population, index, or snapshot change"
+            )
+        return {
+            "status": previous_status,
+            "unchanged": True,
+            "run_id": run_id,
+            "donor_snapshot": snapshot["snapshot_id"],
+            "donor_run_id": selected["run_id"],
+            "warm_config_index": previous_index,
+            "deduplicated": previous_deduplicated,
+            "receipt_path": _display_path(receipt_path),
+        }
+
+    status = "donor_incompatible" if violations else "ok"
+    receipt = {
+        "schema_version": 1,
+        "kind": GLOBAL_DONOR_TRANSFER_KIND,
+        "status": status,
+        "candidate": {
+            "run_id": run_id,
+            "path": _display_path(candidate_path),
+            "brief_path": _display_path(brief_path),
+            "execution_revision": _candidate_execution_revision(candidate_path),
+            "param_schema": _json_native(child_schema),
+            "fresh": fresh,
+        },
+        "ordinary_config_count": len(ordinary_configs),
+        "donor": {
+            "snapshot_id": snapshot["snapshot_id"],
+            "snapshot_path": _display_path(donor_snapshot_path),
+            "selection_rule": snapshot.get("selection_rule"),
+            "selected": _json_native(selected),
+        },
+        "projection": projection,
+        "warm_config_index": warm_config_index,
+        "deduplicated": deduplicated,
+        "dedup_ordinary_index": dedup_ordinary_index,
+        "violations": violations,
+        # Computed by the warm-selection step, which owns mandatory roles;
+        # reserved here so the receipt schema does not change when it lands.
+        "mandatory_role_indices": None,
+        "k_eval": None,
+    }
+
+    updated_configs = list(ordinary_configs)
+    if status == "ok" and not deduplicated:
+        updated_configs.append(projection["params"])
+
+    receipt_tmp.write_text(json.dumps(receipt, indent=2) + "\n")
+    configs_dirty = _canonical_json(updated_configs) != _canonical_json(configs)
+    if configs_dirty:
+        configs_tmp.write_text(json.dumps(updated_configs, indent=2) + "\n")
+    # Receipt first: it freezes the donor binding and the ordinary population.
+    # If the configs replace is interrupted, a rerun rebuilds from this
+    # receipt and deterministically finishes the materialization.
+    receipt_tmp.replace(receipt_path)
+    if configs_dirty:
+        configs_tmp.replace(configs_path)
+
+    result = {
+        "status": status,
+        "run_id": run_id,
+        "fresh": fresh,
+        "donor_snapshot": snapshot["snapshot_id"],
+        "donor_run_id": selected["run_id"],
+        "donor_score": selected["score"],
+        "ordinary_config_count": len(ordinary_configs),
+        "config_count": len(updated_configs),
+        "warm_config_index": warm_config_index,
+        "deduplicated": deduplicated,
+        "copied": len(projection["copied"]),
+        "reset": len(projection["reset"]),
+        "new": len(projection["new"]),
+        "dropped": len(projection["dropped"]),
+        "receipt_path": _display_path(receipt_path),
+    }
+    if violations:
+        result["violations"] = violations
+    return result
+
+
+# =============================================================================
 # Tuning summaries and ledger records
 # =============================================================================
 
@@ -4099,6 +4563,22 @@ def cmd_build_inheritance(args) -> int:
     return 0
 
 
+def cmd_inject_global_donor(args) -> int:
+    try:
+        result = inject_global_donor(
+            args.candidate_path,
+            args.configs_json,
+            donor_snapshot_path=args.donor_snapshot,
+        )
+    except ValueError as exc:
+        # A broken binding, snapshot, or candidate state blocks (design §8);
+        # it never degrades into an ordinary warm pool.
+        print(json.dumps({"status": "error", "error": str(exc)}, indent=2))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _run_cfg(ledger_path: Path, section: str) -> dict:
     """Per-run framework overrides from `<run_dir>/framework_cfg.json` (stdlib only,
     so select-candidate keeps needing no uv env). Shape `{"tuner": {...}, "got": {...}}`.
@@ -4337,6 +4817,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bi.set_defaults(func=cmd_build_inheritance)
+
+    gd = sub.add_parser(
+        "inject-global-donor",
+        help=(
+            "Project the generation-bound global donor incumbent into the "
+            "candidate's warm configs and persist its transfer receipt "
+            "(active only under anchor_transfer_challenger_v1 x "
+            "hebo24-transfer10-hebo10)."
+        ),
+    )
+    gd.add_argument(
+        "--candidate-path",
+        required=True,
+        type=Path,
+        help="candidate train.py with finalized PARAM_SCHEMA and SEARCH_SPACE",
+    )
+    gd.add_argument(
+        "--configs-json",
+        required=True,
+        type=Path,
+        help="_warm_configs.json; the donor row is appended unless it "
+        "duplicates an ordinary config",
+    )
+    gd.add_argument(
+        "--donor-snapshot",
+        type=Path,
+        default=None,
+        help="generation-bound donor snapshot JSON; omit when the generation "
+        "binding is no_donor",
+    )
+    gd.set_defaults(func=cmd_inject_global_donor)
 
     sc = sub.add_parser("select-candidate",
                         help="Pick which candidate to deep-tune next (decoupled tuning, design §15), or none.")
