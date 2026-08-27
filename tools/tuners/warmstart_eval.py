@@ -40,6 +40,14 @@ schema-4 briefs make config 0 mandatory and require a validated
 `implementation_source.kind=provided_entrypoint` enables the observed-control
 guard: exactly one warm config may run, `k_eval` must be one, and a literal
 `DEFAULT_PARAMS` must match that config exactly.
+
+Under the global-donor policy pair (`anchor_transfer_challenger_v1` x
+`hebo24-transfer10-hebo10`), `--donor-snapshot` binds the generation's donor
+snapshot and the candidate must carry a matching helper-written
+`_global_donor_transfer.json`.  A compatible donor row is a mandatory but
+failable warm treatment: its preflight rejection or objective crash is
+persisted as the donor observation and the remaining selected rows continue,
+while a donor row that also carries the lineage control stays fail-closed.
 """
 
 from __future__ import annotations
@@ -74,11 +82,15 @@ from _common import (  # noqa: E402
 )
 from failure_artifacts import record_failure  # noqa: E402
 from tune_tools import (  # noqa: E402
+    GLOBAL_DONOR_TRANSFER_FILENAME,
     PARAMETER_TRANSFER_FILENAME,
     _bounds_violations,
     _candidate_execution_revision,
+    _global_donor_policy_active,
+    _json_native,
     _read_param_schema,
     _read_search_space,
+    _validate_global_donor_receipt,
     _validate_schema_values,
     finite_warm_incumbent_rows,
     lint_contract,
@@ -393,6 +405,10 @@ class WarmstartRun:
     cache: dict[str, float]
     trials_attempted: int
     started: float
+    donor_policy_active: bool
+    donor_warm_config_index: int | None
+    donor_failure_row: dict | None
+    donor_preflight_rejection: dict | None
     warm_rows: list[dict] = field(default_factory=list)
 
     @property
@@ -414,6 +430,16 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(BO enqueue / grid prepend) only if this candidate is selected. "
                              "The sampled permutation is persisted for resume. Default = all "
                              "(no deferral).")
+    parser.add_argument(
+        "--donor-snapshot",
+        type=Path,
+        default=None,
+        help=(
+            "generation-bound global donor snapshot (transfer policy pair "
+            "only); requires the candidate-local _global_donor_transfer.json "
+            "written by inject-global-donor"
+        ),
+    )
     parser.add_argument(
         "--target-k-eval",
         type=int,
@@ -454,6 +480,169 @@ def _load_parameter_transfer(
     except ValueError as exc:
         parser.error(str(exc))
     return parameter_transfer
+
+
+def _load_global_donor_transfer(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    all_configs: list[dict],
+    candidate_code_revision: dict,
+    previous_phase_a: dict,
+) -> dict | None:
+    """Validate the global-donor receipt against its generation-bound snapshot.
+
+    Returns the candidate-local receipt when the candidate carries one, else
+    None (the no_donor binding).  Every inconsistency — missing/stale receipt,
+    snapshot mismatch, population drift, or a post-selection binding change —
+    fails before BASE_PARAMS is written or any objective slot is consumed
+    (design §4.2, §7.1, §8).
+    """
+    receipt_path = args.candidate_path.parent / GLOBAL_DONOR_TRANSFER_FILENAME
+    selection_recorded = isinstance(
+        previous_phase_a.get("warm_config_selection"), dict
+    )
+    if args.donor_snapshot is None:
+        if receipt_path.exists():
+            parser.error(
+                f"global-donor receipt {receipt_path} exists but no "
+                "--donor-snapshot was passed (the no_donor binding); refusing "
+                "to silently drop the donor"
+            )
+        if (
+            selection_recorded
+            and previous_phase_a.get("initialization_mode") == "global_donor"
+        ):
+            parser.error(
+                "phase_a is bound to a global-donor initialization but no "
+                "--donor-snapshot was passed"
+            )
+        return None
+
+    from scheduler import donor as donor_snapshots  # noqa: PLC0415
+
+    try:
+        snapshot = donor_snapshots.load_donor_snapshot(args.donor_snapshot)
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except OSError as exc:
+        parser.error(
+            f"--donor-snapshot requires the helper-written receipt "
+            f"{receipt_path}: {exc}"
+        )
+    except json.JSONDecodeError as exc:
+        parser.error(f"invalid global-donor receipt {receipt_path}: {exc}")
+
+    try:
+        _validate_global_donor_receipt(
+            receipt,
+            args.candidate_path.parent.name,
+            args.candidate_path,
+        )
+        if receipt["donor"]["snapshot_id"] != snapshot["snapshot_id"]:
+            raise ValueError(
+                f"global-donor receipt is bound to snapshot "
+                f"{receipt['donor']['snapshot_id']}; the run passed "
+                f"{snapshot['snapshot_id']}"
+            )
+        ordinary_count = receipt.get("ordinary_config_count")
+        if (
+            not isinstance(ordinary_count, int)
+            or isinstance(ordinary_count, bool)
+            or ordinary_count < 1
+        ):
+            raise ValueError(
+                "global-donor receipt has an invalid ordinary_config_count"
+            )
+        if receipt["status"] == "ok":
+            donor_index = receipt["warm_config_index"]
+            expected = ordinary_count + (0 if receipt["deduplicated"] else 1)
+            if len(all_configs) != expected or donor_index >= len(all_configs):
+                raise ValueError(
+                    "warm-config population does not match the global-donor "
+                    "receipt"
+                )
+            if not receipt["deduplicated"] and donor_index != ordinary_count:
+                raise ValueError(
+                    "global-donor receipt warm_config_index is inconsistent "
+                    "with its ordinary_config_count"
+                )
+            if all_configs[donor_index] != receipt["projection"]["params"]:
+                raise ValueError(
+                    "the donor warm row does not match the global-donor "
+                    "receipt projection"
+                )
+        elif len(all_configs) != ordinary_count:
+            raise ValueError(
+                "warm-config population does not match the global-donor "
+                "receipt"
+            )
+        if selection_recorded:
+            # The donor binding freezes with warm selection; the receipt
+            # embedded in phase_a is the reference (§8).  A helper-frozen
+            # receipt may legitimately carry a stale execution revision after
+            # a post-selection code fix, so freshness checks stop applying.
+            mode = "global_donor" if receipt["status"] == "ok" else "ordinary"
+            if previous_phase_a.get("initialization_mode") != mode:
+                raise ValueError(
+                    "the donor binding changed after warm selection"
+                )
+            previous_receipt = previous_phase_a.get("global_donor_transfer")
+            if not isinstance(previous_receipt, dict):
+                raise ValueError(
+                    "phase_a predates the global-donor receipt; refusing to "
+                    "bind a donor after warm selection"
+                )
+            frozen = (
+                "status",
+                "warm_config_index",
+                "deduplicated",
+                "dedup_ordinary_index",
+                "ordinary_config_count",
+            )
+            if (
+                any(
+                    previous_receipt.get(field) != receipt.get(field)
+                    for field in frozen
+                )
+                or previous_receipt.get("donor", {}).get("snapshot_id")
+                != receipt["donor"]["snapshot_id"]
+                or previous_receipt.get("projection", {}).get("params")
+                != receipt["projection"]["params"]
+            ):
+                raise ValueError(
+                    "the global-donor receipt changed after warm selection"
+                )
+        elif (
+            receipt["candidate"]["execution_revision"] != candidate_code_revision
+            or receipt["candidate"]["param_schema"]
+            != _json_native(_read_param_schema(args.candidate_path))
+        ):
+            raise ValueError(
+                "global-donor receipt is stale relative to the candidate; "
+                "re-run inject-global-donor before warm evaluation"
+            )
+    except ValueError as exc:
+        parser.error(str(exc))
+    return receipt
+
+
+def _mandatory_warm_indices(
+    control_contract: dict,
+    parameter_transfer: dict | None,
+    donor_transfer: dict | None,
+) -> tuple[int, ...]:
+    """Unified mandatory set once lineage and donor receipts are validated (§4.2)."""
+    if donor_transfer is None or donor_transfer["status"] != "ok":
+        return control_contract["mandatory_indices"]
+    indices = {donor_transfer["warm_config_index"]}
+    if parameter_transfer is not None:
+        # The lineage control keeps its mandatory slot next to the donor row;
+        # a deduplicated donor at index 0 collapses the two roles into one.
+        indices.add(0)
+    return tuple(sorted(indices))
 
 
 def _restore_warm_score_cache(
@@ -537,9 +726,83 @@ def _trial_receipt(run: WarmstartRun, proposed_index: int) -> dict:
     receipt = {
         "proposed_index": proposed_index,
     }
+    roles = []
     if run.parameter_transfer is not None and proposed_index == 0:
-        receipt["role"] = "inherited_control"
+        roles.append("inherited_control")
+    if (
+        run.donor_warm_config_index is not None
+        and proposed_index == run.donor_warm_config_index
+    ):
+        roles.append("global_donor")
+    # A deduplicated donor row can carry both roles; keep the historical
+    # plain string when there is exactly one.
+    if len(roles) == 1:
+        receipt["role"] = roles[0]
+    elif roles:
+        receipt["role"] = roles
     return receipt
+
+
+def _global_donor_observation(run: WarmstartRun) -> dict | None:
+    """The persisted donor-row observation (facts only, no eligibility call)."""
+    index = run.donor_warm_config_index
+    if index is None:
+        return None
+    for row in run.warm_rows:
+        if row.get("proposed_index") != index:
+            continue
+        if is_finite_score(row.get("score")):
+            return {
+                "warm_config_index": index,
+                "status": "finite",
+                "score": row["score"],
+                "failure_ref": None,
+            }
+        return {
+            "warm_config_index": index,
+            "status": "crash",
+            "score": None,
+            "failure_ref": row.get("failure_ref"),
+        }
+    if run.donor_preflight_rejection is not None:
+        return {
+            "warm_config_index": index,
+            "status": "preflight_rejected",
+            "score": None,
+            "failure_ref": run.donor_preflight_rejection.get("failure_ref"),
+        }
+    if run.donor_failure_row is not None:
+        # Restored crash row whose replay position has not been reached yet.
+        return {
+            "warm_config_index": index,
+            "status": "crash",
+            "score": None,
+            "failure_ref": run.donor_failure_row.get("failure_ref"),
+        }
+    return {
+        "warm_config_index": index,
+        "status": "not_evaluated",
+        "score": None,
+        "failure_ref": None,
+    }
+
+
+def _stamp_donor_facts(run: WarmstartRun) -> None:
+    """Refresh the donor observation and per-outcome row counts (§4.3)."""
+    if not run.donor_policy_active:
+        return
+    finite = crashed = 0
+    for row in run.warm_rows:
+        if is_finite_score(row.get("score")):
+            finite += 1
+        elif row.get("status") == "failed":
+            crashed += 1
+    run.phase_a["k_finite"] = finite
+    run.phase_a["k_crashed"] = crashed
+    run.phase_a["k_preflight_rejected"] = (
+        1 if run.donor_preflight_rejection is not None else 0
+    )
+    run.phase_a["global_donor_observation"] = _global_donor_observation(run)
 
 
 def _prepare_run(
@@ -616,12 +879,39 @@ def _prepare_run(
     previous_target = previous_phase_a.get("screening_target_k_eval")
     if previous_target is not None and previous_target != target_k_eval:
         parser.error("screening target changed after warm configs were selected")
+
+    # The global-donor policy pair binds the generation's donor snapshot here;
+    # old policies never read the donor receipt at all.
+    try:
+        donor_policy_active = _global_donor_policy_active(args.candidate_path)
+    except ValueError as exc:
+        parser.error(str(exc))
+    donor_transfer = None
+    if donor_policy_active:
+        donor_transfer = _load_global_donor_transfer(
+            args,
+            parser,
+            all_configs=all_configs,
+            candidate_code_revision=candidate_code_revision,
+            previous_phase_a=previous_phase_a,
+        )
+    mandatory_indices = _mandatory_warm_indices(
+        control_contract,
+        parameter_transfer,
+        donor_transfer,
+    )
+    donor_index = (
+        donor_transfer["warm_config_index"]
+        if donor_transfer is not None and donor_transfer["status"] == "ok"
+        else None
+    )
+    initialization_mode = "global_donor" if donor_index is not None else "ordinary"
     try:
         selection = select_warm_config_indices(
             len(all_configs),
             k_eval,
             previous_phase_a,
-            mandatory_indices=control_contract["mandatory_indices"],
+            mandatory_indices=mandatory_indices,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -654,6 +944,47 @@ def _prepare_run(
         candidate_code_revision=candidate_code_revision,
         parameter_transfer=parameter_transfer,
     )
+
+    # Restore a persisted donor-only failure from a previous invocation: the
+    # donor crash/rejection IS the transfer observation, so resume neither
+    # redraws nor re-evaluates it (unlike a fidelity-control crash, which the
+    # caller fixes and re-runs).
+    donor_failure_row = None
+    donor_preflight_rejection = None
+    if (
+        donor_index is not None
+        and not (parameter_transfer is not None and donor_index == 0)
+        and phase_revision_matches
+        and previous_phase_a.get("parameter_transfer") == parameter_transfer
+    ):
+        previous_observation = previous_phase_a.get("global_donor_observation")
+        if (
+            isinstance(previous_observation, dict)
+            and previous_observation.get("warm_config_index") == donor_index
+        ):
+            if previous_observation.get("status") == "crash":
+                for row in previous_phase_a.get("warm_start_configs", []):
+                    if (
+                        isinstance(row, dict)
+                        and row.get("proposed_index") == donor_index
+                        and not is_finite_score(row.get("score"))
+                    ):
+                        donor_failure_row = dict(row)
+                        break
+                if donor_failure_row is None:
+                    donor_failure_row = {
+                        "params": cast_params_to_search_space(
+                            dict(all_configs[donor_index]),
+                            search_space,
+                        ),
+                        "score": None,
+                        "status": "failed",
+                        "proposed_index": donor_index,
+                        "role": "global_donor",
+                        "failure_ref": previous_observation.get("failure_ref"),
+                    }
+            elif previous_observation.get("status") == "preflight_rejected":
+                donor_preflight_rejection = previous_observation
 
     # Rebuild the running Phase-A view while preserving its cumulative budget.
     trials_attempted = previous_phase_a.get("trials_attempted", 0)
@@ -719,6 +1050,45 @@ def _prepare_run(
                 "incumbent_score"
             ],
         }
+    if donor_policy_active:
+        # Facts only: initialization_mode is the single interpretation source
+        # for the first tuning bout; eligibility judgments live downstream.
+        phase_a["initialization_mode"] = initialization_mode
+        if donor_transfer is None:
+            phase_a["global_donor_transfer"] = None
+        else:
+            embedded = dict(donor_transfer)
+            if donor_transfer["status"] == "ok":
+                # The receipt's reserved fields are computed here, where
+                # mandatory roles are owned; the helper-owned file itself
+                # stays untouched.
+                embedded["mandatory_role_indices"] = list(mandatory_indices)
+                embedded["k_eval"] = k_eval
+            phase_a["global_donor_transfer"] = embedded
+        if donor_index is None:
+            observation = None
+        elif donor_failure_row is not None:
+            observation = {
+                "warm_config_index": donor_index,
+                "status": "crash",
+                "score": None,
+                "failure_ref": donor_failure_row.get("failure_ref"),
+            }
+        elif donor_preflight_rejection is not None:
+            observation = {
+                "warm_config_index": donor_index,
+                "status": "preflight_rejected",
+                "score": None,
+                "failure_ref": donor_preflight_rejection.get("failure_ref"),
+            }
+        else:
+            observation = {
+                "warm_config_index": donor_index,
+                "status": "not_evaluated",
+                "score": None,
+                "failure_ref": None,
+            }
+        phase_a["global_donor_observation"] = observation
     write_tune_report(args.tune_report_json, report)
 
     return WarmstartRun(
@@ -740,6 +1110,10 @@ def _prepare_run(
         cache=cache,
         trials_attempted=trials_attempted,
         started=time.time(),
+        donor_policy_active=donor_policy_active,
+        donor_warm_config_index=donor_index,
+        donor_failure_row=donor_failure_row,
+        donor_preflight_rejection=donor_preflight_rejection,
     )
 
 
@@ -754,10 +1128,17 @@ def _preflight_config(
     params: dict,
     proposed_index: int,
     evaluation_position: int,
-) -> bool:
-    """Run and persist one no-score feasibility check; false means stop."""
+    fatal: bool = True,
+) -> str:
+    """Run and persist one no-score feasibility check.
+
+    Returns "evaluate" to proceed to the objective, "stop" after a fatal
+    rejection (the historical fail-closed path), or "skip" when a donor-only
+    row was rejected: the rejection is persisted as the donor observation and
+    the evaluation loop continues with the remaining selected rows.
+    """
     if not run.preflight_enabled:
-        return True
+        return "evaluate"
     try:
         result = timed_preflight(
             params,
@@ -787,8 +1168,16 @@ def _preflight_config(
         run.preflight_report["invocations"] = len(
             run.preflight_report["attempts"]
         )
-        run.preflight_report["status"] = "failed"
+        if run.donor_warm_config_index == proposed_index:
+            run.donor_preflight_rejection = failure
         run.phase_a["warm_start_configs"] = run.warm_rows
+        _stamp_donor_facts(run)
+        if not fatal:
+            # A donor-only rejection consumes no objective slot and does not
+            # stop the screening; it is the persisted transfer observation.
+            write_tune_report(run.report_path, run.report)
+            return "skip"
+        run.preflight_report["status"] = "failed"
         run.phase_a["status"] = "preflight_failed"
         write_tune_report(run.report_path, run.report)
         write_json(
@@ -802,7 +1191,7 @@ def _preflight_config(
                 **failure,
             }
         )
-        return False
+        return "stop"
 
     run.preflight_report.setdefault("attempts", []).append(
         {
@@ -816,7 +1205,7 @@ def _preflight_config(
         run.preflight_report["attempts"]
     )
     write_tune_report(run.report_path, run.report)
-    return True
+    return "evaluate"
 
 
 def _finish_budget_exhausted(
@@ -829,7 +1218,9 @@ def _finish_budget_exhausted(
     if run.preflight_enabled:
         run.preflight_report["status"] = "ok"
 
-    recovered = list(run.warm_rows)
+    # `recovered` IS the live row list so donor-fact stamping below sees the
+    # cache-recovered suffix too (e.g. a donor row scored in a prior run).
+    recovered = run.warm_rows
     truly_unscored = []
     for position in range(current_position, len(run.configs)):
         remaining_params = cast_params_to_search_space(
@@ -885,6 +1276,7 @@ def _finish_budget_exhausted(
                 "budget_exhausted": True,
             }
         )
+        _stamp_donor_facts(run)
         write_tune_report(run.report_path, run.report)
         write_json(
             {
@@ -901,6 +1293,7 @@ def _finish_budget_exhausted(
         return 0
 
     run.phase_a["status"] = "budget_exhausted"
+    _stamp_donor_facts(run)
     write_tune_report(run.report_path, run.report)
     write_json(
         {
@@ -921,7 +1314,8 @@ def _record_objective_failure(
     evaluation_position: int,
     trial_receipt: dict,
     error: Exception,
-) -> int:
+    fatal: bool = True,
+) -> int | None:
     run.trials_attempted += 1
     run.phase_a["trials_attempted"] = run.trials_attempted
     tb = traceback.format_exc()
@@ -945,6 +1339,12 @@ def _record_objective_failure(
         }
     )
     run.phase_a["warm_start_configs"] = run.warm_rows
+    _stamp_donor_facts(run)
+    if not fatal:
+        # The donor row's crash is the transfer observation, not a candidate
+        # crash; the remaining selected rows still get evaluated (§4.3).
+        write_tune_report(run.report_path, run.report)
+        return None
     run.phase_a["status"] = "crashed"
     write_tune_report(run.report_path, run.report)
     write_json(
@@ -964,7 +1364,22 @@ def _finish_phase_a(run: WarmstartRun) -> int:
     """Apply the best finite row and persist the successful Phase A."""
     selectable = finite_warm_incumbent_rows(run.warm_rows)
     if not selectable:
-        raise RuntimeError("warm evaluation produced no finite warm row")
+        # Reachable only when every selected row failed non-fatally (the
+        # donor-only treatment path); the candidate follows the crash path.
+        run.phase_a["warm_start_configs"] = run.warm_rows
+        run.phase_a["status"] = "crashed"
+        _stamp_donor_facts(run)
+        write_tune_report(run.report_path, run.report)
+        write_json(
+            {
+                "phase": "a",
+                "status": "crashed",
+                "reason": "no finite warm row",
+                "k_evaluated": len(run.configs),
+                "trials_attempted": run.trials_attempted,
+            }
+        )
+        return CRASHED
     best_params, best_warm_score = min(
         ((trial["params"], trial["score"]) for trial in selectable),
         key=lambda item: item[1],
@@ -983,28 +1398,33 @@ def _finish_phase_a(run: WarmstartRun) -> int:
             "status": "ok",
         }
     )
+    _stamp_donor_facts(run)
     if run.preflight_enabled:
         run.preflight_report["status"] = "ok"
     write_tune_report(run.report_path, run.report)
 
-    write_json(
-        {
-            "phase": "a",
-            "status": "ok",
-            "k_evaluated": len(run.configs),
-            "k_survived": len(run.warm_rows),
-            "trials_attempted": run.trials_attempted,
-            "warm_config_selection": run.selection,
-            **(
-                {"inherited_control": run.phase_a["inherited_control"]}
-                if run.parameter_transfer is not None
-                else {}
-            ),
-            "best_warm_score": best_warm_score,
-            "best_warm_params": best_params,
-            "elapsed_seconds": round(elapsed, 1),
-        }
-    )
+    completion = {
+        "phase": "a",
+        "status": "ok",
+        "k_evaluated": len(run.configs),
+        "k_survived": len(run.warm_rows),
+        "trials_attempted": run.trials_attempted,
+        "warm_config_selection": run.selection,
+        **(
+            {"inherited_control": run.phase_a["inherited_control"]}
+            if run.parameter_transfer is not None
+            else {}
+        ),
+        "best_warm_score": best_warm_score,
+        "best_warm_params": best_params,
+        "elapsed_seconds": round(elapsed, 1),
+    }
+    if run.donor_policy_active:
+        completion["initialization_mode"] = run.phase_a["initialization_mode"]
+        completion["global_donor_observation"] = run.phase_a[
+            "global_donor_observation"
+        ]
+    write_json(completion)
     return 0
 
 
@@ -1015,13 +1435,34 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
         proposed_index = run.selected_indices[position]
         params = cast_params_to_search_space(dict(raw), run.search_space)
         trial_receipt = _trial_receipt(run, proposed_index)
-        if not _preflight_config(
+        # A donor-only row is a failable treatment, not a fidelity control:
+        # its recorded failure does not stop the remaining selected rows.  A
+        # donor row that also carries the lineage control stays fail-closed.
+        donor_only = (
+            run.donor_warm_config_index is not None
+            and proposed_index == run.donor_warm_config_index
+            and not (run.parameter_transfer is not None and proposed_index == 0)
+        )
+        if donor_only and run.donor_failure_row is not None:
+            run.warm_rows.append(dict(run.donor_failure_row))
+            run.phase_a["warm_start_configs"] = run.warm_rows
+            _stamp_donor_facts(run)
+            write_tune_report(run.report_path, run.report)
+            continue
+        if donor_only and run.donor_preflight_rejection is not None:
+            continue
+
+        preflight = _preflight_config(
             run,
             params=params,
             proposed_index=proposed_index,
             evaluation_position=position,
-        ):
+            fatal=not donor_only,
+        )
+        if preflight == "stop":
             return CRASHED
+        if preflight == "skip":
+            continue
 
         key = _params_key(params)
         if key in run.cache:
@@ -1049,14 +1490,18 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
                     error=exc,
                 )
             except Exception as exc:
-                return _record_objective_failure(
+                outcome = _record_objective_failure(
                     run,
                     params=params,
                     proposed_index=proposed_index,
                     evaluation_position=position,
                     trial_receipt=trial_receipt,
                     error=exc,
+                    fatal=not donor_only,
                 )
+                if outcome is not None:
+                    return outcome
+                continue
             run.trials_attempted += 1
             run.phase_a["trials_attempted"] = run.trials_attempted
             run.warm_rows.append(
@@ -1067,6 +1512,7 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
             run.phase_a["warm_score_cache"] = _cache_receipt(run)
 
         run.phase_a["warm_start_configs"] = run.warm_rows
+        _stamp_donor_facts(run)
         write_tune_report(run.report_path, run.report)
 
     return _finish_phase_a(run)
