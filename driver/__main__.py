@@ -14,6 +14,7 @@ SEMANTIC_POLICIES = (
     "gain",
     "gain_uncertainty",
     "gain_uncertainty_nocost",
+    "judged_slate",
 )
 
 

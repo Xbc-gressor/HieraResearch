@@ -32,9 +32,12 @@ class InvocationContext:
     round_no: int | None = None
     extra: dict = field(default_factory=dict)
     resume_session_id: str | None = None
+    # A verbatim bounded payload for tool-free roles (e.g. the slate judge's
+    # prepared prompt text). None keeps the historical message byte-identical.
+    inline_payload: str | None = None
 
     def user_message(self) -> str:
-        """Paths and compact ids only — durable artifacts are the payload."""
+        """Paths and compact ids first; an inline payload follows a fixed delimiter."""
         lines = [
             f"task: {self.task}",
             f"tag: {self.tag}",
@@ -46,7 +49,10 @@ class InvocationContext:
             lines.append(f"round: {self.round_no}")
         for key, value in self.extra.items():
             lines.append(f"{key}: {value}")
-        return "\n".join(lines)
+        message = "\n".join(lines)
+        if self.inline_payload is not None:
+            message += "\n\n---\n\n" + self.inline_payload
+        return message
 
     def postcondition_checklist(self, role: "RoleDefinition") -> str:
         items = "\n".join(f"- {check.__doc__}" for check in role.postconditions)
@@ -292,5 +298,35 @@ ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"edited": "bool", "summary": "str"},
         postconditions=(editor_train_py_exists,),
+    ),
+    # judged_slate arm: a tool-free listwise judge. The bounded payload
+    # arrives as the invocation context's inline_payload; the receipt's
+    # ranking is the only decision input (rationale is audit-only). The one
+    # corrective chance is a resume of this rollout's own session owned by
+    # the driver's _invoke_slate_judge, so the generic repair loop is off.
+    "slate-judge": RoleDefinition(
+        name="slate-judge",
+        prompt_file="slate-judge.md",
+        tools=(),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={"ranking": "list", "rationale": "str"},
+        corrective_attempts=0,
+        max_turns=8,
+    ),
+    # judged_slate arm: writes the PLAN for exactly one frozen slate seat.
+    # Read-only: the driver persists the receipt as plans/slot-N.json; the
+    # ledger admission helper owns every durable state change.
+    "slate-plan-writer": RoleDefinition(
+        name="slate-plan-writer",
+        prompt_file="slate-plan-writer.md",
+        tools=("Read",),
+        disallowed=_BASE_DISALLOWED + ("Write", "Edit", "Bash"),
+        receipt_schema={
+            "slot": "int",
+            "idea": "str",
+            "change": "str",
+            "candidate_name": "str",
+            "route_provenance": "?dict",
+        },
     ),
 }

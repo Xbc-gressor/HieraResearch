@@ -30,6 +30,18 @@ class ContextTests(unittest.TestCase):
             self.assertIn(str(Path(tmp)), msg)
             self.assertIn("003", msg)
 
+    def test_inline_payload_default_keeps_message_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = make_ctx(Path(tmp), run_id="003", round_no=2,
+                            extra={"k": "v"})
+            self.assertIsNone(base.inline_payload)
+            legacy = base.user_message()
+            self.assertEqual(base.user_message(), legacy)
+            with_payload = make_ctx(Path(tmp), run_id="003", round_no=2,
+                                    extra={"k": "v"}, inline_payload="PAYLOAD")
+            self.assertEqual(with_payload.user_message(),
+                             legacy + "\n\n---\n\nPAYLOAD")
+
     def test_checklist_lists_postcondition_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             role = ROLES["candidate-writer"]
@@ -43,6 +55,7 @@ class RegistryTests(unittest.TestCase):
         "background-researcher", "idea-generator", "candidate-writer",
         "tunable-contract-extractor", "tuner-orchestrator",
         "experience-extractor", "crash-diagnosis", "hillclimb-editor",
+        "slate-judge", "slate-plan-writer",
     }
 
     def test_all_roles_registered(self) -> None:
@@ -55,11 +68,18 @@ class RegistryTests(unittest.TestCase):
                 self.assertIn(banned, role.disallowed, role.name)
 
     def test_read_only_roles_drop_write_tools(self) -> None:
-        for name in ("crash-diagnosis",):
+        for name in ("crash-diagnosis", "slate-plan-writer"):
             role = ROLES[name]
             for write_tool in ("Edit", "Write"):
                 self.assertNotIn(write_tool, role.tools, name)
                 self.assertIn(write_tool, role.disallowed, name)
+
+    def test_slate_judge_is_tool_free_and_bounded(self) -> None:
+        role = ROLES["slate-judge"]
+        self.assertEqual(role.tools, ())
+        self.assertEqual(role.postconditions, ())
+        self.assertEqual(role.corrective_attempts, 0)
+        self.assertIsNotNone(role.max_turns)
 
     def test_tools_tuples_match_retired_agent_frontmatter(self) -> None:
         """Pin each role's positive capability set to exactly the retired
@@ -67,6 +87,8 @@ class RegistryTests(unittest.TestCase):
 
         The fail-closed PreToolUse hook enforces exactly these sets, so any
         drift here is a real permission grant or denial and must fail loudly.
+        The judged-slate roles have no retired agent; their entries pin the
+        new contract instead.
         """
         expected = {
             "background-researcher":
@@ -79,6 +101,8 @@ class RegistryTests(unittest.TestCase):
             "experience-extractor": ("Read", "Write", "Bash"),
             "crash-diagnosis": ("Read", "Bash", "Glob", "Grep"),
             "hillclimb-editor": ("Read", "Write", "Edit", "Bash", "Glob"),
+            "slate-judge": (),
+            "slate-plan-writer": ("Read",),
         }
         self.assertEqual(set(ROLES), set(expected))
         for name, tools in expected.items():

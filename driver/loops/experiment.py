@@ -25,6 +25,7 @@ the complete lifecycle.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -102,7 +103,8 @@ def _scheduler_stopped(run_dir: Path) -> bool:
 
 
 def _invoke(runner, store, role_name, task, tag, run_dir, *,
-            run_id=None, round_no=None, extra=None, resume_from=None) -> dict:
+            run_id=None, round_no=None, extra=None, resume_from=None,
+            inline_payload=None) -> dict:
     """Invoke one role and return its persisted receipt plus invocation id."""
     inv_id = store.next_invocation_id()
     resume = (store.load_session_id(role_name, resume_from)
@@ -110,7 +112,8 @@ def _invoke(runner, store, role_name, task, tag, run_dir, *,
     ctx = InvocationContext(task=task, tag=tag, run_dir=run_dir,
                             invocation_id=inv_id, run_id=run_id,
                             round_no=round_no, extra=extra or {},
-                            resume_session_id=resume)
+                            resume_session_id=resume,
+                            inline_payload=inline_payload)
     try:
         runner.run(ROLES[role_name], ctx)
     except InvocationFailed as exc:
@@ -277,6 +280,484 @@ def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
         _or_block(run_dir, repo_root, cmd, events,
                   f"idea actions not admitted after retry: {missing}")
     return receipt.get("actions", [])
+
+
+# =============================================================================
+# Judged-slate generation (semantic_search.policy == "judged_slate")
+# =============================================================================
+#
+# One generation: action lanes -> per-lane proposals -> pool + shared A1
+# context -> two independent judge rollouts (+ one boundary rollout on
+# disagreement; coverage fallback on failure) -> immutable manifest -> one
+# PLAN per seat -> one atomic two-seat admission -> the regular
+# materialize/implement pipeline.  Every decision lives in tools/ CLIs; this
+# section owns lifecycle, sessions, and resume.  The manifest is the commit
+# point: before it the same gen_no is rebuilt, after it judges never re-run.
+
+
+_SLATE_REGULAR_STAGES = ("regular-0", "regular-1")
+
+
+def _semantic_policy(run_dir: Path) -> str | None:
+    """Read the semantic policy frozen into this run's framework config."""
+    config_path = run_dir / "framework_cfg.json"
+    section = json.loads(config_path.read_text(encoding="utf-8")).get(
+        "semantic_search")
+    return section.get("policy") if isinstance(section, dict) else None
+
+
+def _slate_route_arm(run_dir: Path) -> int:
+    """n_route_sketches from the frozen framework config (0 = arm inactive)."""
+    config_path = run_dir / "framework_cfg.json"
+    section = json.loads(config_path.read_text(encoding="utf-8")).get(
+        "semantic_search")
+    sketches = section.get("n_route_sketches", 0) if isinstance(section, dict) else 0
+    return sketches if isinstance(sketches, int) and not isinstance(
+        sketches, bool) else 0
+
+
+def _slate_cmd(run_dir, repo_root, cmd, events, args, what: str):
+    """A tools/ subprocess whose failure blocks the run (fail closed)."""
+    try:
+        return cmd(args, repo_root)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or str(exc)).strip()
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"judged-slate {what} failed: {detail}")
+
+
+def _find_open_slate_generation(run_dir: Path) -> tuple[Path, int, dict | None]:
+    """The generation this round resumes into: (gen_dir, gen_no, manifest).
+
+    ``manifest`` is the newest committed generation.json whose seats are not
+    all in the ledger with a matching schema-8 binding — that generation must
+    be resumed (or, for a binding violation, blocked by the caller).  When no
+    manifest exists or the newest is fully admitted, ``manifest`` is None and
+    (gen_dir, gen_no) name the next generation, whose provisional artifacts
+    may be overwritten.
+    """
+    semantic = run_dir / ".semantic"
+    count = (
+        sum(1 for _ in semantic.glob("gen-*/generation.json"))
+        if semantic.is_dir() else 0
+    )
+    if count:
+        gen_dir = semantic / f"gen-{count:04d}"
+        manifest = json.loads(
+            (gen_dir / "generation.json").read_text(encoding="utf-8"))
+        seats = _slate_seat_records(run_dir, manifest)
+        if any(seat is None for seat in seats) \
+                or _slate_binding_errors(manifest, seats):
+            return gen_dir, count, manifest
+    gen_no = count + 1
+    return semantic / f"gen-{gen_no:04d}", gen_no, None
+
+
+def _construct_slate_generation(run_dir, gen_dir, repo_root, cmd,
+                                events) -> dict | None:
+    """lanes -> per-lane proposals -> pool + shared A1 context.
+
+    Returns the pool document, or None when the admission cap is zero (a
+    valid budget-boundary no-op: nothing is admitted this generation).
+    """
+    lanes_path = gen_dir / "lanes.json"
+    _slate_cmd(run_dir, repo_root, cmd, events,
+               ["python", "tools/got_select.py", "decide",
+                "--ledger", run_dir / "ledger.json",
+                "--mode", "lanes", "--output", lanes_path], "lanes decide")
+    lanes_doc = json.loads(lanes_path.read_text(encoding="utf-8"))
+    if (lanes_doc.get("budget") or {}).get("admission_cap") == 0:
+        return None
+    proposals_dir = gen_dir / "proposals"
+    for lane in lanes_doc.get("lanes") or []:
+        _slate_cmd(run_dir, repo_root, cmd, events,
+                   ["python", "tools/semantic_search.py", "propose",
+                    "--background", run_dir / "background.md",
+                    "--ledger", run_dir / "ledger.json",
+                    "--op", lane["op"],
+                    "--parents", ",".join(lane["parents"]),
+                    "--max-points", "24",
+                    "--output", proposals_dir / f"{lane['lane_id']}.json"],
+                   f"propose {lane['lane_id']}")
+    _slate_cmd(run_dir, repo_root, cmd, events,
+               ["python", "tools/slate.py", "construct",
+                "--lanes", lanes_path,
+                "--proposals-dir", proposals_dir,
+                "--ledger", run_dir / "ledger.json",
+                "--background", run_dir / "background.md",
+                "--pool-output", gen_dir / "pool.json",
+                "--context-output", gen_dir / "context.json"], "construct")
+    pool_doc = json.loads((gen_dir / "pool.json").read_text(encoding="utf-8"))
+    events.emit("slate_pool_built", gen_no=pool_doc["gen_no"],
+                pool_size=len(pool_doc["pool"]),
+                pool_digest=pool_doc["pool_digest"],
+                lanes_without_proposals=pool_doc["lanes_without_proposals"])
+    return pool_doc
+
+
+def _slate_judge_needed(pool_doc: dict) -> bool:
+    """Whether this generation spawns judge sessions at all.
+
+    Lifecycle mirror of the cardinality gate tools/slate.py enforces at
+    aggregate time: judges run only when the pool can fill past one seat and
+    the admission cap allows two.  The selection itself is never recomputed
+    here; `aggregate` stays the decider.
+    """
+    pool_n = len(pool_doc.get("pool") or [])
+    cap = (pool_doc.get("budget") or {}).get("admission_cap")
+    return pool_n > 2 and (cap is None or cap >= 2)
+
+
+def _validate_judge_stage(run_dir, gen_dir, stage, receipt_path, session_id,
+                          model, repo_root, cmd, events) -> dict:
+    """Write the stage artifact; an invalid permutation (exit 1) still writes."""
+    out_path = gen_dir / "judgments" / f"{stage}.json"
+    args = ["python", "tools/slate.py", "validate-judge",
+            "--input", gen_dir / "judgments" / f"{stage}.input.json",
+            "--output", out_path]
+    if receipt_path is not None and Path(receipt_path).exists():
+        args += ["--receipt", receipt_path]
+    if session_id:
+        args += ["--session-id", session_id]
+    if model:
+        args += ["--model", model]
+    cmd(args, repo_root, check=False)
+    if not out_path.exists():
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"validate-judge produced no stage artifact for {stage}")
+    return json.loads(out_path.read_text(encoding="utf-8"))
+
+
+def _invoke_slate_judge(runner, store, task, tag, run_dir, gen_dir, stage, *,
+                        round_no, model, repo_root, cmd, events,
+                        labels=None) -> None:
+    """One judge rollout: fresh session, validate, ONE corrective resume.
+
+    Both failure kinds — no accepted receipt, or a receipt the deterministic
+    permutation check rejects — share the single resume allowance, which
+    chains onto this rollout's own session with the deterministic errors.
+    A second failure persists a failed stage artifact; `aggregate` then takes
+    the coverage fallback.  Regular stages always start fresh
+    (resume_from=None); so does the boundary stage.
+    """
+    judgments = gen_dir / "judgments"
+    judgments.mkdir(parents=True, exist_ok=True)
+    input_path = judgments / f"{stage}.input.json"
+    args = ["python", "tools/slate.py", "prepare-judge",
+            "--pool", gen_dir / "pool.json",
+            "--context", gen_dir / "context.json",
+            "--stage", stage,
+            "--output", input_path]
+    if labels:
+        args += ["--labels", ",".join(labels)]
+    task_brief = repo_root / "tasks" / task / "TASK.md"
+    if task_brief.is_file():
+        args += ["--task-brief", task_brief]
+    _slate_cmd(run_dir, repo_root, cmd, events, args, f"prepare-judge {stage}")
+    prompt_text = json.loads(input_path.read_text(encoding="utf-8"))[
+        "prompt_text"]
+    extra = {"stage": stage, "gen_dir": str(gen_dir)}
+
+    inv_id = None
+    problems = None
+    try:
+        _, inv_id = _invoke(runner, store, "slate-judge", task, tag, run_dir,
+                            round_no=round_no, extra=extra,
+                            inline_payload=prompt_text)
+    except InvocationFailed as exc:
+        inv_id = exc.invocation_id
+        problems = [str(p) for p in exc.problems]
+    artifact = _validate_judge_stage(
+        run_dir, gen_dir, stage,
+        store.receipt_path("slate-judge", inv_id) if inv_id is not None else None,
+        store.load_session_id("slate-judge", inv_id)
+        if inv_id is not None else None,
+        model, repo_root, cmd, events)
+    if artifact.get("status") == "valid":
+        return
+    reason = "; ".join(problems or artifact.get("errors")
+                       or ["judge receipt invalid"])
+    note = ("Your previous judge receipt was rejected by the deterministic "
+            "validator: " + reason + ". Re-submit the receipt with `ranking` "
+            "holding every presented candidate label exactly once.")
+    try:
+        _, inv_id = _invoke(runner, store, "slate-judge", task, tag, run_dir,
+                            round_no=round_no,
+                            extra={**extra, "correction_note": note},
+                            resume_from=inv_id, inline_payload=prompt_text)
+    except InvocationFailed as exc:
+        inv_id = exc.invocation_id
+    _validate_judge_stage(
+        run_dir, gen_dir, stage,
+        store.receipt_path("slate-judge", inv_id) if inv_id is not None else None,
+        store.load_session_id("slate-judge", inv_id)
+        if inv_id is not None else None,
+        model, repo_root, cmd, events)
+
+
+def _slate_aggregate(run_dir, gen_dir, repo_root, cmd, events) -> dict:
+    """Run `slate.py aggregate`; the small stdout status drives orchestration."""
+    out = _slate_cmd(run_dir, repo_root, cmd, events,
+                     ["python", "tools/slate.py", "aggregate",
+                      "--pool", gen_dir / "pool.json",
+                      "--context", gen_dir / "context.json",
+                      "--judgments-dir", gen_dir / "judgments",
+                      "--output", gen_dir / "judge.json"], "aggregate")
+    return json.loads(out.stdout)
+
+
+def _run_slate_judges(runner, store, task, tag, run_dir, gen_dir, pool_doc,
+                      round_no, model, repo_root, cmd, events) -> dict:
+    """Run the judged (or degraded) aggregation; return the final status."""
+    if not _slate_judge_needed(pool_doc):
+        return _slate_aggregate(run_dir, gen_dir, repo_root, cmd, events)
+    for stage in _SLATE_REGULAR_STAGES:
+        _invoke_slate_judge(runner, store, task, tag, run_dir, gen_dir, stage,
+                            round_no=round_no, model=model,
+                            repo_root=repo_root, cmd=cmd, events=events)
+    status = _slate_aggregate(run_dir, gen_dir, repo_root, cmd, events)
+    if status.get("status") == "boundary_required":
+        _invoke_slate_judge(runner, store, task, tag, run_dir, gen_dir,
+                            "boundary", round_no=round_no, model=model,
+                            repo_root=repo_root, cmd=cmd, events=events,
+                            labels=status["boundary_labels"])
+        status = _slate_aggregate(run_dir, gen_dir, repo_root, cmd, events)
+    if status.get("status") == "fallback":
+        events.emit("slate_judge_fallback", gen_no=pool_doc["gen_no"],
+                    reason=status.get("reason"))
+    elif status.get("status") == "selected":
+        events.emit("slate_judge_completed", gen_no=pool_doc["gen_no"],
+                    path=status.get("path"), slate=status.get("slate"))
+    return status
+
+
+def _reserved_run_ids(run_dir: Path, count: int) -> list[str]:
+    """Consecutive run ids, mirroring tools/ledger_core.next_run_id's rule."""
+    records = _ledger_records(run_dir)
+    numeric = [int(r["run_id"]) for r in records
+               if str(r.get("run_id", "")).isdigit()]
+    width = max([3] + [len(str(r["run_id"])) for r in records
+                       if str(r.get("run_id", "")).isdigit()])
+    start = max(numeric) + 1 if numeric else 0
+    return [f"{start + index:0{width}d}" for index in range(count)]
+
+
+def _commit_slate_manifest(run_dir, gen_dir, slate_size, repo_root, cmd,
+                           events) -> dict:
+    """Reserve run ids and atomically write the immutable generation.json."""
+    reserved = _reserved_run_ids(run_dir, slate_size)
+    _slate_cmd(run_dir, repo_root, cmd, events,
+               ["python", "tools/slate.py", "build-manifest",
+                "--lanes", gen_dir / "lanes.json",
+                "--pool", gen_dir / "pool.json",
+                "--context", gen_dir / "context.json",
+                "--judge", gen_dir / "judge.json",
+                "--reserved-run-ids", ",".join(reserved),
+                "--output", gen_dir / "generation.json"], "build-manifest")
+    manifest = json.loads(
+        (gen_dir / "generation.json").read_text(encoding="utf-8"))
+    events.emit("slate_manifested", gen_no=manifest["gen_no"],
+                generation_id=manifest["generation_id"],
+                reserved_run_ids=reserved,
+                aggregation=manifest["aggregation"].get("path"))
+    return manifest
+
+
+def _slate_plan_problems(plan, slot: dict, route_arm: int) -> list[str]:
+    """Driver-side receipt/plan checks: non-empty fields and slot binding."""
+    if not isinstance(plan, dict):
+        return ["plan is not a JSON object"]
+    problems = []
+    if plan.get("slot") != slot["slot"]:
+        problems.append(
+            f"plan slot {plan.get('slot')!r} != seat slot {slot['slot']}")
+    for field_name in ("idea", "change", "candidate_name"):
+        if not isinstance(plan.get(field_name), str) \
+                or not plan[field_name].strip():
+            problems.append(f"plan needs a non-empty {field_name}")
+    if slot["carrier"]["op"] == "fresh":
+        expected = f"from scratch at {slot['point_id']}"
+        if isinstance(plan.get("change"), str) \
+                and plan["change"].strip() != expected:
+            problems.append(f"fresh-seat change must be {expected!r}")
+    if route_arm and not isinstance(plan.get("route_provenance"), dict):
+        problems.append(
+            "route arm is active: plan needs a route_provenance object")
+    return problems
+
+
+def _slate_plan_payload(slot: dict, pool_doc: dict, context_doc: dict,
+                        route_memory_path) -> str:
+    """The bounded plan input, bound to the manifest's point and carrier."""
+    entry = next(entry for entry in pool_doc["pool"]
+                 if entry["label"] == slot["label"])
+    parts = [
+        "Frozen slot assignment (binding; the slate decision is final):",
+        json.dumps({
+            "slot": slot["slot"],
+            "run_id": slot["run_id"],
+            "label": slot["label"],
+            "candidate_id": slot["candidate_id"],
+            "point_id": slot["point_id"],
+            "point": slot["point"],
+            "carrier": slot["carrier"],
+        }, indent=2),
+        "Candidate summary exactly as the judges saw it:",
+        json.dumps(entry["summary"], indent=2),
+        str(context_doc.get("rendered_text") or ""),
+    ]
+    if route_memory_path is not None:
+        parts.append(
+            f"Route memory for this seat (read before planning routes): "
+            f"{route_memory_path}")
+    return "\n\n".join(parts) + "\n"
+
+
+def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
+                        round_no, repo_root, cmd, events) -> None:
+    """One plan per seat; only missing or invalid plans are (re)written."""
+    plans_dir = gen_dir / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    route_arm = _slate_route_arm(run_dir)
+    pool_doc = json.loads((gen_dir / "pool.json").read_text(encoding="utf-8"))
+    context_doc = json.loads(
+        (gen_dir / "context.json").read_text(encoding="utf-8"))
+    for slot in manifest["slate"]:
+        plan_path = plans_dir / f"slot-{slot['slot']}.json"
+        if plan_path.exists():
+            try:
+                existing = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if existing is not None and not _slate_plan_problems(
+                    existing, slot, route_arm):
+                continue
+        route_memory_path = None
+        if route_arm:
+            point_path = plans_dir / f"slot-{slot['slot']}.point.json"
+            point_path.write_text(
+                json.dumps(slot["point"], indent=2) + "\n", encoding="utf-8")
+            route_memory_path = plans_dir / f"slot-{slot['slot']}.route-memory.json"
+            _slate_cmd(run_dir, repo_root, cmd, events,
+                       ["python", "tools/semantic_routes.py", "memory",
+                        "--ledger", run_dir / "ledger.json",
+                        "--point", point_path,
+                        "--op", slot["carrier"]["op"],
+                        "--output", route_memory_path], "route memory")
+        extra = {"slot": slot["slot"], "candidate_id": slot["candidate_id"],
+                 "gen_dir": str(gen_dir)}
+        if route_arm:
+            extra["n_route_sketches"] = route_arm
+            extra["route_memory"] = str(route_memory_path)
+        try:
+            receipt, _ = _invoke(
+                runner, store, "slate-plan-writer", task, tag, run_dir,
+                run_id=slot["run_id"], round_no=round_no, extra=extra,
+                inline_payload=_slate_plan_payload(
+                    slot, pool_doc, context_doc, route_memory_path))
+        except InvocationFailed as exc:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"slate-plan-writer failed for slot {slot['slot']}: "
+                      f"{exc.problems}")
+        problems = _slate_plan_problems(receipt, slot, route_arm)
+        if problems:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"slate plan for slot {slot['slot']} is invalid: "
+                      f"{problems}")
+        plan = {key: receipt[key]
+                for key in ("slot", "idea", "change", "candidate_name",
+                            "route_provenance")
+                if key in receipt}
+        tmp = plan_path.with_name(plan_path.name + ".tmp")
+        tmp.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        os.replace(tmp, plan_path)
+
+
+def _admit_slate(run_dir, gen_dir, repo_root, cmd, events) -> None:
+    """The single atomic two-seat admission (tools/ledger.py owns the write)."""
+    _slate_cmd(run_dir, repo_root, cmd, events,
+               ["python", "tools/ledger.py", "admit-slate",
+                "--ledger", run_dir / "ledger.json",
+                "--background", run_dir / "background.md",
+                "--manifest", gen_dir / "generation.json",
+                "--plans-dir", gen_dir / "plans"], "admit-slate")
+
+
+def _slate_seat_records(run_dir: Path, manifest: dict) -> list:
+    """Each seat's ledger record, or None; binding errors on present seats."""
+    by_id = {str(r.get("run_id")): r for r in _ledger_records(run_dir)}
+    return [by_id.get(slot["run_id"]) for slot in manifest["slate"]]
+
+
+def _slate_binding_errors(manifest: dict, seats: list) -> list[str]:
+    """A present seat must carry this manifest's schema-8 judge binding."""
+    errors = []
+    for slot, record in zip(manifest["slate"], seats):
+        if record is None:
+            continue
+        receipt = record.get("policy_receipt")
+        judge = receipt.get("judge") if isinstance(receipt, dict) else None
+        if not isinstance(judge, dict) \
+                or receipt.get("schema_version") != 8 \
+                or receipt.get("generation_id") != manifest["generation_id"] \
+                or judge.get("candidate_id") != slot["candidate_id"]:
+            errors.append(f"seat {slot['run_id']} does not carry the "
+                          "manifest's schema-8 judge binding")
+    return errors
+
+
+def _evaluate_admitted_slate(runner, store, task, tag, run_dir, manifest,
+                             repo_root, cmd, events, job_runner) -> None:
+    """Evaluate the seats in slot order; a slot-0 crash never refills it."""
+    for slot in manifest["slate"]:
+        if budget_status(run_dir, repo_root, cmd).get("reached"):
+            break
+        run_id = slot["run_id"]
+        _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
+        _implement_candidate(runner, store, task, tag, run_dir, run_id,
+                             repo_root, cmd, events, job_runner)
+
+
+def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
+                                repo_root, cmd, events, model,
+                                job_runner) -> list[dict]:
+    """One judged-slate generation; the manifest is the only resume anchor."""
+    gen_dir, gen_no, manifest = _find_open_slate_generation(run_dir)
+    if manifest is None:
+        pool_doc = _construct_slate_generation(run_dir, gen_dir, repo_root,
+                                               cmd, events)
+        if pool_doc is None:
+            return []  # admission cap 0: budget-boundary no-op
+        status = _run_slate_judges(runner, store, task, tag, run_dir, gen_dir,
+                                   pool_doc, round_no, model, repo_root, cmd,
+                                   events)
+        if not (status.get("slate") or []):
+            return []  # no lane produced a proposal; gen_no stays unconsumed
+        manifest = _commit_slate_manifest(run_dir, gen_dir,
+                                          len(status["slate"]),
+                                          repo_root, cmd, events)
+    seats = _slate_seat_records(run_dir, manifest)
+    if any(seat is not None for seat in seats):
+        # The atomic batch admits every seat or none, and a manifest whose
+        # seats all landed is closed by _find_open_slate_generation.  Any
+        # ledger presence here violates that contract: fail closed, never
+        # guess the missing seat.
+        problems = _slate_binding_errors(manifest, seats)
+        detail = "; ".join(problems) if problems else "partial admission"
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"judged-slate generation {manifest['gen_no']} violates the "
+                  f"atomic-admission contract: {detail}")
+    _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
+                        round_no, repo_root, cmd, events)
+    _admit_slate(run_dir, gen_dir, repo_root, cmd, events)
+    events.emit("slate_admitted", gen_no=manifest["gen_no"],
+                generation_id=manifest["generation_id"],
+                run_ids=[slot["run_id"] for slot in manifest["slate"]])
+    _evaluate_admitted_slate(runner, store, task, tag, run_dir, manifest,
+                             repo_root, cmd, events, job_runner)
+    return [{"run_id": slot["run_id"], "op": slot["carrier"]["op"]}
+            for slot in manifest["slate"]]
 
 
 # =============================================================================
@@ -775,8 +1256,12 @@ def _resume_pending_candidates(runner, store, task, tag, run_dir, brief,
 
 def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
                          repo_root, cmd, events,
-                         job_runner=execute_driver_job) -> list[dict]:
+                         job_runner=execute_driver_job, model=None) -> list[dict]:
     """Generate one bounded action batch and take each action through step 0+1."""
+    if _semantic_policy(run_dir) == "judged_slate":
+        return _evaluate_judged_generation(runner, store, task, tag, run_dir,
+                                           round_no, repo_root, cmd, events,
+                                           model, job_runner)
     actions = _ideate(runner, store, task, tag, run_dir, round_no,
                       repo_root, cmd, events)
     for action in actions:
@@ -884,7 +1369,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # -----------------------------------------------------------------
             actions = _evaluate_generation(
                 runner, store, task, tag, run_dir, round_no,
-                repo_root, cmd, events, job_runner,
+                repo_root, cmd, events, job_runner, model=model,
             )
 
             # -----------------------------------------------------------------
