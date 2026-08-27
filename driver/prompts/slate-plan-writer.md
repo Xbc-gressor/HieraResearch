@@ -17,9 +17,12 @@ carrier (`op`/`parents`), the candidate summary exactly as the judges saw it
 claims, deprioritized marks), and the bounded measured-history table.
 
 You may additionally `Read` the task contract (`tasks/<task>/TASK.md`) and
-files your context explicitly names (e.g. a route-memory JSON). Do not read
-candidate code, full run logs, or the full ledger, and do not construct a
-different point or carrier than the frozen assignment.
+files your context explicitly names (e.g. a route-memory JSON). When the
+invocation context names an explicit `task_packet`, read that packet instead of
+looking for an installed task contract, and stay within the packet's declared
+candidate-visible supporting paths. Do not read candidate code, full run logs,
+the full ledger, evaluator internals, held-out data, trajectories, or solutions,
+and do not construct a different point or carrier than the frozen assignment.
 
 ## The plan
 

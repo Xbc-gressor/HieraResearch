@@ -15,16 +15,32 @@ claims as hypotheses, not known-good results.
 - **`task_name`** (and/or **`run_dir`**) — the task and run to scope to. Derive
   `runs/<task>/<tag>/` (where `background.md` goes), `tasks/<task>/TASK.md`,
   `tasks/<task>/task.toml`.
+- **`task_packet`** (optional) — an explicit, bounded projection of a task
+  contract for a protocol that must compare tasks which are not installed under
+  `tasks/`. When present, it replaces `tasks/<task>/TASK.md`, `task.toml`, and
+  `prepare.py` as the task-decision-surface input. Read only the candidate-visible
+  supporting paths named by the packet; do not search for an installed adapter,
+  evaluator internals, held-out data, trajectories, or solutions.
+- **`frozen_corpus`** (optional) — an explicitly supplied pinned corpus path.
+  When present, use only the local `frozen` retrieval condition described below;
+  do not call live search or web tools. Respect its declared
+  `prepared_before_task_ids` value: `false` is admissible for a preregistered
+  task-scoped-corpus experiment that measures space construction conditional on
+  supplied evidence, but must not be described as a task-independent prior.
 
 If only `run_dir` is given, infer `task_name` from its `runs/<task>/` segment.
-If neither resolves, stop and report what is missing.
+An explicit `task_packet` may supply the task id when no installed task resolves.
+If neither an installed task nor a packet resolves, stop and report what is
+missing.
 
 ## Workflow
 
 ### Step 1 — Scope from the task (read, do not guess)
 
 Read `TASK.md`'s `## Evaluation Contract`, `task.toml`, and the
-candidate-visible interfaces in `prepare.py`. Pin down:
+candidate-visible interfaces in `prepare.py`; or, when `task_packet` is present,
+read that packet and only the candidate-visible supporting paths it explicitly
+names. Pin down:
 
 - **What is optimized** and the metric — note it is **lower-is-better**
   (framework-wide); frame every recommendation as "drives the metric *down*".
@@ -41,6 +57,8 @@ If `[seed].provided` declares the candidate entrypoint, note its path now. Under
 `llm_induced`, do not inspect that implementation until the dimension catalog is
 final: the supplied solution may ground baseline values, but must not determine
 which dimensions exist.
+An explicit packet's `provided_baseline` declaration follows the same timing
+rule.
 
 ### Step 2 — Resolve and freeze the dimensions
 

@@ -13,6 +13,12 @@ Use only the task's declared candidate decision surface:
 - `tasks/<task>/task.toml`;
 - candidate-visible interfaces in `tasks/<task>/prepare.py`.
 
+When the invocation context supplies an explicit `task_packet`, that bounded
+projection replaces the three installed-task inputs above. Use only the packet
+and candidate-visible supporting paths it names, excluding any declared
+provided-baseline implementation until the catalog is final; the resulting
+catalog provenance must cite the packet and this document.
+
 Do not consult `contracts/semantic-dimensions-v1.json` or literature results
 while inducing dimensions. Do not inspect hidden evaluation data, infer a blind
 task's identity, or treat the fixed evaluator and HieraResearch's own search
