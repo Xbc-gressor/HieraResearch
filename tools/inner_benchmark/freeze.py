@@ -122,7 +122,6 @@ stdlib + numpy only at import time.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import shutil
@@ -869,7 +868,6 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
         # §6): the production inner-tuner policy id whose kernels produced the
         # rows before this boundary. Null when the source run did not set one.
         "tuner_inner_policy": source_policy_id,
-        "train_sha256": "sha256:" + hashlib.sha256(train_src.read_bytes()).hexdigest(),
     }
     if run_metadata is not None:
         source["run_metadata"] = run_metadata

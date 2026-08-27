@@ -1011,7 +1011,7 @@ class CloseExhaustedStageTest(unittest.TestCase):
             "run_id": "001",
             "phase": "phase_a",
             "method": "warmstart",
-            "params_sha256": "sha256:" + "0" * 64,
+            "params": {"x0": 0.0},
         }]
         for index in range(phase_c_attempts):
             rows.append({
@@ -1021,7 +1021,7 @@ class CloseExhaustedStageTest(unittest.TestCase):
                 "run_id": "001",
                 "phase": "phase_c",
                 "method": "grid",
-                "params_sha256": f"sha256:{index:064d}",
+                "params": {"x0": float(index)},
             })
         (run_dir / "evaluation_attempts.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in rows)

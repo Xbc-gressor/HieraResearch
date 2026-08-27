@@ -529,17 +529,7 @@ def _trial_receipt(run: WarmstartRun, proposed_index: int) -> dict:
         "proposed_index": proposed_index,
     }
     if run.parameter_transfer is not None and proposed_index == 0:
-        receipt.update(
-            {
-                "role": "inherited_control",
-                "parameter_transfer_receipt_sha256": run.parameter_transfer[
-                    "receipt_sha256"
-                ],
-                "params_sha256": run.parameter_transfer["projection"][
-                    "params_sha256"
-                ],
-            }
-        )
+        receipt["role"] = "inherited_control"
     return receipt
 
 
@@ -704,8 +694,6 @@ def _prepare_run(
             "parent_incumbent_score": parameter_transfer["primary_parent"][
                 "incumbent_score"
             ],
-            "params_sha256": parameter_transfer["projection"]["params_sha256"],
-            "receipt_sha256": parameter_transfer["receipt_sha256"],
         }
     write_tune_report(args.tune_report_json, report)
 

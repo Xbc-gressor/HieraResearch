@@ -97,7 +97,7 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `semantic_point` | complete mapping over all selected dimensions, including explicit conditional inactivity |
 | `policy_receipt` | policy name/config, action, proposal-set digest, selected point, separate prior/experience-adjusted gain and uncertainty plus cost/coverage components; under a carrier policy the deterministic carrier prior and per-hypothesis context counts; under an attempt policy the non-positive `attempt_prior` and its `attempts` outcome partition, base rate, and contributing run ids; plus experience receipt, evidence, and ranking |
 | `route_provenance` | planned route provenance when the route arm is on: the exact memory rows shown, the route sketches, their preference order, and the chosen route. Planned only — it never claims what the writer actually built. A candidate nobody planned (the task-provided baseline) records `status: not_applicable` with a reason. `null` when the arm is off |
-| `parameter_transfer` | for non-fresh candidates, the full self-hashed primary-parent incumbent projection, semantic-control qualification, mandatory warm config-0 pointer, and scored control rows |
+| `parameter_transfer` | for non-fresh candidates, the full primary-parent incumbent projection, semantic-control qualification, mandatory warm config-0 pointer, and scored control rows |
 | `applied_incumbent` | exact applied params/schema plus candidate/report hashes represented by this record's score; descendants bind to this durable snapshot |
 | `idea` | self-contained complete solution, not merely a list of hypotheses |
 | `change` | implementation process relative to parents; it may be non-empty even when the point is unchanged |
@@ -157,7 +157,7 @@ noise floor still requires independent replicate evidence. A non-finite or
 missing result is a `crash` with `+inf`, never a missing success or ordinary
 discard. If the strict cap is exhausted before a pending candidate owns an
 objective attempt, `ledger.py resolve-unevaluated` stores `status:
-unevaluated`, no score, and a hashed accounting receipt. This resolves
+unevaluated`, no score, and an accounting receipt. This resolves
 lifecycle only; it creates no semantic observation.
 
 `evaluation_attempts.jsonl` is the helper-owned append-only reservation log for

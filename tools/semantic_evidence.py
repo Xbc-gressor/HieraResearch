@@ -925,7 +925,6 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         "candidate",
         "primary_parent",
         "projection",
-        "receipt_sha256",
     }
     receipt_version = (
         receipt.get("schema_version") if isinstance(receipt, dict) else None
@@ -942,19 +941,12 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         errors.append(
             f"record {run_id}.parameter_transfer.receipt has an unsupported contract"
         )
-    unhashed = dict(receipt)
-    receipt_hash = unhashed.pop("receipt_sha256", None)
-    if receipt_hash != _json_sha256(unhashed):
-        errors.append(
-            f"record {run_id}.parameter_transfer.receipt_sha256 is invalid"
-        )
 
     candidate = receipt.get("candidate")
     candidate_fields = {
         "run_id",
         "path",
         "brief_path",
-        "brief_sha256",
         "structure_snapshot",
         "param_schema",
         "defaults",
@@ -1044,7 +1036,7 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         )
 
     projection = receipt.get("projection")
-    projection_fields = {"params", "params_sha256", "copied", "reset", "new", "dropped"}
+    projection_fields = {"params", "copied", "reset", "new", "dropped"}
     if not isinstance(projection, dict) or set(projection) != projection_fields:
         errors.append(
             f"record {run_id}.parameter_transfer.receipt.projection has an invalid shape"
@@ -1056,10 +1048,6 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
             f"record {run_id}.parameter_transfer projected params must be an object"
         )
         projected = {}
-    if projection.get("params_sha256") != _json_sha256(projected):
-        errors.append(
-            f"record {run_id}.parameter_transfer projected params hash is invalid"
-        )
     if set(projected) != set(child_schema):
         errors.append(
             f"record {run_id}.parameter_transfer projection does not cover the child schema"
@@ -1169,8 +1157,6 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
                 "parameter",
                 "target_dimension_id",
                 "target_hypothesis_id",
-                "control_params_sha256",
-                "treatment_params_sha256",
             }
             if (
                 set(semantic_control) != paired_fields
@@ -1201,8 +1187,6 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
         "selected",
         "primary_parent_run_id",
         "parent_incumbent_score",
-        "params_sha256",
-        "receipt_sha256",
     }
     if not isinstance(control, dict) or set(control) != control_fields:
         errors.append(
@@ -1216,8 +1200,6 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
     if (
         control.get("primary_parent_run_id") != primary.get("run_id")
         or control.get("parent_incumbent_score") != primary.get("incumbent_score")
-        or control.get("params_sha256") != projection.get("params_sha256")
-        or control.get("receipt_sha256") != receipt_hash
     ):
         errors.append(
             f"record {run_id}.parameter_transfer inherited-control pointer is inconsistent"
@@ -1237,8 +1219,6 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
             "score",
             "proposed_index",
             "role",
-            "parameter_transfer_receipt_sha256",
-            "params_sha256",
         }
         if not isinstance(observation, dict) or not required.issubset(observation):
             errors.append(
@@ -1251,20 +1231,9 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
             else "semantic_treatment"
         )
         expected_index = observation_index
-        expected_params_hash = (
-            projection.get("params_sha256")
-            if observation_index == 0
-            else (
-                semantic_control.get("treatment_params_sha256")
-                if isinstance(semantic_control, dict)
-                else None
-            )
-        )
         if (
             observation.get("proposed_index") != expected_index
             or observation.get("role") != expected_role
-            or observation.get("parameter_transfer_receipt_sha256") != receipt_hash
-            or observation.get("params_sha256") != expected_params_hash
             or (
                 observation_index == 0
                 and observation.get("params") != projected
@@ -1291,10 +1260,6 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
                 if control_params.get(key) != treatment_params.get(key)
             ]
             != [switch]
-            or semantic_control.get("control_params_sha256")
-            != _json_sha256(control_params)
-            or semantic_control.get("treatment_params_sha256")
-            != _json_sha256(treatment_params)
         ):
             errors.append(
                 f"record {run_id}.parameter_transfer paired semantic control "
@@ -1311,13 +1276,13 @@ def validate_parameter_transfer_evidence(record: dict[str, Any]) -> list[str]:
 def validate_parameter_transfer_binding(
     ledger: dict[str, Any], record: dict[str, Any]
 ) -> list[str]:
-    """Bind a self-consistent transfer receipt to its durable parent snapshot.
+    """Bind a transfer receipt to its durable parent snapshot.
 
     ``validate_parameter_transfer_evidence`` proves only the receipt's internal
-    hashes and pointers.  That is insufficient at the ledger boundary: an
-    internally rehashed receipt could otherwise invent a different parent
-    score.  The binding may target the parent's current record or an append-only
-    lineage snapshot captured before that parent was tuned again.
+    pointers.  That is insufficient at the ledger boundary: an internally
+    consistent receipt could otherwise invent a different parent score.  The
+    binding may target the parent's current record or an append-only lineage
+    snapshot captured before that parent was tuned again.
     """
     errors = validate_parameter_transfer_evidence(record)
     if errors or record.get("parameter_transfer") is None:
@@ -1600,7 +1565,6 @@ def matched_inherited_control(
         "child_final_score": child_final_score,
         "tuning_delta": child_final_score - treatment_score,
         "total_delta": child_final_score - parent_score,
-        "parameter_transfer_receipt_sha256": transfer_receipt["receipt_sha256"],
     }
 
 

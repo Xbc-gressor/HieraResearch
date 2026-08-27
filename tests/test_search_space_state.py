@@ -1449,7 +1449,7 @@ class LedgerIntegrationTests(unittest.TestCase):
                         "run_id": "000",
                         "phase": "phase_a",
                         "method": "warmstart",
-                        "params_sha256": "sha256:terminal",
+                        "params": {"x": 0},
                     }
                 )
                 + "\n"
@@ -1464,7 +1464,7 @@ class LedgerIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(resolved["status"], "unevaluated")
             self.assertIsNone(resolved["final_best_score"])
-            self.assertNotIn("receipt_sha256", resolved["unevaluated_receipt"])
+            self.assertNotIn("attempt_log_sha256", resolved["unevaluated_receipt"])
             self.assertEqual(
                 resolved["unevaluated_receipt"][
                     "candidate_objective_attempts"

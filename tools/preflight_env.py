@@ -9,7 +9,6 @@ never calls ``score_fn`` and writes an auditable run-level receipt.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -22,10 +21,6 @@ from validate_tasks import ROOT, parse_task_toml
 
 SCHEMA_VERSION = 1
 RECEIPT_NAME = "environment_preflight.json"
-
-
-def _sha256(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _load_prepare(path: Path):
@@ -96,10 +91,6 @@ def run_preflight(task_name: str, run_dir: Path) -> dict:
         "runtime": {
             "python": platform.python_version(),
             "platform": platform.platform(),
-        },
-        "contract": {
-            "task_toml_sha256": _sha256(task_toml),
-            "prepare_sha256": _sha256(prepare_path),
         },
         "run_dir": str(Path(run_dir).resolve()),
     }

@@ -109,14 +109,12 @@ def record_failure(
         "retained_traceback_lines": len(retained_line_numbers),
         "omitted_traceback_lines": len(traceback_lines) - len(retained_line_numbers),
     }
-    artifact_without_hash = {
+    artifact = {
         "schema_version": SCHEMA_VERSION,
         "failure_id": failure_id,
         "failure": failure,
         "receipt": receipt,
     }
-    artifact_sha256 = _sha256(_canonical_json(artifact_without_hash))
-    artifact = {**artifact_without_hash, "sha256": artifact_sha256}
     encoded = json.dumps(artifact, indent=2, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
 
     target = report_path.parent / relative_artifact
@@ -134,7 +132,6 @@ def record_failure(
             "schema_version": SCHEMA_VERSION,
             "failure_id": failure_id,
             "artifact": relative_artifact,
-            "sha256": artifact_sha256,
         },
         "failure_receipt": receipt,
     }
@@ -145,11 +142,6 @@ def _load_verified(report_path: Path, failure_id: str) -> dict[str, Any]:
     artifact = json.loads(artifact_path.read_text())
     if artifact.get("schema_version") != SCHEMA_VERSION or artifact.get("failure_id") != failure_id:
         raise ValueError(f"invalid failure artifact: {artifact_path}")
-    expected = artifact.get("sha256")
-    unhashed = {key: value for key, value in artifact.items() if key != "sha256"}
-    actual = _sha256(_canonical_json(unhashed))
-    if expected != actual:
-        raise ValueError(f"failure artifact hash mismatch: {artifact_path}")
     return artifact
 
 

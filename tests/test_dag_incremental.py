@@ -18,7 +18,7 @@ from apply_base_params import apply as apply_base_params  # noqa: E402
 from got_graph import CRASH, Graph, render_incremental  # noqa: E402
 from ledger import _load_ledger, _set_experience, _touch_dag_record  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
-from semantic_evidence import _json_sha256, build_semantic_edges  # noqa: E402
+from semantic_evidence import build_semantic_edges  # noqa: E402
 from semantic_space import complete_point, derive_semantic_lineage, digest  # noqa: E402
 from tune_tools import _candidate_execution_revision  # noqa: E402
 from tests.fixtures import (  # noqa: E402
@@ -275,12 +275,7 @@ class SemanticEdgePersistenceTests(unittest.TestCase):
             selectable = copy.deepcopy(
                 transfer["warm_start_observations"][1]
             )
-            for key in (
-                "role",
-                "parameter_transfer_receipt_sha256",
-                "params_sha256",
-            ):
-                selectable.pop(key, None)
+            selectable.pop("role", None)
             receipt["semantic_control"] = {
                 "status": "unverified",
                 "reason": "no_same_child_code_control_treatment_pair",
@@ -288,15 +283,6 @@ class SemanticEdgePersistenceTests(unittest.TestCase):
             transfer["warm_start_observations"] = [
                 transfer["warm_start_observations"][0]
             ]
-            unhashed = dict(receipt)
-            unhashed.pop("receipt_sha256")
-            receipt["receipt_sha256"] = _json_sha256(unhashed)
-            transfer["inherited_control"]["receipt_sha256"] = receipt[
-                "receipt_sha256"
-            ]
-            transfer["warm_start_observations"][0][
-                "parameter_transfer_receipt_sha256"
-            ] = receipt["receipt_sha256"]
             ledger_path.write_text(json.dumps(pending))
             observations = [
                 transfer["warm_start_observations"][0],

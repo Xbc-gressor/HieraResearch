@@ -372,12 +372,6 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         self.assertEqual(first["semantic_delta"], 0.1)
         self.assertEqual(first["tuning_delta"], 0.0)
         self.assertEqual(first["total_delta"], 0.1)
-        self.assertEqual(
-            first["parameter_transfer_receipt_sha256"],
-            ledger["records"][1]["parameter_transfer"]["receipt"][
-                "receipt_sha256"
-            ],
-        )
         second = edge_observation(ledger, "sedge-002-003")
         self.assertEqual(second["score_basis"], "paired_semantic_control")
         self.assertEqual(second["parent_score"], 0.41)
@@ -745,18 +739,10 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         receipt = transfer["receipt"]
         receipt["primary_parent"]["incumbent_score"] = 0.10
         receipt["primary_parent"]["ledger_record_sha256"] = "sha256:" + "f" * 64
-        unhashed = dict(receipt)
-        unhashed.pop("receipt_sha256")
-        receipt["receipt_sha256"] = _json_sha256(unhashed)
         transfer["inherited_control"]["parent_incumbent_score"] = 0.10
-        transfer["inherited_control"]["receipt_sha256"] = receipt["receipt_sha256"]
-        for observation in transfer["warm_start_observations"]:
-            observation[
-                "parameter_transfer_receipt_sha256"
-            ] = receipt["receipt_sha256"]
 
-        # The forged receipt is internally complete and self-hashed, but it
-        # cannot become semantic evidence because its parent snapshot is false.
+        # The forged receipt is internally complete, but it cannot become
+        # semantic evidence because its parent snapshot is false.
         self.assertEqual(validate_parameter_transfer_evidence(forged), [])
         binding_errors = validate_parameter_transfer_binding(
             {"records": [parent, forged]}, forged
@@ -813,13 +799,6 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         transfer["warm_start_observations"] = [
             transfer["warm_start_observations"][0]
         ]
-        unhashed = dict(receipt)
-        unhashed.pop("receipt_sha256")
-        receipt["receipt_sha256"] = _json_sha256(unhashed)
-        transfer["inherited_control"]["receipt_sha256"] = receipt["receipt_sha256"]
-        transfer["warm_start_observations"][0][
-            "parameter_transfer_receipt_sha256"
-        ] = receipt["receipt_sha256"]
 
         self.assertEqual(validate_parameter_transfer_binding(ledger, child), [])
         coverage = comparator_coverage(
@@ -889,29 +868,11 @@ class SemanticEdgeObservationTests(unittest.TestCase):
         semantic_control = receipt["semantic_control"]
         primary["incumbent_params"] = {"shared": 999.0}
         projection["params"] = {"shared": 999.0}
-        projection["params_sha256"] = _json_sha256(projection["params"])
         projection["copied"] = [{"key": "shared", "value": 999.0}]
         treatment = {"shared": 1000.0}
-        semantic_control["control_params_sha256"] = projection["params_sha256"]
-        semantic_control["treatment_params_sha256"] = _json_sha256(treatment)
         observations = transfer["warm_start_observations"]
         observations[0]["params"] = projection["params"]
-        observations[0]["params_sha256"] = projection["params_sha256"]
         observations[1]["params"] = treatment
-        observations[1]["params_sha256"] = semantic_control[
-            "treatment_params_sha256"
-        ]
-        transfer["inherited_control"]["params_sha256"] = projection[
-            "params_sha256"
-        ]
-        unhashed = dict(receipt)
-        unhashed.pop("receipt_sha256")
-        receipt["receipt_sha256"] = _json_sha256(unhashed)
-        transfer["inherited_control"]["receipt_sha256"] = receipt["receipt_sha256"]
-        for observation in observations:
-            observation[
-                "parameter_transfer_receipt_sha256"
-            ] = receipt["receipt_sha256"]
 
         forged_ledger = {"records": [ledger["records"][0], child]}
         self.assertEqual(validate_parameter_transfer_evidence(child), [])

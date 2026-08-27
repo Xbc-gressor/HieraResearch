@@ -707,7 +707,7 @@ class FailureArtifactTests(unittest.TestCase):
             self.assertEqual(len(list((report_path.parent / "_failures").glob("*.json"))), 1)
             self.assertRegex(first["failure_ref"]["failure_id"], r"^fail-[0-9a-f]{16}$")
             self.assertEqual(first["failure_ref"]["schema_version"], 2)
-            self.assertRegex(first["failure_ref"]["sha256"], r"^sha256:[0-9a-f]{64}$")
+            self.assertNotIn("sha256", first["failure_ref"])
             self.assertNotIn("content_sha256", first["failure_receipt"])
 
     def test_config_infeasible_error_classification(self) -> None:

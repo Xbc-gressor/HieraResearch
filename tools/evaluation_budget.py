@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-import hashlib
 import json
 import math
 import os
@@ -147,17 +146,6 @@ def _deep_tune_usage(
         if isinstance(run_id, str):
             logged[run_id] += 1
     return sum(logged.values()), dict(logged)
-
-
-def _canonical_hash(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=str,
-    ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _read_rows(handle) -> list[dict]:
@@ -305,7 +293,7 @@ def reserve_evaluation(
             "run_id": run_id,
             "phase": str(phase),
             "method": str(method),
-            "params_sha256": _canonical_hash(params),
+            "params": params,
         }
         _append_row(handle, receipt)
         rows.append(receipt)
@@ -378,9 +366,7 @@ def main() -> int:
         ref_path = args.ref_path.resolve()
         if not ref_path.is_file():
             parser.error(f"--ref-path does not exist: {ref_path}")
-        params = {
-            "candidate_sha256": "sha256:" + hashlib.sha256(ref_path.read_bytes()).hexdigest()
-        }
+        params = {}
         try:
             receipt = reserve_evaluation(
                 ref_path,

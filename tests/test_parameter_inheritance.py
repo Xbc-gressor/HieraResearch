@@ -30,17 +30,6 @@ def _sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _json_sha256(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode()
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
-
-
 def _applied_snapshot(
     parent: Path,
     report_path: Path,
@@ -457,11 +446,9 @@ class ParameterInheritanceTests(unittest.TestCase):
     def test_tuning_record_preserves_control_receipts_and_observation(self) -> None:
         receipt = {
             "schema_version": 1,
-            "receipt_sha256": "sha256:" + "1" * 64,
         }
         control = {
             "warm_config_index": 0,
-            "params_sha256": "sha256:" + "2" * 64,
         }
         observation = {
             "params": {"x": 3},
@@ -531,7 +518,6 @@ class ParameterInheritanceTests(unittest.TestCase):
                 ],
                 "parameter_transfer": {
                     "schema_version": 2,
-                    "receipt_sha256": "sha256:" + "1" * 64,
                 },
                 "inherited_control": {
                     "warm_config_index": 0,
@@ -606,11 +592,21 @@ def evaluate_config(make_model, params):
             self.assertEqual(phase_a["parameter_transfer"], receipt)
             self.assertNotIn("param_schema_sha256", receipt["candidate"])
             self.assertNotIn("defaults_sha256", receipt["candidate"])
+            self.assertNotIn("brief_sha256", receipt["candidate"])
+            self.assertNotIn("receipt_sha256", receipt)
+            self.assertNotIn("params_sha256", receipt["projection"])
             self.assertNotIn("incumbent_params_sha256", receipt["primary_parent"])
             self.assertNotIn("param_schema_sha256", receipt["primary_parent"])
             self.assertEqual(
-                phase_a["inherited_control"]["receipt_sha256"],
-                receipt["receipt_sha256"],
+                phase_a["inherited_control"],
+                {
+                    "warm_config_index": 0,
+                    "selected": True,
+                    "primary_parent_run_id": receipt["primary_parent"]["run_id"],
+                    "parent_incumbent_score": receipt["primary_parent"][
+                        "incumbent_score"
+                    ],
+                },
             )
             self.assertEqual(
                 phase_a["warm_start_configs"][0],
@@ -619,10 +615,6 @@ def evaluate_config(make_model, params):
                     "score": -7.0,
                     "proposed_index": 0,
                     "role": "inherited_control",
-                    "parameter_transfer_receipt_sha256": receipt[
-                        "receipt_sha256"
-                    ],
-                    "params_sha256": receipt["projection"]["params_sha256"],
                 },
             )
             self.assertEqual(len(phase_a["warm_start_configs"]), 2)

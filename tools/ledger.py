@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import math
 import sys
@@ -644,9 +643,6 @@ def resolve_unevaluated(
         )
 
     attempt_log = Path(strict["attempt_log"])
-    attempt_log_sha256 = (
-        "sha256:" + hashlib.sha256(attempt_log.read_bytes()).hexdigest()
-    )
     receipt = {
         "schema_version": 1,
         "kind": "budget_exhausted_before_candidate_attempt",
@@ -654,7 +650,6 @@ def resolve_unevaluated(
         "evaluations_done": strict["evaluations_done"],
         "candidate_objective_attempts": 0,
         "attempt_log": attempt_log.name,
-        "attempt_log_sha256": attempt_log_sha256,
     }
     record["metric"] = data.get("metric")
     record["status"] = "unevaluated"

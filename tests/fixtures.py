@@ -477,7 +477,6 @@ def attach_matched_transfer(
             "run_id": child["run_id"],
             "path": f"candidates/{child['run_id']}/train.py",
             "brief_path": f"candidates/{child['run_id']}/_candidate_brief.json",
-            "brief_sha256": "sha256:" + "1" * 64,
             "structure_snapshot": "fixture",
             "param_schema": child_schema,
             "defaults": child_defaults,
@@ -497,7 +496,6 @@ def attach_matched_transfer(
         },
         "projection": {
             "params": projected,
-            "params_sha256": json_sha256(projected),
             "copied": [] if reset else [{"key": "shared", "value": 1.0}],
             "reset": (
                 [
@@ -522,11 +520,8 @@ def attach_matched_transfer(
             "target_hypothesis_id": change.get(
                 "to_hypothesis_id", "fixture-hypothesis"
             ),
-            "control_params_sha256": json_sha256(projected),
-            "treatment_params_sha256": json_sha256(treatment),
         },
     }
-    receipt["receipt_sha256"] = json_sha256(receipt)
 
     child["op"] = child.get("op") or "improve"
     policy = child.setdefault("policy_receipt", {"schema_version": 6})
@@ -553,8 +548,6 @@ def attach_matched_transfer(
             "selected": True,
             "primary_parent_run_id": parent["run_id"],
             "parent_incumbent_score": parent_score,
-            "params_sha256": receipt["projection"]["params_sha256"],
-            "receipt_sha256": receipt["receipt_sha256"],
         },
         "warm_start_observations": [
             {
@@ -562,18 +555,12 @@ def attach_matched_transfer(
                 "score": parent_score,
                 "proposed_index": 0,
                 "role": "inherited_control",
-                "parameter_transfer_receipt_sha256": receipt["receipt_sha256"],
-                "params_sha256": receipt["projection"]["params_sha256"],
             },
             {
                 "params": treatment,
                 "score": child_score,
                 "proposed_index": 1,
                 "role": "semantic_treatment",
-                "parameter_transfer_receipt_sha256": receipt["receipt_sha256"],
-                "params_sha256": receipt["semantic_control"][
-                    "treatment_params_sha256"
-                ],
             },
         ],
     }

@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -2401,22 +2400,16 @@ def authoritative_parent_incumbent(
     }
 
 
-def _receipt_without_self_hash(receipt: dict) -> dict:
-    payload = copy.deepcopy(receipt)
-    payload.pop("receipt_sha256", None)
-    return payload
-
-
-def _valid_self_hashed_receipt(receipt: dict) -> bool:
-    if not isinstance(receipt, dict) or not isinstance(
-        receipt.get("receipt_sha256"), str
-    ):
-        return False
-    try:
-        expected = _json_sha256(_receipt_without_self_hash(receipt))
-    except (OverflowError, TypeError, ValueError):
-        return False
-    return receipt["receipt_sha256"] == expected
+def _receipt_identity(receipt: dict) -> dict:
+    """The candidate identity used to resume an interrupted transfer write."""
+    candidate = receipt.get("candidate") if isinstance(receipt, dict) else None
+    if not isinstance(candidate, dict):
+        return {}
+    return {
+        "run_id": candidate.get("run_id"),
+        "path": candidate.get("path"),
+        "brief_path": candidate.get("brief_path"),
+    }
 
 
 def build_parameter_transfer(
@@ -2498,7 +2491,6 @@ def build_parameter_transfer(
             "run_id": brief.get("run_id"),
             "path": _display_path(candidate_path),
             "brief_path": _display_path(brief_path),
-            "brief_sha256": _file_sha256(brief_path),
             "structure_snapshot": _candidate_structure_snapshot(candidate_path),
             "param_schema": _json_native(child_schema),
             "defaults": child_defaults,
@@ -2519,7 +2511,6 @@ def build_parameter_transfer(
         },
         "projection": {
             "params": projected,
-            "params_sha256": _json_sha256(projected),
             "copied": copied,
             "reset": reset,
             "new": new,
@@ -2534,7 +2525,6 @@ def build_parameter_transfer(
             "reason": "no_same_child_code_control_treatment_pair",
         },
     }
-    receipt["receipt_sha256"] = _json_sha256(receipt)
     return receipt
 
 
@@ -2577,7 +2567,6 @@ def materialize_parameter_transfer(
         "run_id": current_run_id,
         "path": _display_path(candidate_path),
         "brief_path": _display_path(current_brief_path),
-        "brief_sha256": _file_sha256(current_brief_path),
     }
     previous_path = receipt_path
     if not previous_path.exists() and receipt_tmp.exists():
@@ -2591,11 +2580,6 @@ def materialize_parameter_transfer(
                 f"cannot trust existing parameter-transfer receipt "
                 f"{previous_path}: {exc}"
             ) from exc
-        if not _valid_self_hashed_receipt(previous):
-            raise ValueError(
-                f"existing parameter-transfer receipt {previous_path} has an "
-                "invalid self hash"
-            )
         previous_candidate = previous.get("candidate")
         if (
             previous.get("schema_version") not in {2, 3}
@@ -2607,10 +2591,7 @@ def materialize_parameter_transfer(
                 "existing parameter-transfer receipt has an invalid contract "
                 "or lacks original defaults"
             )
-        previous_identity = {
-            key: previous_candidate.get(key)
-            for key in current_identity
-        }
+        previous_identity = _receipt_identity(previous)
         if previous_identity != current_identity:
             raise ValueError(
                 "existing parameter-transfer receipt belongs to a different "
@@ -2658,15 +2639,13 @@ def validate_parameter_transfer(
     receipt: dict,
 ) -> dict:
     """Fail closed when parent, child structure, config 0, or receipt is stale."""
-    if not _valid_self_hashed_receipt(receipt):
-        raise ValueError("parameter-transfer receipt hash is invalid")
     if (
         not isinstance(configs, list)
         or not configs
         or not isinstance(configs[0], dict)
     ):
         raise ValueError("warm configs must contain object config 0")
-    candidate = receipt.get("candidate")
+    candidate = receipt.get("candidate") if isinstance(receipt, dict) else None
     if not isinstance(candidate, dict) or not isinstance(
         candidate.get("defaults"), dict
     ):
@@ -2681,8 +2660,6 @@ def validate_parameter_transfer(
         raise ValueError(
             "warm config 0 does not match the inherited-control receipt"
         )
-    if receipt["projection"].get("params_sha256") != _json_sha256(configs[0]):
-        raise ValueError("inherited-control params hash is invalid")
     return receipt
 
 
@@ -2845,7 +2822,7 @@ def tuning_record(report: dict) -> dict:
         # recomputes both from the closed report.
         "tuning_bouts": 0,
         "last_bout_improved": None,
-        # Additive, durable comparator evidence.  The full self-hashed receipt
+        # Additive, durable comparator evidence.  The full transfer receipt
         # stays beside the compact control pointer and its actually scored row;
         # downstream code need not trust a best-score coincidence.
         "parameter_transfer": parameter_transfer,

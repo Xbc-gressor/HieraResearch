@@ -1817,7 +1817,6 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                 "evaluations_done",
                 "candidate_objective_attempts",
                 "attempt_log",
-                "attempt_log_sha256",
             }
             actual_receipt_fields = (
                 set(unevaluated_receipt)
@@ -1826,8 +1825,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
             )
             if (
                 not isinstance(unevaluated_receipt, dict)
-                or actual_receipt_fields
-                not in (receipt_fields, receipt_fields | {"receipt_sha256"})
+                or actual_receipt_fields != receipt_fields
             ):
                 errors.append(
                     f"{where}.unevaluated_receipt has an invalid shape"
@@ -1848,9 +1846,6 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     or receipt_done < receipt_budget
                     or unevaluated_receipt.get("attempt_log")
                     != "evaluation_attempts.jsonl"
-                    or not isinstance(
-                        unevaluated_receipt.get("attempt_log_sha256"), str
-                    )
                 ):
                     errors.append(
                         f"{where}.unevaluated_receipt is not a valid exhausted-"

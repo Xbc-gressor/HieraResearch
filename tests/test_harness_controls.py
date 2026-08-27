@@ -237,7 +237,7 @@ entrypoint = "train.py"
                             "run_id": "001",
                             "phase": "phase_a",
                             "method": "warmstart",
-                            "params_sha256": f"sha256:{index}",
+                            "params": {"x": index},
                         }
                     )
                     + "\n"
