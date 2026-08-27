@@ -522,8 +522,8 @@ runs/<task>/<tag>/framework_cfg.json
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
 - **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；新 run 默认使用 `coverage_attempt`。`coverage`、`coverage_experience` 等对照臂可通过 `--semantic-policy` 显式选择
-- **`tuner.scheduler_policy`**：新 experiment run 默认 `anchor_challenger_v1`；`v3_2` 与旧 percentile/alternation 调度器均通过 `--scheduler-policy` 显式选择
-- **`tuner.inner_policy`**：新 experiment run 默认 `hebo24-hebo20`（24+10+10 三段全程使用 LLM pool + official HEBO MACE）；其他对照臂可通过 `--inner-tuner-policy` 显式选择，包括 `hebo24-turbo20-v1`、`mixup24-turbo20-v1`、`deferred-random8-hebo10-spsa10-v1`、`localtr8-hebo10-spsa10-v1`、`localtr8-hebo10-hebo10-v1`、`selfrank8-hebo10-hebo10` 和 `legacy`
+- **`tuner.scheduler_policy`**：新 experiment run 默认 `anchor_challenger_v1`；`v3_2` 与旧 percentile/alternation 调度器均通过 `--scheduler-policy` 显式选择；`anchor_transfer_challenger_v1`（global-donor 转移赛程）同样显式选择，且只与 inner policy `hebo24-transfer10-hebo10` 配对
+- **`tuner.inner_policy`**：新 experiment run 默认 `hebo24-hebo20`（24+10+10 三段全程使用 LLM pool + official HEBO MACE）；其他对照臂可通过 `--inner-tuner-policy` 显式选择，包括 `hebo24-turbo20-v1`、`mixup24-turbo20-v1`、`deferred-random8-hebo10-spsa10-v1`、`localtr8-hebo10-spsa10-v1`、`localtr8-hebo10-hebo10-v1`、`selfrank8-hebo10-hebo10` 和 `legacy`；`hebo24-transfer10-hebo10`（TRANSFERRED 首 bout 10 eval，只与 `anchor_transfer_challenger_v1` 配对）也可显式选择
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）。其中 `tuner.K`（每个候选提出的热启动配置数，默认 5）和 `tuner.K_eval`（step 0+1 实际评估的条数，默认 3）分别通过 `--k-warm` / `--k-eval` 暴露；deferred 配置数 = K − K_eval，两者都在 run 产物生成后冻结
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

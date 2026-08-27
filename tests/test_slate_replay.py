@@ -312,19 +312,17 @@ class ReplayTests(unittest.TestCase):
                     f"tamper {name} produced no errors",
                 )
 
-    def test_manifest_bytes_digest_binds_the_seats(self):
+    def test_manifest_seat_bindings_match_the_seats(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             manifest = build_admitted_generation(run_dir)
             ledger = json.loads((run_dir / "ledger.json").read_text())
-            manifest_digest = "sha256:" + hashlib.sha256(
-                (run_dir / ".semantic/gen-0001/generation.json").read_bytes()
-            ).hexdigest()
             for index, slot in enumerate(manifest["slate"]):
                 record = ledger["records"][5 + index]
                 judge = record["policy_receipt"]["judge"]
-                self.assertEqual(judge["manifest_digest"], manifest_digest)
+                self.assertEqual(judge["manifest_path"], ".semantic/gen-0001/generation.json")
                 self.assertEqual(judge["slate_index"], slot["slot"])
+                self.assertEqual(judge["candidate_id"], slot["candidate_id"])
             # The A1 prefix digest still anchors the pre-admission ledger.
             context = json.loads(
                 (run_dir / ".semantic/gen-0001/context.json").read_text()

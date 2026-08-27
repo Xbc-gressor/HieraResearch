@@ -1670,7 +1670,7 @@ def _replay_manifest_errors(
     return errors
 
 
-def _replay_seat_errors(manifest: dict, pool_doc: dict, ledger: dict, manifest_digest: str) -> tuple[list, list]:
+def _replay_seat_errors(manifest: dict, pool_doc: dict, ledger: dict) -> tuple[list, list]:
     """The schema-8 binding of the manifest's seats in the ledger."""
     errors, notes = [], []
     records = [r for r in ledger.get("records", []) if isinstance(r, dict)]
@@ -1723,8 +1723,6 @@ def _replay_seat_errors(manifest: dict, pool_doc: dict, ledger: dict, manifest_d
         expected_path = f".semantic/gen-{gen_no:04d}/generation.json"
         if judge.get("manifest_path") != expected_path:
             errors.append(f"{seat}: judge.manifest_path must be {expected_path}")
-        if judge.get("manifest_digest") != manifest_digest:
-            errors.append(f"{seat}: judge.manifest_digest does not match the manifest bytes")
         if judge.get("slate_index") != slot.get("slot"):
             errors.append(f"{seat}: judge.slate_index does not match the manifest slot")
         if judge.get("candidate_id") != slot.get("candidate_id"):
@@ -2041,11 +2039,8 @@ def replay_generation(gen_dir: Path, ledger: dict, registry: dict | None) -> dic
                 manifest, pool_doc, context_doc, judge_doc, gen_no
             ),
         )
-        manifest_digest = (
-            "sha256:" + hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        )
         seat_errors, seat_notes = _replay_seat_errors(
-            manifest, pool_doc, ledger, manifest_digest
+            manifest, pool_doc, ledger
         )
         checks["ledger_binding"] = not seat_errors
         errors.extend(seat_errors)

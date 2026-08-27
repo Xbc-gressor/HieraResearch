@@ -969,7 +969,6 @@ def _validate_policy_receipt_v8(record: dict[str, Any], where: str) -> list[str]
     judge = receipt.get("judge")
     judge_fields = {
         "manifest_path",
-        "manifest_digest",
         "slate_index",
         "candidate_id",
         "aggregation",
@@ -985,12 +984,11 @@ def _validate_policy_receipt_v8(record: dict[str, Any], where: str) -> list[str]
                 f"{where}.policy_receipt.judge.manifest_path must be a non-empty "
                 "run-relative path"
             )
-        for key in ("manifest_digest", "candidate_id"):
-            value = judge.get(key)
-            if not isinstance(value, str) or DIGEST_RE.fullmatch(value) is None:
-                errors.append(
-                    f"{where}.policy_receipt.judge.{key} must be a sha256 digest"
-                )
+        candidate_id = judge.get("candidate_id")
+        if not isinstance(candidate_id, str) or DIGEST_RE.fullmatch(candidate_id) is None:
+            errors.append(
+                f"{where}.policy_receipt.judge.candidate_id must be a sha256 digest"
+            )
         slate_index = judge.get("slate_index")
         if (
             not isinstance(slate_index, int)

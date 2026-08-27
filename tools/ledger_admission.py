@@ -445,10 +445,10 @@ def _load_slate_plan(request: SlateAdmissionRequest, slot: int) -> dict:
 
 def _validate_judge_binding(
     data: dict, request: SlateAdmissionRequest, registry: dict
-) -> tuple[dict, str, str]:
+) -> tuple[dict, str]:
     """Bind the generation manifest to this run and the pre-admission ledger.
 
-    Returns ``(manifest, run-relative manifest path, manifest digest)``.
+    Returns ``(manifest, run-relative manifest path)``.
     Everything the seats will claim is checked here, before any record is
     constructed: the manifest's location and content id, the artifact digest
     chain, the judge replay, and the generation-start ledger snapshot.
@@ -487,14 +487,13 @@ def _validate_judge_binding(
         raise AdmissionError("slate manifest proposal_set_revisions must be an object")
 
     # The manifest is the generation commit point: it lives at the fixed
-    # run-relative generation path, and the receipt digests its landed bytes.
+    # run-relative generation path.
     manifest_rel = f".semantic/gen-{gen_no:04d}/generation.json"
     resolved = (Path(request.run_dir) / manifest_rel).resolve()
     if resolved != manifest_path.resolve():
         raise AdmissionError(
             f"slate manifest must live at {manifest_rel} under the run directory"
         )
-    manifest_digest = "sha256:" + hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
     run_ids = [
         slot.get("run_id") if isinstance(slot, dict) else None for slot in slate_slots
@@ -585,7 +584,7 @@ def _validate_judge_binding(
             "slate manifest experience snapshot does not match the pre-admission "
             "ledger"
         )
-    return manifest, manifest_rel, manifest_digest
+    return manifest, manifest_rel
 
 
 def _slate_route_provenance(
@@ -641,7 +640,7 @@ def admit_slate_atomic(data: dict, request: SlateAdmissionRequest) -> list[dict]
     records = data["records"]
     pre_count = len(records)
 
-    manifest, manifest_rel, manifest_digest = _validate_judge_binding(
+    manifest, manifest_rel = _validate_judge_binding(
         data, request, registry
     )
     slate_slots = manifest["slate"]
@@ -675,7 +674,6 @@ def admit_slate_atomic(data: dict, request: SlateAdmissionRequest) -> list[dict]
             "generation_id": manifest["generation_id"],
             "judge": {
                 "manifest_path": manifest_rel,
-                "manifest_digest": manifest_digest,
                 "slate_index": index,
                 "candidate_id": slot["candidate_id"],
                 "aggregation": manifest["aggregation"]["path"],

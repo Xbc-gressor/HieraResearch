@@ -281,9 +281,6 @@ class SlateAdmissionTests(unittest.TestCase):
         self.assertEqual([record["status"] for record in admitted], ["pending", "pending"])
         self.assertEqual(len(self.data["records"]), 7)
 
-        manifest_digest = "sha256:" + hashlib.sha256(
-            (self.gen / "generation.json").read_bytes()
-        ).hexdigest()
         for index, record in enumerate(admitted):
             slot = self.manifest["slate"][index]
             self.assertEqual(record["semantic_point"], slot["point"])
@@ -300,7 +297,6 @@ class SlateAdmissionTests(unittest.TestCase):
                 receipt["judge"],
                 {
                     "manifest_path": ".semantic/gen-0001/generation.json",
-                    "manifest_digest": manifest_digest,
                     "slate_index": index,
                     "candidate_id": slot["candidate_id"],
                     "aggregation": "consensus",
@@ -456,7 +452,7 @@ class SlateAdmissionTests(unittest.TestCase):
 
         broken = copy.deepcopy(self.data)
         broken_record = next(r for r in broken["records"] if r["run_id"] == "005")
-        del broken_record["policy_receipt"]["judge"]["manifest_digest"]
+        del broken_record["policy_receipt"]["judge"]["candidate_id"]
         errors = validate_ledger(self.registry, broken)
         self.assertTrue(any("judge" in error for error in errors))
 
@@ -652,15 +648,11 @@ class SlateAdmissionCliTests(unittest.TestCase):
                 record["run_id"]: record for record in admitted["records"][-2:]
             }
             self.assertEqual(sorted(seats), ["005", "006"])
-            manifest_digest = "sha256:" + hashlib.sha256(
-                (gen / "generation.json").read_bytes()
-            ).hexdigest()
             for slot in manifest["slate"]:
                 record = seats[slot["run_id"]]
                 self.assertEqual(record["status"], "pending")
                 receipt = record["policy_receipt"]
                 self.assertEqual(receipt["schema_version"], 8)
-                self.assertEqual(receipt["judge"]["manifest_digest"], manifest_digest)
                 self.assertEqual(receipt["judge"]["slate_index"], slot["slot"])
                 # No evaluation budget is configured in this run: the lanes
                 # budget records admission_cap=null, which the receipt keeps.
