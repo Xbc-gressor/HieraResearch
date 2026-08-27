@@ -14,6 +14,7 @@ import math
 from typing import Any, Optional, TypedDict
 
 from semantic_evidence import LIFECYCLE_TERMINAL_STATUSES
+from semantic_space import digest
 
 
 class LedgerRecord(TypedDict, total=False):
@@ -151,6 +152,79 @@ def new_record(run_id: str) -> dict:
 
 def current_dag_revision(data: dict) -> int:
     return int(data.get("dag_revision", 0))
+
+
+# ---------- judged-slate ledger snapshots (selection-safe projections) ----------
+# The fields a selection layer may read from one prefix record. Notably absent:
+# `final_best_score` and every tuning-lifecycle field, which legitimately change
+# in later bouts and must not invalidate a generation's prefix binding.
+SELECTION_SAFE_RECORD_FIELDS = (
+    "run_id",
+    "selection_index",
+    "op",
+    "source_run_ids",
+    "status",
+    "idea",
+    "semantic_point",
+    "best_warm_score",
+)
+
+
+def selection_safe_record_projection(record: dict, selection_index: int) -> dict:
+    """Project one record to the fields judged-slate artifacts may bind to.
+
+    ``selection_index`` is positional: admission enforces
+    ``len(records) + 1`` (ledger_admission), so the projection derives it
+    instead of trusting a mutable record field.
+    """
+    return {
+        "run_id": record.get("run_id"),
+        "selection_index": selection_index,
+        "op": record.get("op"),
+        "source_run_ids": record.get("source_run_ids"),
+        "status": record.get("status"),
+        "idea": record.get("idea"),
+        "semantic_point": record.get("semantic_point"),
+        "best_warm_score": record.get("best_warm_score"),
+    }
+
+
+def records_prefix_digest(records: list) -> str:
+    """Digest the generation-start ledger prefix in admission order."""
+    return digest(
+        [
+            selection_safe_record_projection(record, index + 1)
+            for index, record in enumerate(records)
+        ]
+    )
+
+
+def experience_receipt(data: dict) -> dict:
+    """Compact receipt of the ledger's experience snapshot (Nones when absent)."""
+    experience = data.get("experience") if isinstance(data, dict) else None
+    if not isinstance(experience, dict) or not experience:
+        return {"generation": None, "updated_at_run": None, "revision": None}
+    return {
+        "generation": experience.get("generation"),
+        "updated_at_run": experience.get("updated_at_run"),
+        "revision": digest(experience),
+    }
+
+
+def search_space_state_revision(data: dict) -> int:
+    state = data.get("search_space_state") if isinstance(data, dict) else None
+    if not isinstance(state, dict):
+        return 0
+    revision = state.get("revision")
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 0
+    ):
+        raise ValueError(
+            "ledger.search_space_state.revision must be a non-negative integer"
+        )
+    return revision
 
 
 def experience_refresh_status(data: dict) -> dict:

@@ -346,11 +346,35 @@ def _validate_anchor_challenger(config: dict, tuner: dict, path: Path) -> None:
         )
 
 
+def _validate_judged_slate_config(judged_slate: dict, path: Path) -> None:
+    """Validate the judged-slate listwise-judge arm's pool configuration."""
+    unknown = sorted(set(judged_slate) - {"pool_size"})
+    if unknown:
+        raise RunConfigError(f"{path}: unknown judged_slate keys {unknown}")
+    if "pool_size" not in judged_slate or judged_slate["pool_size"] is None:
+        return
+    value = judged_slate["pool_size"]
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 3 <= value <= 12
+    ):
+        raise RunConfigError(
+            f"{path}: judged_slate.pool_size must be an integer in [3, 12]"
+        )
+
+
 def _validate_framework_cfg(config: dict, path: Path) -> None:
     """Validate the hard-limit fields shared by deterministic consumers."""
     _validate_optional_positive_int(config, "max_evaluations", path)
     _validate_optional_positive_number(config, "per_runtime_limit", path)
     _validate_optional_positive_number(config, "preflight_runtime_limit", path)
+
+    judged_slate = config.get("judged_slate")
+    if judged_slate is not None:
+        if not isinstance(judged_slate, dict):
+            raise RunConfigError(f"{path}: judged_slate must be an object")
+        _validate_judged_slate_config(judged_slate, path)
 
     tuner = config.get("tuner")
     if tuner is None:

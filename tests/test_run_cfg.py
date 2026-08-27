@@ -248,5 +248,36 @@ class ProgressiveTunerKnobsTest(unittest.TestCase):
                         read_framework_cfg(self.cfg_path)
 
 
+class JudgedSlateConfigTests(unittest.TestCase):
+    def _read(self, section) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "framework_cfg.json"
+            path.write_text(json.dumps({"judged_slate": section}))
+            return read_framework_cfg(path)["judged_slate"]
+
+    def test_pool_size_defaults_and_valid_overrides(self) -> None:
+        self.assertEqual(self._read({}), {})
+        self.assertEqual(self._read({"pool_size": 3}), {"pool_size": 3})
+        self.assertEqual(self._read({"pool_size": 12}), {"pool_size": 12})
+        self.assertEqual(self._read({"pool_size": None}), {"pool_size": None})
+
+    def test_pool_size_bounds_and_types(self) -> None:
+        for value in (2, 13, 0, -1, 6.0, "6", True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    RunConfigError, r"judged_slate.pool_size must be an integer in \[3, 12\]"
+                ):
+                    self._read({"pool_size": value})
+
+    def test_unknown_keys_and_non_object_section_are_rejected(self) -> None:
+        with self.assertRaisesRegex(RunConfigError, "unknown judged_slate keys"):
+            self._read({"pool_size": 6, "slate_size": 2})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "framework_cfg.json"
+            path.write_text(json.dumps({"judged_slate": 6}))
+            with self.assertRaisesRegex(RunConfigError, "judged_slate must be an object"):
+                read_framework_cfg(path)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -293,6 +293,19 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
 
             self.assertEqual(self._strategy(run_dir), "llm_induced")
 
+    def test_judged_slate_policy_is_registered_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+
+            run_dir = initialize_run(
+                repo_root, "toy", "judged", semantic_policy="judged_slate"
+            )
+
+            config = json.loads((run_dir / "framework_cfg.json").read_text())
+            self.assertEqual(config["semantic_search"]["policy"], "judged_slate")
+            self.assertEqual(config["judged_slate"]["pool_size"], 6)
+
     def test_run_limits_are_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

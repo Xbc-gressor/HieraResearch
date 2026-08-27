@@ -20,7 +20,13 @@ from pathlib import Path
 from evaluation_budget import budget_status
 from got_cdag import c_dag
 from got_graph import Graph
+from ledger_core import (
+    experience_receipt,
+    records_prefix_digest,
+    search_space_state_revision,
+)
 from run_cfg import read_framework_cfg
+from slate import write_json_atomic
 
 
 def softmax(d: dict, tau: float) -> dict:
@@ -226,6 +232,79 @@ def load_run_cfg(ledger_path: Path, section: str) -> dict:
     return {}
 
 
+def _generation_number(run_dir: Path) -> int:
+    """1 + count of committed generation manifests under `<run_dir>/.semantic/`.
+
+    Only a successfully landed `generation.json` consumes a generation number;
+    provisional artifacts of an aborted generation are overwritten on retry.
+    """
+    semantic_dir = run_dir / ".semantic"
+    if not semantic_dir.is_dir():
+        return 1
+    return sum(1 for _ in semantic_dir.glob("gen-*/generation.json")) + 1
+
+
+def _lanes_document(
+    path: Path,
+    data: dict,
+    graph: "Graph",
+    cfg: dict,
+    result: dict,
+    *,
+    remaining,
+    admission_cap,
+    k_eval: int,
+    tournament: dict,
+) -> dict:
+    """`decide --mode lanes` output: action lanes for the judged-slate arm.
+
+    The admission cap and tournament reserve are still computed and recorded
+    as budget facts, but they never truncate lanes. Homogeneous fresh actions
+    (bootstrap/stall) merge into one fresh lane; PUCB actions dedupe by
+    (op, parents) and carry their computed Q as `lane_value`.
+    """
+    records = data.get("records", [])
+    lanes = []
+    seen = set()
+    for action in result["actions"]:
+        op = action["op"]
+        parents = [str(p) for p in (action.get("parents") or [])]
+        key = (op, tuple(parents))
+        if key in seen:
+            continue
+        seen.add(key)
+        lane_value = (
+            None if op == "fresh" else Q(graph, (op, tuple(parents)), cfg["gamma"])
+        )
+        lanes.append(
+            {
+                "lane_id": f"lane-{len(lanes):02d}",
+                "op": op,
+                "parents": parents,
+                "lane_value": lane_value,
+            }
+        )
+    budget = {
+        "objective_remaining": remaining,
+        "admission_cap": admission_cap,
+        "candidate_objective_reservation": k_eval,
+        **tournament,
+    }
+    return {
+        "schema_version": 1,
+        "gen_no": _generation_number(path.parent),
+        "ledger_snapshot": {
+            "record_count": len(records),
+            "records_digest": records_prefix_digest(records),
+            "dag_revision": int(data.get("dag_revision", 0) or 0),
+            "search_space_state_revision": search_space_state_revision(data),
+            "experience": experience_receipt(data),
+        },
+        "budget": budget,
+        "lanes": lanes,
+    }
+
+
 def cmd_decide(args) -> int:
     cfg = dict(DEFAULT_CFG)
     cfg.update(load_run_cfg(Path(args.ledger), "got"))   # per-run framework_cfg.json
@@ -246,6 +325,8 @@ def cmd_decide(args) -> int:
         k_eval = max(2, int(tuner_cfg.get("K_eval", 2)))
     except (TypeError, ValueError):
         k_eval = 2
+    tournament: dict = {}
+    admission_cap = None
     if isinstance(remaining, int):
         admission_cap = remaining // k_eval
         if tuner_cfg.get("scheduler_policy") == "anchor_challenger_v1":
@@ -270,10 +351,28 @@ def cmd_decide(args) -> int:
             )
             reserve_cap = generation_admission_cap(tournament_state)
             admission_cap = min(admission_cap, reserve_cap)
-            result["diag"]["tournament_generation_reserve"] = (
+            tournament["tournament_generation_reserve"] = (
                 generation_reserve(tournament_state)
             )
-            result["diag"]["tournament_admission_cap"] = reserve_cap
+            tournament["tournament_admission_cap"] = reserve_cap
+    if getattr(args, "mode", "actions") == "lanes":
+        document = _lanes_document(
+            path,
+            data,
+            graph,
+            cfg,
+            result,
+            remaining=remaining,
+            admission_cap=admission_cap,
+            k_eval=k_eval,
+            tournament=tournament,
+        )
+        if getattr(args, "output", None):
+            write_json_atomic(Path(args.output), document)
+        print(json.dumps(document, indent=2))
+        return 0
+    if isinstance(remaining, int):
+        result["diag"].update(tournament)
         result["actions"] = result["actions"][:admission_cap]
         result["diag"]["objective_remaining"] = remaining
         result["diag"]["candidate_admission_cap"] = admission_cap
@@ -288,6 +387,19 @@ def build_parser() -> argparse.ArgumentParser:
     dec = sub.add_parser("decide", help="读 ledger → 输出本代 {gen,kind,actions,diag}")
     dec.add_argument("--ledger", required=True, help="Path to ledger.json")
     dec.add_argument("--cfg", help="JSON,覆盖 DEFAULT_CFG 的部分键(如 '{\"B\":3}')")
+    dec.add_argument(
+        "--mode",
+        choices=["actions", "lanes"],
+        default="actions",
+        help=(
+            "actions: legacy single-policy output (unchanged); lanes: judged-slate "
+            "action lanes with ledger snapshot and budget facts, never cap-truncated"
+        ),
+    )
+    dec.add_argument(
+        "--output",
+        help="lanes mode only: also write the lanes document to this path (atomic)",
+    )
     dec.set_defaults(func=cmd_decide)
     return parser
 
