@@ -170,7 +170,22 @@ POLICY_NAMES = COVERAGE_POLICY_NAMES | {
     "gain",
     "gain_uncertainty",
     "gain_uncertainty_nocost",
+    # The judged-slate arm admits via schema 8 receipts only; it carries no
+    # acquisition components because the listwise facts live in the manifest.
+    "judged_slate",
 }
+POLICY_CONFIG_KEYS_V8 = {"pool_size", "slate_size", "regular_rollouts"}
+# Aggregation paths that can appear in a manifest with a non-empty slate
+# (mirrors the decision tree in tools/slate.py, which imports this module).
+SLATE_AGGREGATION_PATHS = {
+    "consensus",
+    "boundary",
+    "coverage_fallback",
+    "judge_skipped_cardinality",
+    "judge_skipped_pool_le_B",
+}
+SLATE_POOL_SIZE_RANGE = (3, 12)  # mirrors slate.POOL_SIZE_MIN/MAX
+SLATE_CONFIG_FROZEN = {"slate_size": 2, "regular_rollouts": 2}
 
 
 class ContractError(ValueError):
@@ -875,17 +890,199 @@ def validate_candidate_point(point: Any, registry: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_policy_receipt_v8(record: dict[str, Any], where: str) -> list[str]:
+    """The judged-slate receipt shape (schema 8).
+
+    The receipt binds the record to one generation manifest slot; it carries
+    no ``selected_point_id``/``ranked_point_ids``/``components`` — those
+    listwise facts exist only in the manifest the receipt points to.
+    """
+    receipt = record["policy_receipt"]
+    point = record.get("semantic_point")
+    point_object = point if isinstance(point, dict) else {}
+    errors: list[str] = []
+    allowed = {
+        "schema_version",
+        "space",
+        "search_space_state_revision",
+        "policy",
+        "generation_id",
+        "judge",
+        "carrier_proposal_set_revision",
+        "budget",
+        "experience",
+    }
+    unknown = sorted(set(receipt) - allowed)
+    if unknown:
+        errors.append(f"{where}.policy_receipt has unknown fields {unknown}")
+    state_revision = receipt.get("search_space_state_revision")
+    if (
+        not isinstance(state_revision, int)
+        or isinstance(state_revision, bool)
+        or state_revision < 0
+    ):
+        errors.append(
+            f"{where}.policy_receipt.search_space_state_revision must be a "
+            "non-negative integer"
+        )
+    space = receipt.get("space")
+    if not isinstance(space, dict):
+        errors.append(f"{where}.policy_receipt.space must be the frozen space receipt")
+    elif space.get("space_revision") != point_object.get("space_revision"):
+        errors.append(
+            f"{where}.policy_receipt.space.space_revision must match semantic_point"
+        )
+    policy = receipt.get("policy")
+    if not isinstance(policy, dict) or set(policy) != {"name", "config"}:
+        errors.append(f"{where}.policy_receipt.policy must contain only name and config")
+        policy = {}
+    elif policy.get("name") != "judged_slate":
+        errors.append(
+            f"{where}.policy_receipt.policy.name must be judged_slate at schema 8"
+        )
+    config = policy.get("config") if isinstance(policy, dict) else None
+    if not isinstance(config, dict) or set(config) != POLICY_CONFIG_KEYS_V8:
+        errors.append(
+            f"{where}.policy_receipt.policy.config must keep exactly "
+            f"{sorted(POLICY_CONFIG_KEYS_V8)}"
+        )
+    else:
+        pool_size = config.get("pool_size")
+        low, high = SLATE_POOL_SIZE_RANGE
+        if (
+            not isinstance(pool_size, int)
+            or isinstance(pool_size, bool)
+            or not low <= pool_size <= high
+        ):
+            errors.append(
+                f"{where}.policy_receipt.policy.config.pool_size must be "
+                f"an integer in [{low}, {high}]"
+            )
+        for key, expected in SLATE_CONFIG_FROZEN.items():
+            if config.get(key) != expected:
+                errors.append(
+                    f"{where}.policy_receipt.policy.config.{key} is fixed at {expected}"
+                )
+    generation_id = receipt.get("generation_id")
+    if not isinstance(generation_id, str) or DIGEST_RE.fullmatch(generation_id) is None:
+        errors.append(f"{where}.policy_receipt.generation_id must be a sha256 digest")
+    judge = receipt.get("judge")
+    judge_fields = {
+        "manifest_path",
+        "manifest_digest",
+        "slate_index",
+        "candidate_id",
+        "aggregation",
+    }
+    if not isinstance(judge, dict) or set(judge) != judge_fields:
+        errors.append(
+            f"{where}.policy_receipt.judge must contain exactly "
+            f"{sorted(judge_fields)}"
+        )
+    else:
+        if not _nonempty(judge.get("manifest_path")):
+            errors.append(
+                f"{where}.policy_receipt.judge.manifest_path must be a non-empty "
+                "run-relative path"
+            )
+        for key in ("manifest_digest", "candidate_id"):
+            value = judge.get(key)
+            if not isinstance(value, str) or DIGEST_RE.fullmatch(value) is None:
+                errors.append(
+                    f"{where}.policy_receipt.judge.{key} must be a sha256 digest"
+                )
+        slate_index = judge.get("slate_index")
+        if (
+            not isinstance(slate_index, int)
+            or isinstance(slate_index, bool)
+            or slate_index < 0
+        ):
+            errors.append(
+                f"{where}.policy_receipt.judge.slate_index must be a "
+                "non-negative integer"
+            )
+        if judge.get("aggregation") not in SLATE_AGGREGATION_PATHS:
+            errors.append(
+                f"{where}.policy_receipt.judge.aggregation must be one of "
+                f"{sorted(SLATE_AGGREGATION_PATHS)}"
+            )
+    carrier_revision = receipt.get("carrier_proposal_set_revision")
+    if not isinstance(carrier_revision, str) or DIGEST_RE.fullmatch(carrier_revision) is None:
+        errors.append(
+            f"{where}.policy_receipt.carrier_proposal_set_revision must be a "
+            "sha256 digest"
+        )
+    budget = receipt.get("budget")
+    if not isinstance(budget, dict) or set(budget) != {"selection_index", "admission_cap"}:
+        errors.append(
+            f"{where}.policy_receipt.budget must contain exactly "
+            "['admission_cap', 'selection_index']"
+        )
+    else:
+        selection_index = budget.get("selection_index")
+        if (
+            not isinstance(selection_index, int)
+            or isinstance(selection_index, bool)
+            or selection_index < 1
+        ):
+            errors.append(
+                f"{where}.policy_receipt.budget.selection_index must be a "
+                "positive integer"
+            )
+        admission_cap = budget.get("admission_cap")
+        if admission_cap is not None and (
+            not isinstance(admission_cap, int)
+            or isinstance(admission_cap, bool)
+            or admission_cap < 1
+        ):
+            errors.append(
+                f"{where}.policy_receipt.budget.admission_cap must be null or a "
+                "positive integer"
+            )
+    experience = receipt.get("experience")
+    experience_fields = {"generation", "updated_at_run", "revision"}
+    if not isinstance(experience, dict) or set(experience) != experience_fields:
+        errors.append(
+            f"{where}.policy_receipt.experience must contain exactly "
+            f"{sorted(experience_fields)}"
+        )
+    else:
+        generation = experience.get("generation")
+        updated_at_run = experience.get("updated_at_run")
+        revision = experience.get("revision")
+        snapshot_absent = (
+            generation is None and updated_at_run is None and revision is None
+        )
+        snapshot_present = (
+            isinstance(generation, int)
+            and not isinstance(generation, bool)
+            and generation >= 0
+            and isinstance(updated_at_run, str)
+            and updated_at_run.isdigit()
+            and isinstance(revision, str)
+            and DIGEST_RE.fullmatch(revision) is not None
+        )
+        if not (snapshot_absent or snapshot_present):
+            errors.append(
+                f"{where}.policy_receipt.experience snapshot fields must be "
+                "all null or a valid generation/run/revision receipt"
+            )
+    return errors
+
+
 def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     receipt = record.get("policy_receipt")
     point = record.get("semantic_point")
     if not isinstance(receipt, dict):
         return [f"{where}.policy_receipt must be an object distinct from observations"]
+    if receipt.get("schema_version") == 8:
+        return _validate_policy_receipt_v8(record, where)
     point_object = point if isinstance(point, dict) else {}
     errors: list[str] = []
     receipt_schema = receipt.get("schema_version")
     if receipt_schema not in {6, 7}:
         errors.append(
-            f"{where}.policy_receipt.schema_version must be 6 or 7"
+            f"{where}.policy_receipt.schema_version must be 6, 7, or 8"
         )
     state_revision = receipt.get("search_space_state_revision")
     if (
@@ -1698,6 +1895,14 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         # Replay the overlay at the record's historical selection revision, so
         # later pruning never invalidates an earlier admitted record.
         receipt = record.get("policy_receipt")
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("schema_version") == 8
+            and receipt.get("space") != expected_receipt
+        ):
+            errors.append(
+                f"{where}.policy_receipt.space must equal the frozen space receipt"
+            )
         if isinstance(receipt, dict) and receipt.get("schema_version") in {6, 7}:
             policy = receipt.get("policy")
             config = policy.get("config") if isinstance(policy, dict) else None
@@ -1748,7 +1953,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     record.get("semantic_point"), registry, effective
                 )
                 errors.extend(f"{where}: {error}" for error in eligibility)
-                if isinstance(receipt, dict) and receipt.get("schema_version") in {6, 7}:
+                if isinstance(receipt, dict) and receipt.get("schema_version") in {6, 7, 8}:
                     budget = receipt.get("budget")
                     point = record.get("semantic_point")
                     if isinstance(point, dict) and receipt.get("schema_version") == 6:

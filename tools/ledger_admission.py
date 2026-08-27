@@ -8,6 +8,7 @@ for loading and committing ``ledger.json``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 
@@ -18,9 +19,12 @@ from background_contract import (
     validate_registry,
 )
 from ledger_core import (
+    experience_receipt,
     experience_refresh_status,
     get_record,
     new_record,
+    records_prefix_digest,
+    search_space_state_revision,
 )
 from run_cfg import load_run_cfg
 from search_space_state import empty_search_space_state
@@ -54,6 +58,7 @@ from semantic_space import (
     resolve_dimension_strategy,
     space_receipt,
 )
+from slate import replay_aggregation, verify_manifest
 
 
 class AdmissionError(ValueError):
@@ -79,7 +84,9 @@ class AdmissionRequest:
     task_config: dict | None = None
 
 
-def _resolve_space(request: AdmissionRequest, data: dict) -> tuple[dict, dict, str]:
+def _resolve_space(
+    request: "AdmissionRequest | SlateAdmissionRequest", data: dict
+) -> tuple[dict, dict, str]:
     registry = load_registry(request.background_path)
     try:
         dimension_strategy = resolve_dimension_strategy(request.background_path)
@@ -359,9 +366,9 @@ def admit_record(data: dict, request: AdmissionRequest) -> dict:
             f"current search space state revision {revision}; re-propose and "
             "re-select against the current overlay before admission"
         )
-    if policy_receipt.get("schema_version") not in {6, 7}:
+    if policy_receipt.get("schema_version") not in {6, 7, 8}:
         raise AdmissionError(
-            "new candidate admission requires policy receipt schema 6 or 7 with "
+            "new candidate admission requires policy receipt schema 6, 7, or 8 with "
             "proposal-relevant gated experience conditioning and an auditable "
             "LLM-judgment reliability prior"
         )
@@ -391,3 +398,331 @@ def admit_record(data: dict, request: AdmissionRequest) -> dict:
             "invalid candidate semantic contract: " + "; ".join(errors)
         )
     return record
+
+
+# ---------- judged-slate atomic batch admission (policy receipt schema 8) ----------
+
+
+@dataclass(frozen=True)
+class SlateAdmissionRequest:
+    """One judged-slate generation's atomic admission input.
+
+    ``manifest_path`` is the immutable ``generation.json``; each seat's
+    ``idea``/``change``/``candidate_name`` (and optional ``route_provenance``)
+    come from ``plans/slot-N.json``.  The point/op/parents and the whole
+    schema-8 policy receipt are derived from the manifest, never from the
+    plans.
+    """
+
+    background_path: Path
+    catalog_path: Path | None
+    manifest_path: Path
+    plans_dir: Path
+    run_dir: Path
+
+
+def _load_json_object(path: Path, what: str) -> dict:
+    try:
+        value = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AdmissionError(f"cannot read {what} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise AdmissionError(f"{path}: {what} must be a JSON object")
+    return value
+
+
+def _load_slate_plan(request: SlateAdmissionRequest, slot: int) -> dict:
+    plan = _load_json_object(
+        Path(request.plans_dir) / f"slot-{slot}.json", "slate plan"
+    )
+    if plan.get("slot") != slot:
+        raise AdmissionError(f"slate plan slot-{slot}.json does not belong to slot {slot}")
+    for field in ("idea", "change", "candidate_name"):
+        if not isinstance(plan.get(field), str) or not plan[field].strip():
+            raise AdmissionError(f"slate plan slot {slot} needs a non-empty {field}")
+    return plan
+
+
+def _validate_judge_binding(
+    data: dict, request: SlateAdmissionRequest, registry: dict
+) -> tuple[dict, str, str]:
+    """Bind the generation manifest to this run and the pre-admission ledger.
+
+    Returns ``(manifest, run-relative manifest path, manifest digest)``.
+    Everything the seats will claim is checked here, before any record is
+    constructed: the manifest's location and content id, the artifact digest
+    chain, the judge replay, and the generation-start ledger snapshot.
+    """
+    manifest_path = Path(request.manifest_path)
+    manifest = _load_json_object(manifest_path, "slate manifest")
+    if manifest.get("schema_version") != 1:
+        raise AdmissionError("slate manifest schema_version must be 1")
+    gen_no = manifest.get("gen_no")
+    if not isinstance(gen_no, int) or isinstance(gen_no, bool) or gen_no < 1:
+        raise AdmissionError("slate manifest gen_no must be a positive integer")
+    policy = manifest.get("policy")
+    if not isinstance(policy, dict) or policy.get("name") != "judged_slate":
+        raise AdmissionError("slate manifest policy.name must be judged_slate")
+    slate_slots = manifest.get("slate")
+    if not isinstance(slate_slots, list) or not slate_slots:
+        raise AdmissionError("slate manifest slate must be a non-empty list")
+    aggregation = manifest.get("aggregation")
+    if not isinstance(aggregation, dict) or not isinstance(aggregation.get("path"), str):
+        raise AdmissionError("slate manifest aggregation must record the aggregation path")
+    budget = manifest.get("budget")
+    admission_cap = budget.get("admission_cap") if isinstance(budget, dict) else None
+    if admission_cap is not None and (
+        not isinstance(admission_cap, int)
+        or isinstance(admission_cap, bool)
+        or admission_cap < len(slate_slots)
+    ):
+        raise AdmissionError(
+            "slate manifest budget.admission_cap must be null or cover the slate"
+        )
+    snapshot = manifest.get("ledger_snapshot")
+    if not isinstance(snapshot, dict):
+        raise AdmissionError("slate manifest ledger_snapshot must be an object")
+    revisions = manifest.get("proposal_set_revisions")
+    if not isinstance(revisions, dict):
+        raise AdmissionError("slate manifest proposal_set_revisions must be an object")
+
+    # The manifest is the generation commit point: it lives at the fixed
+    # run-relative generation path, and the receipt digests its landed bytes.
+    manifest_rel = f".semantic/gen-{gen_no:04d}/generation.json"
+    resolved = (Path(request.run_dir) / manifest_rel).resolve()
+    if resolved != manifest_path.resolve():
+        raise AdmissionError(
+            f"slate manifest must live at {manifest_rel} under the run directory"
+        )
+    manifest_digest = "sha256:" + hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    run_ids = [
+        slot.get("run_id") if isinstance(slot, dict) else None for slot in slate_slots
+    ]
+    if manifest.get("reserved_run_ids") != run_ids:
+        raise AdmissionError(
+            "slate manifest reserved_run_ids must equal the slate's run ids"
+        )
+    if len(set(run_ids)) != len(run_ids) or any(
+        not isinstance(run_id, str) or not run_id.isdigit() for run_id in run_ids
+    ):
+        raise AdmissionError("slate run ids must be distinct numeric strings")
+    for run_id in run_ids:
+        if get_record(data, run_id) is not None:
+            raise AdmissionError(f"record already exists for run_id {run_id}")
+    for index, slot in enumerate(slate_slots):
+        if not isinstance(slot, dict) or slot.get("slot") != index:
+            raise AdmissionError(f"slate manifest slot {index} is missing or misnumbered")
+        carrier = slot.get("carrier")
+        op = carrier.get("op") if isinstance(carrier, dict) else None
+        expected = {"fresh": 0, "improve": 1, "crossover": 2}.get(op)
+        parents = carrier.get("parents") if isinstance(carrier, dict) else None
+        if (
+            expected is None
+            or not isinstance(parents, list)
+            or len(parents) != expected
+            or len(set(parents)) != len(parents)
+            or any(
+                not isinstance(parent, str) or not parent.isdigit()
+                for parent in parents
+            )
+        ):
+            raise AdmissionError(
+                f"slate slot {index} carrier has an invalid op/parents shape"
+            )
+        if not isinstance(slot.get("point"), dict):
+            raise AdmissionError(f"slate slot {index} must carry the full point")
+        if slot.get("point_id") != point_id(slot["point"]):
+            raise AdmissionError(f"slate slot {index} point_id does not match its point")
+        if carrier.get("proposal_set_revision") != revisions.get(carrier.get("lane_id")):
+            raise AdmissionError(
+                f"slate slot {index} carrier proposal revision is not one of the "
+                "manifest's recorded proposal sets"
+            )
+
+    gen_dir = manifest_path.parent
+    pool_doc = _load_json_object(gen_dir / "pool.json", "slate pool")
+    context_doc = _load_json_object(gen_dir / "context.json", "slate context")
+    judge_doc = _load_json_object(gen_dir / "judge.json", "slate judge")
+    errors = verify_manifest(manifest, pool_doc, context_doc, judge_doc)
+    if errors:
+        raise AdmissionError(
+            "invalid judged-slate generation artifacts: " + "; ".join(errors)
+        )
+    if pool_doc.get("space") != space_receipt(registry):
+        raise AdmissionError(
+            "the slate generation was constructed against a different search space"
+        )
+    errors = replay_aggregation(pool_doc, judge_doc)
+    if errors:
+        raise AdmissionError("; ".join(errors))
+
+    # The generation-start snapshot must still be the current pre-admission
+    # ledger: nothing may have moved between the manifest and the admission.
+    records = data.get("records", [])
+    dag_revision = int(data.get("dag_revision", 0) or 0)
+    if snapshot.get("record_count") != len(records):
+        raise AdmissionError(
+            "slate manifest ledger_snapshot.record_count does not match the "
+            "pre-admission ledger"
+        )
+    if snapshot.get("records_digest") != records_prefix_digest(records):
+        raise AdmissionError(
+            "slate manifest records_digest does not match the pre-admission "
+            "ledger prefix"
+        )
+    if snapshot.get("dag_revision") != dag_revision:
+        raise AdmissionError(
+            "slate manifest dag_revision does not match the pre-admission ledger"
+        )
+    if snapshot.get("search_space_state_revision") != search_space_state_revision(data):
+        raise AdmissionError(
+            "slate manifest search_space_state_revision does not match the "
+            "pre-admission ledger"
+        )
+    if snapshot.get("experience") != experience_receipt(data):
+        raise AdmissionError(
+            "slate manifest experience snapshot does not match the pre-admission "
+            "ledger"
+        )
+    return manifest, manifest_rel, manifest_digest
+
+
+def _slate_route_provenance(
+    data: dict, route_cfg: dict, route_active: bool, slot: dict, plan: dict
+) -> dict | None:
+    """Validate one seat's planned route provenance against the shared prefix."""
+    provenance = plan.get("route_provenance")
+    if provenance is None:
+        if route_active:
+            raise AdmissionError(
+                "the configured route arm requires route_provenance in each "
+                "slate plan"
+            )
+        return None
+    if is_not_applicable(provenance):
+        raise AdmissionError(
+            "a judged-slate candidate is never the task-provided baseline; "
+            "route provenance cannot be not_applicable"
+        )
+    carrier = slot["carrier"]
+    memory = build_route_memory(data, slot["point"], carrier["op"], route_cfg)
+    errors = validate_route_provenance(provenance, memory=memory)
+    if errors:
+        raise AdmissionError("invalid route provenance: " + "; ".join(errors))
+    return provenance
+
+
+def admit_slate_atomic(data: dict, request: SlateAdmissionRequest) -> list[dict]:
+    """Validate and append one judged-slate generation's slate as one batch.
+
+    Every seat is constructed against the same pre-admission ledger prefix —
+    route memory, semantic edges, and the experience binding never see a
+    sibling seat — then the batch is appended once and the whole ledger is
+    revalidated.  Any failure rolls the in-memory ledger back; the caller must
+    not persist after an ``AdmissionError``.
+    """
+    try:
+        refresh = experience_refresh_status(data)
+    except ValueError as exc:
+        raise AdmissionError(f"invalid experience refresh state: {exc}") from None
+    if refresh["semantic_admission_blocked"]:
+        raise AdmissionError(
+            "stale experience: terminal DAG evidence must be refreshed before "
+            "another semantic candidate is admitted; resolve any already-pending "
+            "siblings first"
+        )
+
+    registry, catalog, dimension_strategy = _resolve_space(request, data)
+    data["search_space"] = data.get("search_space") or space_receipt(registry)
+    data["search_space_state"] = (
+        data.get("search_space_state") or empty_search_space_state()
+    )
+    records = data["records"]
+    pre_count = len(records)
+
+    manifest, manifest_rel, manifest_digest = _validate_judge_binding(
+        data, request, registry
+    )
+    slate_slots = manifest["slate"]
+    admission_cap = manifest["budget"]["admission_cap"]
+    plans = [_load_slate_plan(request, slot["slot"]) for slot in slate_slots]
+    try:
+        route_cfg = route_config(
+            load_run_cfg(request.background_path, "semantic_search")
+        )
+    except RouteError as exc:
+        raise AdmissionError(str(exc)) from None
+    route_active = route_arm_active(route_cfg)
+
+    space = space_receipt(registry)
+    state_revision = search_space_state_revision(data)
+    experience = experience_receipt(data)
+    admitted = []
+    for slot, plan in zip(slate_slots, plans):
+        index = slot["slot"]
+        carrier = slot["carrier"]
+        op = carrier["op"]
+        parents = [str(parent) for parent in carrier["parents"]]
+        receipt = {
+            "schema_version": 8,
+            "space": space,
+            "search_space_state_revision": state_revision,
+            "policy": {
+                "name": "judged_slate",
+                "config": dict(manifest["policy"].get("config") or {}),
+            },
+            "generation_id": manifest["generation_id"],
+            "judge": {
+                "manifest_path": manifest_rel,
+                "manifest_digest": manifest_digest,
+                "slate_index": index,
+                "candidate_id": slot["candidate_id"],
+                "aggregation": manifest["aggregation"]["path"],
+            },
+            "carrier_proposal_set_revision": carrier["proposal_set_revision"],
+            "budget": {
+                "selection_index": pre_count + index + 1,
+                "admission_cap": admission_cap,
+            },
+            "experience": dict(experience),
+        }
+        record = new_record(slot["run_id"])
+        record.update(
+            kind="optimization",
+            idea=plan["idea"],
+            change=plan["change"],
+            source_run_ids=parents,
+            op=op,
+            semantic_point=slot["point"],
+            semantic_edges=[],
+            policy_receipt=receipt,
+            # Recomputed against the pre-admission ledger, so the memory the
+            # plan writer was shown is exactly the memory validated here.
+            route_provenance=_slate_route_provenance(
+                data, route_cfg, route_active, slot, plan
+            ),
+            role=None,
+            candidate_name=plan["candidate_name"],
+            description=plan["idea"],
+            metric=data["metric"],
+        )
+        try:
+            record["semantic_edges"] = build_semantic_edges(records, record)
+        except SemanticEvidenceError as exc:
+            raise AdmissionError(f"invalid candidate semantic contract: {exc}") from exc
+        _validate_experience_binding(data, record, receipt, parents)
+        _validate_attempt_binding(data, record, receipt)
+        admitted.append(record)
+
+    records.extend(admitted)
+    errors = validate_registry(
+        registry,
+        ledger=data,
+        catalog=catalog,
+        dimension_strategy=dimension_strategy,
+    )
+    if errors:
+        del records[pre_count:]
+        raise AdmissionError("invalid judged-slate batch: " + "; ".join(errors))
+    return admitted

@@ -233,6 +233,40 @@ def cmd_add_record(args) -> int:
     return 0
 
 
+def cmd_admit_slate(args) -> int:
+    from ledger_admission import (
+        AdmissionError,
+        SlateAdmissionRequest,
+        admit_slate_atomic,
+    )
+
+    ledger_path = Path(args.ledger)
+    task_name = args.task or infer_task_name([ledger_path])
+    if not task_name:
+        raise SystemExit("could not infer task; pass --task")
+    config = load_task_config(task_name)
+    data = _load_ledger(ledger_path)
+    _ensure_meta(data, ledger_path, task_name, config)
+    try:
+        records = admit_slate_atomic(
+            data,
+            SlateAdmissionRequest(
+                background_path=Path(args.background),
+                catalog_path=Path(args.catalog) if args.catalog else None,
+                manifest_path=Path(args.manifest),
+                plans_dir=Path(args.plans_dir),
+                run_dir=ledger_path.parent,
+            ),
+        )
+    except AdmissionError as exc:
+        raise SystemExit(str(exc)) from None
+    # One transaction: a single ledger write and a single loop-state render.
+    _save_ledger(ledger_path, data)
+    _write_loop_state(ledger_path, data, config)
+    print(json.dumps(records, indent=2))
+    return 0
+
+
 def _tuning_target(
     ledger_path: Path,
     task_name: str,
@@ -401,7 +435,7 @@ def cmd_set_tuning(args) -> int:
         if (
             record.get("op") in {"improve", "crossover"}
             and isinstance(receipt, dict)
-            and receipt.get("schema_version") in {6, 7}
+            and receipt.get("schema_version") in {6, 7, 8}
         ):
             raise SystemExit(
                 "non-fresh candidates require --from-report so the exact "
@@ -986,6 +1020,20 @@ def build_parser() -> argparse.ArgumentParser:
                      help="planned route sketches, preference order, and chosen route; "
                           "required when the run's route arm is enabled")
     add.set_defaults(func=cmd_add_record)
+
+    slate_admit = sub.add_parser(
+        "admit-slate",
+        parents=[common],
+        help="Atomically admit one judged-slate generation's full slate",
+    )
+    slate_admit.add_argument("--background", required=True,
+                             help="hierarchical background.md that freezes this run's search space")
+    slate_admit.add_argument("--catalog", help="explicit dimension catalog override")
+    slate_admit.add_argument("--manifest", required=True, type=Path,
+                             help="the generation's immutable generation.json manifest")
+    slate_admit.add_argument("--plans-dir", required=True, type=Path,
+                             help="directory with the per-seat plans/slot-N.json receipts")
+    slate_admit.set_defaults(func=cmd_admit_slate)
 
     tune = sub.add_parser("set-tuning", parents=[common])
     tune.add_argument("--run-id", required=True)
