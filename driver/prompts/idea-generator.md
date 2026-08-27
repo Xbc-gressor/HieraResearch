@@ -62,12 +62,12 @@ Use its actions exactly. It owns only operation and parents:
 Do not replace its parents with the current best and do not fold semantic
 acquisition into PUCB.
 
-The helper also applies the strict objective-admission cap:
-`floor(remaining_objective_slots / max(2, K_eval))`. It may therefore return
-`actions: []` even when the graph policy had proposals. This is a valid
-budget-boundary no-op; persist no record and submit a receipt with an empty
-`actions` list, so the driver may spend any remainder below that reservation
-on deep tuning.
+The helper also applies the strict objective-admission allocation. Normal
+screens reserve `K_eval`; after scheduler reserve is no longer at risk, a final
+candidate may receive the two-row minimum instead of stranding two objective
+slots. It may return `actions: []` when fewer than two useful calls remain or a
+complete-bout scheduler still owns the budget. Persist no record in that case
+and submit a receipt with an empty `actions` list.
 
 ## Step 2 — Build valid semantic proposals
 

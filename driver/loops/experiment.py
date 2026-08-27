@@ -43,6 +43,12 @@ from ..session import InvocationFailed
 from ..status import budget_status, compact_status
 from . import common
 from .common import RunBlocked
+from tools.evaluation_budget import budget_status as objective_budget_status
+from tools.scheduler.contract import (
+    DEFAULT_K_EVAL,
+    MIN_GENERATION_K_EVAL,
+    ResourceContract,
+)
 
 _RECONCILE_GUIDANCE = (
     " Reconcile from the AUTHORITATIVE artifacts (ledger, "
@@ -796,6 +802,49 @@ def _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd) -> None:
          "--skip-entrypoint"], repo_root)
 
 
+def _screening_contract(run_dir: Path, run_id: str) -> tuple[int, int]:
+    """Return the resume-stable (actual, target) Phase-A screening width."""
+    config_path = run_dir / "framework_cfg.json"
+    config = (
+        json.loads(config_path.read_text(encoding="utf-8"))
+        if config_path.is_file()
+        else {}
+    )
+    tuner = config.get("tuner") if isinstance(config, dict) else {}
+    target = max(
+        MIN_GENERATION_K_EVAL,
+        int((tuner or {}).get("K_eval", DEFAULT_K_EVAL)),
+    )
+
+    report_path = run_dir / "candidates" / run_id / "tune_report.json"
+    if report_path.is_file():
+        selection = json.loads(report_path.read_text(encoding="utf-8")).get(
+            "phase_a", {}
+        ).get("warm_config_selection", {})
+        persisted = selection.get("k_eval")
+        if isinstance(persisted, int) and not isinstance(persisted, bool) \
+                and persisted > 0:
+            return persisted, target
+
+    remaining = objective_budget_status(run_dir).get("remaining")
+    actual = ResourceContract(k_eval=target).screening_reservation(
+        remaining if isinstance(remaining, int) else target,
+        allow_terminal_degrade=isinstance(remaining, int),
+    )
+    return actual, target
+
+
+def _extractor_extra(run_dir: Path, run_id: str, candidate_dir: Path,
+                     **extra) -> dict:
+    actual, target = _screening_contract(run_dir, run_id)
+    return {
+        "candidate_dir": str(candidate_dir),
+        "screening_k_eval": actual,
+        "screening_target_k_eval": target,
+        **extra,
+    }
+
+
 def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                          cmd, events, job_runner=execute_driver_job) -> None:
     """candidate-writer + extractor with evidence-branched escalation."""
@@ -816,7 +865,10 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
     try:
         _, extractor_inv = _invoke_with_driver_jobs(
             runner, store, "tunable-contract-extractor", task, tag, run_dir,
-            run_id=run_id, extra={"candidate_dir": str(candidate_dir)},
+            run_id=run_id,
+            extra=_extractor_extra(
+                run_dir, run_id, candidate_dir
+            ),
             repo_root=repo_root, job_runner=job_runner)
         return
     except InvocationFailed as exc:
@@ -845,8 +897,10 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             _invoke_with_driver_jobs(
                 runner, store, "tunable-contract-extractor", task, tag,
                 run_dir, run_id=run_id,
-                extra={"candidate_dir": str(candidate_dir),
-                       "diagnosis_verdict": verdict},
+                extra=_extractor_extra(
+                    run_dir, run_id, candidate_dir,
+                    diagnosis_verdict=verdict,
+                ),
                 resume_from=extractor_inv, repo_root=repo_root,
                 job_runner=job_runner)
             return
@@ -858,7 +912,9 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
         _invoke_with_driver_jobs(
             runner, store, "tunable-contract-extractor", task, tag,
             run_dir, run_id=run_id,
-            extra={"candidate_dir": str(candidate_dir)}, repo_root=repo_root,
+            extra=_extractor_extra(
+                run_dir, run_id, candidate_dir
+            ), repo_root=repo_root,
             job_runner=job_runner)
     except InvocationFailed as exc3:
         _or_block(run_dir, repo_root, cmd, events,
@@ -1390,14 +1446,27 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # -----------------------------------------------------------------
             # Completion guard: stop if no operation can spend the budget.
             # -----------------------------------------------------------------
-            # Quiescence guard: got_select caps actions by
-            # floor(remaining_slots / max(2, K_eval)), so a nearly-exhausted
-            # budget yields empty ideation rounds forever. Two consecutive
-            # rounds with no new candidates, no tuning, no refresh, and no
-            # pending resolutions mean no progress is possible within the
-            # remaining budget — complete normally instead of spinning.
+            # One leftover objective call cannot form the schema-4
+            # control/treatment minimum, so close it immediately with an
+            # explicit reason. Other zero-progress states still need two
+            # observations because scheduler eligibility may depend on
+            # non-budget facts repaired by the intervening role invocation.
             progressed = (bool(actions) or tuner_progressed or refreshed
                           or bool(pending_ids))
+            remaining = objective_budget_status(run_dir).get("remaining")
+            if not progressed and isinstance(remaining, int) \
+                    and 0 < remaining < MIN_GENERATION_K_EVAL:
+                events.emit(
+                    "quiescent",
+                    round_no=round_no,
+                    reason=(
+                        "remaining objective budget is below the minimum "
+                        f"meaningful action cost ({MIN_GENERATION_K_EVAL})"
+                    ),
+                    unused_budget=remaining,
+                )
+                _complete_run(run_dir, repo_root, cmd, events)
+                break
             zero_progress_rounds = 0 if progressed else zero_progress_rounds + 1
             if zero_progress_rounds >= 2:
                 events.emit("quiescent", round_no=round_no,

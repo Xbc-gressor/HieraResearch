@@ -28,6 +28,7 @@ from tools.scheduler.tournament import (  # noqa: E402
     decide,
     full_tuning_reserve,
     generation_admission_cap,
+    generation_candidate_reservation,
     generation_reserve,
 )
 import got_select  # noqa: E402
@@ -159,10 +160,46 @@ class TournamentPolicyTest(unittest.TestCase):
             state(
                 candidate("000", 1.01, bouts=2, gain=0.0),
                 candidate("001", 1.00, bouts=2, gain=0.02),
-                budget=20,
+                budget=1,
             )
         )
         self.assertEqual(decision.action, "STOP")
+
+    def test_default_k_three_preserves_reserve_then_spends_two_row_tail(self) -> None:
+        contract = ResourceContract(
+            max_bouts=3,
+            k_eval=3,
+            bout_cost_schedule=(24, 10, 10),
+        )
+        before_complete = SchedulerState(
+            global_best=1.0,
+            remaining_budget=46,
+            candidates=(
+                candidate("000", 1.0, bouts=1, gain=0.1),
+                candidate("001", 1.1),
+            ),
+            contract=contract,
+            n_roots=5,
+            n_seed=5,
+        )
+        self.assertEqual(generation_reserve(before_complete), 44)
+        self.assertEqual(generation_admission_cap(before_complete), 0)
+
+        completed = SchedulerState(
+            global_best=1.0,
+            remaining_budget=2,
+            candidates=(
+                candidate("000", 1.01, bouts=2, gain=0.0),
+                candidate("001", 1.00, bouts=2, gain=0.02),
+            ),
+            contract=contract,
+            n_roots=5,
+            n_seed=5,
+        )
+        self.assertEqual(generation_reserve(completed), 0)
+        self.assertEqual(generation_admission_cap(completed), 1)
+        self.assertEqual(generation_candidate_reservation(completed), 2)
+        self.assertEqual(decide(completed).action, "DEFER")
 
     def test_turbo_requires_numeric_space_only_after_initial(self) -> None:
         categorical = CandidateView(

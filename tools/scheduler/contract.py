@@ -36,9 +36,11 @@ MAX_BOUTS_PER_CANDIDATE = 4
 DEEP_MIN_BOUTS = 2
 
 #: Objective calls one generation round reserves per admitted candidate.
-#: Mirrors ``got_select.cmd_decide``'s ``k_eval`` floor: a non-fresh
-#: candidate scores its inherited control and at least one alternative.
-DEFAULT_K_EVAL = 2
+#: Mirrors ``got_select.cmd_decide``'s per-candidate screening reservation.
+#: Three preserves the production experiment setting: a non-fresh candidate
+#: scores its inherited control and two alternative rows.
+DEFAULT_K_EVAL = 3
+MIN_GENERATION_K_EVAL = 2
 
 
 @dataclass(frozen=True)
@@ -105,15 +107,41 @@ class ResourceContract:
         """Whether the remaining global budget funds one complete bout."""
         return remaining_budget >= self.bout_cost(bouts_used)
 
-    def generation_admits(self, remaining_budget: int) -> int:
+    def screening_reservation(
+        self,
+        remaining_budget: int,
+        *,
+        allow_terminal_degrade: bool = False,
+    ) -> int:
+        """Objective calls reserved for each candidate in the next generation.
+
+        ``k_eval`` remains the normal screening fidelity.  Once no later
+        scheduler decision depends on the new candidate, a final generation
+        may use the two-row minimum instead of stranding the global budget.
+        """
+        if (
+            allow_terminal_degrade
+            and MIN_GENERATION_K_EVAL <= remaining_budget < self.k_eval
+        ):
+            return remaining_budget
+        return self.k_eval
+
+    def generation_admits(
+        self,
+        remaining_budget: int,
+        *,
+        allow_terminal_degrade: bool = False,
+    ) -> int:
         """How many candidates the next generation round could admit.
 
-        The same floor division ``got_select`` applies to its action list.
-        Judging DEFER feasibility means asking whether this is positive —
-        a mechanical question about budget, not a prediction about what the
-        generator will actually produce.
+        Normal scheduling uses full ``k_eval`` fidelity. Terminal best-effort
+        mode may admit one two-row screen when that is all the budget left.
         """
-        return max(0, remaining_budget // self.k_eval)
+        reservation = self.screening_reservation(
+            remaining_budget,
+            allow_terminal_degrade=allow_terminal_degrade,
+        )
+        return max(0, remaining_budget // reservation)
 
 
 @dataclass(frozen=True)

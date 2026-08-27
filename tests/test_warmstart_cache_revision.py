@@ -16,6 +16,53 @@ import warmstart_eval  # noqa: E402
 
 
 class WarmstartCacheRevisionTests(unittest.TestCase):
+    def test_terminal_two_row_screen_consumes_budget_and_records_fidelity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "tail"
+            candidate, configs_path, report_path = self._fixture(
+                run_dir,
+                provided=False,
+            )
+            candidate.write_text(
+                candidate.read_text().replace(
+                    'SEARCH_SPACE = {"x": ("int", 1, 2)}',
+                    'SEARCH_SPACE = {"x": ("int", 1, 3)}',
+                )
+            )
+            configs_path.write_text(
+                json.dumps([{"x": 1}, {"x": 2}, {"x": 3}])
+            )
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 2, "tuner": {"K_eval": 3}})
+            )
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path", str(candidate),
+                "--configs-json", str(configs_path),
+                "--tune-report-json", str(report_path),
+                "--k-eval", "2",
+                "--target-k-eval", "3",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                self.assertEqual(warmstart_eval.main(), 0)
+
+            attempts = [
+                json.loads(line)
+                for line in (run_dir / "evaluation_attempts.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(attempts), 2)
+            self.assertTrue(all(row["phase"] == "phase_a" for row in attempts))
+            phase_a = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(phase_a["k_evaluated"], 2)
+            self.assertEqual(len(phase_a["warm_start_configs"]), 2)
+            self.assertEqual(phase_a["screening_target_k_eval"], 3)
+            self.assertEqual(phase_a["screening_actual_k_eval"], 2)
+            self.assertEqual(phase_a["screening_fidelity"], "tail_degraded")
+
     def _fixture(
         self,
         root: Path,

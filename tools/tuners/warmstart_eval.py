@@ -414,6 +414,15 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(BO enqueue / grid prepend) only if this candidate is selected. "
                              "The sampled permutation is persisted for resume. Default = all "
                              "(no deferral).")
+    parser.add_argument(
+        "--target-k-eval",
+        type=int,
+        default=None,
+        help=(
+            "configured full-fidelity screening target. When the driver assigns "
+            "a smaller terminal --k-eval, Phase A records tail_degraded fidelity"
+        ),
+    )
     return parser
 
 
@@ -590,6 +599,13 @@ def _prepare_run(
         if args.k_eval is None
         else max(1, min(args.k_eval, len(all_configs)))
     )
+    target_k_eval = (
+        k_eval
+        if args.target_k_eval is None
+        else max(1, min(args.target_k_eval, len(all_configs)))
+    )
+    if target_k_eval < k_eval:
+        parser.error("--target-k-eval cannot be smaller than --k-eval")
     if parameter_transfer is not None and k_eval < 2:
         parser.error(
             "schema-4 non-fresh candidates require k_eval>=2 to evaluate the "
@@ -597,6 +613,9 @@ def _prepare_run(
         )
     previous_report = read_tune_report(args.tune_report_json)
     previous_phase_a = previous_report.get("phase_a", {})
+    previous_target = previous_phase_a.get("screening_target_k_eval")
+    if previous_target is not None and previous_target != target_k_eval:
+        parser.error("screening target changed after warm configs were selected")
     try:
         selection = select_warm_config_indices(
             len(all_configs),
@@ -667,6 +686,11 @@ def _prepare_run(
     phase_a = {
         "warm_start_configs": [],
         "warm_config_selection": selection,
+        "screening_target_k_eval": target_k_eval,
+        "screening_actual_k_eval": k_eval,
+        "screening_fidelity": (
+            "tail_degraded" if k_eval < target_k_eval else "full"
+        ),
         # deferred = proposed-but-not-evaluated-now; the deep-tuner evaluates these
         # first (BO enqueue / grid prepend) only if this candidate is promoted.
         "deferred_configs": [{"params": cast_params_to_search_space(dict(d), search_space)}

@@ -74,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--k-eval",
         type=int,
         help="how many proposed warm configs are evaluated at step 0+1 "
-             "(minimum 2; template default 2). Frozen once run artifacts exist",
+             "(minimum 2; template default 3). Frozen once run artifacts exist",
     )
     run.add_argument("--cli-path", help="system claude CLI path; default is the "
                                         "SDK-bundled CLI (pinned via uv.lock)")

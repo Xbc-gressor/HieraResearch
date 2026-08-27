@@ -668,7 +668,7 @@ class LanesModeTests(unittest.TestCase):
             doc = self._decide(run_dir, mode="lanes", output=str(out_path))
             self.assertEqual(doc["budget"]["admission_cap"], 0)
             self.assertEqual(doc["budget"]["objective_remaining"], 1)
-            self.assertEqual(doc["budget"]["candidate_objective_reservation"], 2)
+            self.assertEqual(doc["budget"]["candidate_objective_reservation"], 3)
             self.assertTrue(doc["lanes"])
             for lane in doc["lanes"]:
                 self.assertIsInstance(lane["lane_value"], float)

@@ -26,6 +26,7 @@ from ledger_core import (
     search_space_state_revision,
 )
 from run_cfg import read_framework_cfg
+from scheduler.contract import DEFAULT_K_EVAL, ResourceContract
 from slate import write_json_atomic
 
 
@@ -322,13 +323,22 @@ def cmd_decide(args) -> int:
     try:
         # Generated non-fresh candidates score an inherited control plus at
         # least one alternative. Either may become the operational incumbent.
-        k_eval = max(2, int(tuner_cfg.get("K_eval", 2)))
+        k_eval = max(2, int(tuner_cfg.get("K_eval", DEFAULT_K_EVAL)))
     except (TypeError, ValueError):
-        k_eval = 2
+        k_eval = DEFAULT_K_EVAL
     tournament: dict = {}
     admission_cap = None
+    candidate_reservation = k_eval
     if isinstance(remaining, int):
-        admission_cap = remaining // k_eval
+        generic_contract = ResourceContract(k_eval=k_eval)
+        admission_cap = generic_contract.generation_admits(
+            remaining,
+            allow_terminal_degrade=True,
+        )
+        candidate_reservation = generic_contract.screening_reservation(
+            remaining,
+            allow_terminal_degrade=True,
+        )
         if tuner_cfg.get("scheduler_policy") == "anchor_challenger_v1":
             # The tournament's reserve must constrain the real admission
             # prefix, not merely the later scheduler decision.  Otherwise a
@@ -338,6 +348,7 @@ def cmd_decide(args) -> int:
             from scheduler.state import build_state
             from scheduler.tournament import (
                 generation_admission_cap,
+                generation_candidate_reservation,
                 generation_reserve,
             )
 
@@ -351,6 +362,10 @@ def cmd_decide(args) -> int:
             )
             reserve_cap = generation_admission_cap(tournament_state)
             admission_cap = min(admission_cap, reserve_cap)
+            if admission_cap > 0:
+                candidate_reservation = generation_candidate_reservation(
+                    tournament_state
+                )
             tournament["tournament_generation_reserve"] = (
                 generation_reserve(tournament_state)
             )
@@ -364,7 +379,7 @@ def cmd_decide(args) -> int:
             result,
             remaining=remaining,
             admission_cap=admission_cap,
-            k_eval=k_eval,
+            k_eval=candidate_reservation,
             tournament=tournament,
         )
         if getattr(args, "output", None):
@@ -376,7 +391,7 @@ def cmd_decide(args) -> int:
         result["actions"] = result["actions"][:admission_cap]
         result["diag"]["objective_remaining"] = remaining
         result["diag"]["candidate_admission_cap"] = admission_cap
-        result["diag"]["candidate_objective_reservation"] = k_eval
+        result["diag"]["candidate_objective_reservation"] = candidate_reservation
     print(json.dumps(result, indent=2))
     return 0
 

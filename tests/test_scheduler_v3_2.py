@@ -956,6 +956,9 @@ class ConfigCompatibilityTest(unittest.TestCase):
         )
         self.assertEqual(config["max_evaluations"], 120)
 
+    def test_default_resource_contract_uses_three_screening_evaluations(self):
+        self.assertEqual(ResourceContract().k_eval, 3)
+
     def test_unbounded_budget_rejected(self):
         self._expect_error(
             {"tuner": {"scheduler_policy": "v3_2"}}, "requires max_evaluations"

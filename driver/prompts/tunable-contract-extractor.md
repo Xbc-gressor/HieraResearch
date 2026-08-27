@@ -266,8 +266,12 @@ The rest are **deferred**
 promoted). Diagnose + fix every crash in the sampled set inline, until they all
 score or you abandon.
 
-`K_eval` comes from `framework_cfg.json` `tuner.K_eval` (default **2**, minimum
-**2**); pass it as `--k-eval`. Do not encode priority in indices 1..K-1.
+The normal screening target comes from the invocation's
+`screening_target_k_eval` (matching `framework_cfg.json` `tuner.K_eval`,
+default **3**, minimum **2**). This candidate must use the driver-assigned
+`screening_k_eval`; a terminal tail may lower it to 2, and the evaluator marks
+such a candidate `tail_degraded`. Do not restore it to the target yourself, and
+do not encode priority in indices 1..K-1.
 `K_eval ≥ K`
 disables deferral. For a provided entrypoint, pass `--k-eval 1`; its only warm
 trial is the exact supplied default. The finalized `SEARCH_SPACE` remains
@@ -287,13 +291,14 @@ intermediate receipt:
   "driver_job": {
     "kind": "warmstart",
     "run_id": "<run_id>",
-    "k_eval": 2
+    "k_eval": "<screening_k_eval from the invocation>"
   }
 }
 ```
 
-Use the configured `K_eval`; use 1 for a provided entrypoint as specified
-above. The driver validates all paths, launches the evaluator in the task uv
+Use the driver-owned `screening_k_eval`; use 1 for a provided entrypoint as
+specified above. The driver validates it against the invocation allocation,
+passes the configured target separately, launches the evaluator in the task uv
 environment, waits synchronously with no outer timeout, and resumes this same
 session with `driver_job_result`. No candidate generation, tuning bout, or
 other driver work runs while the evaluator owns the process. CUDA tasks also
@@ -333,8 +338,8 @@ evaluates the deferred configs FIRST (bo enqueue / grid prepend).
   DRIVER owns the lifecycle resolution of an unstarted candidate — it proves
   the exhausted cap and stores the evidence-neutral terminal receipt. Never
   convert an unstarted candidate into a crash.
-  This path should be rare because `got_select` reserves `K_eval` admission
-  capacity.
+  This path should be rare because `got_select` reserves the driver-owned
+  screening allocation (normally the target `K_eval`, terminally 2).
 
 For a provided entrypoint, never change its default parameters or
 strategy-bearing behavior to turn the anchor into a success. A mechanical,

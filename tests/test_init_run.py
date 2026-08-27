@@ -52,6 +52,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 config["tuner"]["inner_policy"],
                 "hebo24-hebo20",
             )
+            self.assertEqual(config["tuner"]["K_eval"], 3)
             self.assertEqual(config["tuner"]["deep_tune_per_candidate_cap"], 44)
 
     def test_policy_comparison_arms_are_persisted_from_explicit_options(self) -> None:

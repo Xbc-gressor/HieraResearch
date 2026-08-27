@@ -21,7 +21,7 @@ from search_space_state import empty_search_space_state  # noqa: E402
 
 
 class UsageAndLifecycleTests(unittest.TestCase):
-    def test_got_select_reserves_k_eval_capacity_before_admission(self) -> None:
+    def test_got_select_uses_two_row_terminal_screening_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             (run_dir / "framework_cfg.json").write_text(
@@ -40,9 +40,12 @@ class UsageAndLifecycleTests(unittest.TestCase):
                 )
             payload = json.loads(output.getvalue())
 
-            self.assertEqual(payload["actions"], [])
+            self.assertEqual(len(payload["actions"]), 1)
             self.assertEqual(payload["diag"]["objective_remaining"], 2)
-            self.assertEqual(payload["diag"]["candidate_admission_cap"], 0)
+            self.assertEqual(payload["diag"]["candidate_admission_cap"], 1)
+            self.assertEqual(
+                payload["diag"]["candidate_objective_reservation"], 2
+            )
 
     def test_candidate_brief_contains_only_implementation_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

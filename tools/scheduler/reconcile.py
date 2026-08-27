@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .contract import DEFAULT_K_EVAL
 from .evidence import (
     EVIDENCE_FILENAME,
     INFRA_FAILURE,
@@ -114,7 +115,12 @@ def _arrival_episode(
     )
 
 
-def reconcile(run_dir: Path, ledger: dict, *, k_eval: int = 2) -> dict:
+def reconcile(
+    run_dir: Path,
+    ledger: dict,
+    *,
+    k_eval: int = DEFAULT_K_EVAL,
+) -> dict:
     """Append missing tuning and arrival evidence; report what was added."""
     run_dir = Path(run_dir)
     log = EvidenceLog(run_dir / ".scheduler" / EVIDENCE_FILENAME)
@@ -207,7 +213,11 @@ def _bind_outcomes(
     return []
 
 
-def reconcile_path(ledger_path: Path, *, k_eval: int = 2) -> dict:
+def reconcile_path(
+    ledger_path: Path,
+    *,
+    k_eval: int = DEFAULT_K_EVAL,
+) -> dict:
     ledger_path = Path(ledger_path)
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     return reconcile(ledger_path.parent, ledger, k_eval=k_eval)

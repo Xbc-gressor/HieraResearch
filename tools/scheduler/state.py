@@ -38,6 +38,7 @@ from typing import Any, Iterable
 
 from .contract import (
     CandidateView,
+    DEFAULT_K_EVAL,
     ResourceContract,
     defer_available,
     eligible_candidates,
@@ -267,7 +268,7 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
     contract = ResourceContract(
         bout_trials=int(contract_fields.get("bout_trials", 10)),
         max_bouts=int(contract_fields.get("max_bouts", 4)),
-        k_eval=int(contract_fields.get("k_eval", 2)),
+        k_eval=int(contract_fields.get("k_eval", DEFAULT_K_EVAL)),
         first_bout_trials=int(contract_fields.get("first_bout_trials", 8)),
         bout_cost_schedule=(
             tuple(int(value) for value in contract_fields["bout_cost_schedule"])

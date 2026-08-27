@@ -600,9 +600,9 @@ class JudgedSlateTests(unittest.TestCase):
     def test_admission_cap_zero_is_a_noop_generation(self) -> None:
         self._seed_run(max_evaluations=1)  # remaining 1 -> cap 0
         cmd = JudgedCmd(self.repo)
-        runner = self._run(cmd, [tuner_entry(), tuner_entry()])
+        runner = self._run(cmd, [tuner_entry()])
         roles = [name for name, _ in runner.calls]
-        self.assertEqual(roles, ["tuner-orchestrator"] * 2)
+        self.assertEqual(roles, ["tuner-orchestrator"])
         self.assertFalse(
             any("slate.py" in call and "construct" in call
                 for call in cmd.calls))
@@ -611,7 +611,7 @@ class JudgedSlateTests(unittest.TestCase):
         self.assertEqual(cmd._ledger().get("phase"), "completed")
 
     def test_admission_cap_one_seats_coverage_leader_without_judges(self) -> None:
-        self._seed_run(max_evaluations=2)  # remaining 2 -> cap 1
+        self._seed_run(max_evaluations=2)  # terminal 2-row screen -> cap 1
         cmd = JudgedCmd(self.repo)
         cmd.reached = [False, False, False, True]
         runner = self._run(cmd, [
@@ -625,8 +625,17 @@ class JudgedSlateTests(unittest.TestCase):
         manifest = json.loads((self._gen_dir() / "generation.json").read_text())
         self.assertEqual(manifest["aggregation"]["path"],
                          "judge_skipped_cardinality")
+        self.assertEqual(
+            manifest["budget"]["candidate_objective_reservation"], 2
+        )
         self.assertEqual(len(manifest["slate"]), 1)
         self.assertEqual(len(self._new_records(cmd)), 1)
+        extractor_ctx = next(
+            ctx for name, ctx in runner.calls
+            if name == "tunable-contract-extractor"
+        )
+        self.assertEqual(extractor_ctx.extra["screening_k_eval"], 2)
+        self.assertEqual(extractor_ctx.extra["screening_target_k_eval"], 3)
 
     def test_pool_of_one_skips_the_judge(self) -> None:
         self._seed_run()

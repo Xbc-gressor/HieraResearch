@@ -97,15 +97,30 @@ def generation_reserve(state: SchedulerState) -> int:
 def generation_admission_cap(state: SchedulerState) -> int:
     """Maximum new candidates that preserve the tournament reserve.
 
-    Generation ends permanently once the challenger has completed its INITIAL
-    bout or any DEEP segment has begun.  Before then, admission uses the same
-    ``K_eval`` cost as got_select and leaves the appropriate hard reserve.
+    No generation may interleave with the DEEP segments. After both segments
+    complete, terminal screening may spend the otherwise stranded two-call
+    tail; those candidates cannot affect an already-complete tournament.
     """
     current = status(state)
-    if current.phase in {"deep_segments", "complete"}:
+    if current.phase == "deep_segments":
         return 0
+    if current.phase == "complete":
+        return state.contract.generation_admits(
+            state.remaining_budget,
+            allow_terminal_degrade=True,
+        )
     spendable = max(0, state.remaining_budget - generation_reserve(state))
     return spendable // state.contract.k_eval
+
+
+def generation_candidate_reservation(state: SchedulerState) -> int:
+    """Per-candidate screening cost paired with generation_admission_cap."""
+    if status(state).phase == "complete":
+        return state.contract.screening_reservation(
+            state.remaining_budget,
+            allow_terminal_degrade=True,
+        )
+    return state.contract.k_eval
 
 
 def _best(state: SchedulerState, candidates: tuple[CandidateView, ...]):
@@ -131,6 +146,13 @@ def decide(state: SchedulerState) -> Decision:
     }
 
     if current.phase == "complete":
+        if generation_admission_cap(state) > 0:
+            return Decision(
+                "DEFER",
+                None,
+                "tournament complete; spend terminal screening budget",
+                evidence_mode=mode,
+            )
         return Decision("STOP", None, "tournament complete", evidence_mode=mode)
 
     if (

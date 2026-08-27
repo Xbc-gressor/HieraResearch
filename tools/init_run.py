@@ -22,7 +22,7 @@ Example:
       --dimension-strategy llm_induced \
       --llm-intelligence-score 70 \
       --k-warm 5 \
-      --k-eval 2 \
+      --k-eval 3 \
       --max-evaluations 200 \
       --timeout 60
 """
@@ -592,7 +592,7 @@ def main() -> int:
         metavar="COUNT",
         help=(
             "how many of the K proposed warm configs are evaluated at "
-            "step 0+1 (minimum 2; template default 2). Frozen once run "
+            "step 0+1 (minimum 2; template default 3). Frozen once run "
             "artifacts exist"
         ),
     )

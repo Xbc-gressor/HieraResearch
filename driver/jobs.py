@@ -187,6 +187,16 @@ def build_driver_job(
         if role_name != "tunable-contract-extractor":
             raise DriverJobError("warmstart jobs belong to tunable-contract-extractor")
         k_eval = _positive_int(request.get("k_eval"), "driver_job.k_eval")
+        expected_k_eval = ctx.extra.get("screening_k_eval")
+        if expected_k_eval is not None:
+            expected_k_eval = _positive_int(
+                expected_k_eval, "invocation screening_k_eval"
+            )
+            if k_eval != expected_k_eval:
+                raise DriverJobError(
+                    "driver_job.k_eval must equal the driver-owned screening "
+                    f"allocation {expected_k_eval}, got {k_eval}"
+                )
         configs_path = candidate_path.parent / "_warm_configs.json"
         if not configs_path.is_file():
             raise DriverJobError(f"warm configs do not exist: {configs_path}")
@@ -206,6 +216,16 @@ def build_driver_job(
             "--k-eval",
             str(k_eval),
         ]
+        target_k_eval = ctx.extra.get("screening_target_k_eval")
+        if target_k_eval is not None:
+            target_k_eval = _positive_int(
+                target_k_eval, "invocation screening_target_k_eval"
+            )
+            if target_k_eval < k_eval:
+                raise DriverJobError(
+                    "screening_target_k_eval cannot be smaller than k_eval"
+                )
+            argv += ["--target-k-eval", str(target_k_eval)]
         return argv, candidate_path.parent / "_warmstart.log", run_id
 
     if kind != "phase_c":
