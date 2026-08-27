@@ -19,8 +19,11 @@ Schema (required unless noted)::
       "schema_version": 2,
       "checkpoint_id": "string",
       "regime": "initial" | "deep",                    # current inner-v2
+                | "transferred",                        # transfer-policy first
+                                                        # donor segment
                 | "first" | "continuation",             # historical inner-v1
       "stratum": "initial" | "deep",                   # current inner-v2
+                 | "transferred",
                  | "first" | "cont_improved" |
                    "cont_not_improved",                  # historical inner-v1
       "source": {"...": "opaque provenance dict"},        # default {}
@@ -42,8 +45,11 @@ Schema (required unless noted)::
     }
 
 regime/stratum consistency is validated. Current checkpoints use
-initial<->initial or deep<->deep. The first/continuation spellings remain only
-for frozen inner-v1 comparison checkpoints.
+initial<->initial or deep<->deep. ``transferred`` marks a global-donor
+candidate's first segment under the transfer policy: it runs with
+initialization mechanics (WARMUP-exempt, no post-initial rewarm) but is never
+reported as a completed ``initial``. The first/continuation spellings remain
+only for frozen inner-v1 comparison checkpoints.
 
 ``deferred_configs`` is reserved for the historical inner-v1 Current arm
 (completed PLAN §6.0 / §七); other arms must not read it.
@@ -66,23 +72,26 @@ from pathlib import Path
 SCHEMA_VERSION = 2
 CHECKPOINT_FILENAME = "checkpoint.json"
 
-REGIMES = ("initial", "deep", "first", "continuation")
-STRATA = ("initial", "deep", "first", "cont_improved", "cont_not_improved")
+REGIMES = ("initial", "deep", "first", "continuation", "transferred")
+STRATA = ("initial", "deep", "first", "cont_improved", "cont_not_improved", "transferred")
 _REGIME_STRATA = {
     "initial": ("initial",),
     "deep": ("deep",),
     "first": ("first",),
     "continuation": ("cont_improved", "cont_not_improved"),
+    "transferred": ("transferred",),
 }
 
 
 def is_initial_regime(regime: str) -> bool:
-    """Whether a checkpoint is at the pre-tuning boundary.
+    """Whether a checkpoint runs with initialization mechanics.
 
     ``first`` is the historical inner-v1 spelling; current checkpoints use
-    ``initial``.
+    ``initial``. ``transferred`` (a global-donor candidate's first segment
+    under the transfer policy) is also initialization mechanics: WARMUP-exempt
+    with the proposer rank-1 fallback, and no post-initial rewarm phase.
     """
-    return regime in ("initial", "first")
+    return regime in ("initial", "first", "transferred")
 
 
 @dataclass(frozen=True)

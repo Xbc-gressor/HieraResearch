@@ -136,7 +136,11 @@ class SchedulerState:
             target = next(
                 (c for c in self.candidates if c.run_id == run_id), None
             )
-            charged = self.contract.bout_cost(target.bouts_used if target else 1)
+            charged = (
+                self.contract.bout_cost_for(target)
+                if target is not None
+                else self.contract.bout_cost(1)
+            )
         else:
             charged = int(cost)
         if charged < 0:
@@ -229,6 +233,10 @@ class SchedulerState:
             contract["numeric_required_from_bout_index"] = (
                 self.contract.numeric_required_from_bout_index
             )
+        if self.contract.transferred_first_bout_trials is not None:
+            contract["transferred_first_bout_trials"] = (
+                self.contract.transferred_first_bout_trials
+            )
         return {
             "schema_version": 1,
             "kind": "scheduler_state_snapshot",
@@ -245,6 +253,10 @@ class SchedulerState:
                     "deferred_warm_backlog": candidate.deferred_warm_backlog,
                     "has_movable_continuous": candidate.has_movable_continuous,
                     "has_movable_numeric": candidate.has_movable_numeric,
+                    "initialization_mode": candidate.initialization_mode,
+                    "donor_snapshot_id": candidate.donor_snapshot_id,
+                    "donor_evaluated": candidate.donor_evaluated,
+                    "donor_finite": candidate.donor_finite,
                     "eligible": ineligibility_reason(
                         candidate, self.remaining_budget, self.contract
                     )
@@ -280,6 +292,13 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
             if contract_fields.get("numeric_required_from_bout_index") is not None
             else None
         ),
+        # Pre-transfer snapshots carry no transferred pricing; absent means
+        # None, which keeps ``bout_cost`` as the whole story (design §5.2).
+        transferred_first_bout_trials=(
+            int(contract_fields["transferred_first_bout_trials"])
+            if contract_fields.get("transferred_first_bout_trials") is not None
+            else None
+        ),
     )
     candidates = tuple(
         CandidateView(
@@ -290,6 +309,12 @@ def state_from_snapshot(snapshot: dict) -> SchedulerState:
             deferred_warm_backlog=int(row.get("deferred_warm_backlog", 0)),
             has_movable_continuous=bool(row.get("has_movable_continuous", True)),
             has_movable_numeric=bool(row.get("has_movable_numeric", True)),
+            initialization_mode=str(
+                row.get("initialization_mode") or "ordinary"
+            ),
+            donor_snapshot_id=row.get("donor_snapshot_id"),
+            donor_evaluated=bool(row.get("donor_evaluated", False)),
+            donor_finite=bool(row.get("donor_finite", False)),
             # `eligible` in a snapshot is the derived verdict; the causes
             # that are not budget-dependent are restored here so the
             # predicate recomputes the same answer.
@@ -411,6 +436,7 @@ def build_state(
     previous_gains: dict[str, float] | None = None,
     movable_continuous: dict[str, bool] | None = None,
     movable_numeric: dict[str, bool] | None = None,
+    initialization_facts: dict[str, dict] | None = None,
     diagnostics: dict | None = None,
     n_seed: int = 0,
 ) -> SchedulerState:
@@ -421,6 +447,7 @@ def build_state(
     gains = previous_gains or {}
     movable = movable_continuous or {}
     numeric = movable_numeric or {}
+    init_facts = initialization_facts or {}
     candidates = []
     for record in ledger.get("records", []):
         run_id = str(record.get("run_id"))
@@ -428,6 +455,7 @@ def build_state(
         if score is None:
             # No finite observation yet: not a scheduler-visible candidate.
             continue
+        init = init_facts.get(run_id) or {}
         candidates.append(
             CandidateView(
                 run_id=run_id,
@@ -439,6 +467,12 @@ def build_state(
                 deferred_warm_backlog=int(backlog.get(run_id, 0)),
                 has_movable_continuous=bool(movable.get(run_id, True)),
                 has_movable_numeric=bool(numeric.get(run_id, True)),
+                initialization_mode=str(
+                    init.get("initialization_mode") or "ordinary"
+                ),
+                donor_snapshot_id=init.get("donor_snapshot_id"),
+                donor_evaluated=bool(init.get("donor_evaluated", False)),
+                donor_finite=bool(init.get("donor_finite", False)),
             )
         )
     scores = [
@@ -520,6 +554,7 @@ def load_state(
         previous_gains=previous_gains(run_dir, ledger),
         movable_continuous=movable,
         movable_numeric=movable_numeric,
+        initialization_facts=initialization_facts(run_dir, ledger),
         diagnostics=diagnostics,
         n_seed=seed_quota(run_dir),
     )
@@ -564,3 +599,54 @@ def deferred_warm_backlog(run_dir: Path, ledger: dict) -> dict[str, int]:
         if isinstance(deferred, list) and deferred:
             backlog[run_id] = len(deferred)
     return backlog
+
+
+def initialization_facts(run_dir: Path, ledger: dict) -> dict[str, dict]:
+    """Per-candidate Phase-A initialization facts (design §3.4).
+
+    Read from each candidate's authoritative ``tune_report.json`` — the same
+    path deferred backlog and previous gain already use; the ledger carries
+    no donor fields. ``donor_finite`` is exactly
+    ``global_donor_observation.status == "finite"``; ``donor_evaluated``
+    means warm evaluation processed the donor row (any observed status other
+    than ``not_evaluated``). Only the exact ``global_donor`` stamp activates
+    transfer semantics; candidates whose report lacks the stamps — every
+    pre-transfer run — read as ``ordinary`` with no donor facts.
+    """
+    facts: dict[str, dict] = {}
+    for record in ledger.get("records", []):
+        run_id = str(record.get("run_id"))
+        report_path = (
+            Path(run_dir) / "candidates" / run_id / "tune_report.json"
+        )
+        if not report_path.is_file():
+            continue
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        phase_a = report.get("phase_a")
+        if not isinstance(phase_a, dict):
+            continue
+        observation = phase_a.get("global_donor_observation")
+        status = (
+            observation.get("status") if isinstance(observation, dict) else None
+        )
+        transfer = phase_a.get("global_donor_transfer")
+        donor = transfer.get("donor") if isinstance(transfer, dict) else None
+        snapshot_id = (
+            donor.get("snapshot_id") if isinstance(donor, dict) else None
+        )
+        facts[run_id] = {
+            "initialization_mode": (
+                "global_donor"
+                if phase_a.get("initialization_mode") == "global_donor"
+                else "ordinary"
+            ),
+            "donor_snapshot_id": (
+                snapshot_id if isinstance(snapshot_id, str) else None
+            ),
+            "donor_evaluated": status is not None and status != "not_evaluated",
+            "donor_finite": status == "finite",
+        }
+    return facts

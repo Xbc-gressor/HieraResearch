@@ -105,6 +105,11 @@ _CHECKPOINT_REGIME = {
     inner_policy.FIRST: ("first", "first"),
     inner_policy.CONTINUE: ("continuation", "cont_improved"),
     inner_policy.DEEP: ("deep", "deep"),
+    # TRANSFERRED is a real regime (transfer design §1 rule 3): the
+    # checkpoint reports ``transferred`` — never a fabricated ``initial`` —
+    # while the arm runs with initialization mechanics (the proposer rank-1
+    # fallback below WARMUP=8 applies; see checkpoint.is_initial_regime).
+    inner_policy.TRANSFERRED: ("transferred", "transferred"),
 }
 
 # In-process test seams. Production CLI never sets these.
@@ -427,6 +432,7 @@ def _build_checkpoint(
     remaining: int,
     policy_id: str,
     bout_index: int,
+    initialization_mode: str = inner_policy.INITIALIZATION_ORDINARY,
 ) -> checkpoint_mod.Checkpoint:
     incumbent_params, incumbent_score = incumbent
     incumbent_identity = contract.params_identity(incumbent_params)
@@ -434,10 +440,23 @@ def _build_checkpoint(
     # The arm is regime-agnostic, but the checkpoint's regime/stratum is
     # read-only context the proposer session sees: report the bout's real
     # regime. Historical comparison policies may expose FIRST/CONTINUE/DEEP;
-    # current 24+20 policies expose INITIAL/DEEP only.
+    # current 24+20 policies expose INITIAL/DEEP only, and the transfer
+    # policy adds TRANSFERRED for a global-donor candidate's first segment.
     regime, stratum = _CHECKPOINT_REGIME[
-        inner_policy.regime_for_bout(policy_id, bout_index)
+        inner_policy.regime_for_bout(policy_id, bout_index, initialization_mode)
     ]
+    extra: dict = {"remaining_budget": remaining}
+    if regime == "transferred":
+        # The proposer must see which donor initialization it continues from
+        # (design §5.1); the id is a replay fact, read off the Phase-A stamp.
+        transfer = report.get("phase_a", {}).get("global_donor_transfer")
+        donor = transfer.get("donor") if isinstance(transfer, dict) else None
+        snapshot_id = (
+            donor.get("snapshot_id") if isinstance(donor, dict) else None
+        )
+        extra["donor_snapshot_id"] = (
+            snapshot_id if isinstance(snapshot_id, str) else None
+        )
     return checkpoint_mod.Checkpoint(
         checkpoint_id=candidate_path.parent.name,
         regime=regime,
@@ -461,7 +480,7 @@ def _build_checkpoint(
         ),
         items=_run_global_items(candidate_path, relative_improvement),
         history=tuple(_history_rows(report, incumbent_identity, contract)),
-        extra={"remaining_budget": remaining},
+        extra=extra,
     )
 
 
@@ -535,6 +554,9 @@ def main() -> int:
         )
 
     report = read_tune_report(args.tune_report_json)
+    # The candidate's first-bout interpretation comes from its stamped
+    # Phase-A initialization mode alone (design §5.1).
+    initialization_mode = inner_policy.initialization_mode_of(report)
     stage = _current_hebo_stage(report) or {}
     prior_attempts = _stage_spent(stage)
     remaining = max(0, int(args.n_evals) - prior_attempts)
@@ -572,6 +594,7 @@ def main() -> int:
         remaining=remaining,
         policy_id=policy_id,
         bout_index=bout_index,
+        initialization_mode=initialization_mode,
     )
     codec = codec_mod.Codec(contract)
     history_trials = [
@@ -804,11 +827,15 @@ def main() -> int:
     try:
         # Every LLM-pool initialization kernel follows the policy contract:
         # deferred warm configs consume slots inside the bout before the arm
-        # proposes. Later HEBO bouts have no deferred backlog.
+        # proposes. Later HEBO bouts have no deferred backlog. A TRANSFERRED
+        # bout is the donor candidate's first segment: its deferred backlog
+        # occupies slots inside the 10-eval budget exactly like INITIAL's do.
         if (
             METHOD in ("selfrank", "mixup", "hebo")
-            and inner_policy.regime_for_bout(policy_id, bout_index)
-            in (inner_policy.INITIAL, inner_policy.FIRST)
+            and inner_policy.regime_for_bout(
+                policy_id, bout_index, initialization_mode
+            )
+            in (inner_policy.INITIAL, inner_policy.FIRST, inner_policy.TRANSFERRED)
         ):
             deferred_in_space, n_deferred_projected, deferred_dropped = (
                 project_configs_into_space(
@@ -850,6 +877,7 @@ def main() -> int:
                 remaining=cell_state.budget_remaining,
                 policy_id=policy_id,
                 bout_index=bout_index,
+                initialization_mode=initialization_mode,
             )
 
         ctx = arm_api.CellContext(

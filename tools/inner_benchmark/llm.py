@@ -630,7 +630,7 @@ def first_message_blocks(
         or checkpoint.extra.get("kind")
         or "unknown"
     )
-    candidate = "\n".join([
+    candidate_lines = [
         f"checkpoint_id: {checkpoint.checkpoint_id}",
         f"regime: {checkpoint.regime} (current: initial | deep; "
         "historical inner-v1: first | continuation | deep)",
@@ -640,7 +640,19 @@ def first_message_blocks(
         f"source candidate_id: {source.get('candidate_id', 'unknown')}",
         f"incumbent is the inherited control: "
         f"{checkpoint.incumbent_is_inherited_control}",
-    ])
+    ]
+    if checkpoint.regime == "transferred":
+        # Transfer-policy first segment (design §5.1): the proposer must see
+        # the real production regime and the donor it starts from — never a
+        # fabricated completed INITIAL bout.
+        donor_snapshot = checkpoint.extra.get("donor_snapshot_id")
+        candidate_lines.extend([
+            "production_regime: transferred — the global-donor incumbent was "
+            "evaluated in Phase A; this is the candidate's FIRST tuning "
+            "segment, not a completed INITIAL bout",
+            f"donor_snapshot_id: {donor_snapshot or 'unknown'}",
+        ])
+    candidate = "\n".join(candidate_lines)
     if live_incumbent is None:
         incumbent_params = checkpoint.incumbent.params
         incumbent_score = checkpoint.incumbent.score

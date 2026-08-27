@@ -56,6 +56,12 @@ class ResourceContract:
     # anchor/challenger tournament supplies the active inner policy's first
     # three bout costs here.
     bout_cost_schedule: tuple[int, ...] | None = None
+    # Candidate-aware first-bout override (transfer-scheduler design §5.2):
+    # a ``global_donor`` candidate's first bout is the TRANSFERRED segment
+    # priced here instead of the schedule's INITIAL cost. None — every
+    # pre-transfer contract — keeps ``bout_cost(bouts_used)`` as the whole
+    # story for every candidate.
+    transferred_first_bout_trials: int | None = None
     # Some inner policies switch to a numeric-only kernel before the generic
     # DEEP boundary. None means no additional policy-specific requirement.
     numeric_required_from_bout_index: int | None = None
@@ -75,6 +81,16 @@ class ResourceContract:
                     raise ValueError(
                         "bout_cost_schedule entries must be positive integers"
                     )
+        if self.transferred_first_bout_trials is not None:
+            if self.bout_cost_schedule is None:
+                raise ValueError(
+                    "transferred_first_bout_trials requires bout_cost_schedule"
+                )
+            value = self.transferred_first_bout_trials
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(
+                    "transferred_first_bout_trials must be a positive integer"
+                )
         required_from = self.numeric_required_from_bout_index
         if required_from is not None and (
             not isinstance(required_from, int)
@@ -94,6 +110,25 @@ class ResourceContract:
                 raise ValueError(f"bout index outside contract: {bouts_used}")
             return self.bout_cost_schedule[bouts_used]
         return self.first_bout_trials if bouts_used == 0 else self.bout_trials
+
+    def bout_cost_for(self, candidate: "CandidateView") -> int:
+        """Objective evaluations THIS candidate's next complete bout charges.
+
+        The single candidate-aware cost entry point (transfer-scheduler
+        design §5.2): a ``global_donor`` candidate's first bout is the
+        TRANSFERRED segment priced by ``transferred_first_bout_trials``.
+        Every other case — any later bout, an ordinary candidate, or a
+        contract that never set the field — is exactly
+        ``bout_cost(candidate.bouts_used)``, so callers never write their own
+        mode branch.
+        """
+        if (
+            self.transferred_first_bout_trials is not None
+            and candidate.bouts_used == 0
+            and candidate.initialization_mode == "global_donor"
+        ):
+            return self.transferred_first_bout_trials
+        return self.bout_cost(candidate.bouts_used)
 
     def lifetime_cost(self) -> int:
         """Objective evaluations one candidate spends across its full
@@ -171,6 +206,19 @@ class CandidateView:
     #: TuRBO can move float and integer dimensions, but not a categorical-only
     #: space. Used only when the active resource contract requests it.
     has_movable_numeric: bool = True
+    #: The candidate's stamped Phase-A initialization mode (design §3.4).
+    #: ``ordinary`` — including every pre-transfer report — keeps the
+    #: schedule's first-bout cost; ``global_donor`` prices the first bout as
+    #: the TRANSFERRED segment (see ``ResourceContract.bout_cost_for``).
+    initialization_mode: str = "ordinary"
+    #: Bound global-donor snapshot id, when Phase A ran one.
+    donor_snapshot_id: str | None = None
+    #: The donor row was processed by warm evaluation (observation status
+    #: other than "not_evaluated").
+    donor_evaluated: bool = False
+    #: ``global_donor_observation.status == "finite"`` — the TRANSFERRED
+    #: challenger-eligibility fact (design §6.1).
+    donor_finite: bool = False
 
     @property
     def is_first(self) -> bool:
@@ -205,7 +253,7 @@ def ineligibility_reason(
         and not candidate.has_movable_continuous
     ):
         return "no movable continuous dimension for a DEEP bout"
-    cost = contract.bout_cost(candidate.bouts_used)
+    cost = contract.bout_cost_for(candidate)
     if remaining_budget < cost:
         return (
             f"remaining budget {remaining_budget} cannot admit a full "

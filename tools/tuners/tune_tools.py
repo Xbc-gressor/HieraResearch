@@ -1476,6 +1476,10 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             f"report was admitted under inner_policy {stamped_policy!r}; "
             f"framework_cfg now says {policy_id!r}"
         )
+    # The candidate's first-bout interpretation comes from its stamped
+    # Phase-A initialization mode alone (design §5.1) — never from the
+    # presence of a donor receipt file.
+    initialization_mode = inner_policy.initialization_mode_of(report)
     from _common import load_run_cfg
 
     legacy_bout_trials = int(
@@ -1502,13 +1506,17 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
         legacy_bout_trials = max_evaluations
 
     def chain_for(bout: int) -> list:
-        return inner_policy.method_chain_for_bout(policy_id, bout, search_space)
+        return inner_policy.method_chain_for_bout(
+            policy_id, bout, search_space, initialization_mode
+        )
 
     def extras(bout: int, method) -> dict:
         return {
-            "bout_regime": inner_policy.regime_for_bout(policy_id, bout),
+            "bout_regime": inner_policy.regime_for_bout(
+                policy_id, bout, initialization_mode
+            ),
             "bout_trials": inner_policy.expected_bout_trials(
-                policy_id, bout, legacy_bout_trials
+                policy_id, bout, legacy_bout_trials, initialization_mode
             ),
             "sampler": (
                 inner_policy.bo_sampler_for_bout(policy_id, bout)
@@ -4614,13 +4622,15 @@ def _scheduler_selection(ledger_path: Path, scenarios: int | None) -> dict:
         (c for c in state.candidates if c.run_id == view["run_id"]), None
     )
     selected_bout_cost = (
-        state.contract.bout_cost(candidate.bouts_used)
+        state.contract.bout_cost_for(candidate)
         if selected and candidate is not None
         else None
     )
     policy_id = inner_policy.load_policy_id(ledger_path)
     bout_regime = (
-        inner_policy.regime_for_bout(policy_id, candidate.bouts_used)
+        inner_policy.regime_for_bout(
+            policy_id, candidate.bouts_used, candidate.initialization_mode
+        )
         if candidate
         else None
     )

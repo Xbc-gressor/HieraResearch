@@ -11,8 +11,8 @@ Three subcommands (same names as the library entry points):
   bout count, per-bout best score + strict-improvement flags, finite unique
   config counts at each boundary, eligible regimes. Read-only.
 - ``create --run-dir <dir> --candidate <id> --bouts <N> --out <dir>`` — freeze
-  the boundary after N completed segments (N=0 -> regime "initial", N>=1 ->
-  "deep").
+  the boundary after N completed segments (N=0 -> regime "initial", or
+  "transferred" for a global-donor candidate's first segment; N>=1 -> "deep").
 - ``remeasure --checkpoint <dir> [--eval-limit K]`` — re-evaluate every unique
   frozen config on THIS machine via the Task-2 objective path and rewrite the
   checkpoint with local scores (§七 one-machine comparability rule).
@@ -47,7 +47,8 @@ the descriptive field.
 
 The source run's historical inner-policy id is retained only as factual
 provenance. It does not choose the benchmark taxonomy: current checkpoints are
-always INITIAL or DEEP, even when their history came from an older
+always INITIAL or DEEP (TRANSFERRED only for a global-donor candidate's
+unstarted first segment), even when their history came from an older
 FIRST/CONTINUE/DEEP production policy.
 
 Boundary-time BASE_PARAMS
@@ -83,10 +84,11 @@ when representable in the frozen SEARCH_SPACE (tune_tools._bounds_violations);
 an excluded control is recorded in ``extra.inherited_control_excluded``.
 Create-time scores are SOURCE scores (provisional); ``remeasure`` recomputes.
 
-Stratification: "initial" for N=0 and "deep" for N>=1. For a DEEP checkpoint,
-the last included segment's evidence is recorded in ``extra.last_bout``;
-``extra.incumbents`` carries both the production口径 and benchmark口径
-incumbents so the benchmark口径 recompute is trivial.
+Stratification: "initial" for N=0 ("transferred" when the candidate's Phase-A
+stamp is a global-donor initialization) and "deep" for N>=1. For a DEEP
+checkpoint, the last included segment's evidence is recorded in
+``extra.last_bout``; ``extra.incumbents`` carries both the production口径 and
+benchmark口径 incumbents so the benchmark口径 recompute is trivial.
 
 WARMUP: DEEP checkpoints require >= WARMUP=8 finite unique
 history rows (arm_api.WARMUP; §七 hard condition) — enforced at create with
@@ -698,7 +700,16 @@ def _format_inspect_table(rows: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _regime(n_bouts: int) -> str:
+def _regime(n_bouts: int, initialization_mode: str = "ordinary") -> str:
+    """Benchmark regime for the boundary after ``n_bouts`` completed bouts.
+
+    A global-donor candidate (``phase_a.initialization_mode`` stamp, written
+    only by the transfer policy pair) freezes its pre-segment boundary as
+    ``transferred`` — initialization mechanics without pretending an INITIAL
+    bout completed. Everything else keeps the binary taxonomy.
+    """
+    if n_bouts == 0 and initialization_mode == "global_donor":
+        return "transferred"
     return "initial" if n_bouts == 0 else "deep"
 
 
@@ -781,7 +792,7 @@ def create_checkpoint(run_dir, candidate_id, bouts: int, out_dir) -> dict:
         )
     prod_params = dict(incumbent_row["params"])
     prod_score = float(incumbent_row["score"])
-    regime = _regime(bouts)
+    regime = _regime(bouts, str(phase_a.get("initialization_mode") or "ordinary"))
     if not checkpoint_mod.is_initial_regime(regime):
         finite_unique = _finite_unique_count(history, identity)
         if finite_unique < WARMUP:

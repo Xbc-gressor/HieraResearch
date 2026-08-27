@@ -125,6 +125,9 @@ def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
                     "mixup24-turbo20-v1",
                     "hebo24-turbo20-v1",
                     "hebo24-hebo20",
+                    # 24+10+10 ordinary / 10+10+10 donor-transferred both fit
+                    # under the same 44-eval lifetime cap (design §5.2).
+                    "hebo24-transfer10-hebo10",
                 )
                 else 40,
             )

@@ -11,6 +11,7 @@ default policy.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -30,7 +31,7 @@ from _common import (  # noqa: E402
     deep_tune_time_budget,
 )
 from bo_search import main as bo_main  # noqa: E402
-from driver.jobs import build_driver_job  # noqa: E402
+from driver.jobs import DriverJobError, build_driver_job  # noqa: E402
 from driver.roles import InvocationContext  # noqa: E402
 from driver.session import FakeSessionRunner  # noqa: E402
 import hebo_search  # noqa: E402
@@ -38,7 +39,21 @@ from hebo_search import main as hebo_main  # noqa: E402
 from arms.llm_pool_self_rank import ARM as SELF_RANK_ARM  # noqa: E402
 from arms.mixup_pool_hebo import ARM as MIXUP_ARM  # noqa: E402
 from arms.turbo import ARM as TURBO_ARM  # noqa: E402
+import checkpoint as checkpoint_mod  # noqa: E402
+from evaluation_budget import budget_status  # noqa: E402
+import freeze as freeze_mod  # noqa: E402
 from spsa_search import main as spsa_main  # noqa: E402
+from tools.scheduler.contract import (  # noqa: E402
+    CandidateView,
+    ResourceContract,
+    ineligibility_reason,
+)
+from tools.scheduler.state import (  # noqa: E402
+    SchedulerState,
+    build_state,
+    initialization_facts,
+    state_from_snapshot,
+)
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
     phase_c_action,
@@ -48,6 +63,7 @@ from tune_tools import (  # noqa: E402
 
 
 POLICY = inner_policy.POLICY_ID
+TRANSFER_POLICY = inner_policy.HEBO_TRANSFER_HEBO_POLICY_ID
 
 
 def _write_candidate(
@@ -1841,6 +1857,702 @@ class DriverJobSpsaTest(unittest.TestCase):
                 )
             self.assertIn("spsa_search.py", " ".join(argv))
             self.assertEqual(argv[argv.index("--n-evals") + 1], "10")
+
+
+class TransferPolicyUnitTest(unittest.TestCase):
+    """hebo24-transfer10-hebo10: the candidate-aware first bout (design §5.1)."""
+
+    def test_ordinary_mode_is_initial24_then_deep(self):
+        self.assertEqual(
+            [inner_policy.regime_for_bout(TRANSFER_POLICY, i) for i in range(3)],
+            ["INITIAL", "DEEP", "DEEP"],
+        )
+        self.assertEqual(
+            [
+                inner_policy.expected_bout_trials(TRANSFER_POLICY, i, 10)
+                for i in range(3)
+            ],
+            [24, 10, 10],
+        )
+
+    def test_donor_mode_is_transferred10_then_deep(self):
+        donor = inner_policy.INITIALIZATION_GLOBAL_DONOR
+        self.assertEqual(
+            inner_policy.regime_for_bout(TRANSFER_POLICY, 0, donor),
+            inner_policy.TRANSFERRED,
+        )
+        self.assertEqual(
+            inner_policy.expected_bout_trials(TRANSFER_POLICY, 0, 10, donor),
+            10,
+        )
+        for bout in (1, 2):
+            self.assertEqual(
+                inner_policy.regime_for_bout(TRANSFER_POLICY, bout, donor),
+                inner_policy.DEEP,
+            )
+            self.assertEqual(
+                inner_policy.expected_bout_trials(TRANSFER_POLICY, bout, 10, donor),
+                10,
+            )
+
+    def test_method_chain_is_hebo_under_both_modes(self):
+        for mode in (
+            inner_policy.INITIALIZATION_ORDINARY,
+            inner_policy.INITIALIZATION_GLOBAL_DONOR,
+        ):
+            self.assertEqual(
+                [
+                    inner_policy.method_chain_for_bout(
+                        TRANSFER_POLICY, i, FLOAT3, mode
+                    )
+                    for i in range(3)
+                ],
+                [["hebo"], ["hebo"], ["hebo"]],
+            )
+
+    def test_out_of_bounds_bout_fails_fast_in_both_modes(self):
+        for mode in ("ordinary", "global_donor"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, "exactly 3 bouts"):
+                    inner_policy.regime_for_bout(TRANSFER_POLICY, 3, mode)
+                with self.assertRaisesRegex(ValueError, "exactly 3 bouts"):
+                    inner_policy.expected_bout_trials(TRANSFER_POLICY, 3, 10, mode)
+                with self.assertRaisesRegex(ValueError, "exactly 3 bouts"):
+                    inner_policy.method_chain_for_bout(
+                        TRANSFER_POLICY, 3, FLOAT3, mode
+                    )
+
+    def test_old_policies_ignore_a_donor_mode(self):
+        # The mode parameter exists for the transfer policy alone; every other
+        # policy's regime/size computation is unchanged by it.
+        self.assertEqual(
+            inner_policy.regime_for_bout(
+                inner_policy.HEBO_HEBO_POLICY_ID, 0, "global_donor"
+            ),
+            "INITIAL",
+        )
+        self.assertEqual(
+            inner_policy.expected_bout_trials(
+                inner_policy.HEBO_HEBO_POLICY_ID, 0, 10, "global_donor"
+            ),
+            24,
+        )
+
+    def test_policy_shape_matches_hebo24_hebo20(self):
+        self.assertIn(TRANSFER_POLICY, inner_policy.KNOWN_POLICY_IDS)
+        self.assertTrue(inner_policy.is_regime_policy(TRANSFER_POLICY))
+        self.assertTrue(inner_policy.deferred_occupy_bout_slots(TRANSFER_POLICY))
+        self.assertFalse(
+            inner_policy.deep_requires_movable_continuous(TRANSFER_POLICY)
+        )
+        self.assertIsNone(
+            inner_policy.numeric_required_from_bout_index(TRANSFER_POLICY)
+        )
+
+    def test_initialization_mode_reads_only_the_phase_a_stamp(self):
+        self.assertEqual(inner_policy.initialization_mode_of({}), "ordinary")
+        self.assertEqual(
+            inner_policy.initialization_mode_of({"phase_a": {}}), "ordinary"
+        )
+        self.assertEqual(
+            inner_policy.initialization_mode_of(
+                {"phase_a": {"initialization_mode": "global_donor"}}
+            ),
+            "global_donor",
+        )
+        # Anything but the exact stamp — including junk — reads ordinary.
+        self.assertEqual(
+            inner_policy.initialization_mode_of(
+                {"phase_a": {"initialization_mode": "donor"}}
+            ),
+            "ordinary",
+        )
+
+
+class TransferContractCostTest(unittest.TestCase):
+    """ResourceContract.bout_cost_for — the single candidate-aware cost (§5.2)."""
+
+    @staticmethod
+    def _contract() -> ResourceContract:
+        return ResourceContract(
+            bout_trials=10,
+            max_bouts=3,
+            k_eval=3,
+            first_bout_trials=24,
+            bout_cost_schedule=(24, 10, 10),
+            transferred_first_bout_trials=10,
+        )
+
+    def test_bout_cost_for_three_cases(self):
+        contract = self._contract()
+        ordinary = CandidateView(run_id="o", best_score=1.0, bouts_used=0)
+        donor = CandidateView(
+            run_id="d",
+            best_score=1.0,
+            bouts_used=0,
+            initialization_mode="global_donor",
+            donor_finite=True,
+        )
+        self.assertEqual(contract.bout_cost_for(ordinary), 24)
+        self.assertEqual(contract.bout_cost_for(donor), 10)
+        self.assertEqual(
+            contract.bout_cost_for(replace(ordinary, bouts_used=1)), 10
+        )
+        self.assertEqual(contract.bout_cost_for(replace(donor, bouts_used=1)), 10)
+
+    def test_contract_without_the_field_ignores_mode(self):
+        contract = ResourceContract(
+            bout_trials=10,
+            max_bouts=3,
+            k_eval=3,
+            first_bout_trials=24,
+            bout_cost_schedule=(24, 10, 10),
+        )
+        donor = CandidateView(
+            run_id="d",
+            best_score=1.0,
+            bouts_used=0,
+            initialization_mode="global_donor",
+        )
+        self.assertEqual(contract.bout_cost_for(donor), 24)
+
+    def test_transferred_field_validation(self):
+        with self.assertRaisesRegex(ValueError, "transferred_first_bout_trials"):
+            ResourceContract(transferred_first_bout_trials=10)
+        with self.assertRaisesRegex(ValueError, "transferred_first_bout_trials"):
+            ResourceContract(
+                max_bouts=3,
+                bout_cost_schedule=(24, 10, 10),
+                transferred_first_bout_trials=0,
+            )
+
+    def test_eligibility_and_apply_bout_share_the_candidate_cost(self):
+        contract = self._contract()
+        donor = CandidateView(
+            run_id="d",
+            best_score=1.0,
+            bouts_used=0,
+            initialization_mode="global_donor",
+            donor_finite=True,
+        )
+        ordinary = CandidateView(run_id="o", best_score=1.0, bouts_used=0)
+        # 15 remaining admits the donor's 10-eval TRANSFERRED segment but not
+        # an ordinary 24-eval INITIAL.
+        self.assertIsNone(ineligibility_reason(donor, 15, contract))
+        self.assertIsNotNone(ineligibility_reason(ordinary, 15, contract))
+        state = SchedulerState(
+            global_best=1.0,
+            remaining_budget=50,
+            candidates=(donor, ordinary),
+            contract=contract,
+        )
+        after = state.apply_bout("d", 0.1)
+        self.assertEqual(after.remaining_budget, 40)
+
+    def test_snapshot_round_trip_carries_transfer_fields(self):
+        donor = CandidateView(
+            run_id="d",
+            best_score=1.0,
+            bouts_used=0,
+            initialization_mode="global_donor",
+            donor_snapshot_id="donor-abc",
+            donor_evaluated=True,
+            donor_finite=True,
+        )
+        state = SchedulerState(
+            global_best=1.0,
+            remaining_budget=50,
+            candidates=(donor,),
+            contract=self._contract(),
+        )
+        snapshot = state.snapshot()
+        self.assertEqual(
+            snapshot["contract"]["transferred_first_bout_trials"], 10
+        )
+        row = snapshot["candidates"][0]
+        self.assertEqual(row["initialization_mode"], "global_donor")
+        self.assertEqual(row["donor_snapshot_id"], "donor-abc")
+        self.assertTrue(row["donor_evaluated"])
+        self.assertTrue(row["donor_finite"])
+        rebuilt = state_from_snapshot(snapshot)
+        self.assertEqual(rebuilt.snapshot(), snapshot)
+
+    def test_pre_transfer_snapshot_reads_as_ordinary(self):
+        snapshot = {
+            "schema_version": 1,
+            "kind": "scheduler_state_snapshot",
+            "global_best": 1.0,
+            "remaining_budget": 50,
+            "contract": {
+                "bout_trials": 10,
+                "max_bouts": 3,
+                "k_eval": 3,
+                "first_bout_trials": 24,
+                "bout_cost_schedule": [24, 10, 10],
+            },
+            "candidates": [
+                {
+                    "run_id": "o",
+                    "best_score": 1.0,
+                    "bouts_used": 0,
+                    "previous_gain": None,
+                    "headroom": 0.0,
+                    "deferred_warm_backlog": 0,
+                    "has_movable_continuous": True,
+                    "has_movable_numeric": True,
+                    "eligible": True,
+                    "ineligible_reason": None,
+                }
+            ],
+        }
+        state = state_from_snapshot(snapshot)
+        candidate = state.candidates[0]
+        self.assertEqual(candidate.initialization_mode, "ordinary")
+        self.assertIsNone(candidate.donor_snapshot_id)
+        self.assertFalse(candidate.donor_evaluated)
+        self.assertFalse(candidate.donor_finite)
+        self.assertIsNone(state.contract.transferred_first_bout_trials)
+
+
+class TransferBuildStateTest(unittest.TestCase):
+    """CandidateView donor facts derive from the authoritative tune_report."""
+
+    @staticmethod
+    def _write_report(candidate_dir: Path, phase_a: dict) -> None:
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        (candidate_dir / "tune_report.json").write_text(
+            json.dumps({"phase_a": phase_a})
+        )
+
+    def test_initialization_facts_flow_into_build_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            self._write_report(
+                run_dir / "candidates" / "007",
+                {
+                    "status": "ok",
+                    "initialization_mode": "global_donor",
+                    "global_donor_observation": {
+                        "warm_config_index": 5,
+                        "status": "finite",
+                        "score": 0.9,
+                        "failure_ref": None,
+                    },
+                    "global_donor_transfer": {
+                        "donor": {"snapshot_id": "donor-xyz"}
+                    },
+                },
+            )
+            self._write_report(
+                run_dir / "candidates" / "008",
+                {
+                    "status": "ok",
+                    "initialization_mode": "global_donor",
+                    "global_donor_observation": {
+                        "warm_config_index": 5,
+                        "status": "crash",
+                        "score": None,
+                        "failure_ref": "failure-1",
+                    },
+                    "global_donor_transfer": {
+                        "donor": {"snapshot_id": "donor-xyz"}
+                    },
+                },
+            )
+            ledger = {
+                "records": [
+                    {"run_id": "007", "best_warm_score": 0.9},
+                    {"run_id": "008", "best_warm_score": 1.1},
+                    {"run_id": "009", "best_warm_score": 1.2},
+                ]
+            }
+            facts = initialization_facts(run_dir, ledger)
+            self.assertEqual(
+                facts["007"],
+                {
+                    "initialization_mode": "global_donor",
+                    "donor_snapshot_id": "donor-xyz",
+                    "donor_evaluated": True,
+                    "donor_finite": True,
+                },
+            )
+            # A crashed donor row was processed (evaluated) but is not finite.
+            self.assertEqual(
+                facts["008"],
+                {
+                    "initialization_mode": "global_donor",
+                    "donor_snapshot_id": "donor-xyz",
+                    "donor_evaluated": True,
+                    "donor_finite": False,
+                },
+            )
+            # 009 has no report yet: no facts, and build_state defaults it to
+            # ordinary.
+            self.assertNotIn("009", facts)
+
+            state = build_state(
+                ledger, remaining_budget=50, initialization_facts=facts
+            )
+            by_id = {c.run_id: c for c in state.candidates}
+            self.assertEqual(by_id["007"].initialization_mode, "global_donor")
+            self.assertEqual(by_id["007"].donor_snapshot_id, "donor-xyz")
+            self.assertTrue(by_id["007"].donor_finite)
+            self.assertFalse(by_id["008"].donor_finite)
+            self.assertEqual(by_id["009"].initialization_mode, "ordinary")
+            self.assertIsNone(by_id["009"].donor_snapshot_id)
+            self.assertFalse(by_id["009"].donor_evaluated)
+
+
+class PhaseCActionTransferTest(unittest.TestCase):
+    """phase_c_action reads phase_a.initialization_mode (design §5.1)."""
+
+    @staticmethod
+    def _donor_stamp(report: dict) -> dict:
+        report["phase_a"]["initialization_mode"] = "global_donor"
+        report["phase_a"]["global_donor_observation"] = {
+            "warm_config_index": 5,
+            "status": "finite",
+            "score": 0.9,
+            "failure_ref": None,
+        }
+        report["phase_a"]["global_donor_transfer"] = {
+            "donor": {"snapshot_id": "donor-test-1"}
+        }
+        return report
+
+    def test_ordinary_mode_bout0_is_initial24(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=TRANSFER_POLICY,
+            )
+            action = phase_c_action(json.loads(report_path.read_text()), candidate)
+            self.assertEqual(
+                (
+                    action["action"],
+                    action["method"],
+                    action["bout_index"],
+                    action["bout_regime"],
+                    action["bout_trials"],
+                    action["method_chain"],
+                ),
+                ("run", "hebo", 0, "INITIAL", 24, ["hebo"]),
+            )
+
+    def test_donor_mode_bout0_is_transferred10_then_deep(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=TRANSFER_POLICY,
+            )
+            report = self._donor_stamp(json.loads(report_path.read_text()))
+            first = phase_c_action(report, candidate)
+            self.assertEqual(
+                (
+                    first["action"],
+                    first["method"],
+                    first["bout_index"],
+                    first["bout_regime"],
+                    first["bout_trials"],
+                    first["method_chain"],
+                ),
+                ("run", "hebo", 0, "TRANSFERRED", 10, ["hebo"]),
+            )
+
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "hebo",
+                        "status": "ok",
+                        "trials": [{"params": dict(BASE3), "score": 0.9}],
+                    }
+                ]
+            }
+            _finalize_bout(report, candidate, best=0.9)
+            second = phase_c_action(report, candidate)
+            self.assertEqual(
+                (
+                    second["action"],
+                    second["bout_index"],
+                    second["bout_regime"],
+                    second["bout_trials"],
+                ),
+                ("run", 1, "DEEP", 10),
+            )
+
+    def test_interrupted_transferred_stage_resumes_under_the_10_eval_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=TRANSFER_POLICY,
+            )
+            report = self._donor_stamp(json.loads(report_path.read_text()))
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "hebo",
+                        "status": "running",
+                        "trials": [
+                            {"params": dict(BASE3), "score": 0.95},
+                            {"params": {**BASE3, "a": 0.6}, "score": 0.93},
+                            {"params": {**BASE3, "a": 0.7}, "score": 0.91},
+                        ],
+                    }
+                ]
+            }
+            action = phase_c_action(report, candidate)
+            self.assertEqual(
+                (
+                    action["action"],
+                    action["reason"],
+                    action["bout_index"],
+                    action["bout_regime"],
+                    action["bout_trials"],
+                ),
+                ("run", "resume_interrupted_stage", 0, "TRANSFERRED", 10),
+            )
+
+    def test_donor_stamp_under_an_old_policy_stays_initial24(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=inner_policy.HEBO_HEBO_POLICY_ID,
+            )
+            report = self._donor_stamp(json.loads(report_path.read_text()))
+            action = phase_c_action(report, candidate)
+            self.assertEqual(
+                (action["bout_regime"], action["bout_trials"]),
+                ("INITIAL", 24),
+            )
+
+
+class DriverJobTransferTest(unittest.TestCase):
+    def test_donor_candidate_bout0_rejects_a_24_eval_request(self):
+        # phase-c-action computes the donor candidate's real first-bout cap.
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, report_path = _fixture(
+                Path(tmp),
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=TRANSFER_POLICY,
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_a"]["initialization_mode"] = "global_donor"
+            action = phase_c_action(report, candidate)
+            self.assertEqual(
+                (action["bout_regime"], action["bout_trials"]),
+                ("TRANSFERRED", 10),
+            )
+        # The driver job layer then fails closed on a 24-eval request against
+        # it (design §5.1: no path may price a donor candidate's bout 0 at 24).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            task = repo / "tasks" / "toy"
+            task.mkdir(parents=True)
+            (task / "task.toml").write_text(
+                '[env]\ntype = "uv"\nproject = "tasks/toy"\n'
+            )
+            run_dir = repo / "runs" / "toy" / "r1"
+            candidate_dir = run_dir / "candidates" / "007"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "train.py").write_text("# candidate\n")
+            (candidate_dir / "tune_report.json").write_text(
+                json.dumps({"phase_a": {}})
+            )
+            ctx = InvocationContext(
+                task="toy", tag="r1", run_dir=run_dir,
+                invocation_id=3, run_id="007",
+            )
+            with mock.patch(
+                "driver.jobs._phase_c_action",
+                return_value={
+                    "action": "run",
+                    "method": "hebo",
+                    "bout_trials": 10,
+                    "bout_regime": "TRANSFERRED",
+                    "sampler": None,
+                },
+            ):
+                with self.assertRaisesRegex(
+                    DriverJobError, "exceeds bout_trials"
+                ):
+                    build_driver_job(
+                        "tuner-orchestrator",
+                        ctx,
+                        {
+                            "kind": "phase_c",
+                            "run_id": "007",
+                            "method": "hebo",
+                            "trial_cap": 24,
+                        },
+                        repo_root=repo,
+                    )
+
+
+class HeboTransferredSearchTest(unittest.TestCase):
+    """A TRANSFERRED bout: deferred backlog inside its 10 slots, the real
+    regime and donor id in the proposer context (design §5.1)."""
+
+    def _pool_receipt(self, offset: float) -> dict:
+        return {
+            "configs": [
+                {
+                    "a": 0.11 + offset + 0.01 * index,
+                    "b": 0.002 * (index + 1),
+                    "c": -0.4 + 0.05 * index,
+                }
+                for index in range(5)
+            ],
+            "order": [0, 1, 2, 3, 4],
+            "rationale": "scripted pool",
+        }
+
+    def test_transferred_bout_consumes_deferred_and_reports_its_regime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "autoresearch-baseline" / "r1"
+            candidate, report_path = _fixture(
+                run_dir,
+                space=FLOAT3,
+                base=BASE3,
+                inner_policy_id=TRANSFER_POLICY,
+            )
+            (run_dir / "ledger.json").write_text(
+                json.dumps(
+                    {
+                        "items": {
+                            "task_baseline": {
+                                "kind": "observed_metric",
+                                "metric": "val_bpb",
+                                "value": 4.0,
+                                "direction": "minimize",
+                            }
+                        }
+                    }
+                )
+            )
+            report = json.loads(report_path.read_text())
+            report["phase_a"]["initialization_mode"] = "global_donor"
+            report["phase_a"]["global_donor_transfer"] = {
+                "donor": {"snapshot_id": "donor-test-1"}
+            }
+            report["phase_a"]["deferred_configs"] = [
+                {"params": {"a": 0.7, "b": 0.02, "c": 0.2}}
+            ]
+            report_path.write_text(json.dumps(report))
+
+            runner = FakeSessionRunner([{"receipt": self._pool_receipt(0.0)}])
+            hebo_search._TEST_SESSION_RUNNER = runner
+            try:
+                with mock.patch(
+                    "hebo_search.timed_preflight", return_value={"status": "ok"}
+                ), mock.patch(
+                    "hebo_search.timed_eval", side_effect=[0.9, 0.8]
+                ) as eval_mock, mock.patch(
+                    "hebo_search.write_json"
+                ) as write_result, mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "hebo_search.py",
+                        "--candidate-path",
+                        str(candidate),
+                        "--tune-report-json",
+                        str(report_path),
+                        "--n-evals",
+                        "2",
+                    ],
+                ):
+                    self.assertEqual(hebo_main(), 0)
+            finally:
+                hebo_search._TEST_SESSION_RUNNER = None
+
+            receipt = write_result.call_args.args[0]
+            self.assertEqual(receipt["method"], "hebo")
+            self.assertEqual(receipt["status"], "ok")
+            self.assertEqual(receipt["deferred_evaluated"], 1)
+            self.assertEqual(eval_mock.call_count, 2)
+            stage = json.loads(report_path.read_text())["phase_c"]["stages"][-1]
+            self.assertEqual(
+                [row["source"] for row in stage["trials"]],
+                ["deferred", "pool_hebo_mace"],
+            )
+            extras = runner.calls[0][1].extra
+            self.assertIn("regime: transferred", extras["candidate"])
+            self.assertIn("stratum: transferred", extras["candidate"])
+            self.assertIn("production_regime: transferred", extras["candidate"])
+            self.assertIn("donor_snapshot_id: donor-test-1", extras["candidate"])
+
+
+class TransferredCheckpointTest(unittest.TestCase):
+    """``transferred`` is real checkpoint vocabulary (design §5.1/§8)."""
+
+    def test_transferred_checkpoint_loads_with_initialization_mechanics(self):
+        self.assertIn("transferred", checkpoint_mod.REGIMES)
+        self.assertIn("transferred", checkpoint_mod.STRATA)
+        self.assertTrue(checkpoint_mod.is_initial_regime("transferred"))
+        self.assertEqual(
+            checkpoint_mod._REGIME_STRATA["transferred"], ("transferred",)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            candidate_dir = directory / "candidate"
+            candidate_dir.mkdir()
+            (candidate_dir / "train.py").write_text("x = 1\n")
+            (directory / "checkpoint.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "checkpoint_id": "t1",
+                        "regime": "transferred",
+                        "stratum": "transferred",
+                        "source": {},
+                        "candidate_relpath": "candidate",
+                        "task": {
+                            "score_fn": "evaluate_config",
+                            "preflight_fn": "preflight_config",
+                        },
+                        "incumbent": {"params": {}, "score": 1.0},
+                        "incumbent_is_inherited_control": False,
+                        "history": [],
+                    }
+                )
+            )
+            loaded = checkpoint_mod.load_checkpoint(directory)
+            self.assertEqual(loaded.regime, "transferred")
+            self.assertEqual(loaded.stratum, "transferred")
+
+    def test_freeze_marks_a_donor_candidates_first_boundary_transferred(self):
+        self.assertEqual(freeze_mod._regime(0, "global_donor"), "transferred")
+        self.assertEqual(freeze_mod._regime(0, "ordinary"), "initial")
+        self.assertEqual(freeze_mod._regime(0), "initial")
+        self.assertEqual(freeze_mod._regime(1, "global_donor"), "deep")
+
+    def test_transfer_policy_gets_the_44_eval_lifetime_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "toy" / "r1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": 200,
+                        "tuner": {
+                            "inner_policy": TRANSFER_POLICY,
+                            "scheduler_policy": "anchor_challenger_v1",
+                            "deep_tune_budget_fraction": None,
+                        },
+                    }
+                )
+            )
+            status = budget_status(run_dir)
+            self.assertEqual(status["deep_tune"]["per_candidate_cap"], 44)
 
 
 if __name__ == "__main__":

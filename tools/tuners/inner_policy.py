@@ -68,6 +68,24 @@ zero-gain first DEEP segment, the other candidate starts its own TuRBO
 trajectory. Deferred warm configs occupy slots inside the 24-slot INITIAL
 bout.
 
+The judged-slate transfer policy ``hebo24-transfer10-hebo10`` keeps the same
+three-bout shape but makes the first bout candidate-aware (transfer-scheduler
+design §5.1). The candidate's ``phase_a.initialization_mode`` stamp — written
+by ``warmstart_eval`` and the single interpretation source, never guessed from
+receipt files — selects the first segment::
+
+    mode=ordinary     -> bout 0: INITIAL, 24
+    mode=global_donor -> bout 0: TRANSFERRED, 10 (the mandatory donor row was
+                         already evaluated in Phase A)
+    bout >= 1         -> DEEP, 10 (both modes)
+
+All three regimes run ``pool_hebo_mace``. A TRANSFERRED bout consumes the
+deferred-warm backlog inside its 10 slots exactly like INITIAL does inside
+24, and the HEBO checkpoint reports regime ``transferred`` while running with
+initialization mechanics — TRANSFERRED is a real regime (the candidate's
+``tuning_bouts`` is still 0 before it runs), never a fabricated completed
+INITIAL bout.
+
 Under every regime-conditioned policy a bout's deferred-warm backlog
 occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
 them as extra trials on top of the bout budget.
@@ -77,7 +95,8 @@ The switch is per-run: ``framework_cfg.json`` ``tuner.inner_policy`` —
 ``deferred-random8-hebo10-spsa10-v1`` (historical missing-key fallback),
 ``localtr8-hebo10-spsa10-v1``, ``localtr8-hebo10-hebo10-v1``,
 ``selfrank8-hebo10-hebo10``, ``mixup24-turbo20-v1``,
-``hebo24-turbo20-v1``, ``hebo24-hebo20``,
+``hebo24-turbo20-v1``, ``hebo24-hebo20``, ``hebo24-transfer10-hebo10``
+(judged-slate transfer pair only),
 ``baseline-hebo-full-v1`` (baseline-tune loop only), or ``legacy`` (the
 pre-policy uniform behavior: every bout runs the CONTINUE rule at
 ``tuner.bout_trials``).
@@ -96,6 +115,7 @@ SELF_RANK_HEBO_POLICY_ID = "selfrank8-hebo10-hebo10"
 MIXUP_TURBO_POLICY_ID = "mixup24-turbo20-v1"
 HEBO_TURBO_POLICY_ID = "hebo24-turbo20-v1"
 HEBO_HEBO_POLICY_ID = "hebo24-hebo20"
+HEBO_TRANSFER_HEBO_POLICY_ID = "hebo24-transfer10-hebo10"
 BASELINE_HEBO_POLICY_ID = "baseline-hebo-full-v1"
 LEGACY_POLICY_ID = "legacy"
 INITIAL24_TURBO_POLICY_IDS = (
@@ -105,6 +125,7 @@ INITIAL24_TURBO_POLICY_IDS = (
 INITIAL24_POLICY_IDS = (
     *INITIAL24_TURBO_POLICY_IDS,
     HEBO_HEBO_POLICY_ID,
+    HEBO_TRANSFER_HEBO_POLICY_ID,
 )
 REGIME_POLICY_IDS = (
     POLICY_ID,
@@ -122,13 +143,24 @@ INITIAL = "INITIAL"
 FIRST = "FIRST"  # historical 8/10/10 comparison policies only
 CONTINUE = "CONTINUE"
 DEEP = "DEEP"
+#: A global-donor candidate's real first segment (design §1 rule 3): not a
+#: fabricated completed INITIAL bout — ``tuning_bouts`` is still 0 before it
+#: runs.
+TRANSFERRED = "TRANSFERRED"
 
 B_FIRST = 8
 B_CONTINUE = 10
 B_DEEP = 10
 INITIAL24_BOUT_SIZE = 24
+TRANSFERRED_BOUT_SIZE = 10
 INITIAL24_MAX_BOUTS = 3
 MAX_BOUTS_PER_CANDIDATE = 4
+
+#: ``phase_a.initialization_mode`` stamps (design §3.3). The mode is read
+#: from the candidate's tune report, never guessed from the presence of a
+#: ``_global_donor_transfer.json`` receipt file (§5.1).
+INITIALIZATION_ORDINARY = "ordinary"
+INITIALIZATION_GLOBAL_DONOR = "global_donor"
 
 _HISTORICAL_REGIME_BOUT_SIZES = {
     FIRST: B_FIRST,
@@ -164,12 +196,38 @@ def _historical_regime_for_bout_index(bout_index: int) -> str:
     return DEEP
 
 
-def regime_for_bout(policy_id: str, bout_index: int) -> str:
+def initialization_mode_of(report: dict) -> str:
+    """The candidate's stamped Phase-A initialization mode.
+
+    ``phase_a.initialization_mode`` (stamped by ``warmstart_eval``, design
+    §3.3) is the single interpretation source for a candidate's first bout.
+    Anything but the exact ``global_donor`` stamp — including a missing key
+    on pre-transfer reports — reads as ``ordinary``, so old reports and old
+    policies never acquire transfer semantics by accident.
+    """
+    phase_a = report.get("phase_a") if isinstance(report, dict) else None
+    if (
+        isinstance(phase_a, dict)
+        and phase_a.get("initialization_mode") == INITIALIZATION_GLOBAL_DONOR
+    ):
+        return INITIALIZATION_GLOBAL_DONOR
+    return INITIALIZATION_ORDINARY
+
+
+def regime_for_bout(
+    policy_id: str,
+    bout_index: int,
+    initialization_mode: str = INITIALIZATION_ORDINARY,
+) -> str:
     """Semantic regime of the bout ABOUT TO RUN (0-based).
 
     Current 24+20 policies are deliberately binary: one INITIAL bout followed
     by up to two scheduler-admitted DEEP segments. FIRST/CONTINUE/DEEP remains
     only for the explicitly retained historical comparison policies.
+
+    ``initialization_mode`` is consulted by ``hebo24-transfer10-hebo10``
+    alone: a ``global_donor`` candidate's bout 0 is the TRANSFERRED segment.
+    Every other policy ignores it (its callers never pass it).
     """
     if policy_id == BASELINE_HEBO_POLICY_ID:
         if bout_index != 0:
@@ -184,7 +242,14 @@ def regime_for_bout(policy_id: str, bout_index: int) -> str:
                 f"{policy_id} has exactly {INITIAL24_MAX_BOUTS} bouts; "
                 f"got bout_index={bout_index}"
             )
-        return INITIAL if bout_index == 0 else DEEP
+        if bout_index == 0:
+            if (
+                policy_id == HEBO_TRANSFER_HEBO_POLICY_ID
+                and initialization_mode == INITIALIZATION_GLOBAL_DONOR
+            ):
+                return TRANSFERRED
+            return INITIAL
+        return DEEP
     return _historical_regime_for_bout_index(bout_index)
 
 
@@ -192,13 +257,20 @@ def _historical_bout_size(regime: str) -> int:
     return _HISTORICAL_REGIME_BOUT_SIZES[regime]
 
 
-def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: int) -> int:
+def expected_bout_trials(
+    policy_id: str,
+    bout_index: int,
+    legacy_bout_trials: int,
+    initialization_mode: str = INITIALIZATION_ORDINARY,
+) -> int:
     """The bout's full trial budget under the policy.
 
     The legacy policy sizes every bout by the run's ``tuner.bout_trials``.
     The baseline policy is a single bout sized by the run's
     ``max_evaluations``, which ``phase_c_action`` passes in through
-    ``legacy_bout_trials``.
+    ``legacy_bout_trials``. ``initialization_mode`` matters only for
+    ``hebo24-transfer10-hebo10``: a ``global_donor`` candidate's bout 0 is
+    the 10-eval TRANSFERRED segment instead of the 24-eval INITIAL.
     """
     if not is_regime_policy(policy_id):
         return int(legacy_bout_trials)
@@ -216,16 +288,29 @@ def expected_bout_trials(policy_id: str, bout_index: int, legacy_bout_trials: in
                 f"got bout_index={bout_index}"
             )
         if bout_index == 0:
+            if (
+                policy_id == HEBO_TRANSFER_HEBO_POLICY_ID
+                and initialization_mode == INITIALIZATION_GLOBAL_DONOR
+            ):
+                return TRANSFERRED_BOUT_SIZE
             return INITIAL24_BOUT_SIZE
     return _historical_bout_size(_historical_regime_for_bout_index(bout_index))
 
 
-def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -> list:
+def method_chain_for_bout(
+    policy_id: str,
+    bout_index: int,
+    search_space: dict,
+    initialization_mode: str = INITIALIZATION_ORDINARY,
+) -> list:
     """The deterministic method chain for one bout.
 
     ``mixup24-turbo20-v1`` is ["mixup"] for bout 0, while
     ``hebo24-turbo20-v1`` is ["hebo"] for bout 0; both use ["turbo"] for
-    bouts 1 and 2. ``hebo24-hebo20`` is ["hebo"] for all three bouts.
+    bouts 1 and 2. ``hebo24-hebo20`` is ["hebo"] for all three bouts, and so
+    is ``hebo24-transfer10-hebo10`` — its TRANSFERRED/INITIAL choice changes
+    the bout's size and checkpoint regime, never the kernel, so this chain
+    accepts ``initialization_mode`` for call-site uniformity and ignores it.
     Default FIRST -> ["bo"] (explicit RandomSampler; see
     :func:`bo_sampler_for_bout`). ``localtr8-hebo10-spsa10-v1`` and
     ``localtr8-hebo10-hebo10-v1`` FIRST -> ["local_tr"], while
@@ -253,7 +338,7 @@ def method_chain_for_bout(policy_id: str, bout_index: int, search_space: dict) -
                 f"{policy_id} has exactly {INITIAL24_MAX_BOUTS} bouts; "
                 f"got bout_index={bout_index}"
             )
-        if policy_id == HEBO_HEBO_POLICY_ID:
+        if policy_id in (HEBO_HEBO_POLICY_ID, HEBO_TRANSFER_HEBO_POLICY_ID):
             return ["hebo"]
         if bout_index > 0:
             return ["turbo"]
