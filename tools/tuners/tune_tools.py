@@ -3210,6 +3210,23 @@ def summarize(report: dict) -> dict:
     }
 
 
+def _control_observation_role(row: dict) -> str | None:
+    """Normalize one warm row's provenance role on read.
+
+    Warm rows carry a plain string role.  A dual-role list written before the
+    producer fix (a deduplicated donor row that also carried the lineage
+    control) reads as ``inherited_control``; the donor role fact is persisted
+    in phase_a.global_donor_observation and the embedded donor receipt, so
+    nothing is lost.
+    """
+    role = row.get("role")
+    if isinstance(role, str):
+        return role
+    if isinstance(role, list) and "inherited_control" in role:
+        return "inherited_control"
+    return None
+
+
 def tuning_record(report: dict) -> dict:
     """Every ledger tuning field, derived from one tune_report.json. Imported by
     `ledger.py set-tuning --from-report` so the values flow report -> ledger by
@@ -3235,10 +3252,10 @@ def tuning_record(report: dict) -> dict:
             "receipt": transfer_receipt,
             "inherited_control": phase_a.get("inherited_control"),
             "warm_start_observations": [
-                row
+                {**row, "role": _control_observation_role(row)}
                 for row in warm_configs
                 if isinstance(row, dict)
-                and row.get("role")
+                and _control_observation_role(row)
                 in {"inherited_control", "semantic_treatment"}
                 and _is_finite_score(row.get("score"))
             ],

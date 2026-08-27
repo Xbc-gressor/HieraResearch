@@ -7,8 +7,8 @@ Covers only the new contracts (design §3.1, §3.2, §4.1, §8):
   donor_incompatible, frozen snapshot binding, and interruption recovery.
 
 Fixtures use real candidate files, real ledgers, and real tune reports; the
-new policy pair is probed from a raw framework_cfg.json because it is not
-registered anywhere yet.
+new policy pair is probed from a raw framework_cfg.json so these tests do not
+depend on the run-config registration layer.
 """
 
 from __future__ import annotations

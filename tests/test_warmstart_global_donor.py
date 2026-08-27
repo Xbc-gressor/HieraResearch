@@ -30,6 +30,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "tuners"))
 
 from tools.scheduler.donor import build_donor_snapshot  # noqa: E402
+import semantic_evidence  # noqa: E402
+import tune_tools  # noqa: E402
 from tune_tools import (  # noqa: E402
     GLOBAL_DONOR_TRANSFER_FILENAME,
     _candidate_execution_revision,
@@ -527,9 +529,11 @@ class WarmstartGlobalDonorTests(unittest.TestCase):
             self.assertEqual(len(phase_a["deferred_configs"]), 2)
             rows = phase_a["warm_start_configs"]
             self.assertEqual(rows[0]["proposed_index"], 0)
-            self.assertEqual(
-                rows[0]["role"], ["inherited_control", "global_donor"]
-            )
+            # role stays a plain string for downstream consumers
+            # (tuning_record set membership, semantic-evidence validation);
+            # the dual-role fact lives in global_donor_observation and the
+            # embedded receipt's dedup fields.
+            self.assertEqual(rows[0]["role"], "inherited_control")
             self.assertEqual(phase_a["initialization_mode"], "global_donor")
             self.assertEqual(
                 phase_a["global_donor_observation"],
@@ -539,6 +543,40 @@ class WarmstartGlobalDonorTests(unittest.TestCase):
                     "score": 7.0,
                     "failure_ref": None,
                 },
+            )
+
+    def test_dedup_report_survives_ledger_projection(self) -> None:
+        # Regression (final review C1): a deduplicated donor+control report
+        # must flow through the mandatory ledger write path — tuning_record's
+        # role filter and semantic-evidence validation — which require `role`
+        # to be a plain string.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir, snapshot_path = _donor_run(root, parent_params=DONOR_PARAMS)
+            train, configs_path, report_path = _write_nonfresh_recipient(run_dir)
+            materialize_parameter_transfer(train, configs_path)
+            result = inject_global_donor(train, configs_path, snapshot_path)
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["deduplicated"])
+
+            code, _timed_eval, _stdout = _run_warmstart(
+                train, configs_path, report_path, snapshot_path=snapshot_path
+            )
+            self.assertEqual(code, 0)
+
+            report = json.loads(report_path.read_text())
+            record = {
+                "run_id": "010",
+                "op": "improve",
+                "status": "keep",
+                "source_run_ids": ["020"],
+                **tune_tools.tuning_record(report),
+            }
+            observations = record["parameter_transfer"]["warm_start_observations"]
+            self.assertEqual(len(observations), 1)
+            self.assertEqual(observations[0]["role"], "inherited_control")
+            self.assertEqual(
+                semantic_evidence.validate_parameter_transfer_evidence(record), []
             )
 
     def test_dedup_with_ordinary_config(self) -> None:
@@ -814,9 +852,7 @@ class WarmstartGlobalDonorTests(unittest.TestCase):
             self.assertEqual(phase_a["trials_attempted"], 1)
             rows = phase_a["warm_start_configs"]
             self.assertEqual(len(rows), 1)
-            self.assertEqual(
-                rows[0]["role"], ["inherited_control", "global_donor"]
-            )
+            self.assertEqual(rows[0]["role"], "inherited_control")
             self.assertEqual(rows[0]["status"], "failed")
             self.assertEqual(
                 phase_a["global_donor_observation"]["status"], "crash"

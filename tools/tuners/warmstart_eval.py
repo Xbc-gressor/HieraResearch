@@ -734,12 +734,14 @@ def _trial_receipt(run: WarmstartRun, proposed_index: int) -> dict:
         and proposed_index == run.donor_warm_config_index
     ):
         roles.append("global_donor")
-    # A deduplicated donor row can carry both roles; keep the historical
-    # plain string when there is exactly one.
-    if len(roles) == 1:
+    # `role` stays a plain string so the row is hashable downstream
+    # (tuning_record set membership, semantic-evidence validation).  A
+    # deduplicated donor row carrying the lineage control reports the control
+    # role; the donor role fact is already persisted in
+    # phase_a.global_donor_observation and the embedded donor receipt
+    # (deduplicated/dedup_ordinary_index).
+    if roles:
         receipt["role"] = roles[0]
-    elif roles:
-        receipt["role"] = roles
     return receipt
 
 
