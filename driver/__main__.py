@@ -41,7 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--scheduler-policy",
-        choices=["legacy", "legacy_wide", "v3_2", "anchor_challenger_v1"],
+        choices=["legacy", "legacy_wide", "v3_2", "anchor_challenger_v1",
+                 "anchor_transfer_challenger_v1"],
         help="tuner scheduler policy; new experiment runs default to "
              "anchor_challenger_v1. Ignored by --loop baseline-tune, which "
              "runs without a scheduler",
@@ -56,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
             "mixup24-turbo20-v1",
             "hebo24-turbo20-v1",
             "hebo24-hebo20",
+            "hebo24-transfer10-hebo10",
             "legacy",
         ],
         help="regime-conditioned inner-tuner policy; new experiment runs "

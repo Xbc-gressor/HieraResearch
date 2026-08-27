@@ -77,9 +77,8 @@ from semantic_evidence import unbound_primary_descendants  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PARAMETER_TRANSFER_FILENAME = "_parameter_transfer.json"
 # Global-donor injection (judged-slate x transfer scheduler, design §3.2/§4.1).
-# The policy pair is registered in run_cfg's validation layer but deliberately
-# NOT selectable through init_run / driver CLI yet; the helper probes the raw
-# framework_cfg.json for exactly this pair and is inactive everywhere else.
+# The pair is selectable through init_run / driver CLI; the helper probes the
+# raw framework_cfg.json for exactly this pair and is inactive everywhere else.
 GLOBAL_DONOR_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
 GLOBAL_DONOR_INNER_POLICY = "hebo24-transfer10-hebo10"
 GLOBAL_DONOR_TRANSFER_FILENAME = "_global_donor_transfer.json"

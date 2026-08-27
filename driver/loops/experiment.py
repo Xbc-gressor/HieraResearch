@@ -49,6 +49,12 @@ from tools.scheduler.contract import (
     MIN_GENERATION_K_EVAL,
     ResourceContract,
 )
+from tools.scheduler.donor import build_donor_snapshot, donors_dir
+
+TRANSFER_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
+# Mirrors tune_tools.GLOBAL_DONOR_TRANSFER_FILENAME; the tuners package is a
+# script-level package the driver cannot import in-process.
+_DONOR_RECEIPT_FILENAME = "_global_donor_transfer.json"
 
 _RECONCILE_GUIDANCE = (
     " Reconcile from the AUTHORITATIVE artifacts (ledger, "
@@ -312,6 +318,13 @@ def _semantic_policy(run_dir: Path) -> str | None:
     return section.get("policy") if isinstance(section, dict) else None
 
 
+def _scheduler_policy(run_dir: Path) -> str | None:
+    """Read the scheduler policy frozen into this run's framework config."""
+    config_path = run_dir / "framework_cfg.json"
+    section = json.loads(config_path.read_text(encoding="utf-8")).get("tuner")
+    return section.get("scheduler_policy") if isinstance(section, dict) else None
+
+
 def _slate_route_arm(run_dir: Path) -> int:
     """n_route_sketches from the frozen framework config (0 = arm inactive)."""
     config_path = run_dir / "framework_cfg.json"
@@ -548,10 +561,32 @@ def _reserved_run_ids(run_dir: Path, count: int) -> list[str]:
     return [f"{start + index:0{width}d}" for index in range(count)]
 
 
+def _generation_donor_args(run_dir, repo_root, cmd, events) -> list[str]:
+    """Freeze this generation's donor snapshot once, before the manifest (§3.1).
+
+    The snapshot is content-addressed, so a retried commit binds the same
+    artifact; ``no_donor`` is the normal pre-anchor state.  A construction
+    failure (unreadable ledger, an unreproducible applied incumbent) blocks
+    the run — a corrupt donor state must never silently degrade the
+    generation into an ordinary warm pool (§8).
+    """
+    try:
+        result = build_donor_snapshot(run_dir)
+    except (ValueError, OSError) as exc:
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"donor snapshot construction failed: {exc}")
+    if result["status"] == "no_donor":
+        return ["--no-donor"]
+    return ["--donor-snapshot", result["path"]]
+
+
 def _commit_slate_manifest(run_dir, gen_dir, slate_size, repo_root, cmd,
                            events) -> dict:
     """Reserve run ids and atomically write the immutable generation.json."""
     reserved = _reserved_run_ids(run_dir, slate_size)
+    donor_args = []
+    if _scheduler_policy(run_dir) == TRANSFER_SCHEDULER_POLICY:
+        donor_args = _generation_donor_args(run_dir, repo_root, cmd, events)
     _slate_cmd(run_dir, repo_root, cmd, events,
                ["python", "tools/slate.py", "build-manifest",
                 "--lanes", gen_dir / "lanes.json",
@@ -559,6 +594,7 @@ def _commit_slate_manifest(run_dir, gen_dir, slate_size, repo_root, cmd,
                 "--context", gen_dir / "context.json",
                 "--judge", gen_dir / "judge.json",
                 "--reserved-run-ids", ",".join(reserved),
+                *donor_args,
                 "--output", gen_dir / "generation.json"], "build-manifest")
     manifest = json.loads(
         (gen_dir / "generation.json").read_text(encoding="utf-8"))
@@ -834,6 +870,100 @@ def _screening_contract(run_dir: Path, run_id: str) -> tuple[int, int]:
     return actual, target
 
 
+def _manifest_donor_binding(run_dir, run_id, repo_root, cmd, events):
+    """A judged-slate seat's generation-manifest donor binding, if any."""
+    record = next(
+        (r for r in _ledger_records(run_dir)
+         if str(r.get("run_id")) == str(run_id)),
+        None,
+    )
+    receipt = (record or {}).get("policy_receipt")
+    judge = receipt.get("judge") if isinstance(receipt, dict) else None
+    manifest_rel = judge.get("manifest_path") if isinstance(judge, dict) else None
+    if manifest_rel is None:
+        return None  # not a judged-slate seat
+    manifest_path = run_dir / manifest_rel
+    if not manifest_path.is_file():
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"seat {run_id}'s generation manifest {manifest_rel} is "
+                  "missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    binding = manifest.get("donor_snapshot")
+    if not isinstance(binding, dict):
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"seat {run_id}'s generation manifest lacks the donor "
+                  "binding the transfer scheduler policy requires")
+    return binding
+
+
+def _candidate_donor_binding(run_dir, run_id, repo_root, cmd, events) -> dict:
+    """The coverage arm's per-candidate donor binding (design §3.1 middle arm).
+
+    There is no generation manifest on this arm, so the candidate-local
+    receipt is the binding carrier: an existing receipt re-binds its frozen
+    snapshot even when the current frontier has moved on (§8); otherwise the
+    frontier is frozen once, now, for this candidate.
+    """
+    receipt_path = run_dir / "candidates" / run_id / _DONOR_RECEIPT_FILENAME
+    if receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"candidate {run_id} donor receipt is unreadable: {exc}")
+        donor = receipt.get("donor") if isinstance(receipt, dict) else None
+        snapshot_id = donor.get("snapshot_id") if isinstance(donor, dict) else None
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"candidate {run_id} donor receipt lacks "
+                      "donor.snapshot_id")
+        return {
+            "status": "bound",
+            "snapshot_id": snapshot_id,
+            "path": (donors_dir(run_dir) / f"{snapshot_id}.json")
+            .relative_to(run_dir)
+            .as_posix(),
+        }
+    try:
+        result = build_donor_snapshot(run_dir)
+    except (ValueError, OSError) as exc:
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"donor snapshot construction failed: {exc}")
+    if result["status"] == "no_donor":
+        return {"status": "no_donor", "snapshot_id": None, "path": None}
+    return {
+        "status": "bound",
+        "snapshot_id": result["snapshot_id"],
+        "path": result["path"],
+    }
+
+
+def _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events) -> dict:
+    """The extractor invocation's donor binding for one candidate.
+
+    Empty under every other policy pair.  A judged-slate seat reads its
+    generation manifest's immutable binding, so a donor frontier that moves
+    between seats cannot drift the generation (§3.1); the coverage arm binds
+    per candidate.  A missing bound artifact blocks the run rather than
+    silently degrading to an ordinary warm pool (§8).
+    """
+    if _scheduler_policy(run_dir) != TRANSFER_SCHEDULER_POLICY:
+        return {}
+    binding = _manifest_donor_binding(run_dir, run_id, repo_root, cmd, events)
+    if binding is None:
+        binding = _candidate_donor_binding(
+            run_dir, run_id, repo_root, cmd, events)
+    if binding.get("status") == "no_donor":
+        return {"donor_binding": "no_donor"}
+    path = binding.get("path")
+    snapshot_path = run_dir / path if isinstance(path, str) else None
+    if snapshot_path is None or not snapshot_path.is_file():
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"candidate {run_id} is bound to donor snapshot {path!r} "
+                  "but the artifact is missing")
+    return {"donor_binding": "bound", "donor_snapshot": str(snapshot_path)}
+
+
 def _extractor_extra(run_dir: Path, run_id: str, candidate_dir: Path,
                      **extra) -> dict:
     actual, target = _screening_contract(run_dir, run_id)
@@ -849,6 +979,9 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                          cmd, events, job_runner=execute_driver_job) -> None:
     """candidate-writer + extractor with evidence-branched escalation."""
     candidate_dir = run_dir / "candidates" / run_id
+    # Resolved once per candidate implementation so every extractor retry of
+    # this candidate sees the identical donor binding.
+    donor_extra = _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events)
     try:
         _, writer_inv = _invoke(runner, store, "candidate-writer", task, tag,
                                 run_dir, run_id=run_id,
@@ -867,7 +1000,7 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             runner, store, "tunable-contract-extractor", task, tag, run_dir,
             run_id=run_id,
             extra=_extractor_extra(
-                run_dir, run_id, candidate_dir
+                run_dir, run_id, candidate_dir, **donor_extra
             ),
             repo_root=repo_root, job_runner=job_runner)
         return
@@ -899,7 +1032,7 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                 run_dir, run_id=run_id,
                 extra=_extractor_extra(
                     run_dir, run_id, candidate_dir,
-                    diagnosis_verdict=verdict,
+                    diagnosis_verdict=verdict, **donor_extra
                 ),
                 resume_from=extractor_inv, repo_root=repo_root,
                 job_runner=job_runner)
@@ -913,7 +1046,7 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             runner, store, "tunable-contract-extractor", task, tag,
             run_dir, run_id=run_id,
             extra=_extractor_extra(
-                run_dir, run_id, candidate_dir
+                run_dir, run_id, candidate_dir, **donor_extra
             ), repo_root=repo_root,
             job_runner=job_runner)
     except InvocationFailed as exc3:

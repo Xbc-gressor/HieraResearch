@@ -49,6 +49,36 @@ def test_warmstart_job_argv_is_foreground_and_driver_derived(tmp_path: Path) -> 
     assert run_id == "007" and log.name == "_warmstart.log"
     assert "warmstart_eval.py" in joined and "--k-eval 2" in joined
     assert "nohup" not in joined and "&" not in joined
+    # No donor binding in the invocation (old policies / no_donor) -> no flag.
+    assert "--donor-snapshot" not in argv
+
+
+def test_warmstart_job_passes_the_bound_donor_snapshot(tmp_path: Path) -> None:
+    repo, ctx = _fixture(tmp_path)
+    ctx.extra["donor_binding"] = "bound"
+    ctx.extra["donor_snapshot"] = str(
+        ctx.run_dir / ".scheduler" / "donors" / "donor-abc123.json"
+    )
+    argv, _, _ = build_driver_job(
+        "tunable-contract-extractor",
+        ctx,
+        {"kind": "warmstart", "run_id": "007", "k_eval": 2},
+        repo_root=repo,
+    )
+    assert "--donor-snapshot" in argv
+    assert argv[argv.index("--donor-snapshot") + 1] == ctx.extra["donor_snapshot"]
+
+
+def test_warmstart_job_no_donor_binding_adds_no_flag(tmp_path: Path) -> None:
+    repo, ctx = _fixture(tmp_path)
+    ctx.extra["donor_binding"] = "no_donor"
+    argv, _, _ = build_driver_job(
+        "tunable-contract-extractor",
+        ctx,
+        {"kind": "warmstart", "run_id": "007", "k_eval": 2},
+        repo_root=repo,
+    )
+    assert "--donor-snapshot" not in argv
 
 
 def test_phase_c_job_must_match_deterministic_action(tmp_path: Path) -> None:

@@ -226,6 +226,12 @@ def build_driver_job(
                     "screening_target_k_eval cannot be smaller than k_eval"
                 )
             argv += ["--target-k-eval", str(target_k_eval)]
+        # The generation-bound donor snapshot travels with the same mechanism:
+        # the driver sets it from the manifest/per-candidate binding, and only
+        # the transfer policy pair ever sets it (no_donor binds by omission).
+        donor_snapshot = ctx.extra.get("donor_snapshot")
+        if donor_snapshot is not None:
+            argv += ["--donor-snapshot", str(donor_snapshot)]
         return argv, candidate_path.parent / "_warmstart.log", run_id
 
     if kind != "phase_c":

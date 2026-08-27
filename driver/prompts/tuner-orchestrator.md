@@ -140,6 +140,26 @@ receipt records the current phase, reserve, and admission cap under
 `scheduler.evidence_mode`. With any 24+20 policy, the full hard reserve is
 `2×24 + 10 + 10 = 68` objective calls.
 
+**When `tuner.scheduler_policy` is `anchor_transfer_challenger_v1`** (paired
+with inner policy `hebo24-transfer10-hebo10`), the same exact-target and
+complete-bout rules apply: obey the returned `scheduler.action`, `run_id`,
+and `budget_allocation.trial_cap` without percentile re-ranking. The policy
+buys one ordinary 24-eval INITIAL anchor after the seed set, then exactly
+two 10-eval post-anchor segments. Later candidates may be donor-initialized
+(`phase_a.initialization_mode: global_donor`): their first bout is a
+**TRANSFERRED** regime of 10 evals instead of a 24-eval INITIAL, so a
+candidate's bout sizes are 24/10/10 when `ordinary` and 10/10 when
+`global_donor`. The first post-anchor segment goes to the best
+donor-initialized challenger whose donor row evaluated finite — or to an
+anchor DEEP continuation when no eligible challenger exists; the second
+stays with a positive-gain responder, switches challengers after zero gain,
+and stops rather than funding a partial segment. Every regime runs HEBO
+(`pool_hebo_mace`). `phase_a.initialization_mode` is the only interpretation
+of a candidate's first bout — never infer it from the presence or absence of
+donor files, and never adjust the target, regime, or trial cap yourself
+because of a donor score; all three come from `select-candidate` /
+`phase-c-action` exactly as under the other scheduler policies.
+
 - **`run_id` is `null`** → no candidate is eligible this round (below
   `N_min`; the top tier is tuned and no continuation responded; every tuned
   candidate is a non-responder; or cap/budget exhaustion). No new bout runs.

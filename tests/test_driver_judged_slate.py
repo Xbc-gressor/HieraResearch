@@ -39,8 +39,15 @@ from tests.test_driver_experiment import (  # noqa: E402
     ExperimentCmd,
     writer_effect,
 )
+from tests.test_slate_donor_binding import _donor_record  # noqa: E402
+from tests.test_slate_replay import run_replay  # noqa: E402
+from tools.scheduler.donor import build_donor_snapshot  # noqa: E402
 
-from driver.loops.experiment import run_experiment  # noqa: E402
+from driver.events import EventsLog  # noqa: E402
+from driver.loops.experiment import (  # noqa: E402
+    _resolve_donor_extra,
+    run_experiment,
+)
 from driver.session import FakeSessionRunner  # noqa: E402
 
 
@@ -258,6 +265,12 @@ class JudgedCmd(ExperimentCmd):
                     context=Path(self._opt(args, "--context")),
                     judge=Path(self._opt(args, "--judge")),
                     reserved_run_ids=self._opt(args, "--reserved-run-ids"),
+                    donor_snapshot=(
+                        Path(self._opt(args, "--donor-snapshot"))
+                        if "--donor-snapshot" in args
+                        else None
+                    ),
+                    no_donor="--no-donor" in args,
                     output=Path(self._opt(args, "--output")),
                 )
             )
@@ -675,6 +688,241 @@ class JudgedSlateTests(unittest.TestCase):
                          "judge_skipped_pool_le_B")
         self.assertEqual(
             [r["run_id"] for r in self._new_records(cmd)], ["005", "006"])
+
+
+class JudgedSlateDonorBindingTests(unittest.TestCase):
+    """Design §9.7: one generation binds one donor snapshot for all seats.
+
+    The run freezes the transfer policy pair, so the driver builds the donor
+    snapshot once at manifest commit and hands the manifest binding to every
+    seat — even when the donor frontier moves between seats.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _seed_transfer_run(self, *, with_donor: bool) -> None:
+        """A resumed judged-slate run under the transfer policy pair."""
+        write_judged_task(self.repo)
+        registry = fixture_registry()
+        run_dir = self.repo / "runs" / TASK / TAG
+        run_dir.mkdir(parents=True)
+        (run_dir / "background.md").write_text(background_text(registry))
+        (run_dir / "background_retrieval.json").write_text("{}")
+        (run_dir / "framework_cfg.json").write_text(
+            json.dumps(
+                {
+                    "max_evaluations": 100,
+                    "dimension_strategy": "catalog_subset",
+                    "semantic_search": {"policy": "judged_slate"},
+                    "judged_slate": {"pool_size": 6},
+                    "tuner": {
+                        "scheduler_policy": "anchor_transfer_challenger_v1",
+                        "inner_policy": "hebo24-transfer10-hebo10",
+                    },
+                }
+            )
+        )
+        data = _ledger_data(registry)
+        if with_donor:
+            data["records"].append(_donor_record(run_dir, "005", score=0.3))
+        (run_dir / "ledger.json").write_text(json.dumps(data, indent=2))
+
+    def _run_dir(self) -> Path:
+        return self.repo / "runs" / TASK / TAG
+
+    def _gen_dir(self) -> Path:
+        return self._run_dir() / ".semantic" / "gen-0001"
+
+    def _run(self, cmd: JudgedCmd, script: list) -> FakeSessionRunner:
+        runner = FakeSessionRunner(script)
+        run_experiment(TASK, TAG, runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        return runner
+
+    def _extractor_contexts(self, runner: FakeSessionRunner) -> list:
+        return [
+            ctx
+            for name, ctx in runner.calls
+            if name == "tunable-contract-extractor"
+        ]
+
+    def test_generation_binds_one_snapshot_across_seats(self) -> None:
+        self._seed_transfer_run(with_donor=True)
+        cmd = JudgedCmd(self.repo)
+        cmd.reached = [False, False, False, False, True]
+        run_dir = self._run_dir()
+
+        def seat1_entry():
+            """Seat 1 screens, then a strictly better donor finalizes."""
+            entry: dict = {}
+
+            def effect(ctx):
+                ledger = cmd._ledger()
+                for record in ledger["records"]:
+                    if record["run_id"] == ctx.run_id:
+                        record["status"] = "keep"
+                better = _donor_record(run_dir, "009", score=0.1)
+                ledger["records"].append(better)
+                cmd._save_ledger(ledger)
+                entry["receipt"] = {
+                    "run_id": ctx.run_id,
+                    "status": "keep",
+                    "ledger_updated": True,
+                }
+
+            entry["side_effects"] = effect
+            return entry
+
+        runner = self._run(cmd, [
+            judge_entry(),
+            judge_entry(),
+            plan_entry(),
+            plan_entry(),
+            writer_entry(),
+            seat1_entry(),
+            writer_entry(),
+            extractor_entry(cmd),
+            tuner_entry(),
+        ])
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+
+        manifest = json.loads((self._gen_dir() / "generation.json").read_text())
+        binding = manifest["donor_snapshot"]
+        self.assertEqual(binding["status"], "bound")
+        snapshot_path = run_dir / binding["path"]
+        self.assertTrue(snapshot_path.is_file())
+
+        # The donor frontier really moved between the two seats: rebuilding
+        # now selects 009, not the snapshot the manifest bound.
+        fresh = build_donor_snapshot(run_dir)
+        self.assertEqual(fresh["status"], "ok")
+        self.assertEqual(fresh["snapshot"]["selected"]["run_id"], "009")
+        self.assertNotEqual(fresh["snapshot_id"], binding["snapshot_id"])
+
+        # Both seats were handed the manifest binding, not the moved frontier.
+        extractors = self._extractor_contexts(runner)
+        self.assertEqual(len(extractors), 2)
+        for ctx in extractors:
+            self.assertEqual(ctx.extra["donor_binding"], "bound")
+            self.assertEqual(ctx.extra["donor_snapshot"], str(snapshot_path))
+
+        # Seat receipts citing the manifest-bound snapshot replay clean.
+        for slot in manifest["slate"]:
+            candidate = run_dir / "candidates" / slot["run_id"]
+            candidate.mkdir(parents=True, exist_ok=True)
+            (candidate / "_global_donor_transfer.json").write_text(
+                json.dumps({"donor": {"snapshot_id": binding["snapshot_id"]}})
+            )
+        code, report = run_replay(run_dir)
+        self.assertEqual(code, 0, json.dumps(report, indent=2))
+        self.assertTrue(
+            report["generations"][0]["checks"].get("donor_binding")
+        )
+
+    def test_pre_anchor_generation_binds_no_donor(self) -> None:
+        self._seed_transfer_run(with_donor=False)
+        cmd = JudgedCmd(self.repo)
+        cmd.reached = [False, False, False, False, True]
+        runner = self._run(cmd, [
+            judge_entry(),
+            judge_entry(),
+            plan_entry(),
+            plan_entry(),
+            writer_entry(),
+            extractor_entry(cmd),
+            writer_entry(),
+            extractor_entry(cmd),
+            tuner_entry(),
+        ])
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        manifest = json.loads((self._gen_dir() / "generation.json").read_text())
+        self.assertEqual(
+            manifest["donor_snapshot"],
+            {
+                "status": "no_donor",
+                "snapshot_id": None,
+                "path": None,
+                "digest": None,
+            },
+        )
+        for ctx in self._extractor_contexts(runner):
+            self.assertEqual(ctx.extra["donor_binding"], "no_donor")
+            self.assertNotIn("donor_snapshot", ctx.extra)
+
+
+class CoverageArmDonorBindingTests(unittest.TestCase):
+    """The coverage_attempt middle arm: no manifest, per-candidate binding."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        write_judged_task(self.repo)
+        self.run_dir = self.repo / "runs" / TASK / "cov"
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "framework_cfg.json").write_text(
+            json.dumps(
+                {
+                    "max_evaluations": 100,
+                    "semantic_search": {"policy": "coverage_attempt"},
+                    "tuner": {
+                        "scheduler_policy": "anchor_transfer_challenger_v1",
+                        "inner_policy": "hebo24-transfer10-hebo10",
+                    },
+                }
+            )
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _resolve(self, run_id: str) -> dict:
+        return _resolve_donor_extra(
+            self.run_dir, run_id, self.repo, None, EventsLog(self.run_dir)
+        )
+
+    def _ledger_with(self, records: list) -> None:
+        (self.run_dir / "ledger.json").write_text(
+            json.dumps({"records": records})
+        )
+
+    def test_binds_the_current_frontier_per_candidate(self) -> None:
+        self._ledger_with([_donor_record(self.run_dir, "000", score=0.3)])
+        extra = self._resolve("001")
+        self.assertEqual(extra["donor_binding"], "bound")
+        bound_path = Path(extra["donor_snapshot"])
+        self.assertTrue(bound_path.is_file())
+        self.assertEqual(
+            json.loads(bound_path.read_text())["selected"]["run_id"], "000"
+        )
+
+    def test_existing_candidate_receipt_rebinds_its_frozen_snapshot(self) -> None:
+        self._ledger_with([_donor_record(self.run_dir, "000", score=0.3)])
+        first = self._resolve("001")
+        bound_path = Path(first["donor_snapshot"])
+        bound_id = json.loads(bound_path.read_text())["snapshot_id"]
+
+        # The frontier moves; the candidate's existing receipt still wins (§8).
+        candidate = self.run_dir / "candidates" / "001"
+        candidate.mkdir(parents=True, exist_ok=True)
+        (candidate / "_global_donor_transfer.json").write_text(
+            json.dumps({"donor": {"snapshot_id": bound_id}})
+        )
+        records = json.loads((self.run_dir / "ledger.json").read_text())["records"]
+        records.append(_donor_record(self.run_dir, "009", score=0.1))
+        self._ledger_with(records)
+
+        extra = self._resolve("001")
+        self.assertEqual(extra["donor_binding"], "bound")
+        self.assertEqual(extra["donor_snapshot"], str(bound_path))
+
+    def test_no_eligible_donor_binds_no_donor(self) -> None:
+        self._ledger_with([])
+        self.assertEqual(self._resolve("001"), {"donor_binding": "no_donor"})
 
 
 class CoverageArmRegressionTests(unittest.TestCase):

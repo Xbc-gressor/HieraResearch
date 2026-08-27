@@ -72,11 +72,30 @@ def _quiet(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
 
-def build_admitted_generation(run_dir: Path) -> dict:
-    """One full judged generation, admitted into the on-disk ledger."""
+def build_admitted_generation(
+    run_dir: Path,
+    *,
+    framework_cfg: dict | None = None,
+    extra_records: tuple = (),
+    reserved_run_ids: str = "005,006",
+    donor: str | None = None,
+) -> dict:
+    """One full judged generation, admitted into the on-disk ledger.
+
+    ``framework_cfg`` seeds an optional run config (the transfer policy pair
+    is only meaningful with one); ``extra_records`` appends pre-generation
+    ledger records (e.g. a tuned donor whose candidate files the caller
+    already wrote); ``donor`` selects the manifest's donor binding — "auto"
+    builds and binds the current donor snapshot exactly as the driver does,
+    "no_donor" binds the explicit empty state — both meaningful only under
+    the transfer scheduler policy.
+    """
     registry = fixture_registry()
     (run_dir / "background.md").write_text(background_text(registry))
+    if framework_cfg is not None:
+        (run_dir / "framework_cfg.json").write_text(json.dumps(framework_cfg))
     data = _ledger_data(registry)
+    data["records"].extend(extra_records)
     (run_dir / "ledger.json").write_text(json.dumps(data, indent=2) + "\n")
 
     gen = run_dir / ".semantic" / "gen-0001"
@@ -160,6 +179,16 @@ def build_admitted_generation(run_dir: Path) -> dict:
             output=gen / "judge.json",
         ),
     )
+    donor_snapshot = None
+    no_donor = False
+    if donor == "auto":
+        from scheduler.donor import build_donor_snapshot  # noqa: PLC0415
+
+        result = build_donor_snapshot(run_dir)
+        assert result["status"] == "ok", result
+        donor_snapshot = Path(result["path"])
+    elif donor == "no_donor":
+        no_donor = True
     _quiet(
         slate.cmd_build_manifest,
         SimpleNamespace(
@@ -167,7 +196,9 @@ def build_admitted_generation(run_dir: Path) -> dict:
             pool=gen / "pool.json",
             context=gen / "context.json",
             judge=gen / "judge.json",
-            reserved_run_ids="005,006",
+            reserved_run_ids=reserved_run_ids,
+            donor_snapshot=donor_snapshot,
+            no_donor=no_donor,
             output=gen / "generation.json",
         ),
     )
@@ -195,7 +226,7 @@ def build_admitted_generation(run_dir: Path) -> dict:
             run_dir=run_dir,
         ),
     )
-    assert [entry["run_id"] for entry in admitted] == ["005", "006"]
+    assert [entry["run_id"] for entry in admitted] == reserved_run_ids.split(",")
     (run_dir / "ledger.json").write_text(json.dumps(data, indent=2) + "\n")
     return manifest
 

@@ -119,10 +119,14 @@ def load_donor_snapshot(path: Path) -> dict:
 def _load_tune_tools():
     # Lazy, mirroring ledger_tuning._load_tune_tools: tools/scheduler must not
     # import the tuner module at module import time (the tuners package is a
-    # namespace package under tools/).
+    # namespace package under tools/).  tune_tools' own bare imports resolve
+    # only with tools/tuners on sys.path, so both levels are inserted — the
+    # driver calls build_donor_snapshot in-process with neither on its path.
     tools_dir = Path(__file__).resolve().parent.parent
-    if str(tools_dir) not in sys.path:
-        sys.path.insert(0, str(tools_dir))
+    tuners_dir = tools_dir / "tuners"
+    for directory in (tools_dir, tuners_dir):
+        if str(directory) not in sys.path:
+            sys.path.insert(0, str(directory))
     from tuners import tune_tools  # noqa: PLC0415
 
     return tune_tools

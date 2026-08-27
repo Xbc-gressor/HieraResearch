@@ -247,6 +247,58 @@ python tools/apply_search_space.py --candidate-path <train_py> --space-json <can
 
 AST-inserts `SEARCH_SPACE = {...}` (create mode). Only after 2c is `ok`.
 
+### 2e. Global donor injection (only when the invocation binds one)
+
+This step exists only when your invocation context carries `donor_binding`.
+Skip it entirely otherwise.
+
+Under the run's transfer policy pair, each generation binds one run-global
+donor snapshot and every candidate of that generation injects the same one.
+After the inheritance refresh above and before the segment ③ warmstart job,
+run:
+
+```bash
+python tools/tuners/tune_tools.py inject-global-donor \
+  --candidate-path <train_py> \
+  --configs-json <candidate_dir>/_warm_configs.json \
+  --donor-snapshot <donor_snapshot from the invocation>
+```
+
+Pass the invocation's `donor_snapshot` path verbatim — never a snapshot you
+located yourself. When the invocation's `donor_binding` is `no_donor` (the
+normal state before the run has a donor), run the same command WITHOUT
+`--donor-snapshot`; it reports `status: no_donor` and changes nothing. A
+`status: inactive` result contradicts the invocation binding — stop and
+report it instead of improvising.
+
+The helper — not you — projects the bound donor's applied params onto this
+candidate's finalized PARAM_SCHEMA, deduplicates the projection against the
+ordinary configs (including the lineage control), and appends one donor row
+when it is new. Its decisions:
+
+- `_global_donor_transfer.json` is helper-owned: never create or edit it by
+  hand, and never hand-edit the donor row it appended to
+  `_warm_configs.json`.
+- `status: donor_incompatible` means the projected row falls outside the
+  finalized SEARCH_SPACE. That is a recorded transfer observation, not a
+  failure: the candidate keeps its ordinary warm selection. Do not widen the
+  finalized space to fit the donor, do not clamp the row, and do not retry
+  with a different snapshot.
+- The donor row is a mandatory but failable warm treatment. A non-fresh
+  candidate's mandatory set is `{lineage config 0, donor index}`; a fresh
+  candidate's is `{donor index}`; a duplicated row carries both roles. The
+  remaining `K_eval` slots are still sampled from the ordinary configs.
+- If the donor row alone fails preflight or crashes in segment ③, the
+  evaluator records the observation and continues with the remaining
+  selected rows — the candidate still completes. Do not enter the 3b
+  self-fix loop for a donor-only failure. A donor row that is also the
+  lineage control stays fail-closed under the ordinary rules.
+
+The evaluator's completion payload reports the actual population,
+`k_evaluated`/`k_survived`, the selected/deferred split, and (under this
+policy pair) `initialization_mode` and the donor observation status. Read
+those fields instead of assuming exactly K configs or three finite rows.
+
 ---
 
 ## Segment ③ — evaluate the warm configs (you run the candidate here)
@@ -422,8 +474,9 @@ evaluation budget. Report `status: crash`; the driver skips this candidate.
   (`set-tuning` / `record-run`), never by hand. Never touch other candidates,
   `loop_state.md`, or the task dir.
 - **Edit only `train_py`, `_warm_configs.json`, `_search_space.json`** (in this
-  candidate dir). `_parameter_transfer.json` is helper-owned: let
-  `build-inheritance` create or refresh it, never edit it by hand. Never edit
+  candidate dir). `_parameter_transfer.json` and `_global_donor_transfer.json`
+  are helper-owned: let `build-inheritance` / `inject-global-donor` create or
+  refresh them, never edit them by hand. Never edit
   `prepare.py` or any `readonly_files`. If the only way
   to fix a crash is a forbidden edit (readonly file / new dependency), that crash
   is `abandon`.

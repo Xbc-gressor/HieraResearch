@@ -169,10 +169,8 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "mixup24-turbo20-v1",
             "hebo24-turbo20-v1",
             "hebo24-hebo20",
-            # The transfer pair validates here but stays unfrozen until the
-            # init_run / driver CLI wiring lands; the two transfer policies
-            # pair only with each other (checked below and in
-            # _validate_anchor_transfer_challenger).
+            # The transfer policies pair only with each other (checked below
+            # and in _validate_anchor_transfer_challenger).
             "hebo24-transfer10-hebo10",
             "baseline-hebo-full-v1",
             "legacy",

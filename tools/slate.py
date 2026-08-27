@@ -11,7 +11,8 @@ One generation of the `judged_slate` arm, minus every model call:
                         payload (<stage>.input.json)
       -> validate-judge receipt permutation check -> <stage>.json
       -> aggregate      consensus / boundary / coverage fallback -> judge.json
-      -> build-manifest immutable generation.json
+      -> build-manifest immutable generation.json (under the transfer
+                        scheduler policy: plus the generation's donor binding)
       -> replay         re-derive every generation's deterministic decisions
                         from the artifacts + ledger prefix; exit 1 on mismatch
 
@@ -639,8 +640,25 @@ def candidate_id(point_id_value: str, op: str, parents: list) -> str:
     )
 
 
-def build_manifest(pool: dict, judge: dict, budget: dict, reserved_run_ids: list) -> dict:
-    """The immutable generation manifest; `generation_id` is its content id."""
+def build_manifest(
+    pool: dict,
+    judge: dict,
+    budget: dict,
+    reserved_run_ids: list,
+    donor_snapshot: dict | None = None,
+) -> dict:
+    """The immutable generation manifest; `generation_id` is its content id.
+
+    ``donor_snapshot`` is the generation's donor binding (design §3.1) and is
+    present only under the transfer scheduler policy; older policies pass
+    None and their manifests stay byte-identical.
+    """
+    if donor_snapshot is not None:
+        errors = _donor_binding_shape_errors(donor_snapshot)
+        if errors:
+            raise ContractError(
+                "invalid donor_snapshot binding: " + "; ".join(errors)
+            )
     by_label = {entry["label"]: entry for entry in pool["pool"]}
     slate_labels = list(judge["aggregation"].get("slate") or [])
     if len(reserved_run_ids) != len(slate_labels):
@@ -696,7 +714,87 @@ def build_manifest(pool: dict, judge: dict, budget: dict, reserved_run_ids: list
         "slate": slate,
         "judge_cost": judge.get("judge_cost"),
     }
+    if donor_snapshot is not None:
+        core["donor_snapshot"] = donor_snapshot
     return {**core, "generation_id": digest(core)}
+
+
+# ---------- generation donor binding (transfer scheduler policy, design §3.1) ----------
+
+TRANSFER_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
+# Mirrors tune_tools.GLOBAL_DONOR_TRANSFER_FILENAME (tuners is a script-level
+# package; importing it here would drag its sys.path setup into replay).
+DONOR_RECEIPT_FILENAME = "_global_donor_transfer.json"
+
+
+def _donor_binding_shape_errors(binding) -> list:
+    """Structural contract of the manifest's ``donor_snapshot`` binding."""
+    if not isinstance(binding, dict):
+        return ["donor_snapshot binding must be an object"]
+    status = binding.get("status")
+    if status not in ("bound", "no_donor"):
+        return ["donor_snapshot.status must be 'bound' or 'no_donor'"]
+    if status == "no_donor":
+        if any(
+            binding.get(key) is not None
+            for key in ("snapshot_id", "path", "digest")
+        ):
+            return ["a no_donor binding must carry null snapshot_id/path/digest"]
+        return []
+    errors = []
+    snapshot_id = binding.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not snapshot_id.startswith("donor-"):
+        errors.append("a bound donor_snapshot needs a donor- snapshot_id")
+    path = binding.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+    ):
+        errors.append("a bound donor_snapshot needs a run-relative path")
+    binding_digest = binding.get("digest")
+    if not isinstance(binding_digest, str) or not binding_digest.startswith(
+        "sha256:"
+    ):
+        errors.append("a bound donor_snapshot needs a sha256: byte digest")
+    return errors
+
+
+def no_donor_binding() -> dict:
+    """The explicit no-donor binding (the normal pre-anchor state)."""
+    return {"status": "no_donor", "snapshot_id": None, "path": None, "digest": None}
+
+
+def donor_binding_from_snapshot(snapshot_path: Path, run_dir: Path) -> dict:
+    """Verify a donor snapshot artifact and build the manifest binding for it.
+
+    ``snapshot_path`` may be absolute or run-dir-relative; the recorded
+    binding path is always run-relative so the manifest survives a moved
+    run directory.  A corrupt or inconsistent snapshot is a hard error
+    (design §8): the caller blocks the run rather than degrading to the
+    ordinary warm pool.
+    """
+    from scheduler import donor as donor_snapshots  # noqa: PLC0415
+
+    run_dir = Path(run_dir).resolve()
+    path = Path(snapshot_path)
+    if not path.is_absolute():
+        path = run_dir / path
+    path = path.resolve()
+    try:
+        relative = path.relative_to(run_dir)
+    except ValueError:
+        raise ContractError(
+            f"donor snapshot {path} is not inside the run directory {run_dir}"
+        ) from None
+    snapshot = donor_snapshots.load_donor_snapshot(path)
+    return {
+        "status": "bound",
+        "snapshot_id": snapshot["snapshot_id"],
+        "path": relative.as_posix(),
+        "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
 
 
 # ---------- digest recompute helpers (replay/tamper checks; Patch D reuses) ----------
@@ -804,6 +902,18 @@ def load_judged_slate_config(ledger_path: Path) -> dict:
         return {"pool_size": DEFAULT_POOL_SIZE}
     section = read_framework_cfg(path).get("judged_slate") or {}
     return {"pool_size": section.get("pool_size", DEFAULT_POOL_SIZE)}
+
+
+def _run_scheduler_policy(run_dir: Path) -> str | None:
+    """The run's frozen tuner.scheduler_policy (None when unconfigured)."""
+    path = Path(run_dir) / "framework_cfg.json"
+    if not path.is_file():
+        return None
+    tuner = read_framework_cfg(path).get("tuner")
+    if not isinstance(tuner, dict):
+        return None
+    policy = tuner.get("scheduler_policy")
+    return policy if isinstance(policy, str) else None
 
 
 def _check_lanes_document(lanes_doc: dict) -> None:
@@ -1246,8 +1356,35 @@ def cmd_build_manifest(args: argparse.Namespace) -> int:
     reserved = [
         item.strip() for item in args.reserved_run_ids.split(",") if item.strip()
     ]
+    # The generation layout pins the run directory two levels above the
+    # manifest (<run_dir>/.semantic/gen-NNNN/generation.json); the frozen
+    # scheduler policy there decides whether a donor binding is required,
+    # and an explicit binding anywhere else is meaningless.
+    run_dir = Path(args.output).resolve().parents[2]
+    scheduler_policy = _run_scheduler_policy(run_dir)
+    if scheduler_policy == TRANSFER_SCHEDULER_POLICY:
+        if args.donor_snapshot is None and not args.no_donor:
+            raise ContractError(
+                f"scheduler_policy {TRANSFER_SCHEDULER_POLICY!r} requires an "
+                "explicit donor binding: --donor-snapshot <artifact> or "
+                "--no-donor"
+            )
+        donor_snapshot = (
+            no_donor_binding()
+            if args.no_donor
+            else donor_binding_from_snapshot(args.donor_snapshot, run_dir)
+        )
+    else:
+        if args.donor_snapshot is not None or args.no_donor:
+            raise ContractError(
+                "--donor-snapshot/--no-donor require the run's "
+                f"scheduler_policy to be {TRANSFER_SCHEDULER_POLICY!r} "
+                f"(this run has {scheduler_policy!r})"
+            )
+        donor_snapshot = None
     manifest = build_manifest(
-        pool_doc, judge_doc, pool_doc.get("budget") or {}, reserved
+        pool_doc, judge_doc, pool_doc.get("budget") or {}, reserved,
+        donor_snapshot=donor_snapshot,
     )
     write_json_atomic(args.output, manifest)
     print(
@@ -1619,6 +1756,123 @@ def _replay_seat_errors(manifest: dict, pool_doc: dict, ledger: dict, manifest_d
     return errors, notes
 
 
+def _replay_donor_binding_errors(
+    manifest: dict, run_dir: Path, ledger: dict
+) -> tuple[list, list]:
+    """The generation's donor binding: snapshot integrity + seat receipts (§3.1).
+
+    Recomputes the bound snapshot's content id and byte digest against the
+    manifest binding, re-derives the selection over the snapshot's frozen
+    eligible frontier, and checks that every eligible donor predates the
+    generation (a donor admitted later could not have been bound).  A seat
+    without a candidate-local receipt is simply not implemented yet; a seat
+    whose receipt references a different snapshot — or any receipt under a
+    no_donor binding — breaks the binding.
+    """
+    from scheduler import donor as donor_snapshots  # noqa: PLC0415
+
+    errors: list[str] = []
+    notes: list[str] = []
+    binding = manifest.get("donor_snapshot")
+    shape = _donor_binding_shape_errors(binding)
+    if shape:
+        return ["manifest donor_snapshot: " + error for error in shape], notes
+    if binding["status"] == "bound":
+        snapshot_path = run_dir / binding["path"]
+        if not snapshot_path.is_file():
+            errors.append(f"bound donor snapshot {binding['path']} is missing")
+        else:
+            try:
+                snapshot = donor_snapshots.load_donor_snapshot(snapshot_path)
+            except ValueError as exc:
+                errors.append(f"bound donor snapshot {binding['path']}: {exc}")
+            else:
+                if snapshot["snapshot_id"] != binding["snapshot_id"]:
+                    errors.append(
+                        "the bound snapshot's content id differs from the "
+                        "manifest binding"
+                    )
+                byte_digest = (
+                    "sha256:"
+                    + hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+                )
+                if byte_digest != binding["digest"]:
+                    errors.append(
+                        "the bound snapshot's bytes differ from the manifest "
+                        "binding digest"
+                    )
+                eligible = snapshot["eligible"]
+                if eligible:
+                    try:
+                        chosen = min(
+                            eligible,
+                            key=lambda entry: (
+                                entry["final_best_score"],
+                                entry["run_id"],
+                            ),
+                        )
+                    except (KeyError, TypeError) as exc:
+                        errors.append(
+                            f"the bound snapshot's eligible entries lack "
+                            f"selection fields: {exc}"
+                        )
+                    else:
+                        if snapshot["selected"]["run_id"] != chosen["run_id"]:
+                            errors.append(
+                                "the bound snapshot's selected donor is not "
+                                "the frozen frontier's minimum"
+                            )
+                record_count = (manifest.get("ledger_snapshot") or {}).get(
+                    "record_count"
+                )
+                if isinstance(record_count, int) and not isinstance(
+                    record_count, bool
+                ):
+                    prefix_ids = {
+                        str(record.get("run_id"))
+                        for record in ledger.get("records", [])[:record_count]
+                        if isinstance(record, dict)
+                    }
+                    late = [
+                        entry["run_id"]
+                        for entry in eligible
+                        if entry["run_id"] not in prefix_ids
+                    ]
+                    if late:
+                        errors.append(
+                            f"donor snapshot eligible {late} are not in the "
+                            "generation-start ledger prefix"
+                        )
+    for slot in manifest.get("slate") or []:
+        if not isinstance(slot, dict):
+            continue
+        run_id = str(slot.get("run_id"))
+        receipt_path = run_dir / "candidates" / run_id / DONOR_RECEIPT_FILENAME
+        if not receipt_path.is_file():
+            notes.append(f"seat {run_id} has no donor receipt yet")
+            continue
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"seat {run_id} donor receipt is unreadable: {exc}")
+            continue
+        donor = receipt.get("donor") if isinstance(receipt, dict) else None
+        receipt_snapshot = (
+            donor.get("snapshot_id") if isinstance(donor, dict) else None
+        )
+        if binding["status"] == "no_donor":
+            errors.append(
+                f"seat {run_id} carries a donor receipt under a no_donor "
+                "binding"
+            )
+        elif receipt_snapshot != binding["snapshot_id"]:
+            errors.append(
+                f"seat {run_id} donor receipt references {receipt_snapshot}, "
+                f"not the bound {binding['snapshot_id']}"
+            )
+    return errors, notes
+
+
 def _gen_dir_number(gen_dir: Path) -> int | None:
     name = gen_dir.name
     if name.startswith("gen-") and name[4:].isdigit():
@@ -1796,6 +2050,13 @@ def replay_generation(gen_dir: Path, ledger: dict, registry: dict | None) -> dic
         checks["ledger_binding"] = not seat_errors
         errors.extend(seat_errors)
         notes.extend(seat_notes)
+        if "donor_snapshot" in manifest:
+            binding_errors, binding_notes = _replay_donor_binding_errors(
+                manifest, gen_dir.parent.parent, ledger
+            )
+            checks["donor_binding"] = not binding_errors
+            errors.extend(binding_errors)
+            notes.extend(binding_notes)
     return {
         "generation": gen_dir.name,
         "gen_no": gen_no,
@@ -1911,6 +2172,25 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--judge", type=Path, required=True)
     manifest.add_argument(
         "--reserved-run-ids", required=True, help="comma-separated, one per slot"
+    )
+    donor = manifest.add_mutually_exclusive_group()
+    donor.add_argument(
+        "--donor-snapshot",
+        type=Path,
+        default=None,
+        help=(
+            "donor snapshot artifact (absolute or run-dir-relative) to bind "
+            "into the manifest; transfer scheduler policy only"
+        ),
+    )
+    donor.add_argument(
+        "--no-donor",
+        action="store_true",
+        help=(
+            "bind an explicit no_donor state (transfer scheduler policy "
+            "before any donor exists); one of --donor-snapshot/--no-donor is "
+            "required under that policy and rejected elsewhere"
+        ),
     )
     manifest.add_argument("--output", type=Path, required=True)
     manifest.set_defaults(func=cmd_build_manifest)

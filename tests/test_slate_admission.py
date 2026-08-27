@@ -613,6 +613,8 @@ class SlateAdmissionCliTests(unittest.TestCase):
                         context=gen / "context.json",
                         judge=gen / "judge.json",
                         reserved_run_ids="005,006",
+                        donor_snapshot=None,
+                        no_donor=False,
                         output=gen / "generation.json",
                     )
                 )

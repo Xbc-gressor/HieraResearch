@@ -56,6 +56,7 @@ SCHEDULER_POLICIES = (
     "legacy_wide",
     "v3_2",
     "anchor_challenger_v1",
+    "anchor_transfer_challenger_v1",
 )
 INNER_POLICIES = (
     "deferred-random8-hebo10-spsa10-v1",
@@ -65,6 +66,7 @@ INNER_POLICIES = (
     "mixup24-turbo20-v1",
     "hebo24-turbo20-v1",
     "hebo24-hebo20",
+    "hebo24-transfer10-hebo10",
     "baseline-hebo-full-v1",
     "legacy",
 )
@@ -262,6 +264,19 @@ def initialize_run(
     effective_scheduler = scheduler_policy or effective_tuner.get(
         "scheduler_policy", DEFAULT_SCHEDULER_POLICY
     )
+    # The transfer pair is mutual (run_cfg._validate_anchor_transfer_challenger
+    # enforces the same pairing whenever the frozen config is read). Check the
+    # scheduler side first: a defaulted inner policy must not hide behind the
+    # 24+20 pairing error below.
+    if scheduler_policy == "anchor_transfer_challenger_v1":
+        effective_inner = inner_policy or effective_tuner.get(
+            "inner_policy", DEFAULT_INNER_POLICY
+        )
+        if effective_inner != "hebo24-transfer10-hebo10":
+            raise ValueError(
+                "anchor_transfer_challenger_v1 requires inner tuner policy "
+                "hebo24-transfer10-hebo10"
+            )
     if (
         inner_policy in (
             "mixup24-turbo20-v1",
@@ -273,6 +288,14 @@ def initialize_run(
         raise ValueError(
             f"{inner_policy} requires scheduler_policy "
             "anchor_challenger_v1"
+        )
+    if (
+        inner_policy == "hebo24-transfer10-hebo10"
+        and effective_scheduler != "anchor_transfer_challenger_v1"
+    ):
+        raise ValueError(
+            "hebo24-transfer10-hebo10 requires scheduler_policy "
+            "anchor_transfer_challenger_v1"
         )
     if inner_policy == "baseline-hebo-full-v1":
         if effective_scheduler != "legacy":
@@ -303,7 +326,8 @@ def initialize_run(
     # The maintained template already carries 200; keep initialization valid
     # even when a deployment intentionally omits the template.
     if (
-        scheduler_policy in ("v3_2", "anchor_challenger_v1")
+        scheduler_policy in ("v3_2", "anchor_challenger_v1",
+                             "anchor_transfer_challenger_v1")
         and max_evaluations is None
         and config.get("max_evaluations") is None
     ):
@@ -435,6 +459,7 @@ def initialize_run(
             "mixup24-turbo20-v1",
             "hebo24-turbo20-v1",
             "hebo24-hebo20",
+            "hebo24-transfer10-hebo10",
         ):
             section = config.get("tuner", {})
             current_cap = int(section.get("deep_tune_per_candidate_cap", 40))
