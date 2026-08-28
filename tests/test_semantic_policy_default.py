@@ -791,6 +791,51 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
                     )
                 )
 
+    def test_judged_slate_config_accepted_with_explicit_select_policy(self) -> None:
+        # The provided-baseline path runs `select --policy coverage_experience`
+        # inside runs whose frozen config says judged_slate (an orchestration
+        # policy, never an acquisition one).  The configured value must be
+        # accepted there; an unoverridden judged_slate still fails closed at
+        # the acquisition-policy check.
+        proposal_set = build_proposal_set(
+            fixture_registry(), {"records": []}, op="fresh", parents=[], max_points=3
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            proposals_path = tmp_path / "proposals.json"
+            ledger_path = tmp_path / "ledger.json"
+            proposals_path.write_text(json.dumps(proposal_set))
+            ledger_path.write_text(json.dumps({"records": []}))
+            (tmp_path / "framework_cfg.json").write_text(
+                json.dumps({"semantic_search": {"policy": "judged_slate"}})
+            )
+
+            result = cmd_select(
+                SimpleNamespace(
+                    proposals=proposals_path,
+                    predictions=None,
+                    ledger=ledger_path,
+                    policy="coverage_experience",
+                    cfg=None,
+                    point_output=tmp_path / "point.json",
+                    receipt_output=tmp_path / "policy.json",
+                )
+            )
+            self.assertEqual(result, 0)
+
+            with self.assertRaisesRegex(ContractError, "policy must be one of"):
+                cmd_select(
+                    SimpleNamespace(
+                        proposals=proposals_path,
+                        predictions=None,
+                        ledger=ledger_path,
+                        policy=None,
+                        cfg=None,
+                        point_output=tmp_path / "point2.json",
+                        receipt_output=tmp_path / "policy2.json",
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

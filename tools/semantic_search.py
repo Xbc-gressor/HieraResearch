@@ -1510,8 +1510,16 @@ def _framework_policy_config(
     if unknown:
         raise ContractError(f"{path}: unknown semantic_search keys {unknown}")
     policy = section.get("policy")
-    if policy is not None and policy not in POLICIES:
-        raise ContractError(f"{path}: semantic_search.policy must be one of {sorted(POLICIES)}")
+    # judged_slate is a legal frozen value (an orchestration policy admitted
+    # via schema-8 receipts, never an acquisition policy): the provided-
+    # baseline path calls `select` with an explicit --policy override in runs
+    # configured this way.  If it ever resolves as the acquisition policy, the
+    # selection-time POLICIES check fails closed.
+    legal_config_policies = POLICIES | {"judged_slate"}
+    if policy is not None and policy not in legal_config_policies:
+        raise ContractError(
+            f"{path}: semantic_search.policy must be one of {sorted(legal_config_policies)}"
+        )
     config = {
         key: value
         for key, value in section.items()
