@@ -67,6 +67,20 @@ def _record_keep(run_dir: Path, step: int, score: float, desc: str) -> None:
     shutil.copy(history / f"{step:03d}.py", run_dir / "best.py")
 
 
+def _outcome_note(score: float, best_before: float | None, status: str) -> str:
+    """The feedback the next editor invocation receives about the edit just
+    evaluated (the Karpathy loop's score feedback, which the driver owns)."""
+    before = (f"{best_before:.6f}" if best_before is not None
+              else "none (no finite score yet)")
+    if status == "keep":
+        verdict = (f"KEEP — it strictly improved the then-best ({before}) "
+                   "and is the new incumbent the working copy is synced to")
+    else:
+        verdict = (f"DISCARD — it did not improve the then-best ({before}); "
+                   "the working copy was reverted to the incumbent")
+    return f"your last edit scored {score:.6f} (lower is better): {verdict}."
+
+
 def _revert(run_dir: Path) -> None:
     best = run_dir / "best.py"
     if best.exists():
@@ -163,6 +177,40 @@ def _reconcile(run_dir, cmd, repo_root, events) -> None:
                 "recovery: reserved attempt interrupted before outcome row")
 
 
+def _resume_outcome_note(run_dir: Path) -> str | None:
+    """Rebuild the pending editor feedback after a driver restart from the
+    authoritative TSV: the last row's outcome, with the then-best taken from
+    all earlier rows (mirrors the fresh-path wording)."""
+    rows = _tsv_rows(run_dir)
+    if not rows:
+        return None
+    prior_finite = []
+    for row in rows[:-1]:
+        try:
+            value = float(row[1])
+        except (IndexError, ValueError):
+            continue
+        if math.isfinite(value):
+            prior_finite.append(value)
+    last = rows[-1]
+    try:
+        score = float(last[1])
+    except (IndexError, ValueError):
+        return None
+    if last[0] == "0":
+        if math.isfinite(score):
+            return (f"the unmodified baseline scored {score:.6f} (lower is "
+                    "better); it is the current incumbent")
+        return "the unmodified baseline CRASHED (no valid metric, scored +inf)"
+    if not math.isfinite(score):
+        return ("your last edit CRASHED (no valid metric, scored +inf); the "
+                "driver was interrupted before delivering the outcome")
+    best_before = min(prior_finite, default=None)
+    return _outcome_note(score, best_before,
+                         "keep" if len(last) > 2 and last[2] == "keep"
+                         else "discard")
+
+
 def _restore_best(run_dir, events) -> None:
     """Crash-recovery row 2: a kill between the keep row and the best.py
     snapshot leaves best.py stale. The TSV is authoritative: restore best.py
@@ -248,7 +296,12 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
     per_runtime_limit = _json.loads(cfg_text).get("per_runtime_limit")
 
     store = ReceiptStore(run_dir)
-    last_editor: int | None = None
+    # Reconnect the editor session chain after a driver restart: session ids
+    # are persisted at invocation init, so the latest one is resumable.
+    last_editor: int | None = store.latest_session_invocation("hillclimb-editor")
+    # Feedback handed to the next fresh idea; on a restart, rebuild the
+    # outcome that was recorded but never delivered to the editor.
+    outcome_note: str | None = None if fresh else _resume_outcome_note(run_dir)
 
     # Bootstrap the working copy if the task ships no entrypoint.
     if not (run_dir / "train.py").exists():
@@ -271,8 +324,13 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
             score = _evaluate_outcome(log, rc, metric, required_patterns)
             if math.isfinite(score):
                 _record_keep(run_dir, 0, score, "baseline")
+                outcome_note = (f"the unmodified baseline scored {score:.6f} "
+                                "(lower is better); it is the current "
+                                "incumbent")
             else:
                 _record(run_dir, 0, score, "crash", "baseline")
+                outcome_note = ("the unmodified baseline CRASHED (no valid "
+                                "metric, scored +inf)")
             # A crashed baseline CONTINUES (same semantics as the resume
             # path): the editor starts from the crashed train.py, _revert
             # no-ops without best.py, and the first finite score keeps.
@@ -285,8 +343,11 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
         if needs_editor:
             _revert(run_dir)
             best_before = min(_finite_scores(run_dir), default=None)
+            extra = {"outcome": outcome_note} if outcome_note else None
+            outcome_note = None
             try:
                 last_editor = _editor_session(runner, store, task, tag, run_dir,
+                                              extra=extra,
                                               resume_from=last_editor)
             except InvocationFailed as exc:
                 stop_condition = f"editor invocation failed: {exc.problems}"
@@ -313,6 +374,10 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 verdict = "abandon"
             if verdict == "abandon":
                 _revert(run_dir)
+                outcome_note = ("your last edit failed candidate preflight "
+                                "and the idea was abandoned (no evaluation "
+                                "budget was consumed); the working copy was "
+                                "reverted to the incumbent")
                 continue
             try:
                 last_editor = _editor_session(
@@ -325,6 +390,10 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 break
             if _preflight(task, run_dir, repo_root, cmd, task_toml).returncode != 0:
                 _revert(run_dir)
+                outcome_note = ("your repaired edit still failed candidate "
+                                "preflight and the idea was abandoned (no "
+                                "evaluation budget was consumed); the working "
+                                "copy was reverted to the incumbent")
                 continue
 
         if not _reserve(run_dir, repo_root, cmd):
@@ -363,6 +432,10 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     break
             if not repaired:
                 _revert(run_dir)
+                outcome_note = ("your last edit CRASHED (no valid metric, "
+                                "scored +inf) and was abandoned after "
+                                "diagnosis; the working copy was reverted to "
+                                "the incumbent")
             else:
                 needs_editor = False
             continue  # a repair re-enters the loop; its retry reserves anew
@@ -372,6 +445,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _record_keep(run_dir, step, score, "")
         else:
             _record(run_dir, step, score, "discard", "")
+        outcome_note = _outcome_note(score, best_before, status)
 
     return _status(task, tag, run_dir, metric, stop_condition, repo_root, cmd)
 

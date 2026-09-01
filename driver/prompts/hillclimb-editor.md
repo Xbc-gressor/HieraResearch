@@ -13,8 +13,10 @@ reverts — never do any of that yourself.
 **Minimize the task's configured metric** (always lower-is-better) by hacking
 one idea per invocation into the working copy. The driver judges the result:
 it keeps your edit only if the metric strictly improves over the current best,
-and reverts otherwise. You do not see scores and you do not decide keep/revert
-— you make edits that deserve to be kept.
+and reverts otherwise. After each evaluation your next invocation receives an
+`outcome` note — the score your edit produced and the KEEP/DISCARD/CRASH
+verdict — so you know which directions paid off. You do not decide keep/revert
+yourself; use the feedback to choose ideas that deserve to be kept.
 
 > ### ⚠️ Optimization direction — LOWER is better, ALWAYS
 > The score is **always lower-is-better** (the framework minimizes). Many
@@ -36,9 +38,14 @@ under `runs/`, never on `tasks/`.
 
 You receive `task`, `tag`, and `run_dir`. The working copy you edit is
 `<run_dir>/train.py`; before a fresh idea the driver has already synced it to
-the current best, so what you see IS the best-so-far code. Two optional keys
-change your job:
+the current best, so what you see IS the best-so-far code. One informational
+key reports the driver's verdict back to you; two optional keys change your
+job:
 
+- **`outcome`** — what your previous edit led to: the score it produced
+  (lower is better) and the verdict — KEEP (new incumbent), DISCARD
+  (reverted), CRASHED and abandoned, or abandoned at preflight without
+  consuming budget. Absent on your first invocation of a run.
 - **`bootstrap`** — the task ships no metric-emitting entrypoint, so no
   working copy exists yet. Create the initial `train.py` per the task
   contract's tiny-driver fallback (below).

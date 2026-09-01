@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from driver.loops.hillclimb import run_hillclimb  # noqa: E402
+from driver.receipts import ReceiptStore  # noqa: E402
 from driver.session import FakeSessionRunner  # noqa: E402
 
 
@@ -349,6 +350,55 @@ class HillclimbTests(unittest.TestCase):
         rows = self.rows()
         self.assertEqual(rows[0][1:3], ["-0.730000", "keep"])
         self.assertEqual(rows[1][1:3], ["inf", "crash"])
+
+    def test_editor_receives_previous_outcome(self) -> None:
+        # the Karpathy feedback loop: each fresh-idea invocation carries the
+        # score + verdict of the edit just evaluated
+        cmd = FakeCmd(self.repo, scores=[-0.50, -0.81, -0.70])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "a"},
+             "side_effects": edit_train_py("# a\n")},
+            {"receipt": {"edited": True, "summary": "b"},
+             "side_effects": edit_train_py("# b\n")},
+        ])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd, max_evaluations=3)
+        editor_calls = [ctx for name, ctx in runner.calls
+                        if name == "hillclimb-editor"]
+        self.assertEqual(len(editor_calls), 2)
+        self.assertIn("baseline", editor_calls[0].extra["outcome"])
+        self.assertIn("-0.500000", editor_calls[0].extra["outcome"])
+        self.assertIn("-0.810000", editor_calls[1].extra["outcome"])
+        self.assertIn("KEEP", editor_calls[1].extra["outcome"])
+
+    def test_restart_reanchors_editor_session_chain(self) -> None:
+        # driver restart: the editor resume chain re-anchors from the
+        # receipts store instead of starting a fresh session, and the pending
+        # outcome is rebuilt from results.tsv
+        run_dir = self.run_dir()
+        run_dir.mkdir(parents=True)
+        (run_dir / "results.tsv").write_text(
+            "step\tscore\tstatus\tdescription\n"
+            "0\t-0.700000\tkeep\tbaseline\n"
+            "1\t-0.850000\tkeep\t\n")
+        (run_dir / "train.py").write_text("# v2\n")
+        (run_dir / "best.py").write_text("# v2\n")
+        (run_dir / "framework_cfg.json").write_text(
+            json.dumps({"max_evaluations": 3}))
+        ReceiptStore(run_dir).persist_session_id("hillclimb-editor", 1,
+                                                 "sess-old")
+        cmd = FakeCmd(self.repo, scores=[-0.90])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "c"},
+             "side_effects": edit_train_py("# c\n")},
+        ])
+        run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                      repo_root=self.repo, cmd=cmd)
+        editor_calls = [ctx for name, ctx in runner.calls
+                        if name == "hillclimb-editor"]
+        self.assertEqual(editor_calls[0].resume_session_id, "sess-old")
+        self.assertIn("-0.850000", editor_calls[0].extra["outcome"])
+        self.assertIn("KEEP", editor_calls[0].extra["outcome"])
 
     def test_keep_snapshot_and_best_are_identical(self) -> None:
         # snapshot-before-row ordering: after any keep, history/<step>.py and

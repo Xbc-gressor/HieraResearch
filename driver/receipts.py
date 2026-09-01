@@ -114,6 +114,22 @@ class ReceiptStore:
             return None
         return json.loads(path.read_text(encoding="utf-8")).get("session_id")
 
+    def latest_session_invocation(self, role: str) -> int | None:
+        """Highest invocation id with a persisted session id for ``role`` —
+        the resume anchor for a session chain across driver restarts."""
+        prefix = f"{role}-"
+        highest = None
+        for path in self._dir().iterdir():
+            if not path.name.startswith(prefix) or \
+                    not path.name.endswith(".session.json"):
+                continue
+            match = _ID_SUFFIX.search(path.name)
+            if match:
+                inv = int(match.group(1))
+                if highest is None or inv > highest:
+                    highest = inv
+        return highest
+
 
 def build_receipt_server(
     role_name: str,

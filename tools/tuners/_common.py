@@ -53,6 +53,11 @@ try:
 except ImportError:  # pragma: no cover - Phase C currently runs on POSIX hosts.
     fcntl = None
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - non-POSIX hosts have no getrusage.
+    resource = None
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from evaluation_budget import (  # noqa: E402
     EvaluationBudgetExhausted,
@@ -743,12 +748,79 @@ def _communicate_with_limit(
                 proc.kill()
         except (ProcessLookupError, OSError):
             pass
+        partial_out = partial_err = ""
         try:
-            proc.communicate(timeout=5)
+            partial_out, partial_err = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-        raise TimeoutError(f"{label}={limit:g}s") from None
+        exc = TimeoutError(f"{label}={limit:g}s")
+        exc.partial_stdout = partial_out
+        exc.partial_stderr = partial_err
+        raise exc from None
     return out, err, int(proc.returncode)
+
+
+_TRACE_HEAD_CHARS = 8 * 1024
+_TRACE_TAIL_CHARS = 56 * 1024
+
+
+def _truncate_trace_stream(text: str) -> str:
+    if len(text) <= _TRACE_HEAD_CHARS + _TRACE_TAIL_CHARS:
+        return text
+    omitted = len(text) - _TRACE_HEAD_CHARS - _TRACE_TAIL_CHARS
+    return (
+        text[:_TRACE_HEAD_CHARS]
+        + f"\n...[trace truncated, {omitted} chars omitted]...\n"
+        + text[-_TRACE_TAIL_CHARS:]
+    )
+
+
+def _write_eval_trace(
+    candidate_path: Any,
+    *,
+    attempt_id: str | None,
+    phase: str,
+    method: str,
+    returncode: int | None,
+    timed_out: bool,
+    elapsed_seconds: float,
+    out: str,
+    err: str,
+) -> None:
+    """Persist one subprocess evaluation's bounded output next to the candidate.
+
+    Auxiliary artifact only: skipped outside a run dir (no reservation receipt)
+    and never allowed to break the evaluation path itself.
+    """
+    if attempt_id is None:
+        return
+    try:
+        candidate_dir = Path(candidate_path)
+        if not candidate_dir.is_dir():
+            candidate_dir = candidate_dir.parent
+        trace_dir = candidate_dir / "_traces"
+        trace_dir.mkdir(exist_ok=True)
+        max_rss_kb = (
+            int(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+            if resource is not None
+            else None
+        )
+        content = (
+            f"attempt_id: {attempt_id}\n"
+            f"phase: {phase}\n"
+            f"method: {method}\n"
+            f"returncode: {returncode}\n"
+            f"timed_out: {str(timed_out).lower()}\n"
+            f"elapsed_seconds: {elapsed_seconds:.1f}\n"
+            f"max_rss_kb: {max_rss_kb}\n"
+            f"\n[stdout]\n{_truncate_trace_stream(out)}\n"
+            f"\n[stderr]\n{_truncate_trace_stream(err)}\n"
+        )
+        (trace_dir / f"{attempt_id}.log").write_text(
+            content, encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        pass
 
 
 def timed_eval(
@@ -775,16 +847,21 @@ def timed_eval(
     import the candidate. Absent ``python_cmd``, the historical same-
     interpreter path is unchanged.
 
+    Every subprocess evaluation (success, failure, or timeout) persists a
+    bounded stdout/stderr trace plus process metadata to
+    ``<candidate_dir>/_traces/<attempt_id>.log``.
+
     Timeouts, child-process errors, missing results, and non-finite scores raise
     so callers record an auditable failed trial instead of caching ``+inf`` as
     if it were a successful score.
     """
-    reserve_evaluation(
+    receipt = reserve_evaluation(
         candidate_path,
         params=params,
         phase=phase,
         method=method,
     )
+    attempt_id = receipt.get("attempt_id") if receipt else None
     runtime_limit = read_runtime_limit(candidate_path)
     if runtime_limit is None and python_cmd is None:
         score = float(evaluate(make_model, params))
@@ -799,15 +876,43 @@ def timed_eval(
         json.dumps(params),
         json.dumps(expected_execution_revision),
     ]
+    start = time.monotonic()
     if runtime_limit is None:
         proc = subprocess.run(command, capture_output=True, text=True)
         out, err, returncode = proc.stdout, proc.stderr, int(proc.returncode)
+        timed_out = False
     else:
-        out, err, returncode = _communicate_with_limit(
-            command,
-            limit=runtime_limit,
-            label="evaluation exceeded per_runtime_limit",
-        )
+        try:
+            out, err, returncode = _communicate_with_limit(
+                command,
+                limit=runtime_limit,
+                label="evaluation exceeded per_runtime_limit",
+            )
+            timed_out = False
+        except TimeoutError as exc:
+            _write_eval_trace(
+                candidate_path,
+                attempt_id=attempt_id,
+                phase=phase,
+                method=method,
+                returncode=None,
+                timed_out=True,
+                elapsed_seconds=time.monotonic() - start,
+                out=getattr(exc, "partial_stdout", "") or "",
+                err=getattr(exc, "partial_stderr", "") or "",
+            )
+            raise
+    _write_eval_trace(
+        candidate_path,
+        attempt_id=attempt_id,
+        phase=phase,
+        method=method,
+        returncode=returncode,
+        timed_out=timed_out,
+        elapsed_seconds=time.monotonic() - start,
+        out=out,
+        err=err,
+    )
     for line in out.splitlines():
         if line.startswith("RESULT:"):
             try:
