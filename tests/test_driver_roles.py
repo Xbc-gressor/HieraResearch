@@ -55,7 +55,7 @@ class RegistryTests(unittest.TestCase):
         "background-researcher", "idea-generator", "candidate-writer",
         "tunable-contract-extractor", "tuner-orchestrator",
         "experience-extractor", "crash-diagnosis", "hillclimb-editor",
-        "slate-judge", "slate-plan-writer",
+        "rewrite-editor", "slate-judge", "slate-plan-writer",
     }
 
     def test_all_roles_registered(self) -> None:
@@ -87,8 +87,8 @@ class RegistryTests(unittest.TestCase):
 
         The fail-closed PreToolUse hook enforces exactly these sets, so any
         drift here is a real permission grant or denial and must fail loudly.
-        The judged-slate roles have no retired agent; their entries pin the
-        new contract instead.
+        The judged-slate and rewrite roles have no retired agent; their
+        entries pin the new contract instead.
         """
         expected = {
             "background-researcher":
@@ -101,6 +101,7 @@ class RegistryTests(unittest.TestCase):
             "experience-extractor": ("Read", "Write", "Bash"),
             "crash-diagnosis": ("Read", "Bash", "Glob", "Grep"),
             "hillclimb-editor": ("Read", "Write", "Edit", "Bash", "Glob"),
+            "rewrite-editor": ("Read", "Write", "Edit", "Glob", "Grep"),
             "slate-judge": (),
             "slate-plan-writer": ("Read",),
         }
@@ -124,6 +125,19 @@ class PostconditionTests(unittest.TestCase):
             target = run_dir / "candidates" / "003" / "train.py"
             target.parent.mkdir(parents=True)
             target.write_text("# candidate\n")
+            problems = [p for check in role.postconditions if (p := check(ctx))]
+            self.assertEqual(problems, [])
+
+    def test_rewrite_editor_postcondition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            role = ROLES["rewrite-editor"]
+            candidate_dir = run_dir / "candidates" / "004"
+            ctx = make_ctx(run_dir, extra={"candidate_dir": str(candidate_dir)})
+            problems = [p for check in role.postconditions if (p := check(ctx))]
+            self.assertTrue(any("train.py" in p for p in problems))
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "train.py").write_text("# candidate\n")
             problems = [p for check in role.postconditions if (p := check(ctx))]
             self.assertEqual(problems, [])
 

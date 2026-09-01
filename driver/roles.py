@@ -194,6 +194,12 @@ def editor_train_py_exists(ctx: InvocationContext) -> str | None:
     return None if (ctx.run_dir / "train.py").exists() else "missing working copy train.py"
 
 
+def rewrite_train_py_exists(ctx: InvocationContext) -> str | None:
+    """the rewrite candidate's train.py exists in candidate_dir."""
+    path = Path(ctx.extra["candidate_dir"]) / "train.py"
+    return None if path.exists() else f"missing candidate file: {path}"
+
+
 # --- registry -----------------------------------------------------------------
 
 _BASE_DISALLOWED = ("Agent", "Task", "Skill")
@@ -298,6 +304,17 @@ ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"edited": "bool", "summary": "str"},
         postconditions=(editor_train_py_exists,),
+    ),
+    # rewrite loop: one long-lived session per imported candidate, one
+    # in-place improvement edit per bout; basis names the intelligence the
+    # edit consumed. No Bash — preflight/evaluation are driver-side.
+    "rewrite-editor": RoleDefinition(
+        name="rewrite-editor",
+        prompt_file="rewrite-editor.md",
+        tools=("Read", "Write", "Edit", "Glob", "Grep"),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={"edited": "bool", "summary": "str", "basis": "str"},
+        postconditions=(rewrite_train_py_exists,),
     ),
     # judged_slate arm: a tool-free listwise judge. The bounded payload
     # arrives as the invocation context's inline_payload; the receipt's

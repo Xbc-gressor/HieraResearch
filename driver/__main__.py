@@ -25,7 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("task")
     run.add_argument("tag")
     run.add_argument("--loop", choices=["experiment", "hillclimb",
-                                         "baseline-tune"], required=True)
+                                         "baseline-tune", "rewrite"],
+                     required=True)
     run.add_argument("--model", help="resolved model id; required for a new run, "
                                      "ignored on resume (run_metadata.json wins)")
     run.add_argument("--max-evaluations", type=int)
@@ -78,14 +79,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="how many proposed warm configs are evaluated at step 0+1 "
              "(minimum 2; template default 3). Frozen once run artifacts exist",
     )
+    run.add_argument(
+        "--noise-margin",
+        type=float,
+        default=0.0,
+        help="rewrite loop: a score must beat the candidate's best by more "
+             "than this margin to be kept (0 = strict improvement)",
+    )
+    run.add_argument(
+        "--max-bouts",
+        type=int,
+        default=12,
+        help="rewrite loop: per-candidate bout cap",
+    )
+    run.add_argument(
+        "--stall-after",
+        type=int,
+        default=5,
+        help="rewrite loop: a candidate stalls after this many consecutive "
+             "non-kept bouts",
+    )
+    run.add_argument(
+        "--context",
+        default="full",
+        help="rewrite loop: context.md section subset passed through to "
+             "rewrite_context.py --sections (default 'full' = all sections)",
+    )
     run.add_argument("--cli-path", help="system claude CLI path; default is the "
                                         "SDK-bundled CLI (pinned via uv.lock)")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.command == "run":
+        if args.noise_margin < 0:
+            parser.error("--noise-margin must be >= 0")
         import json
 
         from driver.loops.hillclimb import run_hillclimb
@@ -120,6 +150,19 @@ def main(argv: list[str] | None = None) -> int:
                 args.task, args.tag, runner=runner, model=model,
                 max_evaluations=args.max_evaluations, timeout=args.timeout,
                 k_warm=args.k_warm, k_eval=args.k_eval,
+                cli_path=args.cli_path,
+            )
+            print(json.dumps(status, indent=2, sort_keys=True))
+            return exit_code_for(status, args.loop)
+        if args.loop == "rewrite":
+            from driver.loops.rewrite import run_rewrite
+            runner = SDKSessionRunner(model=model, events=EventsLog(run_dir),
+                                      cli_path=args.cli_path)
+            status = run_rewrite(
+                args.task, args.tag, runner=runner, model=model,
+                noise_margin=args.noise_margin, max_bouts=args.max_bouts,
+                stall_after=args.stall_after, context=args.context,
+                max_evaluations=args.max_evaluations, timeout=args.timeout,
                 cli_path=args.cli_path,
             )
             print(json.dumps(status, indent=2, sort_keys=True))

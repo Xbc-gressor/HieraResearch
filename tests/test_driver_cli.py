@@ -2,8 +2,10 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 
 class CliTests(unittest.TestCase):
@@ -21,6 +23,12 @@ class CliTests(unittest.TestCase):
         result = self.run_cli("run", "t", "tag", "--loop", "nope")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid choice", result.stderr)
+
+    def test_rejects_negative_noise_margin(self) -> None:
+        result = self.run_cli("run", "t", "tag", "--loop", "rewrite",
+                              "--model", "m", "--noise-margin", "-0.1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("noise-margin", result.stderr)
 
     def test_model_required_for_new_run(self) -> None:
         result = self.run_cli("run", "t", "tag", "--loop", "hillclimb")
@@ -44,6 +52,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("--k-warm", result.stdout)
         self.assertIn("--k-eval", result.stdout)
+
+    def test_blocked_rewrite_run_exits_nonzero(self) -> None:
+        # In-process main() with runner/events/loop mocked out: covers the
+        # exit-code contract for a blocked rewrite run without touching the
+        # real repo's runs/.
+        from driver import __main__ as cli
+
+        status = {"active_stop_condition":
+                  "editor invocation failed: ['session died']"}
+        with mock.patch("driver.session.SDKSessionRunner"), \
+                mock.patch("driver.events.EventsLog"), \
+                mock.patch("driver.loops.rewrite.run_rewrite",
+                           return_value=status):
+            rc = cli.main(["run", "t", "tag", "--loop", "rewrite",
+                           "--model", "m"])
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

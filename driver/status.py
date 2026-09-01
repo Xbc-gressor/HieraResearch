@@ -127,7 +127,7 @@ def exit_code_for(status: dict, loop: str) -> int:
     """CLI exit code (Level-3 contract): a blocked run exits non-zero."""
     if loop in ("experiment", "baseline-tune"):
         return 1 if status.get("phase") == "blocked" else 0
-    if loop == "hillclimb":
+    if loop in ("hillclimb", "rewrite"):
         return 1 if status.get("active_stop_condition") not in (None, "none") else 0
     return 0
 
