@@ -67,7 +67,29 @@ def _record_keep(run_dir: Path, step: int, score: float, desc: str) -> None:
     shutil.copy(history / f"{step:03d}.py", run_dir / "best.py")
 
 
-def _outcome_note(score: float, best_before: float | None, status: str) -> str:
+TELEMETRY_PREFIXES = ("training_seconds:", "total_seconds:", "peak_vram_mb:",
+                      "mfu_percent:", "total_tokens_M:", "num_steps:",
+                      "num_params_M:", "depth:")
+
+
+def _telemetry(log_path: Path) -> str:
+    """Informational summary lines from a run log, delivered to the editor
+    alongside the score (the Karpathy agent greps the log itself; here the
+    driver hands the same numbers over)."""
+    if not log_path.exists():
+        return ""
+    lines = [line.strip() for line in
+             log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+             if line.startswith(TELEMETRY_PREFIXES)]
+    return "; ".join(lines[:10])
+
+
+def _crash_tail(log_path: Path) -> str:
+    return f"\nrun log tail:\n{common.tail(log_path, 40)}"
+
+
+def _outcome_note(score: float, best_before: float | None, status: str,
+                  telemetry: str = "") -> str:
     """The feedback the next editor invocation receives about the edit just
     evaluated (the Karpathy loop's score feedback, which the driver owns)."""
     before = (f"{best_before:.6f}" if best_before is not None
@@ -78,7 +100,10 @@ def _outcome_note(score: float, best_before: float | None, status: str) -> str:
     else:
         verdict = (f"DISCARD — it did not improve the then-best ({before}); "
                    "the working copy was reverted to the incumbent")
-    return f"your last edit scored {score:.6f} (lower is better): {verdict}."
+    note = f"your last edit scored {score:.6f} (lower is better): {verdict}."
+    if telemetry:
+        note += f" Run telemetry — {telemetry}."
+    return note
 
 
 def _revert(run_dir: Path) -> None:
@@ -197,18 +222,25 @@ def _resume_outcome_note(run_dir: Path) -> str | None:
         score = float(last[1])
     except (IndexError, ValueError):
         return None
+    log_path = run_dir / "run.log"
     if last[0] == "0":
         if math.isfinite(score):
-            return (f"the unmodified baseline scored {score:.6f} (lower is "
+            note = (f"the unmodified baseline scored {score:.6f} (lower is "
                     "better); it is the current incumbent")
-        return "the unmodified baseline CRASHED (no valid metric, scored +inf)"
+            telemetry = _telemetry(log_path)
+            if telemetry:
+                note += f" Run telemetry — {telemetry}."
+            return note
+        return ("the unmodified baseline CRASHED (no valid metric, scored "
+                "+inf)" + _crash_tail(log_path))
     if not math.isfinite(score):
         return ("your last edit CRASHED (no valid metric, scored +inf); the "
-                "driver was interrupted before delivering the outcome")
+                "driver was interrupted before delivering the outcome"
+                + _crash_tail(log_path))
     best_before = min(prior_finite, default=None)
     return _outcome_note(score, best_before,
                          "keep" if len(last) > 2 and last[2] == "keep"
-                         else "discard")
+                         else "discard", _telemetry(log_path))
 
 
 def _restore_best(run_dir, events) -> None:
@@ -327,10 +359,13 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 outcome_note = (f"the unmodified baseline scored {score:.6f} "
                                 "(lower is better); it is the current "
                                 "incumbent")
+                telemetry = _telemetry(log)
+                if telemetry:
+                    outcome_note += f" Run telemetry — {telemetry}."
             else:
                 _record(run_dir, 0, score, "crash", "baseline")
                 outcome_note = ("the unmodified baseline CRASHED (no valid "
-                                "metric, scored +inf)")
+                                "metric, scored +inf)" + _crash_tail(log))
             # A crashed baseline CONTINUES (same semantics as the resume
             # path): the editor starts from the crashed train.py, _revert
             # no-ops without best.py, and the first finite score keeps.
@@ -435,7 +470,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 outcome_note = ("your last edit CRASHED (no valid metric, "
                                 "scored +inf) and was abandoned after "
                                 "diagnosis; the working copy was reverted to "
-                                "the incumbent")
+                                "the incumbent" + _crash_tail(log))
             else:
                 needs_editor = False
             continue  # a repair re-enters the loop; its retry reserves anew
@@ -445,7 +480,8 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _record_keep(run_dir, step, score, "")
         else:
             _record(run_dir, step, score, "discard", "")
-        outcome_note = _outcome_note(score, best_before, status)
+        outcome_note = _outcome_note(score, best_before, status,
+                                     _telemetry(log))
 
     return _status(task, tag, run_dir, metric, stop_condition, repo_root, cmd)
 
