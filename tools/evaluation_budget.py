@@ -26,7 +26,10 @@ try:  # POSIX is the supported experiment runtime; keep reads usable elsewhere.
 except ImportError:  # pragma: no cover - Windows compatibility fallback
     fcntl = None
 
-from run_cfg import read_framework_cfg
+try:
+    from .run_cfg import read_framework_cfg
+except ImportError:  # direct ``python tools/evaluation_budget.py`` execution
+    from run_cfg import read_framework_cfg
 
 
 SCHEMA_VERSION = 1

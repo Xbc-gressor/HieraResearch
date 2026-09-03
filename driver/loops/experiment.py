@@ -231,10 +231,11 @@ def _or_block(run_dir, repo_root, cmd, events, reason: str):
     raise RunBlocked(reason)
 
 
-def _complete_run(run_dir, repo_root, cmd, events) -> None:
+def _complete_run(run_dir, repo_root, cmd, events, terminal_leftover=False) -> None:
     """Persist normal completion, translating a refusal into a blocked run."""
     try:
-        common.set_phase(run_dir, repo_root, cmd, "completed")
+        common.set_phase(run_dir, repo_root, cmd, "completed",
+                         terminal_leftover=terminal_leftover)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or str(exc)).strip()
         _or_block(run_dir, repo_root, cmd, events,
@@ -767,6 +768,14 @@ def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
     """One judged-slate generation; the manifest is the only resume anchor."""
     gen_dir, gen_no, manifest = _find_open_slate_generation(run_dir)
     if manifest is None:
+        # No committed manifest means this generation is provisional.  Any
+        # judge artifacts left by an interrupted attempt belong to the old
+        # pool/context and must not be mixed into a rebuilt generation.
+        judgments_dir = gen_dir / "judgments"
+        if judgments_dir.is_dir():
+            for artifact in judgments_dir.iterdir():
+                if artifact.is_file() and artifact.suffix == ".json":
+                    artifact.unlink()
         pool_doc = _construct_slate_generation(run_dir, gen_dir, repo_root,
                                                cmd, events)
         if pool_doc is None:
@@ -1535,6 +1544,14 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
 
             if brief is not None and budget_status(
                     run_dir, repo_root, cmd).get("reached"):
+                # Only drain records that are still pending after any work
+                # completed before the reservation boundary.  A candidate
+                # may have become terminal on the final available call.
+                unresolved = (_brief(run_dir, repo_root, cmd) or {}).get(
+                    "pending_run_ids", [])
+                for pending_id in unresolved:
+                    _resolve_unevaluated(run_dir, pending_id, repo_root, cmd)
+                brief = _brief(run_dir, repo_root, cmd)
                 if brief.get("experience_refresh_required"):
                     _refresh(runner, store, task, tag, run_dir, repo_root,
                              cmd, events)
@@ -1573,7 +1590,12 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 if not tuner_progressed and _scheduler_stopped(run_dir):
                     events.emit("quiescent", round_no=round_no,
                                 reason="scheduler terminal STOP")
-                    _complete_run(run_dir, repo_root, cmd, events)
+                    remaining = objective_budget_status(run_dir).get("remaining")
+                    _complete_run(
+                        run_dir, repo_root, cmd, events,
+                        terminal_leftover=(isinstance(remaining, int)
+                                           and 0 < remaining < MIN_GENERATION_K_EVAL),
+                    )
                     break
 
             # -----------------------------------------------------------------
@@ -1598,7 +1620,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     ),
                     unused_budget=remaining,
                 )
-                _complete_run(run_dir, repo_root, cmd, events)
+                _complete_run(run_dir, repo_root, cmd, events,
+                              terminal_leftover=True)
                 break
             zero_progress_rounds = 0 if progressed else zero_progress_rounds + 1
             if zero_progress_rounds >= 2:

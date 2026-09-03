@@ -15,6 +15,11 @@ than the noise margin; every other outcome is reverted byte-for-byte. So
 from the loop's point of view the only edits that exist are kept ones —
 make every bout an edit that deserves to be kept.
 
+**The bar is 1.0265 — beat it.** A free-evolution hillclimb run on this
+task drove val_bpb from a 1.1094 baseline down to ≈1.0265. Treat that
+number as the target to beat — take this candidate below it. Marginal
+polishing that never threatens the bar is a wasted campaign.
+
 Scores are always lower-is-better, and many metrics are negated so this
 holds (e.g. `neg_mean_test_accuracy = -accuracy`: `-0.90` beats `-0.58`).
 Aim every edit at a smaller number, whatever the metric is called.

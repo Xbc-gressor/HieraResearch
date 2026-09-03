@@ -67,11 +67,14 @@ def preflight_env(task, run_dir, repo_root, cmd) -> None:
         repo_root)
 
 
-def set_phase(run_dir, repo_root, cmd, phase, stop_condition=None) -> None:
+def set_phase(run_dir, repo_root, cmd, phase, stop_condition=None,
+              terminal_leftover=False) -> None:
     args = ["python", "tools/ledger.py", "set-phase",
             "--ledger", run_dir / "ledger.json", "--phase", phase]
     if stop_condition:
         args += ["--stop-condition", stop_condition]
+    if terminal_leftover:
+        args += ["--terminal-leftover"]
     cmd(args, repo_root)
 
 

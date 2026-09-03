@@ -913,17 +913,19 @@ def timed_eval(
         out=out,
         err=err,
     )
-    for line in out.splitlines():
-        if line.startswith("RESULT:"):
-            try:
-                score = float(line[len("RESULT:"):])
-            except ValueError:
-                raise ValueError(
-                    f"evaluation subprocess printed invalid result: {line!r}"
-                ) from None
-            if not is_finite_score(score):
-                raise ValueError(f"evaluation returned non-finite score: {score!r}")
-            return score
+    result_lines = [line for line in out.splitlines()
+                    if line.startswith("RESULT:")]
+    if result_lines:
+        line = result_lines[-1]
+        try:
+            score = float(line[len("RESULT:"):])
+        except ValueError:
+            raise ValueError(
+                f"evaluation subprocess printed invalid result: {line!r}"
+            ) from None
+        if not is_finite_score(score):
+            raise ValueError(f"evaluation returned non-finite score: {score!r}")
+        return score
 
     detail = err.strip()
     if len(detail) > 4000:
@@ -982,9 +984,10 @@ def timed_preflight(
         limit=read_preflight_limit(candidate_path),
         label="preflight exceeded preflight_runtime_limit",
     )
-    for line in out.splitlines():
-        if not line.startswith("PREFLIGHT:"):
-            continue
+    result_lines = [line for line in out.splitlines()
+                    if line.startswith("PREFLIGHT:")]
+    if result_lines:
+        line = result_lines[-1]
         payload = line[len("PREFLIGHT:"):]
         try:
             value = json.loads(payload)

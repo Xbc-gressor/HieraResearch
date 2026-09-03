@@ -753,7 +753,9 @@ def cmd_set_phase(args) -> int:
         # Permitting completion here would discard real evaluations, and
         # close_exhausted_stage already holds the matching strict line
         # (it refuses to close a running stage while remaining > 0).
-        if budget is None or attempted < budget:
+        leftover_ok = bool(getattr(args, "terminal_leftover", False)) \
+            and budget is not None and 0 < budget - attempted < 2
+        if budget is None or (attempted < budget and not leftover_ok):
             raise SystemExit(
                 "cannot mark completed before a configured evaluation budget is reached "
                 f"(attempted={attempted}, budget={budget})"
@@ -1093,6 +1095,8 @@ def build_parser() -> argparse.ArgumentParser:
     phase.add_argument("--stop-condition")
     phase.add_argument("--budget", type=int, default=None,
                        help="explicit evaluation budget when framework_cfg.json has none")
+    phase.add_argument("--terminal-leftover", action="store_true",
+                       help="allow completion with less than two unused evaluations")
     phase.set_defaults(func=cmd_set_phase)
 
     state = sub.add_parser("loop-state", parents=[common])
