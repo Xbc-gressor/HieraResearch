@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import platform
 import subprocess
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
@@ -17,6 +19,14 @@ from pathlib import Path
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 PERMISSION_POLICY = "bypassPermissions+pre-tool-use-capability-hook"
+
+
+def code_identity(repo_root: Path) -> dict:
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo_root), *args],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    return {"commit": git("rev-parse", "HEAD"),
+            "dirty": bool(git("status", "--porcelain", "--untracked-files=all"))}
 
 
 def _sha256(path: Path) -> str:
@@ -49,6 +59,8 @@ def collect_metadata(model: str, cli_path: str | None) -> dict:
         "cli_version": cli_version,
         "permission_policy": PERMISSION_POLICY,
         "prompt_hashes": prompt_hashes,
+        "python_version": platform.python_version(),
+        "relay_url": os.environ.get("ANTHROPIC_BASE_URL"),
     }
 
 
@@ -71,6 +83,18 @@ def resolve_model(cli_model: str | None, run_dir: Path) -> tuple[str | None, str
 
 def write_metadata(run_dir: Path, model: str, cli_path: str | None) -> dict:
     meta = collect_metadata(model, cli_path)
+    repo_root = PROMPT_DIR.parent.parent
+    meta["code"] = code_identity(repo_root)
+    cfg = run_dir / "framework_cfg.json"
+    if cfg.is_file():
+        meta["framework_config"] = json.loads(cfg.read_text(encoding="utf-8"))
+    task_dir = repo_root / "tasks" / run_dir.parent.name
+    if task_dir.is_dir():
+        meta["task_files"] = {
+            name: _sha256(task_dir / name)
+            for name in ("task.toml", "prepare.py", "pyproject.toml", "uv.lock")
+            if (task_dir / name).is_file()
+        }
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run_metadata.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -85,7 +109,7 @@ def warn_on_mismatch(run_dir: Path, model: str, cli_path: str | None) -> list[st
     stored = json.loads(stored_path.read_text(encoding="utf-8"))
     current = collect_metadata(model or stored.get("model", ""), cli_path)
     warnings: list[str] = []
-    for key in ("sdk_version", "cli_version"):
+    for key in ("sdk_version", "cli_version", "python_version", "relay_url"):
         if stored.get(key) != current.get(key):
             warnings.append(
                 f"run metadata mismatch: {key} stored={stored.get(key)!r} "
