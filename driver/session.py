@@ -31,6 +31,16 @@ from .roles import (
 
 RECEIPT_TOOL = "mcp__receipts__submit_receipt"
 
+# Consecutive identical (tool, input) calls before the repetition breaker
+# trips. Observed incident: a model retried one hallucinated Edit verbatim
+# 880+ times until the context overflowed. Healthy retries re-read the file
+# or change the input, so the fingerprint necessarily changes.
+REPETITION_LIMIT = 5
+
+
+def new_breaker() -> dict:
+    return {"fp": None, "count": 0, "tripped": None}
+
 
 class InvocationFailed(Exception):
     def __init__(self, role: str, problems: list[str], *, invocation_id: int | None = None):
@@ -66,14 +76,18 @@ class SDKSessionRunner:
 
     # -- internals ------------------------------------------------------------
 
-    def _capability_hook(self, role: RoleDefinition):
+    def _capability_hook(self, role: RoleDefinition, breaker: dict | None = None):
         """Fail-closed: deny every tool outside the role's positive set.
 
         A PreToolUse hook (not canUseTool — that callback is shadowed under
         bypassPermissions and never reached; hooks still run). When the role
         declares bash_patterns, Bash commands must also start with one of
-        those prefixes.
+        those prefixes. The same hook hosts the repetition breaker: the same
+        (tool, input) call REPETITION_LIMIT times in a row trips it, later
+        calls are denied, and the drain interrupts the session.
         """
+        if breaker is None:
+            breaker = new_breaker()
         allowed = set(role.tools) | {RECEIPT_TOOL}
 
         def deny(reason: str) -> dict:
@@ -86,6 +100,17 @@ class SDKSessionRunner:
             }
 
         async def hook(input_data, tool_use_id, context):
+            fp = (input_data.get("tool_name", ""),
+                  json.dumps(input_data.get("tool_input"), sort_keys=True))
+            if fp == breaker["fp"]:
+                breaker["count"] += 1
+            else:
+                breaker["fp"], breaker["count"] = fp, 1
+            if breaker["tripped"] is None and breaker["count"] >= REPETITION_LIMIT:
+                breaker["tripped"] = (f"{fp[0]} invoked {breaker['count']}x "
+                                      "with identical input")
+            if breaker["tripped"] is not None:
+                return deny(f"repetition breaker tripped: {breaker['tripped']}")
             name = input_data.get("tool_name", "")
             if name not in allowed:
                 return deny(f"role {role.name} may not use tool {name}")
@@ -131,7 +156,10 @@ class SDKSessionRunner:
 
         return ClaudeSDKClient(options=options)
 
-    def _build_options(self, role: RoleDefinition, ctx: InvocationContext, server):
+    def _build_options(self, role: RoleDefinition, ctx: InvocationContext,
+                       server, breaker: dict | None = None):
+        if breaker is None:
+            breaker = new_breaker()
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
         kwargs = {}
@@ -154,12 +182,16 @@ class SDKSessionRunner:
             disallowed_tools=list(role.disallowed),
             mcp_servers={"receipts": server},
             hooks={"PreToolUse": [HookMatcher(matcher=None,
-                                              hooks=[self._capability_hook(role)])]},
+                                              hooks=[self._capability_hook(
+                                                  role, breaker)])]},
             **kwargs,
         )
 
     async def _drain(self, client, role: RoleDefinition, ctx: InvocationContext,
-                     store: ReceiptStore, accepted: list[dict]) -> dict | None:
+                     store: ReceiptStore, accepted: list[dict],
+                     breaker: dict | None = None) -> dict | None:
+        if breaker is None:
+            breaker = new_breaker()
         from claude_agent_sdk import ResultMessage, SystemMessage
 
         interrupted = False
@@ -180,6 +212,8 @@ class SDKSessionRunner:
                     store.persist_session_id(role.name, ctx.invocation_id, session_id)
             elif isinstance(msg, ResultMessage):
                 result_info = {"is_error": msg.is_error, "subtype": msg.subtype}
+                store.mark_session_ended(role.name, ctx.invocation_id,
+                                         not msg.is_error, msg.subtype)
                 self.events.emit(
                     "session_end",
                     role=role.name,
@@ -206,6 +240,9 @@ class SDKSessionRunner:
                     "is_error": msg.is_error,
                     "subtype": getattr(msg, "subtype", None),
                 }
+                store.mark_session_ended(role.name, ctx.invocation_id,
+                                         not msg.is_error,
+                                         getattr(msg, "subtype", None))
                 self.events.emit(
                     "session_end",
                     role=role.name,
@@ -228,7 +265,12 @@ class SDKSessionRunner:
             # observed up to 31 extra turns and ~$5 per invocation in
             # degenerate repetition loops. Keep draining after the interrupt
             # so the ResultMessage (usage accounting) still lands.
-            if len(accepted) > accepted_baseline and not interrupted:
+            if (len(accepted) > accepted_baseline
+                    or breaker["tripped"] is not None) and not interrupted:
+                if breaker["tripped"] is not None:
+                    self.events.emit("repetition_breaker", role=role.name,
+                                     invocation_id=ctx.invocation_id,
+                                     description=breaker["tripped"])
                 interrupted = True
                 interrupt = getattr(client, "interrupt", None)
                 if interrupt is not None:
@@ -288,18 +330,24 @@ class SDKSessionRunner:
         server, accepted = build_receipt_server(
             role.name, role.receipt_schema, store, ctx.invocation_id
         )
-        options = self._build_options(role, ctx, server)
+        breaker = new_breaker()
+        options = self._build_options(role, ctx, server, breaker)
         factory = self._client_factory or self._default_client_factory
         self.events.emit("session_start", role=role.name,
                          invocation_id=ctx.invocation_id,
                          resume=bool(ctx.resume_session_id))
         async with factory(options) as client:
             await client.query(ctx.user_message())
-            result = await self._drain(client, role, ctx, store, accepted)
+            result = await self._drain(client, role, ctx, store, accepted,
+                                       breaker)
             receipt = self._latest_receipt(store, role, ctx, accepted)
             problems = self._problems(role, ctx, receipt)
+            if breaker["tripped"] is not None:
+                problems.append(
+                    f"repetition breaker tripped: {breaker['tripped']}")
             attempts = 0
-            while problems and attempts < role.corrective_attempts:
+            while (problems and attempts < role.corrective_attempts
+                   and breaker["tripped"] is None):
                 if result and result["is_error"]:
                     # The session ended on an error result (e.g.
                     # error_max_turns from a role's max_turns cap): the CLI
@@ -316,7 +364,8 @@ class SDKSessionRunner:
                                  invocation_id=ctx.invocation_id,
                                  attempt=attempts, problems=problems)
                 await client.query(self._corrective_message(problems))
-                result = await self._drain(client, role, ctx, store, accepted)
+                result = await self._drain(client, role, ctx, store, accepted,
+                                           breaker)
                 receipt = self._latest_receipt(store, role, ctx, accepted)
                 problems = self._problems(role, ctx, receipt)
         if problems:

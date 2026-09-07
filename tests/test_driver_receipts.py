@@ -100,6 +100,23 @@ class ReceiptStoreTests(unittest.TestCase):
             store.persist_session_id("idea-generator", 2, "sess-abc")
             self.assertEqual(store.load_session_id("idea-generator", 2), "sess-abc")
 
+    def test_resume_guard_refuses_errored_session(self) -> None:
+        """A session that ended on an error result keeps poisoned context;
+        relinking to it must be refused. Killed-mid-flight sessions stay
+        unmarked and resumable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReceiptStore(Path(tmp))
+            store.persist_session_id("idea-generator", 2, "sess-abc")
+            store.mark_session_ended("idea-generator", 2, ok=False,
+                                     subtype="error_during_execution")
+            self.assertIsNone(store.load_session_id("idea-generator", 2))
+            self.assertEqual(
+                store.load_session_id("idea-generator", 2, allow_errored=True),
+                "sess-abc")
+            store.mark_session_ended("idea-generator", 2, ok=True)
+            self.assertEqual(store.load_session_id("idea-generator", 2),
+                             "sess-abc")
+
 
 class SubmitReceiptContractTests(unittest.TestCase):
     def test_rejection_sets_sdk_is_error_key(self) -> None:

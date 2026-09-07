@@ -304,6 +304,10 @@ ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"edited": "bool", "summary": "str"},
         postconditions=(editor_train_py_exists,),
+        # Backstop for pathologies the repetition breaker cannot fingerprint
+        # (varied junk turns). Healthy invocations stay far below: a few
+        # reads, one edit, one receipt. The incident run burned 894 turns.
+        max_turns=120,
     ),
     # rewrite loop: one long-lived session per imported candidate, one
     # in-place improvement edit per bout; basis names the intelligence the

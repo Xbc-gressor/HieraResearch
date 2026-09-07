@@ -12,9 +12,11 @@ from driver.events import EventsLog  # noqa: E402
 from driver.receipts import ReceiptStore, build_receipt_server  # noqa: E402
 from driver.roles import ROLES, InvocationContext, RoleDefinition  # noqa: E402
 from driver.session import (  # noqa: E402
+    REPETITION_LIMIT,
     FakeSessionRunner,
     InvocationFailed,
     SDKSessionRunner,
+    new_breaker,
 )
 
 
@@ -47,6 +49,35 @@ class CapabilityHookTests(unittest.TestCase):
         for name in ("Read", "Write", "mcp__receipts__submit_receipt"):
             verdict = asyncio.run(hook({"tool_name": name, "tool_input": {}}, None, {}))
             self.assertEqual(verdict, {}, name)
+
+    def test_repetition_breaker_trips_on_identical_calls(self) -> None:
+        runner = SDKSessionRunner(model="m", events=EventsLog(Path(tempfile.mkdtemp())))
+        breaker = new_breaker()
+        hook = runner._capability_hook(SIMPLE_ROLE, breaker)
+        call = {"tool_name": "Read", "tool_input": {"file_path": "train.py"}}
+        for _ in range(REPETITION_LIMIT - 1):
+            self.assertEqual(asyncio.run(hook(call, None, {})), {})
+        verdict = asyncio.run(hook(call, None, {}))
+        decision = verdict["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("repetition breaker", decision["permissionDecisionReason"])
+        self.assertIsNotNone(breaker["tripped"])
+        # tripped state persists: the session is being interrupted
+        verdict = asyncio.run(hook(
+            {"tool_name": "Read", "tool_input": {"file_path": "other.py"}},
+            None, {}))
+        self.assertEqual(verdict["hookSpecificOutput"]["permissionDecision"],
+                         "deny")
+
+    def test_repetition_breaker_resets_on_changed_input(self) -> None:
+        runner = SDKSessionRunner(model="m", events=EventsLog(Path(tempfile.mkdtemp())))
+        breaker = new_breaker()
+        hook = runner._capability_hook(SIMPLE_ROLE, breaker)
+        for i in range(REPETITION_LIMIT * 2):
+            call = {"tool_name": "Read",
+                    "tool_input": {"file_path": f"f{i % 2}.py"}}
+            self.assertEqual(asyncio.run(hook(call, None, {})), {})
+        self.assertIsNone(breaker["tripped"])
 
 
 class BashPatternTests(unittest.TestCase):

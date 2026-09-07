@@ -108,11 +108,36 @@ class ReceiptStore:
             json.dumps({"session_id": session_id}) + "\n", encoding="utf-8"
         )
 
-    def load_session_id(self, role: str, invocation_id: int) -> str | None:
+    def mark_session_ended(self, role: str, invocation_id: int, ok: bool,
+                           subtype: str | None = None) -> None:
+        """Record how a session ended, on top of the persisted anchor.
+
+        Sessions killed mid-flight stay unmarked (still resumable — that is
+        the driver-restart recovery case); only a session KNOWN to have
+        ended on an error result is flagged for the resume guard.
+        """
+        path = self.session_path(role, invocation_id)
+        data = (json.loads(path.read_text(encoding="utf-8"))
+                if path.exists() else {})
+        data["ended"] = "ok" if ok else "error"
+        if subtype:
+            data["subtype"] = subtype
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+
+    def load_session_id(self, role: str, invocation_id: int,
+                        allow_errored: bool = False) -> str | None:
         path = self.session_path(role, invocation_id)
         if not path.exists():
             return None
-        return json.loads(path.read_text(encoding="utf-8")).get("session_id")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("ended") == "error" and not allow_errored:
+            # Resume guard: a session that ended on an error result (API
+            # context overflow, max_turns, ...) keeps its poisoned context;
+            # relinking the chain to it reproduces the failure.
+            return None
+        return data.get("session_id")
 
     def latest_session_invocation(self, role: str) -> int | None:
         """Highest invocation id with a persisted session id for ``role`` —

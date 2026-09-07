@@ -384,10 +384,19 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 last_editor = _editor_session(runner, store, task, tag, run_dir,
                                               extra=extra,
                                               resume_from=last_editor)
-            except InvocationFailed as exc:
-                stop_condition = f"editor invocation failed: {exc.problems}"
-                events.emit("blocked", reason=stop_condition)
-                break
+            except InvocationFailed:
+                # One bounded retry with a FRESH session. Errored anchors are
+                # refused by the resume guard anyway, and the repetition
+                # breaker + max_turns bound the cost of re-tripping a
+                # deterministic pathology.
+                try:
+                    last_editor = _editor_session(runner, store, task, tag,
+                                                  run_dir, extra=extra,
+                                                  resume_from=None)
+                except InvocationFailed as exc:
+                    stop_condition = f"editor invocation failed: {exc.problems}"
+                    events.emit("blocked", reason=stop_condition)
+                    break
         needs_editor = True  # a fresh idea next round starts from best.py
 
         proc = _preflight(task, run_dir, repo_root, cmd, task_toml)
