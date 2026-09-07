@@ -32,6 +32,7 @@ ARM_MODULES = {
     "softalt": "arms.softalt",
     "bernsalt": "arms.bernsalt",
     "turbo": "arms.turbo",
+    "rgpe_hebo": "arms.rgpe_hebo",
 }
 
 
