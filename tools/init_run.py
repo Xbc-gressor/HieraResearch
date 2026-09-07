@@ -74,7 +74,7 @@ INNER_POLICIES = (
 # Defaults for newly initialized experiment runs. Existing runs that omit
 # these keys keep their historical runtime fallbacks; init_run never rewrites
 # an existing run merely because the defaults changed.
-DEFAULT_SEMANTIC_POLICY = "coverage_attempt"
+DEFAULT_SEMANTIC_POLICY = "judged_slate"
 DEFAULT_SCHEDULER_POLICY = "anchor_challenger_v1"
 DEFAULT_INNER_POLICY = "hebo24-hebo20"
 DEFAULT_MAX_EVALUATIONS = 200
@@ -577,7 +577,7 @@ def main() -> int:
         "--semantic-policy",
         choices=SEMANTIC_POLICIES,
         help=(
-            "semantic acquisition policy; new runs default to "
+            "semantic point policy; new runs default to "
             f"{DEFAULT_SEMANTIC_POLICY}"
         ),
     )

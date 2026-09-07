@@ -42,7 +42,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(config["per_runtime_limit"], 60)
             self.assertEqual(
                 config["semantic_search"]["policy"],
-                "coverage_attempt",
+                "judged_slate",
             )
             self.assertEqual(
                 config["tuner"]["scheduler_policy"],
@@ -343,7 +343,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(semantic_search["llm_intelligence_score"], 72.5)
             self.assertEqual(
                 semantic_search["policy"],
-                "coverage_attempt",
+                "judged_slate",
             )
             self.assertEqual(semantic_search["uncertainty_weight"], 0.5)
 

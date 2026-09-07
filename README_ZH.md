@@ -55,7 +55,7 @@ uv run python -m driver run tabular-model-search <tag> \
   [--inner-tuner-policy POLICY]
 ```
 
-新 experiment run 默认启用 `coverage_attempt` 语义策略、scheduler `anchor_challenger_v1` 和 inner-tuner `hebo24-hebo20`，即每个入选候选的 24+10+10 三段 `pool_hebo_mace` 合约。无需预建目录或手改 JSON。对照臂可通过 `--scheduler-policy` 和 `--inner-tuner-policy` 显式选择；所有 24+20 inner policy 都必须与 `anchor_challenger_v1` 配对。解析后的选择会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
+新 experiment run 默认启用 `judged_slate` 语义策略、scheduler `anchor_challenger_v1` 和 inner-tuner `hebo24-hebo20`，即每个入选候选的 24+10+10 三段 `pool_hebo_mace` 合约。无需预建目录或手改 JSON。对照臂可通过 `--scheduler-policy` 和 `--inner-tuner-policy` 显式选择；所有 24+20 inner policy 都必须与 `anchor_challenger_v1` 配对。解析后的选择会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
 
 `--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--loop baseline-tune` 是强调优基线：task 提供的 baseline（需要 `[seed].provided`）在 step 0+1 之后，由 driver 确定性地用 ONE 个 HEBO MACE bout 花完整个 `--max-evaluations` 预算（相当于把 INITIAL BOUT 拉长到整个 run；无 ideation、无 scheduler、无 tuner-orchestrator 会话），冻结 `inner_policy=baseline-hebo-full-v1` + `scheduler_policy=legacy`。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations`、`--timeout`、`--semantic-policy`、`--scheduler-policy` 与 `--inner-tuner-policy` 经 `tools/init_run.py` 持久化到 `framework_cfg.json`；`--timeout` 是单次评估时限的别名，不是会话看门狗。`anchor_challenger_v1` 和 `v3_2` 都需要有限的 `max_evaluations`；新 run 模板默认提供 200。
 
@@ -142,7 +142,7 @@ step 0+1: tunable-contract-extractor
 - 空图或停滞 → `fresh`
 - 否则 → 在前沿叶子上 PUCB → ≤B `improve`（单亲）/ `crossover`（多亲）
 
-随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：新 run 默认使用 `coverage_attempt`（确定性 coverage 加上同一 `(point, op)` 历史尝试的 policy-conditioned downside）；`coverage` 是仅用覆盖度的确定性基线，`coverage_experience` 加入按账本边统计的 carrier 先验。`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。`llm_intelligence_score` 是运行前固定的 `[0,100]` 启发式可信度先验：以 `score/100` 缩放完整的 LLM 判断项，不缩放确定性的 coverage，也不改写原始预测；它不是校准概率。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
+随后 `semantic_search.py` 在冻结的层级空间中生成有界合法点：新 run 默认使用 `judged_slate`（分 lane 提案进入有界 judge pool，listwise 评审选出每一代的 slate；它是编排策略，不经 `semantic_search.py select`）；`coverage_attempt`（确定性 coverage 加上同一 `(point, op)` 历史尝试的 policy-conditioned downside）等采集策略保留为对照臂；`coverage` 是仅用覆盖度的确定性基线，`coverage_experience` 加入按账本边统计的 carrier 先验。`gain` 与 `gain_uncertainty` 先用 `gain-context` 固定当前 experience revision，再把背景先验、带 run/semantic-edge 引用的 experience 调整、最终收益/不确定性、成本、覆盖分别保存并组合；`gain_uncertainty_nocost` 与 `gain_uncertainty` 相同但不预测成本（实现前的成本估计通常是噪声）。`llm_intelligence_score` 是运行前固定的 `[0,100]` 启发式可信度先验：以 `score/100` 缩放完整的 LLM 判断项，不缩放确定性的 coverage，也不改写原始预测；它不是校准概率。helper 校验最终值等于先验加调整，并拒绝只在文字中提及历史却不改变 gain 或 uncertainty 的预测；若合法 snapshot 没有任何被引用的 run/edge，则仍固定 revision，但 citations 与调整均为零。LLM 再把选定点落成完整方案。图策略与语义采集策略互不混写。
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
@@ -205,7 +205,7 @@ Search space registry 中的每个来源必须在 retrieval manifest 中存在�
 外层搜索的 LLM 着陆点，通过三步产生下一代：
 
 - **SELECT-1（图）**：`got_select.py decide` 确定 `fresh` / `improve` / `crossover` 与数字父代。**不通过目测适应度改选父代。**
-- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；新 run 默认应用 `coverage_attempt`，也可显式选择 `coverage` / `coverage_experience` / `coverage_carrier_attempt` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。gain 系列用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的门控 adjustment 得到最终 predicted gain / uncertainty；自由文本经验不会进入 acquisition。schema-7 `policy_receipt` 固定 experience revision、目标与 proposal relation、比较覆盖、证据 id、机械 gain direction、配置的 LLM intelligence score 及实际权重；零调整始终合法，非零 gain 必须来自至少两个方向一致、同一份子代代码内只改变语义开关的 control/treatment 配对。仅继承父代超参数的 config 0 不足以隔离代码语义变化，只能增加 uncertainty，不能制造 signed gain。
+- **SELECT-2（语义点）**：`semantic_search.py` 为该行动生成有界合法点集（按账本当前 `search_space_state` revision 过滤/排序）；新 run 默认应用 `judged_slate`（选择由 judged-slate generation 完成，见下文），也可显式选择 `coverage` / `coverage_experience` / `coverage_attempt` / `coverage_carrier_attempt` / `gain` / `gain_uncertainty` / `gain_uncertainty_nocost`。gain 系列用 `[0,1]` rubric 先给出背景先验，再通过当前 bounded experience 的门控 adjustment 得到最终 predicted gain / uncertainty；自由文本经验不会进入 acquisition。schema-7 `policy_receipt` 固定 experience revision、目标与 proposal relation、比较覆盖、证据 id、机械 gain direction、配置的 LLM intelligence score 及实际权重；零调整始终合法，非零 gain 必须来自至少两个方向一致、同一份子代代码内只改变语义开关的 control/treatment 配对。仅继承父代超参数的 config 0 不足以隔离代码语义变化，只能增加 uncertainty，不能制造 signed gain。
 - **IDEATE**：把选定点转成自包含的完整具体方案；用 `ledger.py add-record` 同时保存数字祖先、完整 `semantic_point` 与独立策略收据。映射是归因，不是完整代码规格；同一点可有不同实现。
 
 替换旧的 `idea-proposer` skill 和固定的"一个 crossover + 一个 mutation"代数——行动计数和 op 混合由 `decide` 决定（PUCB 代产生 B 个行动；fresh 代每轮自举 1 个，stall 注入 B 个——fresh 计数折叠到 B 中，无单独的 m_fresh）。
@@ -516,12 +516,12 @@ runs/<task>/<tag>/framework_cfg.json
 - 任务特定的预算约束（例如，最大评估次数、单次评估时间限制）
 - 调整探索与利用的权衡
 
-**使用方法**：正常情况下直接用 `driver run` 的 CLI 标志，不需要手改该文件。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --llm-intelligence-score 61 --semantic-policy coverage_attempt --scheduler-policy anchor_challenger_v1 --inner-tuner-policy hebo24-hebo20 --max-evaluations 200 --timeout 60` 单独初始化；恢复已有运行时可更新预算和超时，但策略、维度来源和 intelligence score 在相关产物生成后被冻结。配置文件仍可用于没有 CLI 暴露的研究参数。
+**使用方法**：正常情况下直接用 `driver run` 的 CLI 标志，不需要手改该文件。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --llm-intelligence-score 61 --semantic-policy judged_slate --scheduler-policy anchor_challenger_v1 --inner-tuner-policy hebo24-hebo20 --max-evaluations 200 --timeout 60` 单独初始化；恢复已有运行时可更新预算和超时，但策略、维度来源和 intelligence score 在相关产物生成后被冻结。配置文件仍可用于没有 CLI 暴露的研究参数。
 
 主要配置包括：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
-- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；新 run 默认使用 `coverage_attempt`。`coverage`、`coverage_experience` 等对照臂可通过 `--semantic-policy` 显式选择
+- **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；新 run 默认使用 `judged_slate`。`coverage`、`coverage_experience`、`coverage_attempt` 等采集策略对照臂可通过 `--semantic-policy` 显式选择
 - **`tuner.scheduler_policy`**：新 experiment run 默认 `anchor_challenger_v1`；`v3_2` 与旧 percentile/alternation 调度器均通过 `--scheduler-policy` 显式选择；`anchor_transfer_challenger_v1`（global-donor 转移赛程）同样显式选择，且只与 inner policy `hebo24-transfer10-hebo10` 配对
 - **`tuner.inner_policy`**：新 experiment run 默认 `hebo24-hebo20`（24+10+10 三段全程使用 LLM pool + official HEBO MACE）；其他对照臂可通过 `--inner-tuner-policy` 显式选择，包括 `hebo24-turbo20-v1`、`mixup24-turbo20-v1`、`deferred-random8-hebo10-spsa10-v1`、`localtr8-hebo10-spsa10-v1`、`localtr8-hebo10-hebo10-v1`、`selfrank8-hebo10-hebo10` 和 `legacy`；`hebo24-transfer10-hebo10`（TRANSFERRED 首 bout 10 eval，只与 `anchor_transfer_challenger_v1` 配对）也可显式选择
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）。其中 `tuner.K`（每个候选提出的热启动配置数，默认 5）和 `tuner.K_eval`（step 0+1 实际评估的条数，默认 3）分别通过 `--k-warm` / `--k-eval` 暴露；deferred 配置数 = K − K_eval，两者都在 run 产物生成后冻结

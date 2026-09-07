@@ -104,9 +104,12 @@ attribution, not a full program specification.
 
 ## Step 3 — Apply the configured semantic policy
 
-Read `framework_cfg.json.semantic_search`. New runs persist
-`coverage_attempt`; if the key is absent in a historical/unconfigured run,
-use the compatibility fallback `coverage_experience`. Supported policies are:
+Read `framework_cfg.json.semantic_search`. New runs default to
+`judged_slate`, where point selection happens upstream in the judged-slate
+generation and this role is not invoked; the policies below apply to
+acquisition-policy comparison arms. If the key is absent in a
+historical/unconfigured run, use the compatibility fallback
+`coverage_experience`. Supported policies are:
 
 - `coverage_experience`: deterministic coverage plus the carrier
   prior — per-hypothesis counts of independent contexts where adding the

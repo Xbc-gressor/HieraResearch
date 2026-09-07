@@ -588,7 +588,7 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
 
     def test_new_run_template_and_unconfigured_cli_policy_defaults(self) -> None:
         template = json.loads((ROOT / "tasks" / "framework_cfg.example.json").read_text())
-        self.assertEqual(template["semantic_search"]["policy"], "coverage_attempt")
+        self.assertEqual(template["semantic_search"]["policy"], "judged_slate")
         self.assertEqual(
             template["semantic_search"]["deprioritized_budget_interval"], 5
         )
@@ -621,7 +621,7 @@ class SemanticPolicyDefaultTests(unittest.TestCase):
             self.assertEqual(result, 0)
             receipt = json.loads(receipt_path.read_text())
             # Missing run config is the compatibility path for historical
-            # artifacts; newly initialized runs persist coverage_attempt.
+            # artifacts; newly initialized runs persist judged_slate.
             self.assertEqual(receipt["policy"]["name"], "coverage_experience")
             self.assertEqual(receipt["schema_version"], 7)
             self.assertIsNone(receipt["components"]["llm_judgment_weight"])

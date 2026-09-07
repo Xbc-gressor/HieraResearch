@@ -38,7 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--semantic-policy",
         choices=SEMANTIC_POLICIES,
-        help="semantic acquisition policy; new runs default to coverage_attempt",
+        help="semantic point policy; new runs default to judged_slate (the "
+             "judged-slate generation); the other values are acquisition-"
+             "policy comparison arms",
     )
     run.add_argument(
         "--scheduler-policy",
