@@ -1,0 +1,33 @@
+name = "mle-spooky"
+description = "Spooky Author Identification: public-training validation log loss and a separate final MLE-bench submission."
+
+[env]
+type = "uv"
+project = "tasks/mle-spooky"
+
+[run]
+working_dir = "tasks/mle-spooky"
+timeout_seconds = 300
+
+[seed]
+target_count = 1
+provided = ["train.py"]
+entrypoint = "train.py"
+
+[evaluation]
+score_fn = "evaluate_config"
+environment_preflight_fn = "preflight_environment"
+
+[result]
+metric = "validation_log_loss"
+required_patterns = ["^score:"]
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true
+
+[mlebench]
+competition_id = "spooky-author-identification"
+public_data_env = "MLEBENCH_PUBLIC_DATA"
+submission = "submission.csv"
