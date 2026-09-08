@@ -19,7 +19,8 @@ Six sections, fixed order:
                       sibling boundary list);
 5. Source material  — snippets behind the selected hypotheses' evidence,
                       resolved evidence -> sources[].url -> canonical_key ->
-                      background_retrieval.json results (visits as fallback);
+                      background_retrieval.json merged results (retained visit
+                      content files as fallback);
 6. Candidate status — current best, baseline, tuning delta/summary, idea.
 
 Budgets: section 4 <= 10KB, every other section <= 4KB, total <= 20KB; long
@@ -44,7 +45,7 @@ from pathlib import Path
 
 from background_contract import ContractError, load_registry
 from rewrite_bout import current_best, load_bouts
-from search_backends import canonical_key
+from search_backends import canonical_key, merged_results, resolve_visit_content
 
 FIELD_LIMIT = 250
 SNIPPET_LIMIT = 600
@@ -371,21 +372,30 @@ def _semantic_point_lines(registry: dict | None, selected: list[dict]) -> list[s
     return lines
 
 
-def _retrieval_lookup(entries: list, key: str, url: str, field: str) -> str | None:
+def _retrieval_match(entries: list, key: str, url: str) -> dict | None:
     """First entry matching by canonical_key, else by exact url."""
     for entry in entries:
         if entry.get("canonical_key") == key:
-            value = entry.get(field)
-            return value if isinstance(value, str) and value.strip() else None
+            return entry
     for entry in entries:
         if entry.get("url") == url:
-            value = entry.get(field)
-            return value if isinstance(value, str) and value.strip() else None
+            return entry
     return None
 
 
+def _retrieval_lookup(entries: list, key: str, url: str, field: str) -> str | None:
+    match = _retrieval_match(entries, key, url)
+    if match is None:
+        return None
+    value = match.get(field)
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _source_material_lines(
-    registry: dict | None, retrieval: dict | None, selected: list[dict]
+    registry: dict | None,
+    retrieval: dict | None,
+    manifest_dir: Path,
+    selected: list[dict],
 ) -> list[str]:
     if registry is None or not selected:
         return [NONE]
@@ -408,11 +418,7 @@ def _source_material_lines(
         for source in registry.get("sources") or []
         if isinstance(source, dict)
     }
-    results = [
-        entry
-        for entry in (retrieval or {}).get("results") or []
-        if isinstance(entry, dict)
-    ]
+    results = merged_results(retrieval or {})
     visits = [
         entry for entry in (retrieval or {}).get("visits") or [] if isinstance(entry, dict)
     ]
@@ -426,7 +432,8 @@ def _source_material_lines(
         key = canonical_key(url)
         text = _retrieval_lookup(results, key, url, "snippet")
         if text is None:
-            text = _retrieval_lookup(visits, key, url, "content")
+            visit = _retrieval_match(visits, key, url)
+            text = resolve_visit_content(visit, manifest_dir)
         lines.append(f"### {source_id} — {_text(source.get('title'))}")
         lines.append(f"url: {url} | canonical_key: {key} | cited: {'; '.join(cited[source_id])}")
         lines.append(_text(text, SNIPPET_LIMIT) if text else "(no retrieval content)")
@@ -470,7 +477,7 @@ def render_context(candidate, sections=None) -> str:
         "traces": _traces_lines(candidate),
         "experience": _experience_lines(run_dir, dimension_ids, hypothesis_ids),
         "background": _semantic_point_lines(registry, selected),
-        "sources": _source_material_lines(registry, retrieval, selected),
+        "sources": _source_material_lines(registry, retrieval, run_dir, selected),
         "status": _status_lines(candidate, manifest),
     }
     wanted = SECTION_ORDER if sections is None else [s for s in SECTION_ORDER if s in sections]

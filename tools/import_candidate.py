@@ -191,12 +191,20 @@ def import_candidate(
     )
 
     # Run-level context is seeded at most once: later imports into the same
-    # run must not overwrite what is already there.
+    # run must not overwrite what is already there. The retrieval manifest's
+    # content_file pointers resolve against the run root, so its retrieval/
+    # content directory travels with the manifest.
     for name in ("background.md", "background_retrieval.json"):
         src_file = source / name
         dst_file = target / name
-        if src_file.is_file() and not dst_file.exists():
-            shutil.copy2(src_file, dst_file)
+        if not (src_file.is_file() and not dst_file.exists()):
+            continue
+        shutil.copy2(src_file, dst_file)
+        if name == "background_retrieval.json":
+            retrieval_src = source / "retrieval"
+            retrieval_dst = target / "retrieval"
+            if retrieval_src.is_dir() and not retrieval_dst.exists():
+                shutil.copytree(retrieval_src, retrieval_dst)
     experience = ledger.get("experience")
     if seed_experience and experience is not None:
         seed_path = target / "experience.seed.json"

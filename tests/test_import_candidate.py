@@ -76,7 +76,28 @@ def _make_source_run(root: Path, run_ids=("004",)) -> Path:
     }
     (source / "ledger.json").write_text(json.dumps(ledger))
     (source / "background.md").write_text("# background\n")
-    (source / "background_retrieval.json").write_text(json.dumps({"results": []}))
+    (source / "background_retrieval.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "rounds": [],
+                "visits": [
+                    {
+                        "url": "https://example.test/toy",
+                        "canonical_key": "example.test/toy",
+                        "status": "success",
+                        "view": "full_text",
+                        "content_file": "retrieval/000-example-test-toy.txt",
+                        "content_chars": len("retained toy source body"),
+                    }
+                ],
+            }
+        )
+    )
+    (source / "retrieval").mkdir()
+    (source / "retrieval" / "000-example-test-toy.txt").write_text(
+        "retained toy source body"
+    )
     return source
 
 
@@ -111,6 +132,13 @@ def test_import_copies_candidate_and_renames_traces(tmp_path) -> None:
     assert (candidate / "prepare.py").read_text() == prepare.read_text()
     # run-level artifacts seed without the flag too; experience does not
     assert (target / "background.md").read_text() == "# background\n"
+    # the retrieval manifest's content_file pointers resolve against the run
+    # root, so the retained content files must be seeded alongside it
+    assert json.loads((target / "background_retrieval.json").read_text())["visits"]
+    assert (
+        (target / "retrieval" / "000-example-test-toy.txt").read_text()
+        == "retained toy source body"
+    )
     assert not (target / "experience.seed.json").exists()
 
 
@@ -219,11 +247,18 @@ def test_run_level_artifacts_seeded_only_once(tmp_path) -> None:
         source, "004", target, seed_experience=True, repo_root=tmp_path
     )
     assert (target / "background.md").read_text() == "# background\n"
-    assert (target / "background_retrieval.json").read_text() == json.dumps({"results": []})
+    assert json.loads((target / "background_retrieval.json").read_text())["visits"][0][
+        "content_file"
+    ] == "retrieval/000-example-test-toy.txt"
+    assert (
+        (target / "retrieval" / "000-example-test-toy.txt").read_text()
+        == "retained toy source body"
+    )
     assert json.loads((target / "experience.seed.json").read_text()) == EXPERIENCE
 
     (target / "background.md").write_text("sentinel background")
     (target / "background_retrieval.json").write_text("sentinel retrieval")
+    (target / "retrieval" / "000-example-test-toy.txt").write_text("sentinel content")
     (target / "experience.seed.json").write_text("sentinel experience")
     import_candidate.import_candidate(
         source, "005", target, seed_experience=True, repo_root=tmp_path
@@ -231,4 +266,8 @@ def test_run_level_artifacts_seeded_only_once(tmp_path) -> None:
 
     assert (target / "background.md").read_text() == "sentinel background"
     assert (target / "background_retrieval.json").read_text() == "sentinel retrieval"
+    assert (
+        (target / "retrieval" / "000-example-test-toy.txt").read_text()
+        == "sentinel content"
+    )
     assert (target / "experience.seed.json").read_text() == "sentinel experience"

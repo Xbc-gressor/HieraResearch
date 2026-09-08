@@ -115,7 +115,12 @@ def _registry() -> dict:
     }
 
 
-def _write_run(run: Path, *, retrieval: dict | None = None) -> Path:
+def _write_run(
+    run: Path,
+    *,
+    retrieval: dict | None = None,
+    retrieval_files: dict[str, str] | None = None,
+) -> Path:
     run.mkdir(parents=True)
     (run / "background.md").write_text(
         "# Background\n\n## Search space registry\n\n```json\n"
@@ -125,23 +130,39 @@ def _write_run(run: Path, *, retrieval: dict | None = None) -> Path:
     )
     if retrieval is None:
         retrieval = {
-            "results": [
+            "schema_version": 4,
+            "rounds": [
                 {
-                    "canonical_key": "arxiv:1604.00772",
-                    "url": "https://arxiv.org/abs/1604.00772",
-                    "title": "The CMA Evolution Strategy: A Tutorial",
-                    "snippet": "CSA updates the global step size from the evolution path.",
+                    "round_id": "r-01",
+                    "results": [
+                        {
+                            "canonical_key": "arxiv:1604.00772",
+                            "url": "https://arxiv.org/abs/1604.00772",
+                            "title": "The CMA Evolution Strategy: A Tutorial",
+                            "snippet": "CSA updates the global step size from the evolution path.",
+                        }
+                    ],
                 }
             ],
             "visits": [
                 {
                     "url": "https://example.com/es-notes",
                     "canonical_key": "example.com/es-notes",
-                    "content": "Field notes on mirror bounds handling.",
+                    "status": "success",
+                    "view": "full_text",
+                    "content_file": "retrieval/000-example-com-es-notes.txt",
+                    "content_chars": len("Field notes on mirror bounds handling."),
                 }
             ],
         }
+        retrieval_files = {
+            "retrieval/000-example-com-es-notes.txt": "Field notes on mirror bounds handling."
+        }
     (run / "background_retrieval.json").write_text(json.dumps(retrieval), encoding="utf-8")
+    for relative, content in (retrieval_files or {}).items():
+        path = run / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     (run / "experience.seed.json").write_text(
         json.dumps(
             {
@@ -348,6 +369,7 @@ def test_cli_renders_all_six_sections_in_order(tmp_path, monkeypatch, capsys) ->
     sources = _section(doc, "## Source material")
     assert "CSA updates the global step size from the evolution path." in sources
     assert "Field notes on mirror bounds handling." in sources
+    assert "(no retrieval content)" not in sources
     # candidate status: best from the kept bout, baseline, delta, idea
     status = _section(doc, "## Candidate status")
     assert "current_best: 1.4" in status
@@ -460,19 +482,30 @@ def test_source_chain_falls_back_to_visit_content(tmp_path) -> None:
     run = _write_run(
         tmp_path / "run",
         retrieval={
-            "results": [],
+            "schema_version": 4,
+            "rounds": [],
             "visits": [
                 {
                     "url": "https://arxiv.org/abs/1604.00772",
                     "canonical_key": "arxiv:1604.00772",
-                    "content": "Visited tutorial full text head.",
+                    "status": "success",
+                    "view": "full_text",
+                    "content_file": "retrieval/000-arxiv-1604-00772.txt",
+                    "content_chars": len("Visited tutorial full text head."),
                 },
                 {
                     "url": "https://example.com/es-notes",
                     "canonical_key": "example.com/es-notes?cached=1",
-                    "content": "Field notes via url equality.",
+                    "status": "success",
+                    "view": "full_text",
+                    "content_file": "retrieval/001-example-com-es-notes.txt",
+                    "content_chars": len("Field notes via url equality."),
                 },
             ],
+        },
+        retrieval_files={
+            "retrieval/000-arxiv-1604-00772.txt": "Visited tutorial full text head.",
+            "retrieval/001-example-com-es-notes.txt": "Field notes via url equality.",
         },
     )
     candidate = _write_candidate(run)
@@ -481,6 +514,7 @@ def test_source_chain_falls_back_to_visit_content(tmp_path) -> None:
 
     assert "Visited tutorial full text head." in sources
     assert "Field notes via url equality." in sources
+    assert "(no retrieval content)" not in sources
 
 
 def test_bout_history_and_trace_windows(tmp_path) -> None:
