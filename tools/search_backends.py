@@ -2,9 +2,9 @@
 """Local-first retrieval, optional backends, and auditable visit receipts.
 
 Frozen-corpus search and every artifact-integrity check use only the standard
-library. DeepXiv, Jina, and Claude-native WebSearch/WebFetch are explicit,
-optional coverage adapters; successful external visits can be recorded with
-``record-visit`` so the same manifest integrity checks still apply.
+library. DeepXiv, Jina (jina-search / jina-reader), and direct fetches are
+explicit, optional adapters; every receipt in the manifest is produced by this
+tool itself.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,20 +31,37 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 3
-LANE_BUDGETS = {"novelty": 2048, "grounding": 6000}
+SCHEMA_VERSION = 4
 EVIDENCE_ROLES = {
     "hypothesis",
     "baseline",
     "failure_mode",
     "counterevidence",
     "relation",
-    "inner_hpo_prior",
 }
-INNER_HPO_ROLE = "inner_hpo_prior"
-DIMENSION_BOUND_ROLES = {"hypothesis", "relation"}
-MAX_SHARED = 6
-MAX_SELECTED = 18
+# Safety cap on stored visit content (~100k tokens); stdout uses bounded views.
+VISIT_CONTENT_STORE_CHARS = 400_000
+VISIT_HEAD_CHARS = 4000
+READ_WINDOW_CHARS = 8000
+HIGH_RANK_THRESHOLD = 5
+# Minimum chars for a web visit to count as success; shorter means an error page.
+VISIT_MIN_CONTENT_CHARS = 200
+_WEB_ERROR_MARKERS = (
+    "no html available",
+    "just a moment",  # anti-bot challenge interstitial
+    "enable javascript",
+    "verify you are human",
+)
+RESULT_METADATA_FIELDS = (
+    "authors",
+    "date",
+    "citation_count",
+    "tldr",
+    "venue",
+    "categories",
+    "github_url",
+    "score",
+)
 HTTP_TIMEOUT = 45
 DEEPXIV_MAX_SECTIONS = 3
 SUBSTANTIVE_VIEWS = {"section", "preview", "full_text", "page"}
@@ -117,28 +135,11 @@ def canonical_url(url: str) -> str:
     )
 
 
-def is_substantive_grounding_visit(visit: Any) -> bool:
-    """Whether a receipt contains source body text suitable for grounding."""
-    return (
-        isinstance(visit, dict)
-        and visit.get("status") == "success"
-        and visit.get("lane") == "grounding"
-        and visit.get("view") in SUBSTANTIVE_VIEWS
-    )
-
-
 def new_manifest() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "lane_budgets": dict(LANE_BUDGETS),
-        "retrieval_condition": None,
-        "queries": [],
-        "coverage_exemptions": [],
-        "results": [],
-        "selected_keys": [],
-        "backend_calls": [],
+        "rounds": [],
         "visits": [],
-        "backend_failures": [],
     }
 
 
@@ -163,52 +164,51 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
 
 
 def _validate_query_plan(
-    queries: Any, coverage_exemptions: Any
+    queries: Any, *, where: str = "retrieval queries"
 ) -> tuple[list[str], set[str]]:
     errors: list[str] = []
     query_ids: set[str] = set()
     query_texts: set[str] = set()
-    targeted_dimensions: set[str] = set()
 
     if not isinstance(queries, list):
-        return ["retrieval manifest queries must be a list"], query_ids
+        return [f"{where} must be a list"], query_ids
     for index, query in enumerate(queries):
-        where = f"retrieval queries[{index}]"
+        label = f"{where}[{index}]"
         if not isinstance(query, dict):
-            errors.append(f"{where} must be an object")
+            errors.append(f"{label} must be an object")
             continue
         unknown = sorted(
-            set(query) - {"id", "text", "lane", "target_dimension_ids", "evidence_roles"}
+            set(query) - {"id", "text", "target_dimension_ids", "evidence_roles"}
         )
         if unknown:
-            errors.append(f"{where} has unknown fields {unknown}")
+            errors.append(f"{label} has unknown fields {unknown}")
         query_id = query.get("id")
         if not isinstance(query_id, str) or not re.fullmatch(r"q-\d{2,}", query_id):
-            errors.append(f"{where}.id must match q-NN")
+            errors.append(f"{label}.id must match q-NN")
         elif query_id in query_ids:
             errors.append(f"duplicate retrieval query id {query_id}")
         else:
             query_ids.add(query_id)
-        if query.get("lane") not in LANE_BUDGETS:
-            errors.append(f"{where}.lane must be one of {sorted(LANE_BUDGETS)}")
         if not isinstance(query.get("text"), str) or not query["text"].strip():
-            errors.append(f"{where}.text must be non-empty")
+            errors.append(f"{label}.text must be non-empty")
         elif query["text"].strip().casefold() in query_texts:
-            errors.append(f"{where}.text duplicates another query")
+            errors.append(f"{label}.text duplicates another query")
         else:
             query_texts.add(query["text"].strip().casefold())
 
         targets = query.get("target_dimension_ids")
-        valid_targets = isinstance(targets, list) and all(
-            isinstance(item, str) and _DIMENSION_RE.fullmatch(item) for item in targets
-        )
-        if not valid_targets:
-            errors.append(f"{where}.target_dimension_ids must be a list of dim-* ids")
+        if targets is None:
+            targets = []
+        elif not (
+            isinstance(targets, list)
+            and all(
+                isinstance(item, str) and _DIMENSION_RE.fullmatch(item) for item in targets
+            )
+        ):
+            errors.append(f"{label}.target_dimension_ids must be a list of dim-* ids")
             targets = []
         elif len(targets) != len(set(targets)):
-            errors.append(f"{where}.target_dimension_ids must not contain duplicates")
-        else:
-            targeted_dimensions.update(targets)
+            errors.append(f"{label}.target_dimension_ids must not contain duplicates")
 
         roles = query.get("evidence_roles")
         valid_roles = (
@@ -218,130 +218,110 @@ def _validate_query_plan(
         )
         if not valid_roles:
             errors.append(
-                f"{where}.evidence_roles must be a non-empty list drawn from "
+                f"{label}.evidence_roles must be a non-empty list drawn from "
                 f"{sorted(EVIDENCE_ROLES)}"
             )
             continue
         if len(roles) != len(set(roles)):
-            errors.append(f"{where}.evidence_roles must not contain duplicates")
-        if INNER_HPO_ROLE in roles:
-            if roles != [INNER_HPO_ROLE]:
-                errors.append(
-                    f"{where} inner_hpo_prior must be the query's only evidence role"
-                )
-            if targets:
-                errors.append(f"{where} inner_hpo_prior must not target semantic dimensions")
-        elif not targets and set(roles) & DIMENSION_BOUND_ROLES:
-            errors.append(
-                f"{where} hypothesis/relation queries must target at least one dimension"
-            )
-
-    if not isinstance(coverage_exemptions, list):
-        errors.append("retrieval manifest coverage_exemptions must be a list")
-        return errors, query_ids
-    exempted_dimensions: set[str] = set()
-    for index, exemption in enumerate(coverage_exemptions):
-        where = f"retrieval coverage_exemptions[{index}]"
-        if not isinstance(exemption, dict):
-            errors.append(f"{where} must be an object")
-            continue
-        unknown = sorted(set(exemption) - {"dimension_id", "rationale"})
-        if unknown:
-            errors.append(f"{where} has unknown fields {unknown}")
-        dimension_id = exemption.get("dimension_id")
-        if not isinstance(dimension_id, str) or not _DIMENSION_RE.fullmatch(dimension_id):
-            errors.append(f"{where}.dimension_id must be a dim-* id")
-        elif dimension_id in exempted_dimensions:
-            errors.append(f"duplicate retrieval coverage exemption {dimension_id}")
-        else:
-            exempted_dimensions.add(dimension_id)
-        if not isinstance(exemption.get("rationale"), str) or not exemption["rationale"].strip():
-            errors.append(f"{where}.rationale must be non-empty")
-    overlap = sorted(targeted_dimensions & exempted_dimensions)
-    if overlap:
-        errors.append(f"retrieval coverage exemptions duplicate query targets: {overlap}")
+            errors.append(f"{label}.evidence_roles must not contain duplicates")
     return errors, query_ids
 
 
-def validate_manifest(manifest: dict[str, Any]) -> list[str]:
+def validate_manifest(
+    manifest: dict[str, Any], manifest_dir: Path | None = None
+) -> list[str]:
     errors: list[str] = []
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"retrieval manifest schema_version must be {SCHEMA_VERSION}")
-    budgets = manifest.get("lane_budgets")
-    if not isinstance(budgets, dict):
-        errors.append("retrieval manifest lane_budgets must be an object")
-    else:
-        for lane, default in LANE_BUDGETS.items():
-            value = budgets.get(lane)
-            if not isinstance(value, int) or value <= 0:
-                errors.append(f"retrieval manifest lane_budgets.{lane} must be positive")
-            elif (
-                lane == "grounding"
-                and isinstance(budgets.get("novelty"), int)
-                and value <= budgets["novelty"]
-            ):
-                errors.append("grounding token budget must exceed novelty token budget")
 
-    plan_errors, query_ids = _validate_query_plan(
-        manifest.get("queries"), manifest.get("coverage_exemptions")
-    )
-    errors.extend(plan_errors)
-    condition = manifest.get("retrieval_condition")
-    if query_ids and condition not in {"frozen", "open_world", "mixed"}:
-        errors.append("retrieval_condition must describe a populated search")
-
-    result_keys: set[str] = set()
-    for index, result in enumerate(manifest.get("results", [])):
-        where = f"retrieval results[{index}]"
-        if not isinstance(result, dict):
-            errors.append(f"{where} must be an object")
+    rounds = manifest.get("rounds")
+    if not isinstance(rounds, list):
+        errors.append("retrieval manifest rounds must be a list")
+        rounds = []
+    seen_round_ids: set[str] = set()
+    all_query_ids: set[str] = set()
+    for round_index, round_ in enumerate(rounds):
+        rwhere = f"retrieval rounds[{round_index}]"
+        if not isinstance(round_, dict):
+            errors.append(f"{rwhere} must be an object")
             continue
-        key = result.get("canonical_key")
-        if not isinstance(key, str) or not key:
-            errors.append(f"{where}.canonical_key must be non-empty")
-        elif key in result_keys:
-            errors.append(f"duplicate merged retrieval result {key}")
+        round_id = round_.get("round_id")
+        if not isinstance(round_id, str) or not re.fullmatch(r"r-\d{2,}", round_id):
+            errors.append(f"{rwhere}.round_id must match r-NN")
+        elif round_id in seen_round_ids:
+            errors.append(f"duplicate retrieval round id {round_id}")
         else:
-            result_keys.add(key)
-        result_query_ids = result.get("query_ids")
-        if not isinstance(result_query_ids, list) or not set(result_query_ids) <= query_ids:
-            errors.append(f"{where}.query_ids contains unknown queries")
-        if result.get("query_support") != len(set(result_query_ids or [])):
-            errors.append(f"{where}.query_support does not match distinct query_ids")
+            seen_round_ids.add(round_id)
+        if not isinstance(round_.get("created_at"), str) or not round_["created_at"]:
+            errors.append(f"{rwhere}.created_at must be non-empty")
 
-    selected = manifest.get("selected_keys")
-    if not isinstance(selected, list) or not set(selected) <= result_keys:
-        errors.append("retrieval selected_keys must reference merged results")
+        plan_errors, query_ids = _validate_query_plan(
+            round_.get("queries"), where=f"{rwhere}.queries"
+        )
+        errors.extend(plan_errors)
+        reused = sorted(query_ids & all_query_ids)
+        if reused:
+            errors.append(f"{rwhere} reuses query ids from earlier rounds: {reused}")
+        all_query_ids |= query_ids
 
-    called_queries: set[str] = set()
-    for index, call in enumerate(manifest.get("backend_calls", [])):
-        where = f"retrieval backend_calls[{index}]"
-        if not isinstance(call, dict):
-            errors.append(f"{where} must be an object")
-            continue
-        if call.get("query_id") not in query_ids:
-            errors.append(f"{where}.query_id is unknown")
-        else:
-            called_queries.add(call["query_id"])
-        if call.get("status") not in {"success", "failed"}:
-            errors.append(f"{where}.status must be success or failed")
-        if not isinstance(call.get("retrieved_at"), str) or not call["retrieved_at"]:
-            errors.append(f"{where}.retrieved_at must be non-empty")
-        if not isinstance(call.get("backend_version"), str) or not call["backend_version"]:
-            errors.append(f"{where}.backend_version must be non-empty")
-        if call.get("status") == "success" and "raw_response" not in call:
-            errors.append(f"{where}.raw_response must be retained")
-    missing_calls = sorted(query_ids - called_queries)
-    if missing_calls:
-        errors.append(f"retrieval queries have no backend call records: {missing_calls}")
+        result_keys: set[str] = set()
+        results = round_.get("results", [])
+        if not isinstance(results, list):
+            errors.append(f"{rwhere}.results must be a list")
+            results = []
+        for index, result in enumerate(results):
+            where = f"{rwhere}.results[{index}]"
+            if not isinstance(result, dict):
+                errors.append(f"{where} must be an object")
+                continue
+            key = result.get("canonical_key")
+            if not isinstance(key, str) or not key:
+                errors.append(f"{where}.canonical_key must be non-empty")
+            elif key in result_keys:
+                errors.append(f"duplicate merged retrieval result {key} in {round_id}")
+            else:
+                result_keys.add(key)
+            result_query_ids = result.get("query_ids")
+            if not isinstance(result_query_ids, list) or not set(result_query_ids) <= query_ids:
+                errors.append(f"{where}.query_ids contains unknown queries")
+            if result.get("query_support") != len(set(result_query_ids or [])):
+                errors.append(f"{where}.query_support does not match distinct query_ids")
 
-    for index, visit in enumerate(manifest.get("visits", [])):
+        called_queries: set[str] = set()
+        calls = round_.get("backend_calls", [])
+        if not isinstance(calls, list):
+            errors.append(f"{rwhere}.backend_calls must be a list")
+            calls = []
+        for index, call in enumerate(calls):
+            where = f"{rwhere}.backend_calls[{index}]"
+            if not isinstance(call, dict):
+                errors.append(f"{where} must be an object")
+                continue
+            if call.get("query_id") not in query_ids:
+                errors.append(f"{where}.query_id is unknown in {round_id}")
+            else:
+                called_queries.add(call["query_id"])
+            if call.get("status") not in {"success", "empty", "failed"}:
+                errors.append(f"{where}.status must be success, empty, or failed")
+            if not isinstance(call.get("retrieved_at"), str) or not call["retrieved_at"]:
+                errors.append(f"{where}.retrieved_at must be non-empty")
+            if not isinstance(call.get("backend_version"), str) or not call["backend_version"]:
+                errors.append(f"{where}.backend_version must be non-empty")
+            if call.get("status") in {"success", "empty"} and "raw_response" not in call:
+                errors.append(f"{where}.raw_response must be retained")
+        missing_calls = sorted(query_ids - called_queries)
+        if missing_calls:
+            errors.append(f"{rwhere} queries have no backend call records: {missing_calls}")
+
+    visits = manifest.get("visits", [])
+    if not isinstance(visits, list):
+        errors.append("retrieval manifest visits must be a list")
+        visits = []
+    for index, visit in enumerate(visits):
         where = f"retrieval visits[{index}]"
         if not isinstance(visit, dict):
             errors.append(f"{where} must be an object")
             continue
-        if visit.get("lane") not in LANE_BUDGETS:
-            errors.append(f"{where}.lane must be one of {sorted(LANE_BUDGETS)}")
         if visit.get("status") not in {"success", "failed"}:
             errors.append(f"{where}.status must be success or failed")
         if not isinstance(visit.get("backend_version"), str) or not visit["backend_version"]:
@@ -349,21 +329,32 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
         url = visit.get("url")
         if not isinstance(url, str) or canonical_key(url) != visit.get("canonical_key"):
             errors.append(f"{where}.canonical_key does not match url")
-        budget = visit.get("budget_tokens")
-        expected_budget = (budgets or {}).get(visit.get("lane"))
-        if budget != expected_budget:
-            errors.append(f"{where}.budget_tokens does not match its lane")
-        if visit.get("status") == "success" and (
-            not isinstance(visit.get("content_chars"), int) or visit["content_chars"] <= 0
-        ):
-            errors.append(f"{where}.content_chars must be positive for a successful visit")
+        if visit.get("content") is not None:
+            errors.append(f"{where} must not retain inline content; use content_file")
+        content_file = visit.get("content_file")
+        content_chars = visit.get("content_chars")
         if visit.get("status") == "success":
-            content = visit.get("content")
-            if not isinstance(content, str) or not content:
-                errors.append(f"{where}.content must be retained for a successful visit")
-            else:
-                if visit.get("content_chars") != len(content):
-                    errors.append(f"{where}.content_chars does not match retained content")
+            if not isinstance(content_file, str) or not content_file:
+                errors.append(f"{where}.content_file must reference a retained content file")
+            if not isinstance(content_chars, int) or content_chars <= 0:
+                errors.append(f"{where}.content_chars must be positive for a successful visit")
+            if (
+                isinstance(content_file, str)
+                and content_file
+                and isinstance(content_chars, int)
+                and manifest_dir is not None
+            ):
+                content_path = manifest_dir / content_file
+                if not content_path.is_file():
+                    errors.append(f"{where}.content_file is missing: {content_file}")
+                else:
+                    retained = len(content_path.read_text(encoding="utf-8", errors="replace"))
+                    if retained != content_chars:
+                        errors.append(
+                            f"{where}.content_chars does not match retained content file"
+                        )
+        elif content_file is not None:
+            errors.append(f"{where}.content_file is only valid for a successful visit")
         view = visit.get("view")
         section = visit.get("section")
         if view == "section" and (not isinstance(section, str) or not section.strip()):
@@ -441,15 +432,18 @@ class FrozenCorpusBackend(SearchBackend):
             if score:
                 scored.append((score, item))
         scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("title", ""))))
-        items = [
-            {
+        items = []
+        for _, item in scored[:max_results]:
+            row: dict[str, Any] = {
                 "url": item["url"],
                 "title": item.get("title") or "No title",
                 "snippet": item.get("abstract") or item.get("text") or "",
                 "external_id": item.get("external_id") or item.get("arxiv_id"),
             }
-            for _, item in scored[:max_results]
-        ]
+            for field in RESULT_METADATA_FIELDS:
+                if item.get(field) is not None:
+                    row[field] = item[field]
+            items.append(row)
         return {
             "items": items,
             "raw_response": {"matches": [item for _, item in scored[:max_results]]},
@@ -509,7 +503,11 @@ class DeepXivBackend(SearchBackend):
             message = (process.stderr or process.stdout).strip().splitlines()
             raise RuntimeError(message[-1] if message else f"exit {process.returncode}")
         payload = json.loads(process.stdout)
-        rows = payload.get("result", []) if isinstance(payload, dict) else []
+        rows = []
+        if isinstance(payload, dict):
+            rows = payload.get("results") or payload.get("result") or []
+        if not isinstance(rows, list):
+            rows = []
         output: list[dict[str, Any]] = []
         for row in rows[:max_results]:
             if not isinstance(row, dict):
@@ -518,14 +516,37 @@ class DeepXivBackend(SearchBackend):
             url = row.get("url") or (f"https://arxiv.org/abs/{paper_id}" if paper_id else "")
             if not url:
                 continue
-            output.append(
-                {
-                    "url": url,
-                    "title": row.get("title") or "No title",
-                    "snippet": row.get("abstract") or row.get("tldr") or "",
-                    "external_id": paper_id,
-                }
-            )
+            tldr = row.get("tldr")
+            if isinstance(tldr, dict):
+                tldr = tldr.get("text")
+            authors = row.get("authors")
+            if isinstance(authors, list):
+                authors = [
+                    a.get("name", str(a)) if isinstance(a, dict) else str(a)
+                    for a in authors
+                ]
+            citation_count = row.get("citation_count")
+            if citation_count is None:
+                citation_count = row.get("citation")
+            item: dict[str, Any] = {
+                "url": url,
+                "title": row.get("title") or "No title",
+                "snippet": row.get("abstract") or tldr or "",
+                "external_id": paper_id,
+            }
+            for field, value in (
+                ("authors", authors),
+                ("date", row.get("date") or row.get("published")),
+                ("citation_count", citation_count),
+                ("tldr", tldr),
+                ("venue", row.get("venue")),
+                ("categories", row.get("categories")),
+                ("github_url", row.get("github_url")),
+                ("score", row.get("score")),
+            ):
+                if value is not None:
+                    item[field] = value
+            output.append(item)
         return {
             "items": output,
             "raw_response": payload,
@@ -537,8 +558,14 @@ class DeepXivBackend(SearchBackend):
 
 
 class JinaSearchBackend(SearchBackend):
-    name = "jina"
+    name = "jina-search"
     version = "hosted-api-unknown"
+
+    def __init__(self) -> None:
+        if not os.environ.get("JINA_API_KEY"):
+            raise RuntimeError(
+                "JINA_API_KEY is not set; keyless s.jina.ai always returns 401"
+            )
 
     async def search(self, query: str, max_results: int) -> dict[str, Any]:
         return await asyncio.to_thread(self._search_sync, query, max_results)
@@ -586,7 +613,7 @@ def build_backends(
                 backends.append(FrozenCorpusBackend(frozen_corpus))
             elif name == "deepxiv":
                 backends.append(DeepXivBackend())
-            elif name == "jina":
+            elif name == "jina-search":
                 backends.append(JinaSearchBackend())
             else:
                 failures.append({"backend": name, "error": "unknown backend"})
@@ -631,6 +658,10 @@ def merge_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             current["title"] = candidate["title"]
         if not current.get("external_id") and candidate.get("external_id"):
             current["external_id"] = candidate["external_id"]
+        for field in RESULT_METADATA_FIELDS:
+            value = candidate.get(field)
+            if value not in (None, "", []) and current.get(field) in (None, "", []):
+                current[field] = value
 
     output = list(merged.values())
     for item in output:
@@ -649,36 +680,239 @@ def merge_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
-def select_balanced(results: list[dict[str, Any]], query_ids: list[str]) -> list[str]:
-    selected: list[str] = []
-    seen: set[str] = set()
+def merged_results(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Derived global dedup view over all rounds; not authoritative state."""
+    merged: dict[str, dict[str, Any]] = {}
+    for round_ in manifest.get("rounds", []):
+        if not isinstance(round_, dict):
+            continue
+        round_id = round_.get("round_id")
+        results = round_.get("results", [])
+        if not isinstance(results, list):
+            continue
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            key = result.get("canonical_key")
+            if not isinstance(key, str) or not key:
+                continue
+            entry = merged.get(key)
+            if entry is None:
+                entry = {
+                    "canonical_key": key,
+                    "url": result.get("url"),
+                    "title": result.get("title") or "No title",
+                    "snippet": result.get("snippet") or "",
+                    "external_id": result.get("external_id"),
+                    "rounds": [],
+                    "query_ids": [],
+                    "queries": [],
+                    "backends": [],
+                    "best_rank": 9999,
+                    "appearances": [],
+                }
+                merged[key] = entry
+            if isinstance(round_id, str) and round_id not in entry["rounds"]:
+                entry["rounds"].append(round_id)
+            for field in ("query_ids", "queries", "backends"):
+                for value in result.get(field) or []:
+                    if value and value not in entry[field]:
+                        entry[field].append(value)
+            best = result.get("best_rank")
+            if isinstance(best, (int, float)):
+                entry["best_rank"] = min(entry["best_rank"], best)
+            if len(result.get("snippet") or "") > len(entry["snippet"]):
+                entry["snippet"] = result["snippet"]
+            if not entry.get("external_id") and result.get("external_id"):
+                entry["external_id"] = result["external_id"]
+            for field in RESULT_METADATA_FIELDS:
+                value = result.get(field)
+                if value not in (None, "", []) and entry.get(field) in (None, "", []):
+                    entry[field] = value
+            entry["appearances"].append(
+                {
+                    "round_id": round_id,
+                    "query_ids": list(result.get("query_ids") or []),
+                    "backends": list(result.get("backends") or []),
+                    "best_rank": result.get("best_rank"),
+                    "average_rank": result.get("average_rank"),
+                }
+            )
+    output = list(merged.values())
+    for item in output:
+        item["query_support"] = len(item["query_ids"])
+        item["backend_support"] = len(item["backends"])
+    output.sort(
+        key=lambda item: (
+            -item["query_support"],
+            -item["backend_support"],
+            item["best_rank"],
+            item["canonical_key"],
+        )
+    )
+    return output
 
-    def add(item: dict[str, Any]) -> bool:
-        key = item["canonical_key"]
-        if key in seen:
-            return False
-        seen.add(key)
-        selected.append(key)
-        return True
 
-    for item in results:
-        if item["query_support"] > 1:
-            add(item)
-        if len(selected) >= min(MAX_SHARED, MAX_SELECTED):
-            return selected
+def resolve_visit_content(visit: dict[str, Any], manifest_dir: Path) -> str | None:
+    """Read a visit's retained content file; None when there is none to read."""
+    content_file = visit.get("content_file") if isinstance(visit, dict) else None
+    if not isinstance(content_file, str) or not content_file:
+        return None
+    path = manifest_dir / content_file
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8", errors="replace")
 
-    while len(selected) < MAX_SELECTED:
-        progressed = False
-        for query_id in query_ids:
-            for item in results:
-                if query_id in item["query_ids"] and add(item):
-                    progressed = True
-                    break
-            if len(selected) >= MAX_SELECTED:
-                return selected
-        if not progressed:
-            break
-    return selected
+
+_VERIFICATION_RANK = {"snippet_only": 0, "preview": 1, "section": 2, "full_text": 3}
+_VIEW_VERIFICATION = {
+    "preview": "preview",
+    "section": "section",
+    "full_text": "full_text",
+    "page": "full_text",
+}
+
+
+def verification_statuses(manifest: dict[str, Any]) -> dict[str, str]:
+    """Per-key verification tier, derivable from the manifest alone.
+
+    Every canonical key with a tool-recorded receipt starts at
+    ``snippet_only`` (no substantive read: a search hit, or only head/brief
+    triage visits).  A successful visit raises the tier to its view's level:
+    ``preview``, ``section``, or ``full_text`` (``page`` counts as
+    ``full_text``); ``head``/``brief`` never raise it.
+    """
+    tiers: dict[str, str] = {}
+    for result in merged_results(manifest):
+        tiers.setdefault(result["canonical_key"], "snippet_only")
+    for visit in manifest.get("visits", []):
+        if not isinstance(visit, dict) or visit.get("status") != "success":
+            continue
+        key = visit.get("canonical_key")
+        if not isinstance(key, str) or not key:
+            continue
+        current = tiers.setdefault(key, "snippet_only")
+        raised = _VIEW_VERIFICATION.get(str(visit.get("view")))
+        if raised is not None and _VERIFICATION_RANK[raised] > _VERIFICATION_RANK[current]:
+            tiers[key] = raised
+    return tiers
+
+
+def unexplored_leads(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """High-rank merged hits with no visit receipt — the status dashboard's leads."""
+    visited_keys = {
+        visit.get("canonical_key")
+        for visit in manifest.get("visits", [])
+        if isinstance(visit, dict) and visit.get("canonical_key")
+    }
+    return [
+        entry
+        for entry in merged_results(manifest)
+        if isinstance(entry.get("best_rank"), (int, float))
+        and entry["best_rank"] <= HIGH_RANK_THRESHOLD
+        and entry["canonical_key"] not in visited_keys
+    ]
+
+
+def _clip(text: Any, limit: int = 200) -> str:
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _render_result_card(result: dict[str, Any]) -> str:
+    queries = ",".join(str(q) for q in result.get("query_ids") or [])
+    lines = [f"[{queries} rank {result.get('best_rank')}] {_clip(result.get('title'), 120)}"]
+    meta = [str(result.get("url") or result.get("canonical_key") or "")]
+    authors = result.get("authors")
+    if isinstance(authors, list):
+        authors = ", ".join(str(a) for a in authors)
+    if authors:
+        meta.append(f"authors: {_clip(authors, 120)}")
+    if result.get("date"):
+        meta.append(f"date: {result['date']}")
+    if result.get("citation_count") is not None:
+        meta.append(f"citations: {result['citation_count']}")
+    lines.append("  " + " | ".join(meta))
+    if result.get("tldr"):
+        lines.append(f"  tldr: {_clip(result['tldr'])}")
+    if result.get("snippet"):
+        lines.append(f"  snippet: {_clip(result['snippet'])}")
+    return "\n".join(lines)
+
+
+def _round_query_outcomes(round_: dict[str, Any]) -> list[dict[str, str]]:
+    """Per-query outcome within one round: ok / empty (success, zero hits) / failed."""
+    hit_queries: set[str] = set()
+    for result in round_.get("results", []):
+        if isinstance(result, dict):
+            hit_queries.update(str(q) for q in result.get("query_ids") or [])
+    call_statuses: dict[str, list[str]] = {}
+    for call in round_.get("backend_calls", []):
+        if isinstance(call, dict) and call.get("query_id"):
+            call_statuses.setdefault(str(call["query_id"]), []).append(
+                str(call.get("status"))
+            )
+    outcomes: list[dict[str, str]] = []
+    for query in round_.get("queries", []):
+        if not isinstance(query, dict):
+            continue
+        qid = str(query.get("id"))
+        statuses = call_statuses.get(qid, [])
+        if qid in hit_queries:
+            outcome = "ok"
+        elif "empty" in statuses or "success" in statuses:
+            # explicit empty first; bare success with zero hits is the T2-era fallback
+            outcome = "empty"
+        else:
+            outcome = "failed"
+        outcomes.append(
+            {"id": qid, "text": str(query.get("text") or ""), "outcome": outcome}
+        )
+    return outcomes
+
+
+_HEADING_RE = re.compile(r"(?m)^#{1,6}\s+(.+?)\s*$")
+
+
+def _markdown_sections(content: str) -> list[dict[str, Any]]:
+    headings = [
+        (match.start(), match.group(1).strip())
+        for match in _HEADING_RE.finditer(content)
+    ]
+    return [
+        {
+            "name": name,
+            "start": start,
+            "end": headings[index + 1][0] if index + 1 < len(headings) else len(content),
+        }
+        for index, (start, name) in enumerate(headings)
+    ]
+
+
+def _render_head_view(url: str, content: str, manifest: Path) -> str:
+    if len(content) <= VISIT_HEAD_CHARS:
+        return content
+    lines = [
+        content[:VISIT_HEAD_CHARS],
+        f"\n… [{len(content) - VISIT_HEAD_CHARS} more chars of {len(content)}]",
+    ]
+    sections = _markdown_sections(content)
+    if sections:
+        lines.append("sections:")
+        for section in sections:
+            lines.append(
+                f"  {section['name']}  (chars {section['start']}-{section['end']})"
+            )
+    else:
+        lines.append(f"no markdown headings; page by offset ({READ_WINDOW_CHARS} chars):")
+        for start in range(0, len(content), READ_WINDOW_CHARS):
+            lines.append(f"  chars {start}-{min(start + READ_WINDOW_CHARS, len(content))}")
+    lines.append(
+        f"continue: python tools/search_backends.py read "
+        f"--manifest {shlex.quote(str(manifest))} "
+        f"--url {shlex.quote(url)} [--section NAME | --offset N]"
+    )
+    return "\n".join(lines)
 
 
 async def dispatch_search(
@@ -713,7 +947,7 @@ async def dispatch_search(
                 "query_id": query["id"],
                 "backend": backend.name,
                 "backend_version": backend.version,
-                "status": "success",
+                "status": "success" if rows else "empty",
                 "retrieved_at": retrieved_at,
                 "raw_response": raw_response,
                 "metadata": response.get("metadata", {}) if isinstance(response, dict) else {},
@@ -734,20 +968,49 @@ def _strip_html(raw: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _jina_visit(url: str) -> tuple[str, str]:
+def _web_read(url: str) -> tuple[str, str, str | None]:
+    """jina-reader first, direct fallback; the note records any reader failure."""
     headers = {"Accept": "text/plain", "X-Return-Format": "markdown",
                "User-Agent": "HieraResearch/1"}
     if os.environ.get("JINA_API_KEY"):
         headers["Authorization"] = f"Bearer {os.environ['JINA_API_KEY']}"
+    reader_error: str | None = None
     try:
         request = urllib.request.Request("https://r.jina.ai/" + url, headers=headers)
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             text = response.read().decode("utf-8", errors="replace")
         if text.strip():
-            return text, "jina-reader"
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        pass
-    return _direct_visit(url), "direct"
+            return text, "jina-read", None
+        reader_error = "jina-reader returned empty content"
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        reader_error = f"jina-reader: {type(exc).__name__}: {exc}"
+    try:
+        return _direct_visit(url), "direct", reader_error
+    except Exception as exc:
+        raise RuntimeError(f"{exc} (after {reader_error})") from exc
+
+
+def _web_content_error(content: str) -> str | None:
+    """Rejection reason for a fetched web page, or None when it looks like content."""
+    stripped = content.strip()
+    if not stripped:
+        return "empty content"
+    lowered = stripped[:2000].casefold()
+    for marker in _WEB_ERROR_MARKERS:
+        if marker in lowered:
+            return f"error-page marker {marker!r}"
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and not payload.get("data") and (
+            "code" in payload or "message" in payload
+        ):
+            return "JSON error response instead of page content"
+    if len(stripped) < VISIT_MIN_CONTENT_CHARS:
+        return f"content too short ({len(stripped)} chars)"
+    return None
 
 
 def _direct_visit(url: str) -> str:
@@ -859,21 +1122,24 @@ def _head_sections(content: str) -> list[dict[str, Any]]:
 def _source_query_context(manifest: dict[str, Any], url: str) -> tuple[str, set[str]]:
     key = canonical_key(url)
     query_ids: set[str] = set()
-    for result in manifest.get("results", []):
-        if isinstance(result, dict) and result.get("canonical_key") == key:
+    for result in merged_results(manifest):
+        if result.get("canonical_key") == key:
             query_ids.update(
                 item for item in result.get("query_ids", []) if isinstance(item, str)
             )
     texts: list[str] = []
     roles: set[str] = set()
-    for query in manifest.get("queries", []):
-        if not isinstance(query, dict) or query.get("id") not in query_ids:
+    for round_ in manifest.get("rounds", []):
+        if not isinstance(round_, dict):
             continue
-        if isinstance(query.get("text"), str):
-            texts.append(query["text"])
-        roles.update(
-            role for role in query.get("evidence_roles", []) if isinstance(role, str)
-        )
+        for query in round_.get("queries", []):
+            if not isinstance(query, dict) or query.get("id") not in query_ids:
+                continue
+            if isinstance(query.get("text"), str):
+                texts.append(query["text"])
+            roles.update(
+                role for role in query.get("evidence_roles", []) if isinstance(role, str)
+            )
     return " ".join(texts), roles
 
 
@@ -1033,28 +1299,34 @@ def _retain_progressive_content(
 
 
 def add_visit(
-    manifest: dict[str, Any], *, url: str, lane: str, backend: str, view: str,
+    manifest: dict[str, Any], manifest_dir: Path, *, url: str, backend: str, view: str,
     status: str, content: str | None = None, error: str | None = None,
     backend_version: str = "unknown", section: str | None = None,
+    note: str | None = None,
 ) -> None:
-    budgets = manifest.setdefault("lane_budgets", dict(LANE_BUDGETS))
-    manifest.setdefault("visits", []).append(
-        {
-            "url": canonical_url(url),
-            "canonical_key": canonical_key(url),
-            "lane": lane,
-            "backend": backend,
-            "backend_version": backend_version,
-            "view": view,
-            "section": section,
-            "status": status,
-            "budget_tokens": budgets[lane],
-            "content_chars": len(content or ""),
-            "content": content,
-            "retrieved_at": datetime.now(timezone.utc).isoformat(),
-            "error": error,
-        }
-    )
+    visits = manifest.setdefault("visits", [])
+    visit: dict[str, Any] = {
+        "url": canonical_url(url),
+        "canonical_key": canonical_key(url),
+        "backend": backend,
+        "backend_version": backend_version,
+        "view": view,
+        "section": section,
+        "status": status,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "error": error,
+    }
+    if note:
+        visit["note"] = note
+    if status == "success" and content:
+        slug = re.sub(r"[^a-z0-9]+", "-", visit["canonical_key"].lower()).strip("-")[:60]
+        filename = f"{len(visits):03d}-{slug or 'source'}.txt"
+        retrieval_dir = manifest_dir / "retrieval"
+        retrieval_dir.mkdir(parents=True, exist_ok=True)
+        (retrieval_dir / filename).write_text(content, encoding="utf-8")
+        visit["content_file"] = f"retrieval/{filename}"
+        visit["content_chars"] = len(content)
+    visits.append(visit)
 
 
 def _parse_cli_objects(
@@ -1083,36 +1355,27 @@ def _reject_legacy_manifest(manifest: dict[str, Any]) -> None:
         )
 
 
+def _next_query_number(manifest: dict[str, Any]) -> int:
+    highest = 0
+    for round_ in manifest.get("rounds", []):
+        if not isinstance(round_, dict):
+            continue
+        for query in round_.get("queries", []):
+            if isinstance(query, dict):
+                match = re.fullmatch(r"q-(\d+)", str(query.get("id") or ""))
+                if match:
+                    highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     specs = _parse_cli_objects(
         args.query_spec,
         label="--query-spec",
         fields={"text", "target_dimension_ids", "evidence_roles"},
     )
-    exemptions = _parse_cli_objects(
-        args.coverage_exemption or [],
-        label="--coverage-exemption",
-        fields={"dimension_id", "rationale"},
-    )
-    queries = [
-        {
-            "id": f"q-{index:02d}",
-            "text": spec.get("text"),
-            "lane": args.lane,
-            "target_dimension_ids": spec.get("target_dimension_ids"),
-            "evidence_roles": spec.get("evidence_roles"),
-        }
-        for index, spec in enumerate(specs, start=1)
-    ]
-    plan_errors, _ = _validate_query_plan(queries, exemptions)
-    if plan_errors:
-        print(json.dumps({"ok": False, "errors": plan_errors}, indent=2), file=sys.stderr)
-        return 1
-
-    if args.manifest.exists():
-        existing = load_manifest(args.manifest)
-        _reject_legacy_manifest(existing)
-    manifest = new_manifest()
+    manifest = load_manifest(args.manifest)
+    _reject_legacy_manifest(manifest)
     names = args.backend or (["frozen"] if args.frozen_corpus else [])
     if not names:
         print(
@@ -1128,6 +1391,39 @@ def cmd_search(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if args.frozen_corpus is not None and any(name != "frozen" for name in names):
+        print(
+            json.dumps(
+                {"ok": False, "errors": ["--frozen-corpus permits only the frozen backend"]},
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    if args.frozen_corpus is None and "frozen" in names:
+        print(
+            json.dumps(
+                {"ok": False, "errors": ["the frozen backend requires --frozen-corpus"]},
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    start = _next_query_number(manifest)
+    queries = [
+        {
+            "id": f"q-{number:02d}",
+            "text": spec.get("text"),
+            "target_dimension_ids": spec.get("target_dimension_ids"),
+            "evidence_roles": spec.get("evidence_roles"),
+        }
+        for number, spec in enumerate(specs, start=start)
+    ]
+    plan_errors, _ = _validate_query_plan(queries)
+    if plan_errors:
+        print(json.dumps({"ok": False, "errors": plan_errors}, indent=2), file=sys.stderr)
+        return 1
+
     backends, unavailable = build_backends(names, args.frozen_corpus)
     raw, failures, calls = asyncio.run(dispatch_search(queries, backends, args.max_results))
     for failure in unavailable:
@@ -1143,42 +1439,57 @@ def cmd_search(args: argparse.Namespace) -> int:
                 }
             )
     results = merge_candidates(raw)
-    manifest.update(
+    rounds = manifest.setdefault("rounds", [])
+    round_id = f"r-{len(rounds) + 1:02d}"
+    rounds.append(
         {
-            "schema_version": SCHEMA_VERSION,
-            "lane_budgets": dict(LANE_BUDGETS),
-            "retrieval_condition": (
-                "frozen"
-                if set(names) == {"frozen"}
-                else "open_world"
-                if "frozen" not in names
-                else "mixed"
-            ),
+            "round_id": round_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "queries": queries,
-            "coverage_exemptions": exemptions,
-            "results": results,
-            "selected_keys": select_balanced(results, [q["id"] for q in queries]),
             "backend_calls": calls,
-            "visits": [],
             "backend_failures": unavailable + failures,
+            "results": results,
         }
     )
     save_manifest(args.manifest, manifest)
-    errors = validate_manifest(manifest)
-    print(json.dumps({"ok": not errors, "selected": manifest["selected_keys"],
-                      "failures": manifest["backend_failures"], "errors": errors}, indent=2))
+    errors = validate_manifest(manifest, manifest_dir=args.manifest.parent)
+    outcomes = _round_query_outcomes(rounds[-1])
+    empty = [o["id"] for o in outcomes if o["outcome"] == "empty"]
+    failed = [o["id"] for o in outcomes if o["outcome"] == "failed"]
+    summary = (
+        f"round {round_id} | queries: {len(queries)} | hits: {len(results)} "
+        f"| max_results: {args.max_results} | empty: {','.join(empty) or '-'} "
+        f"| failed: {','.join(failed) or '-'} | validate: {'ok' if not errors else 'FAILED'}"
+    )
+    round_failures = unavailable + failures
+    if round_failures:
+        summary += "\nfailures: " + "; ".join(
+            f"{failure['backend']}:{failure.get('query_id', '-')} {failure['error']}"
+            for failure in round_failures
+        )
+    if empty:
+        summary += (
+            "\nempty calls returned zero results; treat them as diagnostic failures "
+            "(check backend credentials/quota, or widen the query)"
+        )
+    print(summary)
+    for result in results:
+        print()
+        print(_render_result_card(result))
+    if errors:
+        print(json.dumps({"ok": False, "errors": errors}, indent=2), file=sys.stderr)
     return 0 if results and not errors else 1
 
 
 def cmd_visit(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     _reject_legacy_manifest(manifest)
-    budget = manifest.get("lane_budgets", LANE_BUDGETS).get(args.lane, LANE_BUDGETS[args.lane])
     view = args.view
     if args.section and view != "section":
         print("visit failed: --section is only valid with --view section", file=sys.stderr)
         return 1
     try:
+        note = None
         if args.frozen_corpus:
             frozen = FrozenCorpusBackend(args.frozen_corpus)
             content = frozen.read(args.url)
@@ -1186,9 +1497,9 @@ def cmd_visit(args: argparse.Namespace) -> int:
             backend_version = frozen.version
             if view == "auto":
                 view = "full_text"
-        elif args.visit_backend == "jina":
-            content, backend = _jina_visit(args.url)
-            backend_version = "hosted-api-unknown" if backend == "jina-reader" else "stdlib"
+        elif args.visit_backend == "jina-read":
+            content, backend, note = _web_read(args.url)
+            backend_version = "hosted-api-unknown" if backend == "jina-read" else "stdlib"
             if view == "auto":
                 view = "full_text"
         elif args.visit_backend == "direct":
@@ -1198,12 +1509,13 @@ def cmd_visit(args: argparse.Namespace) -> int:
                 view = "full_text"
         elif arxiv_id(args.url) and view == "auto":
             attempts = _deepxiv_progressive_read(args.url, manifest)
-            _retain_progressive_content(attempts, budget * 4)
+            _retain_progressive_content(attempts, VISIT_CONTENT_STORE_CHARS)
+            first_visit = len(manifest.get("visits", []))
             for attempt in attempts:
                 add_visit(
                     manifest,
+                    args.manifest.parent,
                     url=args.url,
-                    lane=args.lane,
                     backend=attempt["backend"],
                     view=attempt["view"],
                     status=attempt["status"],
@@ -1220,13 +1532,23 @@ def cmd_visit(args: argparse.Namespace) -> int:
                 and attempt["view"] in SUBSTANTIVE_VIEWS
             ]
             rendered = []
-            for attempt in attempts:
+            for index, attempt in enumerate(attempts):
                 if attempt["status"] != "success":
                     continue
                 label = attempt["view"]
                 if attempt["section"]:
                     label += f": {attempt['section']}"
-                rendered.append(f"## DeepXiv {label}\n\n{attempt['content']}")
+                body = attempt["content"]
+                chunk = body[:VISIT_HEAD_CHARS]
+                if len(body) > VISIT_HEAD_CHARS:
+                    # the receipt index pins the exact visit: a --url/--view
+                    # scan would page through the last section instead
+                    chunk += (
+                        f"\n… [{len(body) - VISIT_HEAD_CHARS} more chars; continue: read "
+                        f"--manifest {shlex.quote(str(args.manifest))} "
+                        f"--visit {first_visit + index}]"
+                    )
+                rendered.append(f"## DeepXiv {label}\n\n{chunk}")
             if rendered:
                 print("\n\n".join(rendered))
             if not body_attempts:
@@ -1240,19 +1562,31 @@ def cmd_visit(args: argparse.Namespace) -> int:
         elif arxiv_id(args.url) and view in {"brief", "head", "preview", "section", "full_text"}:
             content, backend, backend_version = _deepxiv_read(args.url, view, args.section)
         else:
-            content, backend = _direct_visit(args.url), "direct"
-            backend_version = "stdlib"
+            content, backend, note = _web_read(args.url)
+            backend_version = "hosted-api-unknown" if backend == "jina-read" else "stdlib"
             if view == "auto":
                 view = "full_text"
-        content = content[: budget * 4]
-        add_visit(manifest, url=args.url, lane=args.lane, backend=backend, view=view,
+        content = content[:VISIT_CONTENT_STORE_CHARS]
+        problem = (
+            _web_content_error(content) if backend in {"jina-read", "direct"} else None
+        )
+        if problem:
+            if note:
+                problem = f"{problem} (after {note})"
+            add_visit(manifest, args.manifest.parent, url=args.url, backend=backend,
+                      view=view, status="failed", error=problem,
+                      backend_version=backend_version, section=args.section)
+            save_manifest(args.manifest, manifest)
+            print(f"visit failed: {problem}", file=sys.stderr)
+            return 1
+        add_visit(manifest, args.manifest.parent, url=args.url, backend=backend, view=view,
                   status="success", content=content, backend_version=backend_version,
-                  section=args.section)
+                  section=args.section, note=note)
         save_manifest(args.manifest, manifest)
-        print(content)
+        print(_render_head_view(canonical_url(args.url), content, args.manifest))
         return 0
     except Exception as exc:
-        add_visit(manifest, url=args.url, lane=args.lane, backend="auto", view=view,
+        add_visit(manifest, args.manifest.parent, url=args.url, backend="auto", view=view,
                   status="failed", error=f"{type(exc).__name__}: {exc}",
                   backend_version="unknown", section=args.section)
         save_manifest(args.manifest, manifest)
@@ -1260,31 +1594,192 @@ def cmd_visit(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_record_visit(args: argparse.Namespace) -> int:
+def cmd_read(args: argparse.Namespace) -> int:
+    """Read back stored visit content; never appends a visit receipt."""
     manifest = load_manifest(args.manifest)
     _reject_legacy_manifest(manifest)
-    content = args.content_file.read_text(errors="replace") if args.content_file else None
-    if args.status == "success" and not content:
-        print(
-            json.dumps(
-                {"ok": False, "errors": ["successful external visits require --content-file"]},
-                indent=2,
-            ),
-            file=sys.stderr,
-        )
+    visit = None
+    if args.visit is not None:
+        visits = manifest.get("visits", [])
+        if 0 <= args.visit < len(visits):
+            visit = visits[args.visit]
+    else:
+        if not args.url:
+            print("read failed: --url is required without --visit", file=sys.stderr)
+            return 1
+        key = canonical_key(args.url)
+        for candidate in reversed(manifest.get("visits", [])):
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("status") != "success" or not candidate.get("content_file"):
+                continue
+            if key and candidate.get("canonical_key") != key:
+                continue
+            if args.view and candidate.get("view") != args.view:
+                continue
+            visit = candidate
+    if not isinstance(visit, dict) or not visit.get("content_file"):
+        print("read failed: no stored successful visit matches", file=sys.stderr)
         return 1
-    add_visit(manifest, url=args.url, lane=args.lane, backend=args.backend,
-              view=args.view, status=args.status, content=content, error=args.error,
-              backend_version=args.backend_version, section=args.section)
-    save_manifest(args.manifest, manifest)
-    errors = validate_manifest(manifest)
-    print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
-    return 0 if not errors else 1
+    content_path = args.manifest.parent / visit["content_file"]
+    if not content_path.is_file():
+        print(f"read failed: missing content file {visit['content_file']}", file=sys.stderr)
+        return 1
+    content = content_path.read_text(encoding="utf-8", errors="replace")
+    if args.section:
+        sections = _markdown_sections(content)
+        match = next(
+            (s for s in sections if s["name"].casefold() == args.section.casefold()), None
+        )
+        if match is None:
+            available = ", ".join(s["name"] for s in sections) or "(no markdown headings)"
+            print(f"read failed: no section {args.section!r}; available: {available}",
+                  file=sys.stderr)
+            return 1
+        body = content[match["start"]:match["end"]]
+        print(body[: args.length])
+        if len(body) > args.length:
+            print(f"\n… [section continues: --offset {match['start'] + args.length}]")
+        return 0
+    start = args.offset
+    if start < 0 or start >= len(content):
+        print(f"read failed: offset {start} outside content of {len(content)} chars",
+              file=sys.stderr)
+        return 1
+    print(content[start: start + args.length])
+    if start + args.length < len(content):
+        print(f"\n… [continue: --offset {start + args.length}]")
+    return 0
+
+
+def cmd_results(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    _reject_legacy_manifest(manifest)
+    rounds = [r for r in manifest.get("rounds", []) if isinstance(r, dict)]
+    if not rounds:
+        print("results failed: manifest has no rounds yet", file=sys.stderr)
+        return 1
+    if args.round is None:
+        round_ = rounds[-1]
+    else:
+        wanted = args.round
+        if not wanted.startswith("r-"):
+            try:
+                wanted = f"r-{int(wanted):02d}"
+            except ValueError:
+                pass
+        round_ = next((r for r in rounds if r.get("round_id") == wanted), None)
+        if round_ is None:
+            available = ", ".join(str(r.get("round_id")) for r in rounds)
+            print(
+                f"results failed: no round {args.round!r}; available: {available}",
+                file=sys.stderr,
+            )
+            return 1
+    results = round_.get("results", [])
+    print(
+        f"round {round_.get('round_id')} | queries: {len(round_.get('queries', []))} "
+        f"| hits: {len(results)}"
+    )
+    for result in results:
+        print()
+        print(_render_result_card(result))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    _reject_legacy_manifest(manifest)
+    rounds = [r for r in manifest.get("rounds", []) if isinstance(r, dict)]
+    visits = [v for v in manifest.get("visits", []) if isinstance(v, dict)]
+
+    query_dims: dict[str, list[str]] = {}
+    for round_ in rounds:
+        for query in round_.get("queries", []):
+            if not isinstance(query, dict) or not isinstance(query.get("id"), str):
+                continue
+            targets = query.get("target_dimension_ids")
+            query_dims[query["id"]] = (
+                [t for t in targets if isinstance(t, str)]
+                if isinstance(targets, list)
+                else []
+            )
+
+    result_queries: dict[str, set[str]] = {}
+    dim_results: dict[str, set[str]] = {}
+    for round_ in rounds:
+        for result in round_.get("results", []):
+            if not isinstance(result, dict) or not result.get("canonical_key"):
+                continue
+            key = result["canonical_key"]
+            for qid in result.get("query_ids") or []:
+                result_queries.setdefault(key, set()).add(qid)
+                for dim in query_dims.get(qid, []):
+                    dim_results.setdefault(dim, set()).add(key)
+
+    visited_keys = {v.get("canonical_key") for v in visits if v.get("canonical_key")}
+    dim_visits: dict[str, int] = {}
+    for visit in visits:
+        dims: set[str] = set()
+        for qid in result_queries.get(visit.get("canonical_key"), ()):
+            dims.update(query_dims.get(qid, []))
+        for dim in dims:
+            dim_visits[dim] = dim_visits.get(dim, 0) + 1
+
+    global_view = merged_results(manifest)
+    total_queries = sum(len(r.get("queries", [])) for r in rounds)
+    tier_counts: dict[str, int] = {}
+    for tier in verification_statuses(manifest).values():
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+    verification = " ".join(
+        f"{tier}={tier_counts[tier]}"
+        for tier in ("full_text", "section", "preview", "snippet_only")
+        if tier_counts.get(tier)
+    )
+    lines = [
+        f"rounds: {len(rounds)} | queries: {total_queries} | "
+        f"unique results: {len(global_view)} | visits: {len(visits)}",
+        f"verification: {verification or '(no receipts)'}",
+        "dimensions (results / visits):",
+    ]
+    dims = sorted(set(dim_results) | set(dim_visits))
+    if not dims:
+        lines.append("  (no query targets recorded)")
+    for dim in dims:
+        lines.append(f"  {dim}: {len(dim_results.get(dim, set()))} / {dim_visits.get(dim, 0)}")
+
+    leads = unexplored_leads(manifest)
+    lines.append(
+        f"unvisited high-rank hits (best_rank <= {HIGH_RANK_THRESHOLD}): {len(leads)}"
+    )
+    for entry in leads[:20]:
+        lines.append(
+            f"  [rank {entry['best_rank']}] {_clip(entry.get('title'), 100)} — "
+            f"{entry['canonical_key']} (rounds: {','.join(entry['rounds'])})"
+        )
+    if len(leads) > 20:
+        lines.append(f"  … and {len(leads) - 20} more")
+
+    lines.append("queries with no results:")
+    reported = False
+    for round_ in rounds:
+        for outcome in _round_query_outcomes(round_):
+            if outcome["outcome"] == "ok":
+                continue
+            reported = True
+            lines.append(
+                f"  {round_.get('round_id')} {outcome['id']} [{outcome['outcome']}] "
+                f"\"{_clip(outcome['text'], 80)}\""
+            )
+    if not reported:
+        lines.append("  (none)")
+    print("\n".join(lines))
+    return 0
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
-    errors = validate_manifest(manifest)
+    errors = validate_manifest(manifest, manifest_dir=args.manifest.parent)
     print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
     return 0 if not errors else 1
 
@@ -1301,25 +1796,19 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="JSON object with text, target_dimension_ids, and evidence_roles",
     )
-    search.add_argument(
-        "--coverage-exemption",
-        action="append",
-        help="JSON object with dimension_id and rationale",
-    )
-    search.add_argument("--backend", action="append", choices=["frozen", "deepxiv", "jina"])
+    search.add_argument("--backend", action="append",
+                        choices=["frozen", "deepxiv", "jina-search"])
     search.add_argument(
         "--frozen-corpus",
         type=Path,
         help="pinned local JSON corpus; implies the frozen backend when --backend is omitted",
     )
-    search.add_argument("--lane", choices=sorted(LANE_BUDGETS), default="grounding")
-    search.add_argument("--max-results", type=int, default=10)
+    search.add_argument("--max-results", type=int, default=50)
     search.set_defaults(func=cmd_search)
 
     visit = sub.add_parser("visit", help="read a source and append a visit receipt")
     visit.add_argument("--manifest", type=Path, required=True)
     visit.add_argument("--url", required=True)
-    visit.add_argument("--lane", choices=sorted(LANE_BUDGETS), default="grounding")
     visit.add_argument(
         "--view", choices=["auto", "brief", "head", "preview", "section", "full_text"],
         default="auto",
@@ -1328,26 +1817,36 @@ def build_parser() -> argparse.ArgumentParser:
     visit.add_argument("--frozen-corpus", type=Path)
     visit.add_argument(
         "--visit-backend",
-        choices=["auto", "direct", "jina"],
+        choices=["auto", "direct", "jina-read"],
         default="auto",
-        help="Jina is explicit and optional; auto uses DeepXiv for arXiv and direct fetch otherwise",
+        help="direct skips the reader; auto uses DeepXiv for arXiv and jina-reader (direct fallback) otherwise",
     )
     visit.set_defaults(func=cmd_visit)
 
-    record = sub.add_parser(
-        "record-visit", help="record a successful/failed visit performed by an external tool"
+    read = sub.add_parser(
+        "read", help="read back stored visit content (section/offset); appends no receipt"
     )
-    record.add_argument("--manifest", type=Path, required=True)
-    record.add_argument("--url", required=True)
-    record.add_argument("--lane", choices=sorted(LANE_BUDGETS), default="grounding")
-    record.add_argument("--backend", required=True)
-    record.add_argument("--backend-version", default="unknown")
-    record.add_argument("--view", required=True)
-    record.add_argument("--section")
-    record.add_argument("--status", choices=["success", "failed"], required=True)
-    record.add_argument("--content-file", type=Path)
-    record.add_argument("--error")
-    record.set_defaults(func=cmd_record_visit)
+    read.add_argument("--manifest", type=Path, required=True)
+    read.add_argument("--url")
+    read.add_argument(
+        "--visit", type=int, help="visit receipt index; overrides --url selection"
+    )
+    read.add_argument("--view", help="restrict --url selection to a receipt view")
+    read.add_argument("--section", help="markdown heading name within the stored content")
+    read.add_argument("--offset", type=int, default=0)
+    read.add_argument("--length", type=int, default=READ_WINDOW_CHARS)
+    read.set_defaults(func=cmd_read)
+
+    status = sub.add_parser("status", help="triage dashboard over rounds and visits")
+    status.add_argument("--manifest", type=Path, required=True)
+    status.set_defaults(func=cmd_status)
+
+    results = sub.add_parser("results", help="browse a past round's result cards")
+    results.add_argument("--manifest", type=Path, required=True)
+    results.add_argument(
+        "--round", help="round id (r-NN or bare number); default: latest round"
+    )
+    results.set_defaults(func=cmd_results)
 
     validate = sub.add_parser("validate", help="validate a retrieval manifest")
     validate.add_argument("--manifest", type=Path, required=True)
