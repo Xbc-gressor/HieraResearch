@@ -123,7 +123,11 @@ python tools/search_backends.py visit \
 - For other web sources, the adapter reads through the jina reader with a
   direct HTTP fallback; `--visit-backend direct` skips the reader. Error
   pages, empty pages, and tiny responses are recorded as failed visits with
-  the reason.
+  the reason. A page that is only a consent or anti-bot wall — a challenge
+  interstitial or cookie banner with no substantial body — is a failed visit
+  whose error says so; switch to a different source for that evidence instead
+  of retrying the wall. A long navigation header above real body content is
+  not a wall: the visit succeeds, so read on.
 - `--view section` requires `--section <name>`; in the frozen condition,
   `--frozen-corpus` replays retained corpus content without network access.
 
@@ -182,9 +186,25 @@ A source enters the registry only from this record: a search hit (a snippet
 receipt) or a successful visit. From the record, each source derives a
 verification tier — `snippet_only`, `preview`, `section`, or `full_text` —
 surfaced in `status`. Read deep enough that the claims you register match the
-tier behind them; before the space freezes, citations are spot-checked
-against the recorded content, and one the record does not carry comes back
-for repair or removal.
+tier behind them; before the space freezes, every claim↔source mapping is
+audited against the recorded content, and one the record does not carry comes
+back for repair or removal.
+
+The retained content is also the only legal carrier for numbers. At validate
+time, every result-type number in a hypothesis or guidance item's audit text
+(`claim`, `scope`, `credibility_rationale`, `reopen_when`) — any token with a
+decimal point or a `%`; arXiv-id-shaped tokens such as `2003.11545` do not
+count — must appear in the retained content of at least one of the item's
+cited sources at tier `preview` or better. An `abstract` view counts as
+`preview`; a bare search hit or a `head`/`brief` visit does not. The error
+names the missing token and the item's cited candidates, and there are
+exactly three ways out: visit a cited source that contains the number, cite a
+different source that carries it, or downgrade the claim to a qualitative
+statement without the number. A visit that never surfaced the number does not
+count — the record is checked, not your memory of the page. Equivalent forms
+match (`0.3843` against `38.43%`) and rounding to fewer digits passes;
+precision the source never states fails. Check yourself before finishing by
+adding `--number-gate` to the `tools/background_contract.py validate` command.
 
 Finish with:
 

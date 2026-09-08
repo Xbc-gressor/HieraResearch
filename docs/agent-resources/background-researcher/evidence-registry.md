@@ -92,15 +92,36 @@ consideration is a runtime decision made later from scored evidence.
 `unverified`/`contested` findings remain cautions. A scope mismatch never
 changes standing. Guidance does not delete hypotheses.
 
+A `deprioritize` item is binding, so it must keep at least one direct
+`supports` link to a directly scoped, non-withdrawn primary empirical source
+(`paper`, `benchmark`, or `first_party_report`). Removing that link or
+downgrading it to `context` — for example while dropping a source after a
+failed visit or a number-gate error — fails validation with a different
+error: binding guidance requires a directly scoped primary empirical source.
+Re-ground the item on another qualifying source or drop the guidance item;
+do not leave it without its direct support.
+
 ## Source receipts
 
 Every registry source must come from your CLI retrieval record: a search hit
 or a successful visit in `background_retrieval.json`. From that record each
 source derives a verification tier — `snippet_only`, `preview`, `section`, or
 `full_text` — reflecting how much of it was actually read. Cite only what the
-recorded content carries: before the space freezes, citations are
-spot-checked against the receipts, and a claim the record does not support
-comes back for repair or removal.
+recorded content carries: before the space freezes, every claim↔source
+mapping is audited against the receipts, and a claim the record does not
+support comes back for repair or removal.
+
+Numbers are gated at validate time. Every result-type number in a hypothesis
+or guidance item's audit text (`claim`, `scope`, `credibility_rationale`,
+`reopen_when`) — a token with a decimal point or a `%`; arXiv-id-shaped
+tokens such as `2003.11545` never count — must appear in the retained content
+of at least one cited source at tier `preview` or better (`abstract` counts
+as `preview`; a snippet or `head`/`brief` receipt does not). The error names
+the missing token and the item's cited candidates; the three ways out are to
+visit a cited source containing the number, cite a different source that
+carries it, or downgrade the claim to a qualitative statement. Equivalent
+forms match (`0.3843` against `38.43%`) and rounding to fewer digits passes,
+but precision the record never states fails.
 
 ## Hypothesis preservation
 

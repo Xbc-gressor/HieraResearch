@@ -263,15 +263,15 @@ python tools/background_contract.py validate \
 ```
 
 Fix every contract error before returning. Once validation passes and the
-citation spot-check below clears, the space freezes: the registry, manifest,
+citation audit below clears, the space freezes: the registry, manifest,
 and catalog become the run's permanent setup artifacts.
 
 Two feedback channels can return the artifacts to you:
 
 - `validation_errors` — deterministic validator output naming the exact
   problem. Fix it and re-validate.
-- `faithfulness_findings` — before the space freezes, citations are
-  spot-checked against the recorded source content, and each finding names a
+- `faithfulness_findings` — before the space freezes, every citation is
+  checked against the recorded source content, and each finding names a
   claim its recorded source does not carry. Repair the claim or delete the
   citation, re-run the validators, and submit again.
 

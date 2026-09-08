@@ -500,7 +500,7 @@ render --retrieval-manifest` lists them as `unexplored_leads`. DeepXiv `auto`
 visits record `head`
 as triage and then fetch up to three query-relevant body sections, falling
 back to a preview only when necessary. Before the background freezes, a
-synchronous audit spot-checks citations against the recorded source content
+synchronous audit checks every citation against the recorded source content
 and returns unfaithful ones to the researcher for repair or removal. Older
 retrieval manifests are rejected rather than migrated silently.
 
