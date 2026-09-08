@@ -93,6 +93,7 @@ import llm  # noqa: E402
 import space as space_mod  # noqa: E402
 import state as state_mod  # noqa: E402
 from arms.pool_hebo_mace import ARM  # noqa: E402
+from arms.explicit_e3u2 import ARM as EXPLICIT_E3U2_ARM  # noqa: E402
 from driver.events import EventsLog  # noqa: E402
 
 
@@ -892,7 +893,12 @@ def main() -> int:
             extras=extras,
             emit=emit,
         )
-        gen = ARM.run(ctx)
+        selected_arm = (
+            EXPLICIT_E3U2_ARM
+            if policy_id == inner_policy.EXPLICIT_E3U2_POLICY_ID
+            else ARM
+        )
+        gen = selected_arm.run(ctx)
         feedback = None
         while cell_state.budget_remaining > 0:
             proposal = next(gen) if feedback is None else gen.send(feedback)

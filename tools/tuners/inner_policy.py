@@ -115,6 +115,7 @@ SELF_RANK_HEBO_POLICY_ID = "selfrank8-hebo10-hebo10"
 MIXUP_TURBO_POLICY_ID = "mixup24-turbo20-v1"
 HEBO_TURBO_POLICY_ID = "hebo24-turbo20-v1"
 HEBO_HEBO_POLICY_ID = "hebo24-hebo20"
+EXPLICIT_E3U2_POLICY_ID = "explicit-e3u2-hebo-v1"
 HEBO_TRANSFER_HEBO_POLICY_ID = "hebo24-transfer10-hebo10"
 BASELINE_HEBO_POLICY_ID = "baseline-hebo-full-v1"
 LEGACY_POLICY_ID = "legacy"
@@ -134,6 +135,7 @@ REGIME_POLICY_IDS = (
     SELF_RANK_HEBO_POLICY_ID,
     *INITIAL24_POLICY_IDS,
     BASELINE_HEBO_POLICY_ID,
+    EXPLICIT_E3U2_POLICY_ID,
 )
 #: Regime policies whose FIRST bout is the inner-benchmark ``local_tr`` arm.
 LOCAL_TR_FIRST_POLICY_IDS = (LOCAL_TR_POLICY_ID, LOCAL_TR_HEBO_POLICY_ID)
