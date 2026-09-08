@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import traceback
@@ -893,9 +894,11 @@ def main() -> int:
             extras=extras,
             emit=emit,
         )
+        arm_override = os.environ.get("INNER_ARM_OVERRIDE", "")
         selected_arm = (
             EXPLICIT_E3U2_ARM
             if policy_id == inner_policy.EXPLICIT_E3U2_POLICY_ID
+               or arm_override == "explicit_e3u2"
             else ARM
         )
         gen = selected_arm.run(ctx)
