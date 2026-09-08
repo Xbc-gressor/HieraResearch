@@ -188,6 +188,7 @@ AGGREGATE_ARM_STATE_KEYS = (
     "llm_output_tokens",
     "ranker_fallback_count",
     "internal_duplicate_count",
+    "internal_out_of_space_count",
     "internal_resample_count",
 )
 

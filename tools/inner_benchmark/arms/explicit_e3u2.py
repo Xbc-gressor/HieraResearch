@@ -24,5 +24,10 @@ class ExplicitE3U2(PoolHeboMace):
                 explorer.report_outcome(chosen, feedback, incumbent_before=before)
                 exploiter.report_outcome(chosen, feedback, incumbent_before=before)
         finally:
-            ctx.emit({**explorer.totals(), "exploit_llm_calls": exploiter.totals()["llm_calls"], "exploit_llm_input_tokens": exploiter.totals()["llm_input_tokens"], "exploit_llm_output_tokens": exploiter.totals()["llm_output_tokens"]})
+            ex, ep = explorer.totals(), exploiter.totals()
+            merged = {
+                key: ex.get(key, 0) + ep.get(key, 0)
+                for key in ("internal_duplicate_count", "internal_out_of_space_count")
+            }
+            ctx.emit({**ex, "exploit_llm_calls": ep["llm_calls"], "exploit_llm_input_tokens": ep["llm_input_tokens"], "exploit_llm_output_tokens": ep["llm_output_tokens"], **merged})
 ARM = ExplicitE3U2()

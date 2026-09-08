@@ -1042,6 +1042,7 @@ def main() -> int:
         "llm_calls": totals.get("llm_calls", 0),
         "ranker_fallback_count": totals.get("ranker_fallback_count", 0),
         "internal_duplicate_count": totals.get("internal_duplicate_count", 0),
+        "internal_out_of_space_count": totals.get("internal_out_of_space_count", 0),
         "deferred_evaluated": counters["deferred_evaluated"],
         "deferred_skipped_outside_space": counters[
             "deferred_skipped_outside_space"

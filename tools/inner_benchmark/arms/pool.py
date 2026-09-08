@@ -7,15 +7,17 @@ proposer's self-ranking in ONE call. This module owns the arm-side obligations
 the bench roles deliberately do NOT enforce (arm_api author checklist #10):
 
 - receipt semantics: exactly POOL config dicts, each contract-shaped
-  (exact key set, castable, in-bounds), mutually distinct, and ``order`` a
-  permutation of 0..POOL-1;
-- internal dedupe: pool members duplicating ANY executed history row
-  (crashes and the incumbent included) are dropped before ranking and
-  counted under ``internal_duplicate_count`` — the runner never sees them;
-- retries: an unparseable/failed invocation, a semantically invalid pool, or
-  an all-duplicate pool after filtering is a failed attempt (the proposer is
-  re-asked with a ``correction`` block; no budget is consumed); 3 consecutive
-  failed attempts end the cell as ``arm_error``.
+  (exact key set, castable), mutually distinct, and ``order`` a permutation
+  of 0..POOL-1;
+- soft filtering: out-of-space members and members duplicating ANY executed
+  history row (crashes and the incumbent included) are dropped before
+  ranking and counted (``internal_out_of_space_count`` /
+  ``internal_duplicate_count``) — the runner never sees them;
+- retries: an unparseable/failed invocation, a semantically invalid pool,
+  or a pool left with too few non-out-of-space members (empty after
+  filtering, or majority lost to bounds violations) is a failed attempt
+  (the proposer is re-asked with a ``correction`` block; no budget is
+  consumed); 3 consecutive failed attempts end the cell as ``arm_error``.
 
 The selection variant (self-rank / GP-EI / TPE / HEBO) lives in the arm, not
 here: ``ask_pool`` returns the filtered pool in PROPOSER rank order and the
@@ -39,8 +41,7 @@ import tune_tools  # noqa: E402
 ROLE = "bench-pool-proposer"
 MAX_CONSECUTIVE_FAILED_ATTEMPTS = 3
 
-def pool_protocol(pool_size: int) -> str:
-    count_word = "five" if pool_size == 5 else str(pool_size)
+def _pool_protocol_core(pool_size: int) -> str:
     return (
         "LLM pool protocol (PLAN §6.4): each step you generate exactly "
         f"POOL={pool_size} complete, mutually distinct candidate configs in "
@@ -48,10 +49,17 @@ def pool_protocol(pool_size: int) -> str:
         "most want executed). A deterministic selector then executes exactly "
         "ONE config from the pool and appends its authoritative outcome. "
         "Unexecuted pool members are not outcome evidence; every step asks "
-        "for a fresh pool. If recent evidence shows the incumbent region is "
-        "converged, build the pool to cover genuinely different regions "
-        "rather than near-duplicates of the incumbent — "
-        f"{count_word} near-identical configs waste the selector's choice."
+        "for a fresh pool."
+    )
+
+
+def pool_protocol(pool_size: int) -> str:
+    count_word = "five" if pool_size == 5 else str(pool_size)
+    return _pool_protocol_core(pool_size) + (
+        " If recent evidence shows the incumbent region is converged, build "
+        "the pool to cover genuinely different regions rather than "
+        f"near-duplicates of the incumbent — {count_word} near-identical "
+        "configs waste the selector's choice."
     )
 
 
@@ -100,23 +108,30 @@ class PoolDriver:
         self._ctx = ctx
         self._contract = ctx.contract
         self._pool_size = pool_size
+        base_protocol = protocol if protocol is not None else pool_protocol(pool_size)
+        if role_protocol is not None:
+            # Compose, never replace: the count contract the validator
+            # enforces lives in the core protocol; the diversity clause is
+            # for the single-proposer default and contradicts an exploiter
+            # role, so role-scoped drivers compose core + focus instead.
+            if protocol is None:
+                base_protocol = _pool_protocol_core(pool_size)
+            base_protocol = f"{base_protocol}\n\nRole focus: {role_protocol}"
         self._session = factory(
             role,
             first_extras=llm.first_message_blocks(
                 ctx.checkpoint,
                 ctx.contract,
-                    protocol=(
-                    role_protocol if role_protocol is not None else (protocol if protocol is not None else pool_protocol(pool_size))
-                ),
+                protocol=base_protocol,
                 budget_remaining=ctx.state.budget_remaining,
                 trials=first_trials,
                 live_incumbent=first_live_incumbent,
             ),
         )
         self.internal_duplicate_count = 0
+        self.internal_out_of_space_count = 0
         self._pending_messages: list[str] = []
         self._consecutive_failures = 0
-        self._soft_invalid: set[int] = set()
 
     @staticmethod
     def precheck(ctx) -> None:
@@ -228,15 +243,17 @@ class PoolDriver:
     def ask_pool(self) -> dict:
         """Return {"pool": filtered configs in proposer rank order,
         "pool_ranked": pre-filter configs in proposer rank order,
-        "pool_duplicate_mask": per-ranked-member True when dropped as an
-        executed-history duplicate, "order": the proposer's raw permutation,
-        "rationale": str|None, "attempts": asks used}. Raises ArmError after
-        3 consecutive failed attempts.
+        "pool_duplicate_mask": per-ranked-member True when dropped before
+        ranking (executed-history duplicate OR out-of-space),
+        "pool_out_of_space_mask": the out-of-space subset of that mask,
+        "order": the proposer's raw permutation, "rationale": str|None,
+        "attempts": asks used}. Raises ArmError after 3 consecutive failed
+        attempts.
 
-        ``pool_ranked`` / ``order`` / ``pool_duplicate_mask`` exist so arms
-        can persist the complete pool and original order (PLAN §6.4) — rank
-        scores (``pool_eis`` etc.) are position indexes into the ranked pool
-        and uninterpretable without it.
+        ``pool_ranked`` / ``order`` / the masks exist so arms can persist
+        the complete pool and original order (PLAN §6.4) — rank scores
+        (``pool_eis`` etc.) are position indexes into the ranked pool and
+        uninterpretable without it.
         """
         attempts = 0
         while True:
@@ -267,30 +284,60 @@ class PoolDriver:
             configs = receipt["configs"]
             ranked = [configs[index] for index in receipt["order"]]
             pool = []
-            duplicate_mask = []
-            for rank_index, config in enumerate(ranked):
+            # "pool_duplicate_mask" keeps its consumed meaning — the member
+            # was dropped before ranking (either reason); the out-of-space
+            # mask carries the reason split for analysis.
+            dropped_mask = []
+            out_of_space_mask = []
+            for config in ranked:
                 if self._is_out_of_space(config):
-                    duplicate_mask.append(True)
+                    self.internal_out_of_space_count += 1
+                    out_of_space_mask.append(True)
+                    dropped_mask.append(True)
                     continue
+                out_of_space_mask.append(False)
                 if self._is_executed_duplicate(config):
                     self.internal_duplicate_count += 1
-                    duplicate_mask.append(True)
+                    dropped_mask.append(True)
                     continue
-                duplicate_mask.append(False)
+                dropped_mask.append(False)
                 pool.append(config)
-            if not pool:
-                self._pending_messages.append(
-                    "correction: no usable pool member remained after "
-                    "filtering invalid or previously executed configs. "
-                    "Generate a fresh pool inside the declared bounds."
+            # Executed-history duplicates are the expected state late in a
+            # cell; only out-of-space losses are sanctionable violations, so
+            # the majority rule counts non-OOS members, not the usable pool.
+            non_oos = sum(
+                1 for dropped, oos in zip(dropped_mask, out_of_space_mask)
+                if not oos
+            )
+            min_usable = -(-self._pool_size // 2)  # majority must survive
+            if not pool or non_oos < min_usable:
+                reason = (
+                    "no usable pool member after filtering"
+                    if not pool
+                    else f"{self._pool_size - non_oos} of {self._pool_size} "
+                         "pool members were out of bounds"
                 )
-                self._fail("no usable pool member after filtering")
+                self._pending_messages.append(
+                    f"correction: {reason}. Generate a fresh pool of exactly "
+                    f"{self._pool_size} configs inside the declared bounds "
+                    "and distinct from executed history."
+                )
+                self._fail(reason)
                 continue
+            dropped = self._pool_size - len(pool)
+            if dropped:
+                self._pending_messages.append(
+                    f"note: {dropped} of {self._pool_size} pool members were "
+                    "dropped (out-of-bounds or executed duplicates); keep "
+                    "every member inside the declared bounds and distinct "
+                    "from executed history."
+                )
             self._consecutive_failures = 0
             return {
                 "pool": pool,
                 "pool_ranked": ranked,
-                "pool_duplicate_mask": duplicate_mask,
+                "pool_duplicate_mask": dropped_mask,
+                "pool_out_of_space_mask": out_of_space_mask,
                 "order": list(receipt["order"]),
                 "rationale": receipt.get("rationale"),
                 "attempts": attempts,
@@ -313,7 +360,6 @@ class PoolDriver:
         if not isinstance(configs, list) or len(configs) != self._pool_size:
             return [f"configs must be a list of exactly {self._pool_size} dicts"]
         problems: list[str] = []
-        soft_invalid: list[str] = []
         names = [dim.name for dim in self._contract.dimensions]
         identities: set[str] = set()
         for index, config in enumerate(configs):
@@ -335,9 +381,8 @@ class PoolDriver:
                 cast, self._contract.search_space
             )
             if violations:
-                # A pool is a proposal batch: retain valid members and let the
-                # proposer repair the soft-invalid members on the next call.
-                soft_invalid.append(f"configs[{index}] is out of space: {violations}")
+                # Soft-invalid: the member is dropped downstream before
+                # ranking instead of rejecting the whole receipt.
                 continue
             identity = self._contract.params_identity(cast)
             if identity in identities:
@@ -381,6 +426,7 @@ class PoolDriver:
         return {
             **self._session.totals(),
             "internal_duplicate_count": self.internal_duplicate_count,
+            "internal_out_of_space_count": self.internal_out_of_space_count,
         }
 
 
@@ -388,14 +434,16 @@ def pool_persistence_state(result: dict) -> dict:
     """arm_state keys persisting the complete pool (PLAN §6.4): the pre-
     filter pool in proposer rank order, the proposer's raw permutation over
     its declaration order (``pool_configs[k] == raw_configs[pool_order[k]]``),
-    and which ranked members were dropped as executed-history duplicates.
-    Rank scores (``pool_eis`` etc.) index into the filtered pool — i.e.
-    ``pool_configs`` with the masked members dropped, in order.
+    the drop mask (executed-history duplicate OR out-of-space), and the
+    out-of-space reason split. Rank scores (``pool_eis`` etc.) index
+    into the filtered pool — i.e. ``pool_configs`` with the masked members
+    dropped, in order.
     """
     return {
         "pool_configs": result["pool_ranked"],
         "pool_order": result["order"],
         "pool_duplicate_mask": result["pool_duplicate_mask"],
+        "pool_out_of_space_mask": result["pool_out_of_space_mask"],
     }
 
 
