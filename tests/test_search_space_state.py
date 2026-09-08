@@ -305,26 +305,6 @@ class EffectiveSelectionTests(unittest.TestCase):
             "active",
         )
 
-    def test_excluded_guidance_beats_runtime_pruned(self) -> None:
-        registry = fixture_registry()
-        registry["guidance"].append(
-            {"id": "g-90", "effect": "exclude", "scope": _scope("filtering")}
-        )
-        guidance = derive_hypothesis_selection(registry)
-        self.assertEqual(
-            guidance["hyp-data-filtered"]["selection_status"], "excluded"
-        )
-        runtime = {
-            "dimensions": {},
-            "hypotheses": {"hyp-data-filtered": "pruned"},
-        }
-        entry = compose_effective_selection(registry, guidance, runtime)[
-            "hyp-data-filtered"
-        ]
-        self.assertEqual(entry["effective_status"], "excluded")
-        self.assertEqual(entry["hypothesis_runtime_status"], "pruned")
-        self.assertEqual(entry["guidance_status"], "excluded")
-
     def test_runtime_pruned_beats_any_deprioritized(self) -> None:
         registry = fixture_registry()
         registry["guidance"].append(
@@ -388,7 +368,7 @@ class EffectiveSelectionTests(unittest.TestCase):
 
 
 class PointEligibilityTests(unittest.TestCase):
-    """Only exclusion and pruning bar selection; deprioritizing just rebudgets."""
+    """Only runtime pruning bars selection; deprioritizing just rebudgets."""
 
     @staticmethod
     def _effective(registry: dict, runtime: dict | None = None) -> dict:
@@ -422,31 +402,18 @@ class PointEligibilityTests(unittest.TestCase):
                     validate_point_eligibility(point, registry, effective), []
                 )
 
-    def test_excluded_and_pruned_points_are_ineligible(self) -> None:
-        excluded_registry = fixture_registry()
-        excluded_registry["guidance"].append(
-            {"id": "g-90", "effect": "exclude", "scope": _scope("filtering")}
+    def test_pruned_points_are_ineligible(self) -> None:
+        registry = fixture_registry()
+        runtime = {"dimensions": {}, "hypotheses": {"hyp-data-filtered": "pruned"}}
+        effective = self._effective(registry, runtime)
+        point = complete_point(
+            registry, {"dim-data-curation": "hyp-data-filtered"}
         )
-        pruned_registry = fixture_registry()
-
-        for needle, registry, runtime in (
-            ("excluded", excluded_registry, None),
-            (
-                "pruned",
-                pruned_registry,
-                {"dimensions": {}, "hypotheses": {"hyp-data-filtered": "pruned"}},
-            ),
-        ):
-            with self.subTest(needle=needle):
-                effective = self._effective(registry, runtime)
-                point = complete_point(
-                    registry, {"dim-data-curation": "hyp-data-filtered"}
-                )
-                # Ineligible for new selection, yet still a structurally valid
-                # point, so historical observations at it stay readable.
-                self.assertEqual(validate_point(point, registry), [])
-                errors = validate_point_eligibility(point, registry, effective)
-                self.assertTrue(any(needle in error for error in errors), errors)
+        # Ineligible for new selection, yet still a structurally valid
+        # point, so historical observations at it stay readable.
+        self.assertEqual(validate_point(point, registry), [])
+        errors = validate_point_eligibility(point, registry, effective)
+        self.assertTrue(any("pruned" in error for error in errors), errors)
 
 
 class ExperienceTransitionTests(unittest.TestCase):
@@ -857,14 +824,6 @@ class ExperienceTransitionTests(unittest.TestCase):
         # A crash alone cannot contradict or prune a semantic element, even
         # when the belief prose asks for a transition.
         self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
-
-    def test_excluded_target_makes_no_transition(self) -> None:
-        self.registry["guidance"].append(
-            {"id": "g-90", "effect": "exclude", "scope": _scope("filtering")}
-        )
-        self.ledger["experience"] = self.experience(generation=1)
-        self.assertEqual(append_experience_transitions(self.registry, self.ledger), [])
-        self.assertEqual(self.ledger["search_space_state"]["revision"], 0)
 
     def test_reopening_appends_pruned_to_active(self) -> None:
         self.ledger["experience"] = self.experience(generation=1)

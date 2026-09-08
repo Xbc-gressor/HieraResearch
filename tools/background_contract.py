@@ -25,8 +25,10 @@ from typing import Any
 
 from search_backends import (
     canonical_key,
-    is_substantive_grounding_visit,
+    merged_results,
+    unexplored_leads,
     validate_manifest,
+    verification_statuses,
 )
 from search_space_state import (
     compose_effective_selection,
@@ -131,7 +133,7 @@ SCOPE_FACETS = (
     "evaluation_protocols",
 )
 GUIDANCE_SECTIONS = {"pitfall", "deprioritize"}
-GUIDANCE_EFFECTS = {"caution", "deprioritize", "exclude"}
+GUIDANCE_EFFECTS = {"caution", "deprioritize"}
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 BASELINE_INVENTORY_SCHEMA_VERSION = 1
 BASELINE_INVENTORY_KIND = "baseline_mechanism_inventory"
@@ -301,7 +303,9 @@ def _evidence_link_errors(
 
 
 def _validate_sources(
-    registry: dict[str, Any], retrieval_manifest: dict[str, Any] | None
+    registry: dict[str, Any],
+    retrieval_manifest: dict[str, Any] | None,
+    manifest_dir: Path | None = None,
 ) -> tuple[list[str], dict[str, dict[str, Any]]]:
     errors: list[str] = []
     sources = registry.get("sources")
@@ -360,88 +364,28 @@ def _validate_sources(
             errors.append(f"{where} has unknown fields {unknown}")
 
     if retrieval_manifest is not None:
-        errors.extend(validate_manifest(retrieval_manifest))
-        if retrieval_manifest.get("retrieval_condition") == "mixed":
-            errors.append("background evidence cannot mix frozen and live retrieval in one condition")
-        substantively_visited_grounding = {
-            visit.get("canonical_key")
-            for visit in retrieval_manifest.get("visits", [])
-            if is_substantive_grounding_visit(visit)
+        errors.extend(validate_manifest(retrieval_manifest, manifest_dir))
+        # Receipt hard gate: every cited URL needs a tool-recorded receipt —
+        # a search hit (snippet receipt) or a successful visit.  The tier of
+        # that receipt is reported by source_verification, never gated here.
+        receipt_keys = {
+            result["canonical_key"] for result in merged_results(retrieval_manifest)
         }
+        receipt_keys.update(
+            visit["canonical_key"]
+            for visit in retrieval_manifest.get("visits", [])
+            if isinstance(visit, dict)
+            and visit.get("status") == "success"
+            and _nonempty(visit.get("canonical_key"))
+        )
         for source_id, url in source_urls.items():
-            if canonical_key(url) not in substantively_visited_grounding:
+            if canonical_key(url) not in receipt_keys:
                 errors.append(
-                    f"source {source_id} has no substantive grounding-lane visit "
-                    "(section, preview, full_text, or page); head/brief metadata is triage only"
+                    f"source {source_id} has no retrieval receipt for {url}; "
+                    "the retrieval manifest must record a search hit or a "
+                    "successful visit"
                 )
     return errors, source_by_id
-
-
-def _validate_query_dimension_coverage(
-    registry: dict[str, Any], retrieval_manifest: dict[str, Any] | None
-) -> list[str]:
-    if retrieval_manifest is None:
-        return []
-    dimensions = registry.get("dimensions")
-    if not isinstance(dimensions, list):
-        return []
-    dimension_by_id = {
-        dimension.get("id"): dimension
-        for dimension in dimensions
-        if isinstance(dimension, dict) and isinstance(dimension.get("id"), str)
-    }
-    known_dimension_ids = set(dimension_by_id)
-    grounding_coverage: set[str] = set()
-    errors: list[str] = []
-
-    queries = retrieval_manifest.get("queries")
-    if isinstance(queries, list):
-        for index, query in enumerate(queries):
-            if not isinstance(query, dict):
-                continue
-            targets = query.get("target_dimension_ids")
-            if not isinstance(targets, list):
-                continue
-            valid_targets = {item for item in targets if isinstance(item, str)}
-            unknown = sorted(valid_targets - known_dimension_ids)
-            if unknown:
-                errors.append(
-                    f"retrieval query {query.get('id', index)!r} targets unknown registry "
-                    f"dimensions {unknown}"
-                )
-            if query.get("lane") == "grounding":
-                grounding_coverage.update(valid_targets & known_dimension_ids)
-
-    exempted: set[str] = set()
-    exemptions = retrieval_manifest.get("coverage_exemptions")
-    if isinstance(exemptions, list):
-        for index, exemption in enumerate(exemptions):
-            if not isinstance(exemption, dict):
-                continue
-            dimension_id = exemption.get("dimension_id")
-            if not isinstance(dimension_id, str):
-                continue
-            if dimension_id not in known_dimension_ids:
-                errors.append(
-                    f"retrieval coverage exemption {index} names unknown registry dimension "
-                    f"{dimension_id!r}"
-                )
-            else:
-                exempted.add(dimension_id)
-
-    uncovered = sorted(
-        dimension_id
-        for dimension_id, dimension in dimension_by_id.items()
-        if dimension.get("mode") == "searchable"
-        and dimension_id not in grounding_coverage
-        and dimension_id not in exempted
-    )
-    if uncovered:
-        errors.append(
-            "searchable registry dimensions lack a grounding query or coverage exemption: "
-            f"{uncovered}"
-        )
-    return errors
 
 
 def _credibility_errors(
@@ -786,7 +730,7 @@ def _validate_guidance(
             )
             == "direct"
         }
-        if effect in {"deprioritize", "exclude"}:
+        if effect == "deprioritize":
             if credibility in {"unverified", "contested"}:
                 errors.append(
                     f"{where} {credibility} negative guidance may only caution"
@@ -816,18 +760,6 @@ def _validate_guidance(
                 errors.append(
                     f"{where} binding guidance requires an out-of-scope scope_probe hypothesis"
                 )
-        if effect == "exclude":
-            if credibility not in {"corroborated", "replicated"}:
-                errors.append(f"{where} exclusion requires corroborated or replicated evidence")
-            if len(direct_support_ids) < 2:
-                errors.append(f"{where} exclusion requires two directly scoped supporting sources")
-            reproduced = any(
-                source_by_id.get(source_id, {}).get("validation_status")
-                == "independently_reproduced"
-                for source_id in direct_support_ids
-            )
-            if not reproduced:
-                errors.append(f"{where} exclusion requires directly scoped independent reproduction")
         unknown = sorted(
             set(item)
             - {
@@ -859,35 +791,14 @@ def derive_hypothesis_selection(registry: dict[str, Any]) -> dict[str, dict[str,
                 continue
             receipt = {"id": item.get("id"), "effect": item.get("effect")}
             matched.append(receipt)
-            if item.get("effect") in {"deprioritize", "exclude"}:
+            if item.get("effect") == "deprioritize":
                 binding.append(receipt)
-        status = "active"
-        if any(item["effect"] == "exclude" for item in binding):
-            status = "excluded"
-        elif any(item["effect"] == "deprioritize" for item in binding):
-            status = "deprioritized"
         result[hypothesis_id] = {
-            "selection_status": status,
+            "selection_status": "deprioritized" if binding else "active",
             "matched_guidance": matched,
             "binding_guidance": binding,
         }
     return result
-
-
-def validate_candidate_point(point: Any, registry: dict[str, Any]) -> list[str]:
-    """Validate one structural point plus guidance-derived eligibility."""
-    errors = validate_point(point, registry)
-    if errors or not isinstance(point, dict):
-        return errors
-    selection = derive_hypothesis_selection(registry)
-    excluded = sorted(
-        hypothesis_id
-        for hypothesis_id in selected_assignments(point).values()
-        if selection.get(hypothesis_id, {}).get("selection_status") == "excluded"
-    )
-    if excluded:
-        errors.append(f"semantic_point selects guidance-excluded hypotheses {excluded}")
-    return errors
 
 
 def _validate_policy_receipt_v8(record: dict[str, Any], where: str) -> list[str]:
@@ -1882,7 +1793,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
             errors.append(
                 f"{where} {op} requires {expected_parent_count} distinct numeric parents"
             )
-        point_errors = validate_candidate_point(record.get("semantic_point"), registry)
+        point_errors = validate_point(record.get("semantic_point"), registry)
         errors.extend(f"{where}: {error}" for error in point_errors)
         errors.extend(_validate_policy_receipt(record, where))
         # Replay the overlay at the record's historical selection revision, so
@@ -2072,6 +1983,7 @@ def validate_registry(
     *,
     ledger: dict[str, Any] | None = None,
     retrieval_manifest: dict[str, Any] | None = None,
+    manifest_dir: Path | None = None,
     catalog: dict[str, Any] | None = None,
     dimension_strategy: str = DEFAULT_DIMENSION_STRATEGY,
     baseline_mechanisms: dict[str, Any] | None = None,
@@ -2079,9 +1991,10 @@ def validate_registry(
     errors = validate_space_core(
         registry, catalog=catalog, dimension_strategy=dimension_strategy
     )
-    source_errors, source_by_id = _validate_sources(registry, retrieval_manifest)
+    source_errors, source_by_id = _validate_sources(
+        registry, retrieval_manifest, manifest_dir=manifest_dir
+    )
     errors.extend(source_errors)
-    errors.extend(_validate_query_dimension_coverage(registry, retrieval_manifest))
     errors.extend(_validate_hypotheses(registry, source_by_id))
     errors.extend(
         _validate_baseline_mechanism_disjointness(registry, baseline_mechanisms)
@@ -2108,6 +2021,33 @@ def validate_registry(
     if ledger is not None:
         errors.extend(validate_ledger(registry, ledger))
     return errors
+
+
+def source_verification(
+    registry: dict[str, Any], retrieval_manifest: dict[str, Any] | None
+) -> dict[str, str]:
+    """Join registry sources to manifest-derived verification tiers.
+
+    Each source id maps to the tier of its tool-recorded receipt
+    (``snippet_only``/``preview``/``section``/``full_text``), joined by
+    ``canonical_key(url)``.  A source with no receipt is absent — with a
+    manifest supplied, ``validate_registry`` rejects it.
+    """
+    if retrieval_manifest is None:
+        return {}
+    tiers = verification_statuses(retrieval_manifest)
+    result: dict[str, str] = {}
+    for source in registry.get("sources", []):
+        if not isinstance(source, dict):
+            continue
+        source_id = source.get("id")
+        url = source.get("url")
+        if not isinstance(source_id, str) or not _nonempty(url):
+            continue
+        tier = tiers.get(canonical_key(url))
+        if tier is not None:
+            result[source_id] = tier
+    return result
 
 
 def validate_background_markdown(path: Path, registry: dict[str, Any]) -> list[str]:
@@ -2251,7 +2191,11 @@ def validate_background_markdown(path: Path, registry: dict[str, Any]) -> list[s
 
 
 def render_space(
-    registry: dict[str, Any], ledger: dict[str, Any] | None, *, max_hypotheses: int
+    registry: dict[str, Any],
+    ledger: dict[str, Any] | None,
+    *,
+    max_hypotheses: int,
+    retrieval_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     coverage = coverage_from_records(registry, (ledger or {}).get("records", []))
     counts = {
@@ -2295,7 +2239,7 @@ def render_space(
             )
         hypotheses.sort(
             key=lambda item: (
-                {"active": 0, "deprioritized": 1, "pruned": 2, "excluded": 3}.get(
+                {"active": 0, "deprioritized": 1, "pruned": 2}.get(
                     (item.get("selection") or {}).get("effective_status"), 4
                 ),
                 item["coverage_count"],
@@ -2313,7 +2257,7 @@ def render_space(
                 "omitted_hypotheses": max(0, len(hypotheses) - max_hypotheses),
             }
         )
-    return {
+    view = {
         "ok": True,
         "space": space_receipt(registry),
         "search_space_state_revision": state_revision,
@@ -2332,6 +2276,21 @@ def render_space(
             if isinstance(relation, dict)
         ],
     }
+    if retrieval_manifest is not None:
+        leads = []
+        for entry in unexplored_leads(retrieval_manifest)[:10]:
+            title = str(entry.get("title") or "")
+            tldr = entry.get("tldr")
+            leads.append(
+                {
+                    "title": title[:120],
+                    "url": entry.get("url"),
+                    "best_rank": entry.get("best_rank"),
+                    "tldr": str(tldr)[:200] if tldr else None,
+                }
+            )
+        view["unexplored_leads"] = leads
+    return view
 
 
 TARGET_EVIDENCE_REQUIRED = {
@@ -2860,6 +2819,11 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         if getattr(args, "retrieval_manifest", None)
         else None
     )
+    manifest_dir = (
+        args.retrieval_manifest.parent
+        if getattr(args, "retrieval_manifest", None)
+        else None
+    )
     baseline_mechanisms = (
         _load_json(args.baseline_mechanisms)
         if getattr(args, "baseline_mechanisms", None)
@@ -2869,6 +2833,7 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         registry,
         ledger=ledger,
         retrieval_manifest=manifest,
+        manifest_dir=manifest_dir,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
         baseline_mechanisms=baseline_mechanisms,
@@ -2916,9 +2881,17 @@ def cmd_render(args: argparse.Namespace) -> int:
     # registry and the current helper-owned ledger state.
     registry = load_registry(args.background)
     ledger = _load_json(args.ledger) if args.ledger else None
+    manifest = (
+        _load_json(args.retrieval_manifest) if args.retrieval_manifest else None
+    )
     print(
         json.dumps(
-            render_space(registry, ledger, max_hypotheses=args.max_hypotheses),
+            render_space(
+                registry,
+                ledger,
+                max_hypotheses=args.max_hypotheses,
+                retrieval_manifest=manifest,
+            ),
             separators=(",", ":"),
         )
     )
@@ -2929,7 +2902,7 @@ def cmd_validate_point(args: argparse.Namespace) -> int:
     registry, _, errors = _validated_inputs(args)
     point = _load_json(args.point)
     if not errors:
-        errors.extend(validate_candidate_point(point, registry))
+        errors.extend(validate_point(point, registry))
     print(
         json.dumps(
             {
@@ -3022,6 +2995,11 @@ def build_parser() -> argparse.ArgumentParser:
     render = sub.add_parser("render", help="bounded dimension/hypothesis/coverage view")
     render.add_argument("--background", type=Path, required=True)
     render.add_argument("--ledger", type=Path)
+    render.add_argument(
+        "--retrieval-manifest",
+        type=Path,
+        help="retrieval manifest; adds a bounded unexplored_leads section",
+    )
     render.add_argument("--max-hypotheses", type=int, default=6)
     render.set_defaults(func=cmd_render)
 

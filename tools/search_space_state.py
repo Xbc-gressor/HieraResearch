@@ -20,8 +20,8 @@ validated experience snapshot into the next decision receipts, and
 :func:`append_experience_transitions` appends them, advancing only
 ``search_space_state.revision`` (never ``dag_revision``).  Recommendation
 gates recompute comparator coverage and evaluation state from the cited
-receipts rather than trusting belief prose; baseline and externally excluded
-targets never receive a runtime transition.
+receipts rather than trusting belief prose; baseline targets never receive a
+runtime transition.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ LEGAL_TRANSITIONS = {
 DECISION_ID_RE = re.compile(r"^sdec-[0-9]{6}$")
 
 TARGET_KINDS = {"dimension", "hypothesis"}
-GUIDANCE_STATUSES = {"active", "deprioritized", "excluded"}
+GUIDANCE_STATUSES = {"active", "deprioritized"}
 
 STATE_FIELDS = {"schema_version", "revision", "decisions"}
 DECISION_FIELDS = {
@@ -403,11 +403,10 @@ def compose_effective_selection(
     """Compose external guidance and runtime state per hypothesis.
 
     Returns every component status rather than a single lossy label; the
-    effective precedence is ``guidance excluded > runtime hypothesis/dimension
-    pruned > guidance or runtime hypothesis/dimension deprioritized > active``.
-    A dimension's runtime status pins its non-baseline hypotheses; the
-    explicit baseline stays eligible so a pruned dimension remains selectable
-    at its baseline.  ``excluded`` and ``pruned`` stay distinguishable.
+    effective precedence is ``runtime hypothesis/dimension pruned > guidance
+    or runtime hypothesis/dimension deprioritized > active``.  A dimension's
+    runtime status pins its non-baseline hypotheses; the explicit baseline
+    stays eligible so a pruned dimension remains selectable at its baseline.
     """
     dimensions = dimension_map(registry)
     runtime_dimensions = runtime.get("dimensions", {}) if isinstance(runtime, dict) else {}
@@ -426,9 +425,7 @@ def compose_effective_selection(
             hypothesis_runtime = "active"
         is_baseline = dimensions[dimension_id].get("baseline_hypothesis_id") == hypothesis_id
         binding_dimension = "active" if is_baseline else dimension_runtime
-        if guidance_status == "excluded":
-            effective = "excluded"
-        elif hypothesis_runtime == "pruned" or binding_dimension == "pruned":
+        if hypothesis_runtime == "pruned" or binding_dimension == "pruned":
             effective = "pruned"
         elif "deprioritized" in (guidance_status, hypothesis_runtime, binding_dimension):
             effective = "deprioritized"
@@ -450,14 +447,13 @@ def validate_point_eligibility(
 ) -> list[str]:
     """Check selection-time policy eligibility of one candidate point.
 
-    Only policy gates live here: guidance-excluded hypotheses and runtime-pruned
-    hypotheses (directly or via a pruned dimension; a pruned dimension's
-    non-baseline hypotheses already carry ``pruned`` effective status, so
-    pinning it to its explicit baseline needs no separate check).  Runtime-
-    deprioritized dimensions and hypotheses stay eligible but enter the
-    selection helper's limited admission-budget lane.  Structural validity stays with
-    :func:`semantic_space.validate_point`, so historical points remain valid
-    after later pruning.
+    Only policy gates live here: runtime-pruned hypotheses (directly or via a
+    pruned dimension; a pruned dimension's non-baseline hypotheses already
+    carry ``pruned`` effective status, so pinning it to its explicit baseline
+    needs no separate check).  Runtime-deprioritized dimensions and hypotheses
+    stay eligible but enter the selection helper's limited admission-budget
+    lane.  Structural validity stays with :func:`semantic_space.validate_point`,
+    so historical points remain valid after later pruning.
     """
     errors: list[str] = []
     if not isinstance(point, dict):
@@ -466,12 +462,7 @@ def validate_point_eligibility(
         entry = effective.get(hypothesis_id) if isinstance(effective, dict) else None
         if not isinstance(entry, dict):
             continue  # unknown hypotheses are a structural concern, not eligibility
-        status = entry.get("effective_status")
-        if status == "excluded":
-            errors.append(
-                f"semantic_point selects guidance-excluded hypothesis {hypothesis_id}"
-            )
-        elif status == "pruned":
+        if entry.get("effective_status") == "pruned":
             errors.append(
                 f"semantic_point selects runtime-pruned hypothesis {hypothesis_id}; "
                 "pruning bars new proposals but never erases the id"
@@ -718,16 +709,15 @@ def _dimension_contraction_ready(
     dimension: dict[str, Any],
     generation: int,
     runtime: dict[str, Any],
-    guidance: dict[str, Any],
     beliefs: dict[tuple[str, str], dict[str, Any]],
     to_status: str,
 ) -> bool:
     """Scoped guard: dimension contraction never suppresses adjacent mechanisms.
 
-    Every non-baseline hypothesis must be externally excluded, already
-    at least as contracted as the requested dimension status, or covered by
-    its own same-generation belief that independently satisfies the matching
-    comparator-covered recommendation gate.
+    Every non-baseline hypothesis must already be at least as contracted as
+    the requested dimension status, or be covered by its own same-generation
+    belief that independently satisfies the matching comparator-covered
+    recommendation gate.
     """
     acceptable = (
         {"deprioritized", "pruned"}
@@ -740,9 +730,6 @@ def _dimension_contraction_ready(
         if hypothesis.get("kind") == "baseline":
             continue
         hypothesis_id = hypothesis.get("id")
-        entry = guidance.get(hypothesis_id) if isinstance(guidance, dict) else None
-        if isinstance(entry, dict) and entry.get("selection_status") == "excluded":
-            continue
         if runtime["hypotheses"].get(hypothesis_id) in acceptable:
             continue
         belief = beliefs.get(("hypothesis", hypothesis_id))
@@ -802,8 +789,8 @@ def derive_experience_transitions(
 
     Pure: returns the receipts that would be appended without mutating the
     ledger.  Decisions follow registry dimension order, a dimension before
-    its hypotheses; baseline hypotheses, ``baseline_only`` dimensions, and
-    externally excluded hypotheses never receive a runtime transition.
+    its hypotheses; baseline hypotheses and ``baseline_only`` dimensions
+    never receive a runtime transition.
     """
     experience = ledger.get("experience") if isinstance(ledger, dict) else None
     if not isinstance(experience, dict):
@@ -826,10 +813,6 @@ def derive_experience_transitions(
     beliefs = _normalized_beliefs(ledger, experience, generation, dag_revision)
     if not beliefs:
         return []
-    # Lazy import: background_contract already imports this module.
-    from background_contract import derive_hypothesis_selection
-
-    guidance = derive_hypothesis_selection(registry)
     last_decisions: dict[tuple[Any, Any], dict[str, Any]] = {}
     for decision in decisions:
         target = decision.get("target")
@@ -850,7 +833,6 @@ def derive_experience_transitions(
                 dimension,
                 generation,
                 runtime,
-                guidance,
                 beliefs,
                 to_status,
             ):
@@ -879,9 +861,6 @@ def derive_experience_transitions(
                 continue
             if hypothesis.get("kind") == "baseline":
                 continue  # the frozen space keeps an unconditional valid baseline
-            entry = guidance.get(hypothesis_id)
-            if isinstance(entry, dict) and entry.get("selection_status") == "excluded":
-                continue  # runtime decisions never override external exclusion
             current = runtime["hypotheses"].get(hypothesis_id, "active")
             last = last_decisions.get(("hypothesis", hypothesis_id))
             to_status = _recommended_transition(current, belief, last)

@@ -306,8 +306,8 @@ def _eligible_hypotheses(
 
     A missing bootstrap ledger or an absent top-level state replays as
     :func:`empty_search_space_state` (the first proposal); a persisted P2
-    ledger is validated upstream to carry the overlay object.  ``excluded``
-    and ``pruned`` content is dropped, ``deprioritized`` content stays
+    ledger is validated upstream to carry the overlay object.  ``pruned``
+    content is dropped, ``deprioritized`` content stays
     eligible, and a protected baseline always remains: under a validated
     registry and state the explicit baseline's effective status is ``active``,
     so a runtime-pruned dimension exposes only its baseline.
@@ -337,7 +337,7 @@ def _eligible_hypotheses(
             for hypothesis in dimension.get("hypotheses", [])
             if isinstance(hypothesis, dict)
             and effective.get(hypothesis.get("id"), {}).get("effective_status")
-            not in {"excluded", "pruned"}
+            != "pruned"
         ]
         result[dimension["id"]] = [str(item) for item in choices]
     return result, effective, state_revision

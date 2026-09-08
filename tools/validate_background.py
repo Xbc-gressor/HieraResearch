@@ -8,7 +8,9 @@ Keep this validator small. It covers only what the pytest suite cannot:
 * benchmark-shape neutrality — the MLE-bench-shaped and PostTrainBench-shaped
   ownership maps must drive the shared helpers identically, so any
   estimator-specific branch shows up as a divergent signature;
-* retrieval provenance gating, where head/brief metadata is triage only;
+* retrieval receipt gating — a cited source needs a tool-recorded receipt (a
+  search hit suffices), and head/brief triage never raises the derived
+  verification tier while a substantive visit does;
 * one real-subprocess run of the round lifecycle (admit, score, refresh
   belief, apply state, re-propose), using an explicit fixture-only capability
   to exercise the dormant downstream paired-comparator contract without
@@ -22,7 +24,6 @@ Run: ``python3 tools/validate_background.py`` (exit code 0 means all passed).
 
 from __future__ import annotations
 
-import copy
 import json
 import subprocess
 import sys
@@ -37,6 +38,7 @@ from background_contract import (  # noqa: E402
     EXPERIENCE_SCHEMA_VERSION,
     derive_hypothesis_selection,
     load_registry,
+    source_verification,
     validate_background_markdown,
     validate_registry,
 )
@@ -69,6 +71,7 @@ from tests.fixtures import (  # noqa: E402
     background_text,
     fixture_registry,
     policy_receipt,
+    retrieval_hit_manifest,
     shape_registry,
 )
 
@@ -151,40 +154,55 @@ def check_shape_neutrality() -> None:
 
 
 def check_retrieval_provenance(registry: dict) -> None:
-    """Every literature source needs an inspected primary-source visit."""
-    manifest = new_manifest()
-    manifest["coverage_exemptions"] = [
-        {
-            "dimension_id": dimension["id"],
-            "rationale": "Synthetic contract fixture does not run literature search.",
-        }
-        for dimension in registry["dimensions"]
-        if dimension["mode"] == "searchable"
-    ]
+    """The receipt gate and the verification tier it derives.
 
-    head_only = copy.deepcopy(manifest)
-    add_visit(
-        head_only,
-        url=registry["sources"][0]["url"],
-        lane="grounding",
-        backend="deepxiv",
-        view="head",
-        status="success",
-        content='{"abstract":"metadata only","sections":{"Method":{"token_count":100}}}',
-    )
-    errors = validate_registry(registry, retrieval_manifest=head_only)
-    assert any("head/brief metadata is triage only" in error for error in errors), errors
+    A cited source with no tool-recorded receipt is refused; a search hit
+    alone satisfies the gate (a snippet receipt).  Head/brief visits stay
+    triage — they never raise the tier — while a substantive section visit
+    does.
+    """
+    source = registry["sources"][0]
+    url = source["url"]
 
-    add_visit(
-        manifest,
-        url=registry["sources"][0]["url"],
-        lane="grounding",
-        backend="fixture",
-        view="full_text",
-        status="success",
-        content="inspected primary source" * 30,
-    )
-    assert validate_registry(registry, retrieval_manifest=manifest) == []
+    errors = validate_registry(registry, retrieval_manifest=new_manifest())
+    assert any("no retrieval receipt" in error for error in errors), errors
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        manifest = retrieval_hit_manifest(source)
+        assert validate_registry(
+            registry, retrieval_manifest=manifest, manifest_dir=tmp_path
+        ) == []
+        tiers = source_verification(registry, manifest)
+        assert tiers[source["id"]] == "snippet_only", tiers
+
+        add_visit(
+            manifest,
+            tmp_path,
+            url=url,
+            backend="deepxiv",
+            view="head",
+            status="success",
+            content='{"abstract":"metadata only","sections":{"Method":{"token_count":100}}}',
+        )
+        tiers = source_verification(registry, manifest)
+        assert tiers[source["id"]] == "snippet_only", tiers
+
+        add_visit(
+            manifest,
+            tmp_path,
+            url=url,
+            backend="deepxiv",
+            view="section",
+            section="Method",
+            status="success",
+            content="inspected primary source" * 30,
+        )
+        tiers = source_verification(registry, manifest)
+        assert tiers[source["id"]] == "section", tiers
+        assert validate_registry(
+            registry, retrieval_manifest=manifest, manifest_dir=tmp_path
+        ) == []
 
 
 class Run:

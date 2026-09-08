@@ -17,6 +17,12 @@ from background_contract import (  # noqa: E402
     validate_experience_replacement,
     validate_registry,
 )
+from search_backends import (  # noqa: E402
+    add_visit,
+    canonical_key,
+    new_manifest,
+    verification_statuses,
+)
 from semantic_evidence import build_semantic_edges  # noqa: E402
 from semantic_search import (  # noqa: E402
     build_proposal_set,
@@ -29,12 +35,15 @@ from semantic_space import (  # noqa: E402
     load_catalog,
     resolve_dimension_catalog,
     resolve_dimension_strategy,
+    selected_assignments,
     validate_catalog,
 )
 from tests.fixtures import (  # noqa: E402
+    TOY_SOURCE,
     attach_matched_transfer,
     belief_ledger,
     fixture_registry,
+    retrieval_hit_manifest,
 )
 
 
@@ -424,32 +433,25 @@ class GuidanceGateTests(unittest.TestCase):
                 errors = validate_registry(registry)
                 self.assertTrue(any(needle in error for error in errors), errors)
 
-    def test_exclusion_requires_independently_reproduced_evidence(self) -> None:
-        """Excluding a mechanism outright is the strongest claim available."""
-        corroborated = _binding_registry()
-        corroborated["guidance"][0].update(
-            {"effect": "exclude", "literature_credibility": "corroborated"}
-        )
-        two_sources = copy.deepcopy(corroborated)
-        second = copy.deepcopy(two_sources["sources"][0])
-        second.update({"id": "src-02", "url": "https://example.test/second-study"})
-        two_sources["sources"].append(second)
-        two_sources["guidance"][0]["evidence"] = [
-            {"source_id": "src-01", "role": "supports"},
-            {"source_id": "src-02", "role": "supports"},
-        ]
-        preliminary = _binding_registry()
-        preliminary["guidance"][0]["effect"] = "exclude"
+    def test_exclude_is_rejected_and_deprioritize_stays_eligible(self) -> None:
+        """Background guidance cannot delete space; it only reweights it."""
+        registry = _binding_registry()
+        registry["guidance"][0]["effect"] = "exclude"
+        errors = validate_registry(registry)
+        self.assertTrue(any("effect must be one of" in error for error in errors), errors)
 
-        cases = [
-            ("requires corroborated or replicated", preliminary),
-            ("requires two directly scoped", corroborated),
-            ("independent reproduction", two_sources),
-        ]
-        for needle, registry in cases:
-            with self.subTest(needle=needle):
-                errors = validate_registry(registry)
-                self.assertTrue(any(needle in error for error in errors), errors)
+        registry = _binding_registry()
+        self.assertEqual(validate_registry(registry), [])
+        proposals = build_proposal_set(
+            registry, {"records": []}, op="fresh", parents=[], max_points=16
+        )
+        self.assertTrue(
+            any(
+                selected_assignments(item["point"]).get("dim-data-curation")
+                == "hyp-data-filtered"
+                for item in proposals["proposals"]
+            )
+        )
 
     def test_credibility_claims_must_be_backed_by_sources(self) -> None:
         duplicate = fixture_registry()
@@ -467,6 +469,39 @@ class GuidanceGateTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 errors = validate_registry(registry)
                 self.assertTrue(any(needle in error for error in errors), errors)
+
+
+class RetrievalReceiptTests(unittest.TestCase):
+    """The receipt gate and the verification tiers derived from it."""
+
+    def test_source_without_a_receipt_is_rejected(self) -> None:
+        registry = fixture_registry()
+        errors = validate_registry(registry, retrieval_manifest=new_manifest())
+        self.assertTrue(
+            any("no retrieval receipt" in error for error in errors), errors
+        )
+
+    def test_search_hit_alone_satisfies_the_gate(self) -> None:
+        registry = fixture_registry()
+        manifest = retrieval_hit_manifest()
+        self.assertEqual(validate_registry(registry, retrieval_manifest=manifest), [])
+
+    def test_verification_status_upgrades_with_substantive_visits(self) -> None:
+        key = canonical_key(TOY_SOURCE["url"])
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = retrieval_hit_manifest()
+            self.assertEqual(verification_statuses(manifest)[key], "snippet_only")
+            add_visit(
+                manifest,
+                Path(tmp),
+                url=TOY_SOURCE["url"],
+                backend="deepxiv",
+                view="section",
+                section="Method",
+                status="success",
+                content="inspected primary source" * 30,
+            )
+            self.assertEqual(verification_statuses(manifest)[key], "section")
 
 
 def _base_experience() -> dict:
