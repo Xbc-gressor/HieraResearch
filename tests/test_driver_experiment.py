@@ -134,6 +134,32 @@ def writer_effect(ctx):
     target.write_text("# implemented\n")
 
 
+def write_background(run_dir: Path) -> None:
+    """Minimal background artifacts the in-process faithfulness gate accepts.
+
+    The gate must be able to load the registry; an evidence-free registry
+    yields an empty audit sample ("no_mappings"), so no judge invocation
+    enters the scripted session sequence.
+    """
+    registry = {
+        "schema_version": 3,
+        "kind": "semantic_search_space",
+        "space_id": "fake-loop-space",
+        "dimensions": [],
+        "relations": [],
+        "guidance": [],
+        "sources": [],
+    }
+    (run_dir / "background.md").write_text(
+        "# bg\n\n## Search space registry\n```json\n"
+        + json.dumps(registry)
+        + "\n```\n"
+    )
+    (run_dir / "background_retrieval.json").write_text(
+        json.dumps({"schema_version": 4, "rounds": [], "visits": []})
+    )
+
+
 class ExperimentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -158,9 +184,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
                  "python", "tools/ledger.py", "add-record", "--run-id", "000"],
@@ -198,9 +222,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
                  "python", "tools/ledger.py", "add-record", "--run-id", "000"],
@@ -254,9 +276,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
                  "python", "tools/ledger.py", "add-record", "--run-id", "000"],
@@ -285,8 +305,7 @@ class ExperimentTests(unittest.TestCase):
         write_task(self.repo)
         cmd = ExperimentCmd(self.repo)
         (cmd.run_dir / "ledger.json").parent.mkdir(parents=True, exist_ok=True)
-        (cmd.run_dir / "background.md").write_text("# bg\n")
-        (cmd.run_dir / "background_retrieval.json").write_text("{}")
+        write_background(cmd.run_dir)
         (cmd.run_dir / "framework_cfg.json").write_text(json.dumps(
             {"max_evaluations": 3, "dimension_strategy": "catalog_subset"}))
         cmd._save_ledger({"records": [{"run_id": "000", "status": "keep"}]})
@@ -311,9 +330,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"status": "existing", "wrote": False,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
@@ -336,9 +353,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
                  "python", "tools/ledger.py", "add-record", "--run-id", "000"],
@@ -365,9 +380,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
                  "python", "tools/ledger.py", "add-record", "--run-id", "000"],
@@ -405,8 +418,7 @@ class ExperimentTests(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "framework_cfg.json").write_text(json.dumps(
             {"max_evaluations": 3, "dimension_strategy": "catalog_subset"}))
-        (run_dir / "background.md").write_text("# bg\n")
-        (run_dir / "background_retrieval.json").write_text("{}")
+        write_background(run_dir)
         (run_dir / "ledger.json").write_text(json.dumps({"records": records}))
 
     def test_pending_record_resumed_in_place_before_ideation(self) -> None:
@@ -493,9 +505,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
                  "python", "tools/ledger.py", "add-record", "--run-id", "000"],
@@ -533,9 +543,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
@@ -549,8 +557,8 @@ class ExperimentTests(unittest.TestCase):
         cmd = ExperimentCmd(self.repo)
         cmd.reached = [False, False, True]
         cmd.run_dir.mkdir(parents=True, exist_ok=True)
-        (cmd.run_dir / "background.md").write_text("# frozen\n")
-        (cmd.run_dir / "background_retrieval.json").write_text("{}")
+        write_background(cmd.run_dir)
+        frozen_text = (cmd.run_dir / "background.md").read_text()
         runner = FakeSessionRunner([
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
@@ -578,7 +586,7 @@ class ExperimentTests(unittest.TestCase):
                 for call in cmd.calls),
             1)
         self.assertEqual((cmd.run_dir / "background.md").read_text(),
-                         "# frozen\n")
+                         frozen_text)
 
     def test_invalid_preseeded_background_blocks_without_repair(self) -> None:
         write_task(self.repo)
@@ -602,9 +610,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: (
-                 (ctx.run_dir / "background.md").write_text("# bg\n"),
-                 (ctx.run_dir / "background_retrieval.json").write_text("{}"))},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
             {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
              "side_effects": lambda ctx: cmd([
                  "python", "tools/ledger.py", "add-record", "--run-id", "000"],
@@ -640,8 +646,7 @@ class ExperimentTests(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "framework_cfg.json").write_text(json.dumps(
             {"max_evaluations": 3, "dimension_strategy": "catalog_subset"}))
-        (run_dir / "background.md").write_text("# bg\n")
-        (run_dir / "background_retrieval.json").write_text("{}")
+        write_background(run_dir)
         if ledger is not None:
             (run_dir / "ledger.json").write_text(json.dumps(ledger))
         return run_dir

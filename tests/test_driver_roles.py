@@ -56,6 +56,7 @@ class RegistryTests(unittest.TestCase):
         "tunable-contract-extractor", "tuner-orchestrator",
         "experience-extractor", "crash-diagnosis", "hillclimb-editor",
         "rewrite-editor", "slate-judge", "slate-plan-writer",
+        "background-faithfulness-judge",
     }
 
     def test_all_roles_registered(self) -> None:
@@ -87,12 +88,11 @@ class RegistryTests(unittest.TestCase):
 
         The fail-closed PreToolUse hook enforces exactly these sets, so any
         drift here is a real permission grant or denial and must fail loudly.
-        The judged-slate and rewrite roles have no retired agent; their
-        entries pin the new contract instead.
+        The judged-slate, rewrite, and faithfulness-judge roles have no
+        retired agent; their entries pin the new contract instead.
         """
         expected = {
-            "background-researcher":
-                ("Read", "Write", "Bash", "Glob", "WebSearch", "WebFetch"),
+            "background-researcher": ("Read", "Write", "Bash", "Glob"),
             "idea-generator": ("Read", "Write", "Bash", "Glob"),
             "candidate-writer": ("Read", "Write", "Edit", "Glob"),
             "tunable-contract-extractor":
@@ -104,6 +104,7 @@ class RegistryTests(unittest.TestCase):
             "rewrite-editor": ("Read", "Write", "Edit", "Glob", "Grep"),
             "slate-judge": (),
             "slate-plan-writer": ("Read",),
+            "background-faithfulness-judge": (),
         }
         self.assertEqual(set(ROLES), set(expected))
         for name, tools in expected.items():

@@ -44,6 +44,7 @@ from tests.test_slate_replay import run_replay  # noqa: E402
 from tools.scheduler.donor import build_donor_snapshot  # noqa: E402
 
 from driver.events import EventsLog  # noqa: E402
+from driver.loops import background_audit  # noqa: E402
 from driver.loops.experiment import (  # noqa: E402
     _resolve_donor_extra,
     run_experiment,
@@ -53,6 +54,22 @@ from driver.session import FakeSessionRunner  # noqa: E402
 
 TASK = "hard-interactions"
 TAG = "t1"
+
+
+def write_completed_audit(run_dir: Path) -> None:
+    """Mark the synchronous faithfulness audit as terminal-ok.
+
+    The seed fictions a run killed after setup completed — the audit is part
+    of setup, so a resumed run carries its artifact and does not re-audit.
+    """
+    (run_dir / background_audit.ARTIFACT_NAME).write_text(
+        json.dumps(
+            {
+                "written_at": "2026-01-01T00:00:00Z",
+                "rounds": [{"attempt": 1, "outcome": "passed", "sample": []}],
+            }
+        )
+    )
 
 
 def write_judged_task(repo: Path) -> None:
@@ -383,6 +400,7 @@ class JudgedSlateTests(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "background.md").write_text(background_text(registry))
         (run_dir / "background_retrieval.json").write_text("{}")
+        write_completed_audit(run_dir)
         (run_dir / "framework_cfg.json").write_text(
             json.dumps(
                 {
@@ -713,6 +731,7 @@ class JudgedSlateDonorBindingTests(unittest.TestCase):
         run_dir.mkdir(parents=True)
         (run_dir / "background.md").write_text(background_text(registry))
         (run_dir / "background_retrieval.json").write_text("{}")
+        write_completed_audit(run_dir)
         (run_dir / "framework_cfg.json").write_text(
             json.dumps(
                 {
@@ -936,7 +955,7 @@ class CoverageArmRegressionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_coverage_attempt_arm_ignores_the_judged_path(self) -> None:
-        from tests.test_driver_experiment import write_task
+        from tests.test_driver_experiment import write_background, write_task
 
         write_task(self.repo)
         run_dir = self.repo / "runs" / "fake-task" / "t1"
@@ -946,8 +965,7 @@ class CoverageArmRegressionTests(unittest.TestCase):
             "dimension_strategy": "catalog_subset",
             "semantic_search": {"policy": "coverage_attempt"},
         }))
-        (run_dir / "background.md").write_text("# bg\n")
-        (run_dir / "background_retrieval.json").write_text("{}")
+        write_background(run_dir)
         (run_dir / "ledger.json").write_text(
             json.dumps({"records": [{"run_id": "000", "status": "keep"}]}))
         cmd = ExperimentCmd(self.repo)

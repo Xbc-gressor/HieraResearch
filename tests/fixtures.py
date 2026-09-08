@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from semantic_evidence import build_semantic_edges  # noqa: E402
 from semantic_space import catalog_receipt, complete_point, load_catalog  # noqa: E402
+from search_backends import canonical_key, new_manifest  # noqa: E402
 
 
 SCOPE_AXES = (
@@ -339,6 +340,60 @@ def background_text(registry: dict) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def retrieval_hit_manifest(source: dict | None = None) -> dict:
+    """A schema-4 retrieval manifest whose single round hit ``source``'s URL.
+
+    The search-hit receipt is the minimum that admits a cited source through
+    the contract's receipt gate; no visit has happened yet, so the source's
+    verification tier is ``snippet_only``.
+    """
+    source = source or TOY_SOURCE
+    url = source["url"]
+    manifest = new_manifest()
+    manifest["rounds"].append(
+        {
+            "round_id": "r-01",
+            "created_at": "2026-01-01T00:00:00Z",
+            "queries": [
+                {
+                    "id": "q-01",
+                    "text": "toy mechanism",
+                    "target_dimension_ids": [],
+                    "evidence_roles": ["hypothesis"],
+                }
+            ],
+            "backend_calls": [
+                {
+                    "query_id": "q-01",
+                    "backend": "frozen",
+                    "backend_version": "toy",
+                    "status": "success",
+                    "retrieved_at": "2026-01-01T00:00:00Z",
+                    "raw_response": {"items": []},
+                }
+            ],
+            "backend_failures": [],
+            "results": [
+                {
+                    "canonical_key": canonical_key(url),
+                    "url": url,
+                    "title": source["title"],
+                    "snippet": "A search-hit snippet receipt.",
+                    "query_ids": ["q-01"],
+                    "queries": ["toy mechanism"],
+                    "backends": ["frozen"],
+                    "best_rank": 1,
+                    "query_support": 1,
+                    "backend_support": 1,
+                    "average_rank": 1.0,
+                    "external_id": None,
+                }
+            ],
+        }
+    )
+    return manifest
 
 
 # --------------------------------------------------------------------------

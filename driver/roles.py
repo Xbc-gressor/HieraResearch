@@ -208,7 +208,7 @@ ROLES: dict[str, RoleDefinition] = {
     "background-researcher": RoleDefinition(
         name="background-researcher",
         prompt_file="background-researcher.md",
-        tools=("Read", "Write", "Bash", "Glob", "WebSearch", "WebFetch"),
+        tools=("Read", "Write", "Bash", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "status": ("enum", "ok"),
@@ -331,6 +331,18 @@ ROLES: dict[str, RoleDefinition] = {
         tools=(),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"ranking": "list", "rationale": "str"},
+        corrective_attempts=0,
+        max_turns=8,
+    ),
+    # background faithfulness audit: a tool-free judge over a prepared
+    # payload of claim↔receipt mappings. corrective_attempts=0: the driver's
+    # audit gate owns the single fresh-session retry.
+    "background-faithfulness-judge": RoleDefinition(
+        name="background-faithfulness-judge",
+        prompt_file="background-faithfulness-judge.md",
+        tools=(),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={"verdicts": "list", "rationale": "str"},
         corrective_attempts=0,
         max_turns=8,
     ),
