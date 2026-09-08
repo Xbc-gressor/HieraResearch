@@ -22,6 +22,7 @@ ARM_MODULES = {
     "pool_gp_ei": "arms.pool_gp_ei",
     "pool_tpe": "arms.pool_tpe",
     "pool_hebo_mace": "arms.pool_hebo_mace",
+    "explicit_e3u2": "arms.explicit_e3u2",
     "pool3_hebo_mace": "arms.pool3_hebo_mace",
     "pool7_hebo_mace": "arms.pool7_hebo_mace",
     "pool_hebo_mace_llmtie": "arms.pool_hebo_mace_llmtie",

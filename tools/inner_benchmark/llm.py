@@ -180,6 +180,16 @@ BENCH_ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"configs": "list", "order": "list", "rationale": "?str"},
     ),
+    "bench-pool-explorer": RoleDefinition(
+        name="bench-pool-explorer", prompt_file="bench-pool-explorer.md",
+        tools=(), disallowed=_BASE_DISALLOWED,
+        receipt_schema={"configs": "list", "order": "list", "rationale": "?str"},
+    ),
+    "bench-pool-exploiter": RoleDefinition(
+        name="bench-pool-exploiter", prompt_file="bench-pool-exploiter.md",
+        tools=(), disallowed=_BASE_DISALLOWED,
+        receipt_schema={"configs": "list", "order": "list", "rationale": "?str"},
+    ),
     # Same-pool shadow experiment: one fresh, tool-free session judges one
     # pair and is then discarded. A/B are opaque positions, not proposer
     # ranks; the standalone runner maps the verdict back to pool indexes.

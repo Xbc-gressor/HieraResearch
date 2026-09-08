@@ -90,6 +90,8 @@ class PoolDriver:
         *,
         protocol: str | None = None,
         pool_size: int = arm_api.POOL,
+        role: str = ROLE,
+        role_protocol: str | None = None,
         first_trials=None,
         first_live_incumbent=None,
     ) -> None:
@@ -99,12 +101,12 @@ class PoolDriver:
         self._contract = ctx.contract
         self._pool_size = pool_size
         self._session = factory(
-            ROLE,
+            role,
             first_extras=llm.first_message_blocks(
                 ctx.checkpoint,
                 ctx.contract,
-                protocol=(
-                    protocol if protocol is not None else pool_protocol(pool_size)
+                    protocol=(
+                    role_protocol if role_protocol is not None else (protocol if protocol is not None else pool_protocol(pool_size))
                 ),
                 budget_remaining=ctx.state.budget_remaining,
                 trials=first_trials,
@@ -114,6 +116,7 @@ class PoolDriver:
         self.internal_duplicate_count = 0
         self._pending_messages: list[str] = []
         self._consecutive_failures = 0
+        self._soft_invalid: set[int] = set()
 
     @staticmethod
     def precheck(ctx) -> None:
@@ -265,7 +268,10 @@ class PoolDriver:
             ranked = [configs[index] for index in receipt["order"]]
             pool = []
             duplicate_mask = []
-            for config in ranked:
+            for rank_index, config in enumerate(ranked):
+                if self._is_out_of_space(config):
+                    duplicate_mask.append(True)
+                    continue
                 if self._is_executed_duplicate(config):
                     self.internal_duplicate_count += 1
                     duplicate_mask.append(True)
@@ -274,11 +280,11 @@ class PoolDriver:
                 pool.append(config)
             if not pool:
                 self._pending_messages.append(
-                    "correction: every pool member duplicated executed "
-                    "history and was filtered out. Generate a fresh pool of "
-                    "configs you have NOT seen evaluated."
+                    "correction: no usable pool member remained after "
+                    "filtering invalid or previously executed configs. "
+                    "Generate a fresh pool inside the declared bounds."
                 )
-                self._fail("all-duplicate pool after filtering")
+                self._fail("no usable pool member after filtering")
                 continue
             self._consecutive_failures = 0
             return {
@@ -307,6 +313,7 @@ class PoolDriver:
         if not isinstance(configs, list) or len(configs) != self._pool_size:
             return [f"configs must be a list of exactly {self._pool_size} dicts"]
         problems: list[str] = []
+        soft_invalid: list[str] = []
         names = [dim.name for dim in self._contract.dimensions]
         identities: set[str] = set()
         for index, config in enumerate(configs):
@@ -328,7 +335,9 @@ class PoolDriver:
                 cast, self._contract.search_space
             )
             if violations:
-                problems.append(f"configs[{index}] is out of space: {violations}")
+                # A pool is a proposal batch: retain valid members and let the
+                # proposer repair the soft-invalid members on the next call.
+                soft_invalid.append(f"configs[{index}] is out of space: {violations}")
                 continue
             identity = self._contract.params_identity(cast)
             if identity in identities:
@@ -359,6 +368,13 @@ class PoolDriver:
                 if trial.status in _EXECUTED
             ],
         )
+
+    def _is_out_of_space(self, config: dict) -> bool:
+        try:
+            cast = self._contract.cast(config)
+        except (TypeError, ValueError, ArithmeticError):
+            return True
+        return bool(tune_tools._bounds_violations(cast, self._contract.search_space))
 
     def totals(self) -> dict:
         """Aggregate keys for ctx.emit (arm_api.AGGREGATE_ARM_STATE_KEYS)."""

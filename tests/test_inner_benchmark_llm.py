@@ -155,6 +155,8 @@ EXPECTED_SCHEMAS = {
     "bench-rewarm-proposer": {"configs": "list", "rationale": "?str"},
     "bench-active-set": {"parameter": "str", "step": "float", "rationale": "?str"},
     "bench-pool-proposer": {"configs": "list", "order": "list", "rationale": "?str"},
+    "bench-pool-explorer": {"configs": "list", "order": "list", "rationale": "?str"},
+    "bench-pool-exploiter": {"configs": "list", "order": "list", "rationale": "?str"},
     "bench-pool-pairwise-judge": {
         "winner": ("enum", "A", "B"),
         "reasoning": "?str",
@@ -197,6 +199,8 @@ def test_pure_proposal_roles_carry_no_tools() -> None:
         "bench-rewarm-proposer",
         "bench-active-set",
         "bench-pool-proposer",
+        "bench-pool-explorer",
+        "bench-pool-exploiter",
         "bench-pool-pairwise-judge",
         "bench-tiebreak-judge",
     ):
