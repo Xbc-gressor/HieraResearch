@@ -1,0 +1,33 @@
+name = "mle-cactus"
+description = "Aerial Cactus Identification: public-training validation ROC AUC (scored as 1 - AUC) and a separate final MLE-bench submission."
+
+[env]
+type = "uv"
+project = "tasks/mle-cactus"
+
+[run]
+working_dir = "tasks/mle-cactus"
+timeout_seconds = 300
+
+[seed]
+target_count = 1
+provided = ["train.py"]
+entrypoint = "train.py"
+
+[evaluation]
+score_fn = "evaluate_config"
+environment_preflight_fn = "preflight_environment"
+
+[result]
+metric = "one_minus_auc"
+required_patterns = ["^score:"]
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true
+
+[mlebench]
+competition_id = "aerial-cactus-identification"
+public_data_env = "MLEBENCH_PUBLIC_DATA"
+submission = "submission.csv"
