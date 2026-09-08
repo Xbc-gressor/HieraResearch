@@ -24,8 +24,11 @@ from pathlib import Path
 from typing import Any
 
 from search_backends import (
+    _VERIFICATION_RANK,
+    _VIEW_VERIFICATION,
     canonical_key,
     merged_results,
+    resolve_visit_content,
     unexplored_leads,
     validate_manifest,
     verification_statuses,
@@ -1987,6 +1990,7 @@ def validate_registry(
     catalog: dict[str, Any] | None = None,
     dimension_strategy: str = DEFAULT_DIMENSION_STRATEGY,
     baseline_mechanisms: dict[str, Any] | None = None,
+    number_gate: bool = False,
 ) -> list[str]:
     errors = validate_space_core(
         registry, catalog=catalog, dimension_strategy=dimension_strategy
@@ -2002,6 +2006,14 @@ def validate_registry(
     errors.extend(_validate_relations_evidence(registry, source_by_id))
     errors.extend(_validate_provenance_refs(registry, source_by_id))
     errors.extend(_validate_guidance(registry, source_by_id))
+    if number_gate and retrieval_manifest is not None and manifest_dir is not None:
+        # Generation-path runs only: the researcher must ground every result
+        # number in a cited source's retained content.  Pre-seeded frozen
+        # backgrounds never get this gate (the audit's judge-side rules carry
+        # their number-absence cases as warnings instead).
+        errors.extend(
+            _number_presence_gate_errors(registry, retrieval_manifest, manifest_dir)
+        )
     if not errors:
         selection = derive_hypothesis_selection(registry)
         for dimension in registry.get("dimensions", []):
@@ -2048,6 +2060,343 @@ def source_verification(
         if tier is not None:
             result[source_id] = tier
     return result
+
+
+# Audit text and the result-number precheck.  One shared text per registry
+# item feeds mapping identity, the judge payload, and the validate-time
+# number gate; the deterministic matcher below answers whether that text's
+# result-type numbers survive in the tool-recorded retained content.
+
+AUDIT_TEXT_FIELDS = ("claim", "scope", "credibility_rationale", "reopen_when")
+
+_ARXIV_ID_RE = re.compile(r"\d{4}\.\d{4,5}(?:v\d+)?")
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?\\*%?")
+_RANGE_SEPARATOR_RE = re.compile(r"[-–~]")
+_TOKEN_EDGE_PUNCT = "\"'`“”‘’.,;:!?()[]{}<>*_#$-–~"
+
+
+def audit_text(item: dict[str, Any]) -> str:
+    """The shared audit text of one claim-bearing registry item.
+
+    Present fields are taken in a fixed order, each annotated with its field
+    name; the structured ``scope`` facet dict is serialized deterministically
+    with facets sorted by facet name.  Every consumer — mapping identity, the
+    number precheck, the contract gate, the judge payload — reads this text.
+    """
+    lines: list[str] = []
+    for field in AUDIT_TEXT_FIELDS:
+        value = item.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if isinstance(value, dict):
+            facets = []
+            for facet, tags in sorted(value.items()):
+                tag_list = tags if isinstance(tags, list) else [tags]
+                facets.append(f"{facet}: {', '.join(str(tag) for tag in tag_list)}")
+            rendered = "; ".join(facets)
+        else:
+            rendered = str(value)
+        lines.append(f"{field}: {rendered}")
+    return "\n".join(lines)
+
+
+def _number_tokens(raw: str) -> list[str]:
+    """Result-type number tokens inside one whitespace-delimited raw token.
+
+    A result-type number carries a decimal point or a ``%``; LaTeX-escaped
+    percent counts too — deepxiv stores LaTeX-ish text JSON-wrapped, so the
+    raw content carries a backslash run before the ``%`` (``$(97\\%)$``).  Citation-shaped tokens (arXiv ids) never count.  A range token
+    splits into its endpoints with the unit inherited (``94-95%`` → ``94%``,
+    ``95%``); a verbatim range in a source hits the same endpoints, so no
+    separate range match is needed.
+    """
+    token = raw.strip(_TOKEN_EDGE_PUNCT)
+    if not token or not any(char.isdigit() for char in token):
+        return []
+    if _ARXIV_ID_RE.fullmatch(token):
+        return []
+    parts = _RANGE_SEPARATOR_RE.split(token)
+    if len(parts) == 2 and all(_NUMBER_RE.fullmatch(part) for part in parts):
+        endpoints = list(parts)
+        for index, other in ((0, 1), (1, 0)):
+            if endpoints[other].endswith("%") and not (
+                endpoints[index].endswith("%") or "." in endpoints[index]
+            ):
+                endpoints[index] += "%"
+        return [
+            endpoint
+            for endpoint in endpoints
+            if ("." in endpoint or "%" in endpoint)
+            and _ARXIV_ID_RE.fullmatch(endpoint) is None
+        ]
+    if _NUMBER_RE.fullmatch(token) and ("." in token or "%" in token):
+        return [token]
+    return []
+
+
+def extract_result_numbers(text: str) -> list[str]:
+    """Result-type number tokens in ``text``, deduped in first-appearance order."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for raw in text.split():
+        for token in _number_tokens(raw):
+            if token not in seen:
+                seen.add(token)
+                tokens.append(token)
+    return tokens
+
+
+def _normalized_digits(token: str) -> tuple[str, int] | None:
+    """Canonical ``(digits, exponent)`` with value ``int(digits) * 10**exponent``.
+
+    The decimal point, a trailing ``%`` (÷100, any backslash run before it
+    ignored — LaTeX/JSON escaping), leading zeros, and trailing zeros all
+    fold into the pair, so ``0.3843`` and ``38.43%`` normalize equal and
+    ``0.380`` equals ``0.38``.
+    """
+    match = re.fullmatch(r"(\d+)(?:\.(\d+))?\\*(%)?", token)
+    if match is None:
+        return None
+    integer, fraction, percent = match.groups()
+    exponent = -len(fraction or "") - (2 if percent else 0)
+    digits = (integer + (fraction or "")).lstrip("0")
+    trailing = len(digits) - len(digits.rstrip("0"))
+    if trailing:
+        digits = digits[:-trailing]
+        exponent += trailing
+    if not digits:
+        return ("0", 0)
+    return digits, exponent
+
+
+def result_number_matches(claim_token: str, source_token: str) -> bool:
+    """Whether one claim number is supported by one source number.
+
+    Normalized equality passes (``0.3843`` ↔ ``38.43%``).  A claim carrying
+    *fewer* digits than the source passes as a rounding truncation
+    (``0.38`` vs source ``0.3843``); a claim carrying *more* is fabricated
+    precision and fails (``0.3843`` vs source ``0.38``).
+    """
+    claim = _normalized_digits(claim_token)
+    source = _normalized_digits(source_token)
+    if claim is None or source is None:
+        return False
+    claim_digits, claim_exponent = claim
+    source_digits, source_exponent = source
+    if claim_digits == source_digits:
+        return claim_exponent == source_exponent
+    return source_digits.startswith(claim_digits) and claim_exponent == (
+        source_exponent + len(source_digits) - len(claim_digits)
+    )
+
+
+def _presence(claim_tokens: list[str], source_tokens: list[str]) -> tuple[str, list[str]]:
+    """present/absent/none plus the claim tokens no source token supports."""
+    if not claim_tokens:
+        return "none", []
+    missing = [
+        token
+        for token in claim_tokens
+        if not any(result_number_matches(token, source) for source in source_tokens)
+    ]
+    return ("absent" if missing else "present"), missing
+
+
+def _best_substantive_visit(manifest: dict[str, Any], key: str) -> dict[str, Any] | None:
+    """The highest-tier successful substantive visit for one canonical key."""
+    best: dict[str, Any] | None = None
+    best_rank = -1
+    for visit in manifest.get("visits", []):
+        if not isinstance(visit, dict) or visit.get("status") != "success":
+            continue
+        if visit.get("canonical_key") != key:
+            continue
+        tier = _VIEW_VERIFICATION.get(str(visit.get("view")))
+        if tier is None:
+            continue
+        rank = _VERIFICATION_RANK[tier]
+        if rank > best_rank:
+            best, best_rank = visit, rank
+    return best
+
+
+def _cited_source_contents(
+    item: dict[str, Any],
+    sources_by_id: dict[str, dict[str, Any]],
+    tiers: dict[str, str],
+    manifest: dict[str, Any],
+    manifest_dir: Path,
+) -> dict[str, str]:
+    """source_id → retained content for cited sources at tier preview or better.
+
+    A source's retained content is every successful substantive visit receipt,
+    not just the best one: several visits can sit at the same tier (e.g.
+    section views of one paper) with the number carried by any of them, so
+    their contents are concatenated in manifest order for the matcher.
+    """
+    contents: dict[str, str] = {}
+    for link in item.get("evidence") or []:
+        if not isinstance(link, dict):
+            continue
+        source_id = link.get("source_id")
+        if not isinstance(source_id, str) or source_id in contents:
+            continue
+        source = sources_by_id.get(source_id)
+        url = source.get("url") if isinstance(source, dict) else None
+        if not _nonempty(url):
+            continue
+        key = canonical_key(url)
+        if _VERIFICATION_RANK.get(tiers.get(key, ""), -1) < _VERIFICATION_RANK["preview"]:
+            continue
+        retained: list[str] = []
+        for visit in manifest.get("visits", []):
+            if not isinstance(visit, dict) or visit.get("status") != "success":
+                continue
+            if visit.get("canonical_key") != key:
+                continue
+            if _VIEW_VERIFICATION.get(str(visit.get("view"))) is None:
+                continue
+            content = resolve_visit_content(visit, manifest_dir)
+            if content:
+                retained.append(content)
+        if retained:
+            contents[source_id] = "\n".join(retained)
+    return contents
+
+
+def item_number_presence(
+    item: dict[str, Any],
+    registry: dict[str, Any],
+    manifest: dict[str, Any],
+    manifest_dir: Path,
+) -> dict[str, Any]:
+    """Item-level result-number presence across all cited tier≥preview sources.
+
+    The validate-time number gate consumes this: ``missing`` names the audit
+    text tokens that no qualifying cited source's retained content contains.
+    """
+    tokens = extract_result_numbers(audit_text(item))
+    sources_by_id = {
+        source.get("id"): source
+        for source in registry.get("sources", [])
+        if isinstance(source, dict)
+    }
+    contents = _cited_source_contents(
+        item, sources_by_id, verification_statuses(manifest), manifest, manifest_dir
+    )
+    source_tokens = [
+        token for content in contents.values() for token in extract_result_numbers(content)
+    ]
+    presence, missing = _presence(tokens, source_tokens)
+    return {"presence": presence, "tokens": tokens, "missing": missing}
+
+
+def _number_presence_gate_errors(
+    registry: dict[str, Any],
+    manifest: dict[str, Any],
+    manifest_dir: Path,
+) -> list[str]:
+    """The item-level result-number gate, one error per missing token.
+
+    Every result-type number in a claim-bearing item's audit text must appear
+    in the retained content of at least one of the item's tier≥preview cited
+    sources.  Retained content is tool receipts, so a visit that never
+    surfaced the number does not satisfy the gate; the error names the token,
+    the item, and the cited candidates, and points at the three ways out.
+    """
+    errors: list[str] = []
+    items: list[tuple[str, dict[str, Any]]] = []
+    for dimension in registry.get("dimensions", []):
+        if not isinstance(dimension, dict):
+            continue
+        for hypothesis in dimension.get("hypotheses", []):
+            if isinstance(hypothesis, dict):
+                items.append(("hypothesis", hypothesis))
+    for item in registry.get("guidance", []):
+        if isinstance(item, dict):
+            items.append(("guidance", item))
+    for item_kind, item in items:
+        result = item_number_presence(item, registry, manifest, manifest_dir)
+        candidates = list(
+            dict.fromkeys(
+                str(link.get("source_id"))
+                for link in item.get("evidence") or []
+                if isinstance(link, dict) and link.get("source_id")
+            )
+        )
+        for token in result["missing"]:
+            errors.append(
+                f"{item_kind} {item.get('id')} number {token} is in no cited "
+                "source's retained content at preview tier or better "
+                f"(candidates: {', '.join(candidates) or 'none'}); visit a "
+                "cited source containing the number, cite a different source "
+                "that carries it, or downgrade the claim to a qualitative "
+                "statement"
+            )
+    return errors
+
+
+def mapping_number_presence(
+    item: dict[str, Any],
+    link: dict[str, Any],
+    registry: dict[str, Any],
+    manifest: dict[str, Any],
+    manifest_dir: Path,
+) -> dict[str, Any]:
+    """Per-mapping number presence, coverage facts, and the coverage routing.
+
+    ``number_presence`` carries the item-level verdict (the number must ride
+    on *some* cited tier≥preview source of the item) next to this source's
+    own; source-level absence alone does not make a mapping unfaithful, since
+    the number may be carried by a sibling link.  ``coverage.routing`` is the
+    pinned routing fact: only a ``full_text`` receipt without a store cap hit
+    is ``sufficient`` (an absence-based negative may then be judged
+    unfaithful); section/preview or truncated coverage is ``partial``, where
+    an absence-based negative is at most unverifiable.
+    """
+    tokens = extract_result_numbers(audit_text(item))
+    sources_by_id = {
+        source.get("id"): source
+        for source in registry.get("sources", [])
+        if isinstance(source, dict)
+    }
+    tiers = verification_statuses(manifest)
+    contents = _cited_source_contents(item, sources_by_id, tiers, manifest, manifest_dir)
+    item_presence, item_missing = _presence(
+        tokens,
+        [token for content in contents.values() for token in extract_result_numbers(content)],
+    )
+    this_content = contents.get(str(link.get("source_id")))
+    this_presence, this_missing = _presence(
+        tokens, extract_result_numbers(this_content) if this_content else []
+    )
+
+    source = sources_by_id.get(link.get("source_id"))
+    url = source.get("url") if isinstance(source, dict) else None
+    key = canonical_key(url) if _nonempty(url) else ""
+    tier = tiers.get(key, "none")
+    visit = _best_substantive_visit(manifest, key) if key else None
+    best_content = (
+        resolve_visit_content(visit, manifest_dir) if isinstance(visit, dict) else None
+    )
+    store_cap_hit = bool(visit.get("store_cap_hit")) if isinstance(visit, dict) else False
+    return {
+        "number_presence": {"item": item_presence, "this_source": this_presence},
+        "missing_tokens": {"item": item_missing, "this_source": this_missing},
+        "coverage": {
+            "tier": tier,
+            "routing": (
+                "sufficient" if tier == "full_text" and not store_cap_hit else "partial"
+            ),
+            # Coverage facts describe the best visit （决策 6 attribution), not
+            # the concatenated retained content the matcher reads.
+            "retained_chars": len(best_content) if best_content is not None else None,
+            "store_cap_hit": store_cap_hit,
+            "content_file": visit.get("content_file") if isinstance(visit, dict) else None,
+            "view": visit.get("view") if isinstance(visit, dict) else None,
+            "section": visit.get("section") if isinstance(visit, dict) else None,
+        },
+    }
 
 
 def validate_background_markdown(path: Path, registry: dict[str, Any]) -> list[str]:
@@ -2837,6 +3186,7 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         catalog=catalog,
         dimension_strategy=dimension_strategy,
         baseline_mechanisms=baseline_mechanisms,
+        number_gate=getattr(args, "number_gate", False),
     )
     errors.extend(validate_background_markdown(args.background, registry))
     return registry, ledger, errors
@@ -2989,6 +3339,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="baseline mechanism inventory for a task with a provided entrypoint; "
         "required whenever [seed].provided resolves",
+    )
+    validate.add_argument(
+        "--number-gate",
+        action="store_true",
+        help="generation-path item-level number gate: every result-type number "
+        "in an item's audit text must appear in a tier≥preview cited source's "
+        "retained content",
     )
     validate.set_defaults(func=cmd_validate)
 

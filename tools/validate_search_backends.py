@@ -11,7 +11,9 @@ loopback-only HTTP server, and a fake ``deepxiv`` executable.  Covered:
 * the empty three-state — a zero-hit query records ``empty``, never enters
   ``backend_failures``, and still validates;
 * error-page rejection — an error page or an empty page fetched over HTTP is
-  recorded as a failed visit, never a successful one.
+  recorded as a failed visit, never a successful one;
+* boilerplate triage — a full-page consent wall fails with switch-source
+  guidance, while a long page behind a boilerplate navigation header succeeds.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from pathlib import Path
 
 from search_backends import (
     VISIT_CONTENT_STORE_CHARS,
+    WEB_BOILERPLATE_MARKERS,
     FrozenCorpusBackend,
     SearchBackend,
     _render_result_card,
@@ -38,6 +41,7 @@ from search_backends import (
     merged_results,
     new_manifest,
     validate_manifest,
+    verification_statuses,
 )
 
 TOOL = Path(__file__).with_name("search_backends.py")
@@ -318,7 +322,7 @@ def check_frozen_isolation(tmp: Path) -> None:
 
 
 def check_error_pages_rejected(tmp: Path) -> None:
-    """Loopback HTTP: error pages and empty pages never record success."""
+    """Loopback HTTP: walls, error and empty pages fail; nav headers don't."""
     tmp.mkdir(parents=True, exist_ok=True)
     error_page = (
         "<html><body><h1>Just a moment...</h1><p>Please enable JavaScript "
@@ -326,13 +330,37 @@ def check_error_pages_rejected(tmp: Path) -> None:
         "This interstitial retains no readable page content for a reader.</p>"
         "</body></html>"
     )
+    wall_page = (
+        "<html><body><h1>We use cookies</h1><p>We and our partners use "
+        "cookies to personalize content and ads. Click Accept all cookies to "
+        "consent and continue browsing.</p></body></html>"
+    )
+    nav_page = (
+        "<html><body><nav>Home Courses Tutorials Blog Shop About Login. "
+        "Enable JavaScript for the full interactive menu. We use cookies to "
+        "improve your experience. " + "Menu item. " * 50 + "</nav>"
+        "<article>" + (
+            "The fixture method applies gradient boosting to tabular data, "
+            "reports ablations over tree depth and learning rate, and "
+            "discusses the failure regimes observed on wide sparse feature "
+            "spaces. "
+        ) * 10 + "</article></body></html>"
+    )
     ok_page = (
         "A retained primary source describing the method, the ablations, and "
         "the failure regimes of the fixture mechanism in enough prose to "
         "clear the minimum content length for a successful visit receipt. "
         "Additional sentences keep the readable body well above that bar."
     )
-    pages = {"/error": error_page, "/empty": "", "/ok": ok_page}
+    huge_page = "Retained evidence prose for the storage-cap fixture. " * 10000
+    pages = {
+        "/error": error_page,
+        "/empty": "",
+        "/wall": wall_page,
+        "/ok": ok_page,
+        "/nav": nav_page,
+        "/huge": huge_page,
+    }
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -359,8 +387,9 @@ def check_error_pages_rejected(tmp: Path) -> None:
         manifest_path.write_text(json.dumps(new_manifest()))
 
         for path, needle in (
-            ("/error", "error-page marker"),
+            ("/error", "consent/anti-bot wall"),
             ("/empty", "empty content"),
+            ("/wall", "consent/anti-bot wall"),
         ):
             run = run_cli(
                 "visit",
@@ -371,13 +400,22 @@ def check_error_pages_rejected(tmp: Path) -> None:
             assert run.returncode == 1, (path, run.stdout)
             assert needle in run.stderr, run.stderr
 
-        control = run_cli(
+        for path in ("/ok", "/nav"):
+            control = run_cli(
+                "visit",
+                "--manifest", str(manifest_path),
+                "--url", base + path,
+                "--visit-backend", "direct",
+            )
+            assert control.returncode == 0, (path, control.stderr)
+
+        capped = run_cli(
             "visit",
             "--manifest", str(manifest_path),
-            "--url", base + "/ok",
+            "--url", base + "/huge",
             "--visit-backend", "direct",
         )
-        assert control.returncode == 0, control.stderr
+        assert capped.returncode == 0, capped.stderr
     finally:
         server.shutdown()
         server.server_close()
@@ -385,7 +423,14 @@ def check_error_pages_rejected(tmp: Path) -> None:
 
     manifest = json.loads(manifest_path.read_text())
     statuses = [visit["status"] for visit in manifest["visits"]]
-    assert statuses == ["failed", "failed", "success"], statuses
+    assert statuses == ["failed", "failed", "failed", "success", "success", "success"], statuses
+    retained = (tmp / manifest["visits"][-2]["content_file"]).read_text()
+    assert "gradient boosting" in retained  # the body past the nav header is kept
+    assert "store_cap_hit" not in manifest["visits"][-2]
+    # The 400K store cap truncates the huge page and marks the visit.
+    capped_visit = manifest["visits"][-1]
+    assert capped_visit["store_cap_hit"] is True
+    assert capped_visit["content_chars"] == VISIT_CONTENT_STORE_CHARS
     assert validate_manifest(manifest, manifest_dir=tmp) == []
 
 
@@ -411,10 +456,11 @@ elif args and args[0] == "paper" and "--head" in args:
     }))
 elif args and args[0] == "paper" and "--section" in args:
     name = args[args.index("--section") + 1]
-    print(json.dumps({
-        "section": name,
-        "content": "Primary source body for " + name + ". " + ("evidence " * 100)
-    }))
+    content = "Primary source body for " + name + ". " + ("evidence " * 100)
+    if args[1] == "2409.05594":
+        # Oversized sections force the progressive retention split to truncate.
+        content = "Oversized body for " + name + ". " + ("evidence " * 15000)
+    print(json.dumps({"section": name, "content": content}))
 elif args and args[0] == "paper" and "--preview" in args:
     if args[1] == "2409.05593":
         print("preview unavailable", file=sys.stderr)
@@ -427,7 +473,7 @@ else:
 
 
 def check_deepxiv_progressive(tmp: Path) -> None:
-    """Fake deepxiv CLI: progressive read, preview fallback, head-only failure."""
+    """Fake deepxiv CLI: progressive read, abstract view, preview fallback."""
     tmp.mkdir(parents=True, exist_ok=True)
     fake_deepxiv = tmp / "deepxiv"
     fake_deepxiv.write_text(FAKE_DEEPXIV)
@@ -452,6 +498,12 @@ def check_deepxiv_progressive(tmp: Path) -> None:
         visit for visit in progressive_manifest["visits"] if visit["status"] == "success"
     ]
     assert successful_visits[0]["view"] == "head"
+    # The head lists an abstract: it is retained once, as its own view.
+    assert successful_visits[1]["view"] == "abstract"
+    assert successful_visits[1]["section"] is None
+    abstract_retained = (tmp / successful_visits[1]["content_file"]).read_text()
+    assert abstract_retained == "A metadata-only abstract."
+    # The abstract does not consume one of the three section slots.
     section_visits = [
         visit for visit in successful_visits if visit["view"] == "section"
     ]
@@ -461,22 +513,28 @@ def check_deepxiv_progressive(tmp: Path) -> None:
         "Limitations",
     }
     assert "Primary source body for Method" in progressive_run.stdout
+    assert "## DeepXiv abstract" in progressive_run.stdout
     assert all("content" not in visit for visit in progressive_manifest["visits"])
     assert sum(visit["content_chars"] for visit in successful_visits) <= (
         VISIT_CONTENT_STORE_CHARS
     )
     assert validate_manifest(progressive_manifest, manifest_dir=tmp) == []
 
+    # No sections are listed: the abstract alone must not suppress the
+    # preview fallback, and the visit still counts as having body content.
     preview_manifest_path = tmp / "preview-fallback.json"
     preview_run = visit(preview_manifest_path, "2409.05592")
     assert preview_run.returncode == 0, preview_run.stderr or preview_run.stdout
     preview_manifest = json.loads(preview_manifest_path.read_text())
     assert [visit["view"] for visit in preview_manifest["visits"]] == [
         "head",
+        "abstract",
         "preview",
     ]
     assert validate_manifest(preview_manifest, manifest_dir=tmp) == []
 
+    # Abstract-only is not body content: with the preview also failing, the
+    # visit fails even though the abstract was retained.
     head_only_manifest_path = tmp / "head-only-failure.json"
     head_only_run = visit(head_only_manifest_path, "2409.05593")
     assert head_only_run.returncode == 1
@@ -484,10 +542,32 @@ def check_deepxiv_progressive(tmp: Path) -> None:
     head_only_manifest = json.loads(head_only_manifest_path.read_text())
     assert [visit["view"] for visit in head_only_manifest["visits"]] == [
         "head",
+        "abstract",
         "preview",
     ]
     assert head_only_manifest["visits"][-1]["status"] == "failed"
+    # The retained abstract still raises the tier: abstract counts as preview.
+    assert verification_statuses(head_only_manifest)["arxiv:2409.05593"] == "preview"
     assert validate_manifest(head_only_manifest, manifest_dir=tmp) == []
+
+    # Oversized sections truncate at the shared retention budget: abstract +
+    # three sections split it four ways, and truncation marks store_cap_hit.
+    capped_manifest_path = tmp / "store-cap.json"
+    capped_run = visit(capped_manifest_path, "2409.05594")
+    assert capped_run.returncode == 0, capped_run.stderr or capped_run.stdout
+    capped_manifest = json.loads(capped_manifest_path.read_text())
+    capped_visits = {
+        (visit["view"], visit["section"]): visit
+        for visit in capped_manifest["visits"]
+    }
+    body_share = (VISIT_CONTENT_STORE_CHARS - 4000) // 4
+    for section in ("Method", "Results", "Limitations"):
+        visit_entry = capped_visits[("section", section)]
+        assert visit_entry["content_chars"] == body_share
+        assert visit_entry["store_cap_hit"] is True
+    assert "store_cap_hit" not in capped_visits[("head", None)]
+    assert "store_cap_hit" not in capped_visits[("abstract", None)]
+    assert validate_manifest(capped_manifest, manifest_dir=tmp) == []
 
 
 def check_query_plan() -> None:
@@ -535,6 +615,8 @@ def main() -> int:
     assert canonical_key("https://arxiv.org/abs/2203.11171v4") == "arxiv:2203.11171"
     assert canonical_key("https://www.alphaxiv.org/pdf/2203.11171") == "arxiv:2203.11171"
     assert canonical_key("https://Example.com/a/?utm_source=x") == "example.com/a"
+    # The audit excerpt locator reuses the public boilerplate marker set.
+    assert "enable javascript" in WEB_BOILERPLATE_MARKERS
 
     check_dispatch_merge_and_cards()
     check_query_plan()

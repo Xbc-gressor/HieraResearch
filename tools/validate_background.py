@@ -171,7 +171,8 @@ def check_retrieval_provenance(registry: dict) -> None:
         tmp_path = Path(tmp)
         manifest = retrieval_hit_manifest(source)
         assert validate_registry(
-            registry, retrieval_manifest=manifest, manifest_dir=tmp_path
+            registry, retrieval_manifest=manifest, manifest_dir=tmp_path,
+            number_gate=True,
         ) == []
         tiers = source_verification(registry, manifest)
         assert tiers[source["id"]] == "snippet_only", tiers
@@ -201,7 +202,8 @@ def check_retrieval_provenance(registry: dict) -> None:
         tiers = source_verification(registry, manifest)
         assert tiers[source["id"]] == "section", tiers
         assert validate_registry(
-            registry, retrieval_manifest=manifest, manifest_dir=tmp_path
+            registry, retrieval_manifest=manifest, manifest_dir=tmp_path,
+            number_gate=True,
         ) == []
 
 

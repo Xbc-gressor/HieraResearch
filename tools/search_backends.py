@@ -46,12 +46,21 @@ READ_WINDOW_CHARS = 8000
 HIGH_RANK_THRESHOLD = 5
 # Minimum chars for a web visit to count as success; shorter means an error page.
 VISIT_MIN_CONTENT_CHARS = 200
-_WEB_ERROR_MARKERS = (
+# Consent/anti-bot boilerplate markers, matched casefolded in the page head;
+# also imported by the audit excerpt locator to skip boilerplate spans.
+WEB_BOILERPLATE_MARKERS = (
     "no html available",
     "just a moment",  # anti-bot challenge interstitial
     "enable javascript",
     "verify you are human",
+    "we use cookies",  # consent wall
+    "accept all cookies",
+    "accept cookies",
+    "cookie consent",
 )
+# Head window scanned for boilerplate markers. A marker hit fails a visit only
+# when no substantial body follows the head: navigation-header pages pass.
+BOILERPLATE_HEAD_CHARS = 2000
 RESULT_METADATA_FIELDS = (
     "authors",
     "date",
@@ -766,6 +775,7 @@ def resolve_visit_content(visit: dict[str, Any], manifest_dir: Path) -> str | No
 
 _VERIFICATION_RANK = {"snippet_only": 0, "preview": 1, "section": 2, "full_text": 3}
 _VIEW_VERIFICATION = {
+    "abstract": "preview",
     "preview": "preview",
     "section": "section",
     "full_text": "full_text",
@@ -779,8 +789,9 @@ def verification_statuses(manifest: dict[str, Any]) -> dict[str, str]:
     Every canonical key with a tool-recorded receipt starts at
     ``snippet_only`` (no substantive read: a search hit, or only head/brief
     triage visits).  A successful visit raises the tier to its view's level:
-    ``preview``, ``section``, or ``full_text`` (``page`` counts as
-    ``full_text``); ``head``/``brief`` never raise it.
+    ``preview`` (``abstract`` counts as ``preview``), ``section``, or
+    ``full_text`` (``page`` counts as ``full_text``); ``head``/``brief``
+    never raise it.
     """
     tiers: dict[str, str] = {}
     for result in merged_results(manifest):
@@ -995,10 +1006,15 @@ def _web_content_error(content: str) -> str | None:
     stripped = content.strip()
     if not stripped:
         return "empty content"
-    lowered = stripped[:2000].casefold()
-    for marker in _WEB_ERROR_MARKERS:
-        if marker in lowered:
-            return f"error-page marker {marker!r}"
+    head = stripped[:BOILERPLATE_HEAD_CHARS].casefold()
+    wall = next(
+        (marker for marker in WEB_BOILERPLATE_MARKERS if marker in head), None
+    )
+    if wall is not None and len(stripped) < BOILERPLATE_HEAD_CHARS + VISIT_MIN_CONTENT_CHARS:
+        return (
+            f"consent/anti-bot wall marker {wall!r} with no substantial body; "
+            "switch to a different source for this evidence"
+        )
     if stripped.startswith("{"):
         try:
             payload = json.loads(stripped)
@@ -1119,6 +1135,26 @@ def _head_sections(content: str) -> list[dict[str, Any]]:
     return normalized
 
 
+def _head_abstract(content: str) -> str:
+    """Abstract text carried by DeepXiv's head payload, or "" when absent."""
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return ""
+    containers: list[Any] = [payload]
+    if isinstance(payload, dict):
+        for key in ("data", "result", "paper"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+    for container in containers:
+        if isinstance(container, dict):
+            abstract = container.get("abstract")
+            if isinstance(abstract, str) and abstract.strip():
+                return abstract.strip()
+    return ""
+
+
 def _source_query_context(manifest: dict[str, Any], url: str) -> tuple[str, set[str]]:
     key = canonical_key(url)
     query_ids: set[str] = set()
@@ -1214,6 +1250,21 @@ def _deepxiv_progressive_read(
             "error": None,
         }
     ]
+    # The abstract is retained as its own view whenever the head carries one:
+    # it is tool-fetched content (tier-raising), but it never counts as body.
+    abstract = _head_abstract(head)
+    if abstract:
+        attempts.append(
+            {
+                "backend": backend_name,
+                "backend_version": backend_version,
+                "view": "abstract",
+                "section": None,
+                "status": "success",
+                "content": abstract,
+                "error": None,
+            }
+        )
     query_text, evidence_roles = _source_query_context(manifest, url)
     section_names = _select_deepxiv_sections(
         head, query_text=query_text, evidence_roles=evidence_roles
@@ -1281,20 +1332,31 @@ def _deepxiv_progressive_read(
 def _retain_progressive_content(
     attempts: list[dict[str, Any]], budget_chars: int
 ) -> None:
-    """Share one source-reading budget across triage and body receipts."""
+    """Share one source-reading budget across triage and body receipts.
+
+    The abstract shares the body split (three section slots become four
+    shares when it is present) without consuming a section-selection slot.
+    Attempts whose retained content is shortened are marked store_cap_hit.
+    """
     successful = [
         attempt for attempt in attempts if attempt["status"] == "success"
     ]
     head = next(
         (attempt for attempt in successful if attempt["view"] == "head"), None
     )
-    body = [attempt for attempt in successful if attempt["view"] in SUBSTANTIVE_VIEWS]
+    body = [
+        attempt
+        for attempt in successful
+        if attempt["view"] in SUBSTANTIVE_VIEWS or attempt["view"] == "abstract"
+    ]
     head_budget = min(4000, max(budget_chars // 6, 1)) if head else 0
     if head:
+        head["store_cap_hit"] = len(head["content"]) > head_budget
         head["content"] = head["content"][:head_budget]
     remaining = max(budget_chars - head_budget, 0)
     body_budget = max(remaining // len(body), 1) if body else 0
     for attempt in body:
+        attempt["store_cap_hit"] = len(attempt["content"]) > body_budget
         attempt["content"] = attempt["content"][:body_budget]
 
 
@@ -1302,7 +1364,7 @@ def add_visit(
     manifest: dict[str, Any], manifest_dir: Path, *, url: str, backend: str, view: str,
     status: str, content: str | None = None, error: str | None = None,
     backend_version: str = "unknown", section: str | None = None,
-    note: str | None = None,
+    note: str | None = None, store_cap_hit: bool = False,
 ) -> None:
     visits = manifest.setdefault("visits", [])
     visit: dict[str, Any] = {
@@ -1318,6 +1380,10 @@ def add_visit(
     }
     if note:
         visit["note"] = note
+    if store_cap_hit:
+        # retention was truncated at the storage cap; coverage attribution
+        # reads this fact (a capped visit can never evidence "sufficient")
+        visit["store_cap_hit"] = True
     if status == "success" and content:
         slug = re.sub(r"[^a-z0-9]+", "-", visit["canonical_key"].lower()).strip("-")[:60]
         filename = f"{len(visits):03d}-{slug or 'source'}.txt"
@@ -1523,6 +1589,7 @@ def cmd_visit(args: argparse.Namespace) -> int:
                     error=attempt["error"],
                     backend_version=attempt["backend_version"],
                     section=attempt["section"],
+                    store_cap_hit=attempt.get("store_cap_hit", False),
                 )
             save_manifest(args.manifest, manifest)
             body_attempts = [
@@ -1566,6 +1633,7 @@ def cmd_visit(args: argparse.Namespace) -> int:
             backend_version = "hosted-api-unknown" if backend == "jina-read" else "stdlib"
             if view == "auto":
                 view = "full_text"
+        store_cap_hit = len(content) > VISIT_CONTENT_STORE_CHARS
         content = content[:VISIT_CONTENT_STORE_CHARS]
         problem = (
             _web_content_error(content) if backend in {"jina-read", "direct"} else None
@@ -1581,7 +1649,7 @@ def cmd_visit(args: argparse.Namespace) -> int:
             return 1
         add_visit(manifest, args.manifest.parent, url=args.url, backend=backend, view=view,
                   status="success", content=content, backend_version=backend_version,
-                  section=args.section, note=note)
+                  section=args.section, note=note, store_cap_hit=store_cap_hit)
         save_manifest(args.manifest, manifest)
         print(_render_head_view(canonical_url(args.url), content, args.manifest))
         return 0

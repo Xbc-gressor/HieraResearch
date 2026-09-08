@@ -12,7 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from background_contract import (  # noqa: E402
+    audit_text,
     derive_hypothesis_selection,
+    extract_result_numbers,
+    item_number_presence,
+    mapping_number_presence,
+    result_number_matches,
     validate_experience,
     validate_experience_replacement,
     validate_registry,
@@ -1053,3 +1058,339 @@ class CarrierDemotionGateTests(unittest.TestCase):
         }
         errors = self._validate(_confounded_ledger(registry), entry)
         self.assertTrue(any("deprioritized" in error for error in errors), errors)
+
+
+class NumberPrecheckTests(unittest.TestCase):
+    """The audit text builder and the deterministic result-number precheck."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.manifest_dir = Path(self._tmp.name)
+
+    def _manifest(self, visits: list[tuple[str, str, str, bool]]) -> dict:
+        manifest = new_manifest()
+        for url, view, content, store_cap_hit in visits:
+            add_visit(
+                manifest,
+                self.manifest_dir,
+                url=url,
+                backend="web",
+                view=view,
+                status="success",
+                content=content,
+                store_cap_hit=store_cap_hit,
+            )
+        return manifest
+
+    @staticmethod
+    def _registry() -> dict:
+        return {
+            "sources": [
+                {"id": "src-01", "url": "https://example.test/study-a", "title": "Study A"},
+                {"id": "src-02", "url": "https://example.test/study-b", "title": "Study B"},
+            ]
+        }
+
+    @staticmethod
+    def _item(claim: str, *source_ids: str) -> dict:
+        return {
+            "id": "g-01",
+            "claim": claim,
+            "evidence": [
+                {"source_id": source_id, "role": "supports"} for source_id in source_ids
+            ],
+        }
+
+    def test_audit_text_takes_present_fields_with_names(self) -> None:
+        item = {
+            "claim": "Filtering lifts accuracy.",
+            "scope": {"metrics": ["accuracy"], "data_regimes": ["toy-data"]},
+            "credibility_rationale": "One study reports it (2003.11545).",
+            "title": "not part of the audit surface",
+        }
+        self.assertEqual(
+            audit_text(item),
+            "claim: Filtering lifts accuracy.\n"
+            "scope: data_regimes: toy-data; metrics: accuracy\n"
+            "credibility_rationale: One study reports it (2003.11545).",
+        )
+
+    def test_result_number_matches_percent_decimal_and_truncation(self) -> None:
+        for claim, source, expected in (
+            ("0.3843", "38.43%", True),  # % ↔ decimal variant
+            ("38.43%", "0.3843", True),
+            ("94%", "0.94", True),
+            ("0.380", "0.38", True),  # trailing-zero equivalence
+            ("0.38", "0.3843", True),  # one-direction rounding truncation
+            ("38.4%", "0.3843", True),
+            ("0.3843", "0.38", False),  # fabricated precision
+            ("0.4", "0.3843", False),  # rounding up is not truncation
+            ("5%", "0.50", False),  # magnitude differs
+        ):
+            with self.subTest(claim=claim, source=source):
+                self.assertIs(result_number_matches(claim, source), expected)
+
+    def test_extract_result_numbers_excludes_arxiv_and_splits_ranges(self) -> None:
+        text = (
+            "Reported (2003.11545) and 2003.11545v2 with 38.43% accuracy, "
+            "a 94-95% range, 3 plain integers, and 0.3843."
+        )
+        self.assertEqual(
+            extract_result_numbers(text), ["38.43%", "94%", "95%", "0.3843"]
+        )
+        self.assertEqual(extract_result_numbers("no result numbers, 42 plain"), [])
+
+    def test_mapping_number_presence_present_absent_none(self) -> None:
+        registry = self._registry()
+        url = registry["sources"][0]["url"]
+        link = {"source_id": "src-01", "role": "supports"}
+        item = self._item("Filtering lifts accuracy to 0.3843.", "src-01")
+
+        manifest = self._manifest([(url, "full_text", "We report 38.43% accuracy.", False)])
+        result = mapping_number_presence(item, link, registry, manifest, self.manifest_dir)
+        self.assertEqual(
+            result["number_presence"], {"item": "present", "this_source": "present"}
+        )
+        self.assertEqual(result["missing_tokens"], {"item": [], "this_source": []})
+        coverage = result["coverage"]
+        self.assertEqual(coverage["tier"], "full_text")
+        self.assertEqual(coverage["routing"], "sufficient")
+        self.assertFalse(coverage["store_cap_hit"])
+        self.assertEqual(coverage["retained_chars"], len("We report 38.43% accuracy."))
+        self.assertEqual(coverage["view"], "full_text")
+        self.assertTrue(coverage["content_file"])
+
+        manifest = self._manifest([(url, "full_text", "No numbers retained here.", True)])
+        result = mapping_number_presence(item, link, registry, manifest, self.manifest_dir)
+        self.assertEqual(
+            result["number_presence"], {"item": "absent", "this_source": "absent"}
+        )
+        self.assertEqual(
+            result["missing_tokens"],
+            {"item": ["0.3843"], "this_source": ["0.3843"]},
+        )
+        self.assertEqual(result["coverage"]["routing"], "partial")  # store cap hit
+        self.assertTrue(result["coverage"]["store_cap_hit"])
+
+        # Citation-shaped tokens are not result numbers: nothing to check.
+        rationale_only = self._item("Supported by prior work (2003.11545).", "src-01")
+        result = mapping_number_presence(
+            rationale_only, link, registry, manifest, self.manifest_dir
+        )
+        self.assertEqual(
+            result["number_presence"], {"item": "none", "this_source": "none"}
+        )
+
+    def test_latex_escaped_percent_matches(self) -> None:
+        # deepxiv retained content is LaTeX-ish, stored JSON-wrapped: the raw
+        # file carries a backslash run before the % (single 97\%, or the
+        # JSON-escaped double 97\\% actually seen on disk).
+        registry = self._registry()
+        url = registry["sources"][0]["url"]
+        link = {"source_id": "src-01", "role": "supports"}
+        item = self._item("Accuracy reaches 97%, 98.5%, or 0.985.", "src-01")
+        for content in (
+            r"Reports $(97\%)$ and $98.5\%$ accuracy.",
+            r"Followed by $n$-grams $(97\\%)$, $97\\%$, and $98.5\\%$ accuracy.",
+        ):
+            with self.subTest(content=content):
+                manifest = self._manifest([(url, "section", content, False)])
+                result = mapping_number_presence(
+                    item, link, registry, manifest, self.manifest_dir
+                )
+                self.assertEqual(
+                    result["number_presence"],
+                    {"item": "present", "this_source": "present"},
+                )
+        self.assertEqual(
+            extract_result_numbers(r"$(97\%)$ and $98.5\\%$"),
+            [r"97\%", r"98.5\\%"],
+        )
+
+    def test_all_substantive_visits_count_for_presence(self) -> None:
+        # A source's retained content is every substantive visit receipt: the
+        # number may live in a later same-tier visit than the first/best one.
+        registry = self._registry()
+        url = registry["sources"][0]["url"]
+        manifest = new_manifest()
+        first = "Introduction section without decimals."
+        for content in (first, r"Followed by $n$-grams $(97\\%)$ accuracy."):
+            add_visit(
+                manifest,
+                self.manifest_dir,
+                url=url,
+                backend="deepxiv",
+                view="section",
+                status="success",
+                content=content,
+            )
+        item = self._item("Char n-grams reach 97% accuracy.", "src-01")
+        result = mapping_number_presence(
+            item,
+            {"source_id": "src-01", "role": "supports"},
+            registry,
+            manifest,
+            self.manifest_dir,
+        )
+        self.assertEqual(
+            result["number_presence"], {"item": "present", "this_source": "present"}
+        )
+        # Coverage facts still describe the best (first highest-tier) visit.
+        self.assertEqual(result["coverage"]["retained_chars"], len(first))
+
+    def test_range_token_matches_by_endpoints(self) -> None:
+        registry = self._registry()
+        url = registry["sources"][0]["url"]
+        item = self._item("Accuracy lands in the 94-95% range.", "src-01")
+        link = {"source_id": "src-01", "role": "supports"}
+        for content, expected, missing in (
+            ("We reach 94-95% accuracy.", "present", []),  # verbatim range hits
+            ("A 94% floor and a 95% peak.", "present", []),  # endpoints each hit
+            ("The peak is 95%.", "absent", ["94%"]),  # one endpoint missing
+        ):
+            with self.subTest(content=content):
+                manifest = self._manifest([(url, "full_text", content, False)])
+                result = mapping_number_presence(
+                    item, link, registry, manifest, self.manifest_dir
+                )
+                self.assertEqual(result["number_presence"]["this_source"], expected)
+                self.assertEqual(result["missing_tokens"]["this_source"], missing)
+
+    def test_item_level_presence_spans_sibling_sources(self) -> None:
+        # The number rides on a sibling link: this source lacks it, the item
+        # still has it (the judge must not read this_source absence as a lie).
+        registry = self._registry()
+        url_a, url_b = (source["url"] for source in registry["sources"])
+        manifest = self._manifest(
+            [
+                (url_a, "full_text", "A qualitative discussion without decimals.", False),
+                (url_b, "section", "The ablation reaches 0.3843 accuracy.", False),
+            ]
+        )
+        item = self._item("Filtering lifts accuracy to 0.3843.", "src-01", "src-02")
+        result = mapping_number_presence(
+            item,
+            {"source_id": "src-01", "role": "supports"},
+            registry,
+            manifest,
+            self.manifest_dir,
+        )
+        self.assertEqual(
+            result["number_presence"], {"item": "present", "this_source": "absent"}
+        )
+        self.assertEqual(result["coverage"]["routing"], "sufficient")
+
+        item_result = item_number_presence(item, registry, manifest, self.manifest_dir)
+        self.assertEqual(item_result["presence"], "present")
+        self.assertEqual(item_result["tokens"], ["0.3843"])
+        self.assertEqual(item_result["missing"], [])
+
+        # A snippet-only citation is not a qualifying carrier for the gate.
+        snippet_only = self._item("Filtering lifts accuracy to 0.3843.", "src-02")
+        result = mapping_number_presence(
+            item,
+            {"source_id": "src-02", "role": "supports"},
+            registry,
+            new_manifest(),
+            self.manifest_dir,
+        )
+        self.assertEqual(result["coverage"]["tier"], "none")
+        self.assertEqual(result["coverage"]["routing"], "partial")
+        item_result = item_number_presence(
+            snippet_only, registry, new_manifest(), self.manifest_dir
+        )
+        self.assertEqual(item_result["presence"], "absent")
+        self.assertEqual(item_result["missing"], ["0.3843"])
+
+
+class NumberGateTests(unittest.TestCase):
+    """The validate-time item-level number gate (generation path only)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.manifest_dir = Path(self._tmp.name)
+        self.registry = fixture_registry()
+        self.url = self.registry["sources"][0]["url"]
+
+    def _manifest(self, *visits: tuple[str, str, str]) -> dict:
+        manifest = new_manifest()
+        for url, view, content in visits:
+            add_visit(
+                manifest,
+                self.manifest_dir,
+                url=url,
+                backend="web",
+                view=view,
+                status="success",
+                content=content,
+            )
+        return manifest
+
+    def _errors(self, manifest: dict, **kwargs) -> list[str]:
+        return validate_registry(
+            self.registry,
+            retrieval_manifest=manifest,
+            manifest_dir=self.manifest_dir,
+            **kwargs,
+        )
+
+    def test_gate_passes_when_a_cited_source_retains_the_number(self) -> None:
+        self.registry["guidance"][0]["claim"] = (
+            "Filtering lifts accuracy to 0.3843 in this exact regime."
+        )
+        manifest = self._manifest(
+            (self.url, "full_text", "We report 38.43% accuracy on the split.")
+        )
+        self.assertEqual(self._errors(manifest, number_gate=True), [])
+
+    def test_gate_flags_a_number_no_cited_source_retains(self) -> None:
+        self.registry["guidance"][0]["credibility_rationale"] = (
+            "One direct primary study reports 0.3843."
+        )
+        manifest = self._manifest(
+            (self.url, "full_text", "A qualitative discussion without decimals.")
+        )
+        # The flag defaults off: pre-seeded backgrounds stay ungated.
+        self.assertEqual(self._errors(manifest), [])
+        errors = self._errors(manifest, number_gate=True)
+        self.assertEqual(len(errors), 1)
+        (error,) = errors
+        self.assertIn("guidance g-01", error)
+        self.assertIn("0.3843", error)
+        self.assertIn("src-01", error)
+        self.assertIn("visit a cited source containing the number", error)
+        self.assertIn("cite a different source", error)
+        self.assertIn("downgrade the claim to a qualitative statement", error)
+
+    def test_gate_passes_when_no_item_has_result_numbers(self) -> None:
+        manifest = self._manifest(
+            (self.url, "full_text", "A qualitative discussion without decimals.")
+        )
+        self.assertEqual(self._errors(manifest, number_gate=True), [])
+
+    def test_gate_passes_when_a_sibling_source_carries_the_number(self) -> None:
+        sibling = {
+            **self.registry["sources"][0],
+            "id": "src-02",
+            "url": "https://example.test/toy-mechanism-followup",
+        }
+        self.registry["sources"].append(sibling)
+        guidance = self.registry["guidance"][0]
+        guidance["claim"] = "Filtering lifts accuracy to 0.3843 in this exact regime."
+        guidance["evidence"].append({"source_id": "src-02", "role": "supports"})
+        manifest = self._manifest(
+            (self.url, "full_text", "A qualitative discussion without decimals."),
+            (sibling["url"], "preview", "The ablation reaches 0.3843 accuracy."),
+        )
+        self.assertEqual(self._errors(manifest, number_gate=True), [])
+
+    def test_gate_ignores_citation_shaped_tokens(self) -> None:
+        self.registry["guidance"][0]["credibility_rationale"] = (
+            "One direct primary study (2003.11545); caution only."
+        )
+        manifest = self._manifest(
+            (self.url, "full_text", "A qualitative discussion without decimals.")
+        )
+        self.assertEqual(self._errors(manifest, number_gate=True), [])
