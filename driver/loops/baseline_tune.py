@@ -31,10 +31,12 @@ from ..status import budget_status, compact_status
 from . import common
 from .common import RunBlocked
 from .experiment import (
+    _brief,
     _complete_run,
     _ensure_provided_baseline,
     _init_run_extra,
     _or_block,
+    _refresh,
     _resume_setup,
     _setup,
 )
@@ -54,6 +56,23 @@ def _phase_c_action(run_dir: Path, candidate_path: Path, report_path: Path,
         _or_block(run_dir, repo_root, cmd, events,
                   f"phase-c-action failed: {detail}")
     return json.loads(out.stdout)
+
+
+def _tuning_finalized(run_dir: Path) -> bool:
+    """Whether candidate 000's single bout already closed and applied.
+
+    A finalized single-bout report makes ``phase-c-action`` raise the
+    inner-policy single-bout contract error, so resume must skip the tuning
+    loop entirely once the close has landed.
+    """
+    report_path = run_dir / "candidates" / BASELINE_RUN_ID / "tune_report.json"
+    if not report_path.exists():
+        return False
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(report, dict) and report.get("applied_to_base_params") is True
 
 
 def _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
@@ -169,8 +188,13 @@ def run_baseline_tune(task, tag, *, runner, model, repo_root=REPO_ROOT,
                                   task_toml, repo_root, cmd, events,
                                   job_runner)
 
-        _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
-                          job_runner)
+        if not _tuning_finalized(run_dir):
+            _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
+                              job_runner)
+        brief = _brief(run_dir, repo_root, cmd)
+        if brief.get("experience_refresh_required"):
+            _refresh(runner, store, task, tag, run_dir, repo_root, cmd,
+                     events)
         _complete_run(run_dir, repo_root, cmd, events)
     except RunBlocked:
         pass
