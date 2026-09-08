@@ -11,8 +11,8 @@ this file as a prose explanation of the schema.
 ## Task framing
 <one or two lines: what is optimized (lower is better), the data shape, the dependency constraint>
 
-## Retrieval condition
-<frozen: corpus id + cutoff + SHA-256, or open_world: explicit live backends;
+## Retrieval
+<backends used and rounds run; for a frozen corpus: corpus id + cutoff + SHA-256;
 include backend failures and coverage limitations>
 
 ## Dimension coverage
@@ -100,7 +100,7 @@ include backend failures and coverage limitations>
     {
       "id": "g-01",
       "section": "pitfall | deprioritize",
-      "effect": "caution | deprioritize | exclude",
+      "effect": "caution | deprioritize",
       "claim": "<negative finding stated only within the typed scope>",
       "scope": {
         "model_families": ["xgboost"],

@@ -18,7 +18,9 @@ You receive one `run_dir`. Infer the task and read only:
 
 - `tasks/<task>/TASK.md` and `task.toml`;
 - `tools/ledger.py brief` and action-local parent records;
-- `tools/background_contract.py render` (bounded hierarchy and coverage);
+- `tools/background_contract.py render` (bounded hierarchy and coverage; with
+  `--retrieval-manifest <run_dir>/background_retrieval.json` it also lists
+  high-rank hits not yet visited);
 - the `gain-context.json` bounded experience view generated below when needed;
 - the proposal file for the current action.
 

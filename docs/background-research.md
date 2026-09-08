@@ -39,9 +39,10 @@ python tools/background_contract.py catalog
 Deterministic tools resolve the source through
 `framework_cfg.json.space_initialization.dimension_strategy`. The default
 `catalog_subset` strategy loads the built-in catalog. `llm_induced` instead
-has the background researcher create a validated
-`<run_dir>/dimension_catalog.json` from the task contract before literature
-retrieval. Its instructions live in `docs/dimension-induction.md` and are loaded
+has the background researcher draft and validate a
+`<run_dir>/dimension_catalog.json` from the task contract; the draft may
+interleave with literature retrieval and be revised until the background
+freezes. Its instructions live in `docs/dimension-induction.md` and are loaded
 only for that strategy. An explicit catalog path is a setup/validation input;
 once the background is frozen, high-frequency runtime commands such as
 `background_contract.py render` and `semantic_search.py propose` consume that
@@ -108,7 +109,7 @@ means the dimension is not applicable; it does not mean its baseline was chosen.
 A task-fixed material choice remains visible as a one-value `baseline_only`
 dimension.
 
-If the task declares a provided candidate entrypoint, freeze the dimension set
+If the task declares a provided candidate entrypoint, settle the dimension set
 before inspecting its implementation under `llm_induced`, then make every local
 baseline hypothesis describe that supplied candidate's actual choice on the
 dimension. This makes the complete all-baselines point a faithful attribution
@@ -146,11 +147,11 @@ Each hypothesis preserves:
 - testable lower-is-better expectation;
 - typed source evidence links.
 
-The frozen registry never authors pruning state. `active`, directly
-`deprioritized`, and directly `excluded` eligibility are derived from typed
-external guidance without deleting the registered element. Evidence-preserving
-run-time pruning is implemented in the append-only `search_space_state`
-overlay described below; it never appears inside the registry.
+The frozen registry never authors pruning state. Typed external guidance
+derives `active` or `deprioritized` standing without deleting the registered
+element. Evidence-preserving run-time pruning is implemented in the
+append-only `search_space_state` overlay described below; it never appears
+inside the registry.
 
 ## Conditions and exclusions
 
@@ -338,7 +339,7 @@ still tunes numeric parameters inside the chosen semantic point.
 The implemented P2 loop closes over the frozen registry without mutating it:
 
 ```text
-background schema 3 (immutable S)
+background schema 3 (frozen when the stage ends)
   -> semantic point selection at search_space_state revision r
   -> candidate + persistent semantic edge receipts
   -> score/crash observations
@@ -348,15 +349,18 @@ background schema 3 (immutable S)
   -> next proposal set filters/orders against r+1
 ```
 
+The registry is revised freely within the background stage and freezes at its
+end; expanding registry membership mid-run is a planned extension (P4) and
+remains deferred.
+
 Every proposal set and policy receipt carries the
 `search_space_state_revision` it was built against; `select` and `add-record`
 reject stale revisions. Historical points remain valid at the revision where
 they were selected: later pruning never rewrites a record, a point, an
 observation, or a prior decision, and reopening appends a new transition.
 
-Three state families stay distinct. External guidance is `active`,
-`deprioritized`, or `excluded`. Runtime control is `active`, `deprioritized`,
-or `pruned`. Belief coverage is `unevaluated`, `failed`, `observed`, or
+Three state families stay distinct. External guidance is `active` or
+`deprioritized`. Runtime control is `active`, `deprioritized`, or `pruned`. Belief coverage is `unevaluated`, `failed`, `observed`, or
 `comparator_covered`. A crash is `+inf`, distinct from an unevaluated target,
 and cannot by itself contradict or prune a semantic element. Automated pruning
 is two-stage (`active -> deprioritized`, then `deprioritized -> pruned` in a
@@ -378,11 +382,10 @@ uncertainty/value of information, and cost. A worse child score or score delta
 alone is never sufficient; weakly attributed or incomplete evidence remains
 `mixed` and active.
 
-Transitions never touch baselines, `baseline_only` dimensions, or externally
-`excluded` hypotheses. A dimension may be deprioritized only when every
-selectable non-baseline hypothesis in it is externally excluded, already
-runtime-deprioritized/pruned, or independently deprioritize/prune-recommended
-in the same generation. Dimension pruning requires the corresponding stronger
+Transitions never touch baselines or `baseline_only` dimensions. A dimension
+may be deprioritized only when every selectable non-baseline hypothesis in it
+is already runtime-deprioritized/pruned or independently
+deprioritize/prune-recommended in the same generation. Dimension pruning requires the corresponding stronger
 pruned state or recommendation, so evidence against one hypothesis cannot ban
 adjacent mechanisms. A runtime-pruned dimension keeps its explicit baseline eligible:
 new proposals pin the dimension to `baseline_hypothesis_id` instead of
@@ -445,69 +448,61 @@ it has an explicit revision contract.
 ## Evidence-aware background research
 
 The background-researcher runtime prompts keep only the mission, boundaries,
-and phase order always loaded; they load the operational details on demand
+and the loop shape always loaded; they load the operational details on demand
 from `docs/agent-resources/background-researcher/` (`retrieval.md` before the
 first retrieval action, `evidence-registry.md` before registry distillation,
 and `background-template.md` before writing the artifact).
 
-The retrieval path starts from the task contract and resolved registry. For each
-searchable dimension, research asks what evidence is needed to propose or
-compare hypotheses and to establish relevant relations, consolidating shared
-needs into many-to-many queries. It may add cross-cutting evidence **angles**—
-such as problem-class baselines, failure modes, or counterevidence—that are not
-claims about a particular search-space dimension. Those angles remain retrieval
-intent rather than becoming new dimensions. The resulting plan is run under an
-explicitly selected condition:
+The retrieval path alternates between drafting the space and searching. Each
+round poses a few bounded questions through the adapter, reads the result
+cards, visits the hits worth reading, and revises dimensions, hypotheses, and
+follow-up questions from what landed. Recipe-shaped, bottleneck-shaped, and
+community-source questions are first class. Exploratory rounds without
+dimension targets are fine: targets are intent records, and per-dimension
+coverage is a `status`-dashboard signal the researcher manages, not a gate.
+Cross-cutting evidence **angles**—such as problem-class baselines, failure
+modes, or counterevidence—remain retrieval intent rather than becoming new
+dimensions. The query count is governed by evidence need and context budget,
+not a fixed number.
 
-- `frozen`: a pinned local JSON corpus for reproducible, network-disabled work;
-- `deepxiv`: optional open-world scholarly retrieval;
-- `jina`: explicit live-web fallback/ablation, never an invisible default;
-- runtime-native web tools: fallback only, with successful content recorded
-  through `search_backends.py record-visit`.
+Backends are selected explicitly per round:
 
-The run-local `background_retrieval.json` uses retrieval schema 3. In addition
-to backend failures, canonical deduplication, balanced selections, visits,
-content depth, budgets, versions, and hashes, each query records
-`target_dimension_ids` and `evidence_roles`. Queries are not dimensions: the
-alignment is many-to-many, and any target ids come from the resolved registry.
-Semantic roles are `hypothesis`, `baseline`, `failure_mode`, `counterevidence`,
-and `relation`. `hypothesis` and `relation` queries make claims inside the
-search space and must name at least one target; `baseline`, `failure_mode`,
-and `counterevidence` questions about the problem class as a whole may name
-none. A separate `inner_hpo_prior` query has no dimension targets and cannot
-be mixed with semantic roles.
+- `frozen`: a pinned local JSON corpus (`--frozen-corpus`) for reproducible,
+  network-disabled work; the adapter permits no live backend alongside it;
+- `deepxiv`: open-world scholarly retrieval;
+- `jina-search`: live web search (requires `JINA_API_KEY`). Web visits read
+  through the jina reader with a direct fallback (`--visit-backend
+  auto|jina-read|direct`).
 
-Every `searchable` dimension needs at least one grounding query or a unique
-`coverage_exemption` with a rationale. `baseline_only` dimensions need no query
-coverage, and novelty-only queries do not satisfy grounding coverage. The query
-count is governed by evidence need and context budget, not a fixed number.
-
-Structured planning is passed to the adapter before any backend call:
+The run-local `background_retrieval.json` uses retrieval schema 4 and is
+append-only: each `search` call appends a round of queries, three-state
+backend calls (`success`/`empty`/`failed`), and results deduplicated by
+canonical work; visits append globally, with retained content stored under
+`retrieval/`. There are no lanes, reading budgets, balanced selections, or
+coverage exemptions. Each query records optional `target_dimension_ids` and
+`evidence_roles` (`hypothesis`, `baseline`, `failure_mode`, `counterevidence`,
+`relation`).
 
 ```bash
 python tools/search_backends.py search \
-  --manifest <run_dir>/background_retrieval.json --lane grounding \
+  --manifest <run_dir>/background_retrieval.json \
   --query-spec '{"text":"<bounded evidence question>","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","counterevidence"]}' \
   --query-spec '{"text":"<problem-class comparator question>","target_dimension_ids":[],"evidence_roles":["baseline"]}' \
-  --query-spec '{"text":"<numeric prior question>","target_dimension_ids":[],"evidence_roles":["inner_hpo_prior"]}' \
-  --coverage-exemption '{"dimension_id":"<exact-uncovered-dim-id>","rationale":"<why applicable evidence is unavailable>"}' \
-  --frozen-corpus <pinned-corpus.json>
+  --backend deepxiv
 ```
 
-The exemption argument is omitted when queries cover every searchable
-dimension. Grounding has a 6000-token reading lane; novelty is a separate
-2048-token lane. A novelty-only visit cannot support a registry claim.
-
-All registry sources must have a successful substantive grounding visit
-(`section`, `preview`, `full_text`, or exact fetched `page`). DeepXiv
-`auto` visits record `head` as triage and then fetch up to three
-query-relevant body sections, falling back to a preview only when necessary;
-head/brief metadata alone never qualifies. Final background validation also
-joins query targets and exemptions to the registry, rejecting unknown ids and
-uncovered searchable dimensions. Search snippets, generated summaries, and
-unvisited URLs are insufficient. Frozen and live conditions cannot be mixed in
-one main evidence condition. Older retrieval manifests are rejected rather
-than migrated silently.
+A registry source needs a tool-recorded receipt: a search hit or a successful
+visit in the manifest. From the record the contract derives each source's
+`verification_status` (`snippet_only`, `preview`, `section`, `full_text`),
+surfaced in `search_backends.py status`. The status dashboard's unvisited
+high-rank hits also reach downstream consumers: `background_contract.py
+render --retrieval-manifest` lists them as `unexplored_leads`. DeepXiv `auto`
+visits record `head`
+as triage and then fetch up to three query-relevant body sections, falling
+back to a preview only when necessary. Before the background freezes, a
+synchronous audit spot-checks citations against the recorded source content
+and returns unfaithful ones to the researcher for repair or removal. Older
+retrieval manifests are rejected rather than migrated silently.
 
 ## Credibility, scope, and negative guidance
 
@@ -526,17 +521,16 @@ Sources, hypotheses, and guidance share five exact-tag scope facets:
   `evaluation_protocols`.
 
 `background_contract.py` derives claim-to-hypothesis transfer as `direct`,
-`partial`, `mismatch`, or `unknown`. Only `direct` guidance changes eligibility.
-`caution` annotates; external `deprioritize` marks a directly matched
+`partial`, `mismatch`, or `unknown`. Only `direct` guidance carries selection
+weight. `caution` annotates; external `deprioritize` marks a directly matched
 hypothesis deprioritized — like runtime deprioritization it stays eligible
-but earns at least a one-context carrier-prior penalty in selection;
-`exclude` removes it from proposal generation while preserving its identity
-and receipt.
+but earns at least a one-context carrier-prior penalty in selection. Removing
+a hypothesis from consideration is a runtime decision the `search_space_state`
+overlay makes from scored evidence; background guidance cannot remove
+anything.
 
 Unverified or contested negatives may only caution. Binding guidance needs
-directly scoped, non-withdrawn primary empirical evidence. Exclusion additionally
-requires corroborated/replicated evidence, two canonical independent direct
-support sources, and directly scoped independent reproduction. Every binding
+directly scoped, non-withdrawn primary empirical evidence. Every binding
 negative retains an out-of-scope `scope_probe` hypothesis so adjacent mechanisms
 remain representable.
 

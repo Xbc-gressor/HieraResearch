@@ -1,130 +1,162 @@
 # Retrieval mechanics for the background researcher
 
-Read this resource immediately before the first retrieval action, after the
-evidence-search plan exists. It defines the retrieval condition, the adapter
-command forms, manifest receipts, lane budgets, progressive reading,
-source-quality checks, and grounding-visit requirements.
+Read this resource immediately before the first retrieval action. It defines
+the adapter commands, the append-only manifest, result cards, the status
+dashboard, progressive reading, and source-quality checks.
 
-Contents: retrieval condition · search dispatch · visits and progressive
-reading · runtime web fallback and record-visit · novelty lane isolation ·
-backend failure handling · source-quality checks · grounding-visit
-requirement.
+Contents: manifest · backends · search rounds · result cards and status ·
+visits and progressive reading · continuation reads · backend failures ·
+source-quality checks · receipts.
 
 The run-local retrieval manifest at `<run_dir>/background_retrieval.json`
 records which questions ran, which resolved dimensions and evidence roles they
-target, which backends answered, how duplicate results merged, and which
-sources were opened.
+targeted, which backends answered, and which sources were opened. It is
+append-only and written only through `tools/search_backends.py` — never
+hand-edit it or the `retrieval/` content files it points to.
 
-## Retrieval condition
+## Manifest
 
-Choose the retrieval condition explicitly. For a reproducible benchmark or
-publication comparison, use the task-provided
-`tasks/<task>/background_corpus.json` (a pinned object with `corpus_id`,
-`cutoff`, `created_at`, `provenance`, `prepared_before_task_ids`, and retained
-`items`) or an explicitly supplied equivalent path;
-pass it as `--frozen-corpus <path>`, which implies the fully local `frozen`
-backend. For strict benchmark comparisons, confirm that this is a generic
-prior frozen before task identities were exposed and that it excludes
-task-specific discussions, notebooks, repositories, and solutions; the
-task-local path is storage, not evidence of compliant provenance. For an
-exploratory open-world run, opt into `--backend deepxiv`. Use `--backend jina`
-only as a separately noted live-web fallback/ablation, not an invisible
-default. Do not mix frozen and live results in the main reproducible
-condition.
+Every `search` call appends one round (`r-01`, `r-02`, …) holding that call's
+queries, backend calls, and merged results; query ids (`q-01`, `q-02`, …)
+keep counting up across rounds. Nothing is ever rebuilt or deleted: a
+follow-up round adds to the record instead of rerunning earlier questions.
+Visits append globally, independent of rounds. A successful visit's content
+lives in a file under `retrieval/` next to the manifest; the manifest keeps
+the pointer and the character count.
 
-## Search dispatch
+## Backends
 
-Dispatch the planned questions together through the local adapter. Replace
-each placeholder dimension with an exact id from the resolved registry:
+Select search backends explicitly:
+
+- `frozen` — a pinned local JSON corpus for reproducible, network-disabled
+  work. Pass `--frozen-corpus <path>`; it implies the frozen backend when
+  `--backend` is omitted, and the adapter refuses any other backend alongside
+  it. For strict benchmark comparisons, confirm the corpus is a generic prior
+  frozen before task identities were exposed and that it excludes
+  task-specific discussions, notebooks, repositories, and solutions; the
+  task-local path is storage, not evidence of compliant provenance.
+- `deepxiv` — open-world scholarly retrieval.
+- `jina-search` — live web search; requires `JINA_API_KEY` in the environment,
+  without it every call fails.
+
+Repeat `--backend` to fan a round across several. A backend that is
+unavailable or errors records per-query failed calls and does not block the
+others. Never mix frozen and live backends in one run's evidence.
+
+## Search rounds
 
 ```bash
-# Reproducible condition:
 python tools/search_backends.py search \
-  --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --query-spec '{"text":"Which mechanisms address the dominant task failure under its declared constraints?","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","counterevidence"]}' \
-  --query-spec '{"text":"Which results are the standard strong comparators for this problem class?","target_dimension_ids":[],"evidence_roles":["baseline"]}' \
-  --query-spec '{"text":"Which numeric ranges are stable for the task-declared parameters?","target_dimension_ids":[],"evidence_roles":["inner_hpo_prior"]}' \
-  --coverage-exemption '{"dimension_id":"<exact-uncovered-dim-id>","rationale":"<why applicable literature evidence is unavailable>"}' \
-  --frozen-corpus <pinned-corpus.json>
-
-# Or, explicitly, an open-world condition:
-python tools/search_backends.py search \
-  --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --query-spec '{"text":"<bounded evidence question>","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","baseline"]}' \
-  --backend deepxiv
+  --manifest <run_dir>/background_retrieval.json \
+  --query-spec '{"text":"<bounded evidence question>","target_dimension_ids":["<exact-resolved-dim-id>"],"evidence_roles":["hypothesis","counterevidence"]}' \
+  --query-spec '{"text":"<problem-class comparator question>","target_dimension_ids":[],"evidence_roles":["baseline"]}' \
+  --backend deepxiv --backend jina-search
 ```
 
-Omit `--coverage-exemption` when every searchable dimension is targeted.
-The adapter fans each query across every explicitly selected usable backend
-(local frozen corpus, DeepXiv, and/or keyless Jina search), drops
-unavailable/failing backends, canonicalizes URLs, deduplicates across backends
-and queries, ranks by the number of **distinct** supporting queries, then
-balances the selected set so one broad query cannot erase the others. Backend
-and query agreement are retrieval signals, not scientific corroboration.
+Each `--query-spec` is a JSON object with `text`, optional
+`target_dimension_ids` (exact `dim-*` ids the question informs right now; an
+intent record, empty allowed), and a non-empty `evidence_roles` list drawn
+from `hypothesis`, `baseline`, `failure_mode`, `counterevidence`, `relation`.
+`--max-results` caps hits per query per backend (default 50).
+
+Results deduplicate by canonical URL / arXiv work and rank by the number of
+distinct supporting queries. Backend and query agreement are retrieval
+signals, not scientific corroboration.
+
+## Result cards and status
+
+`search` prints a summary line — round id, query count, hits, this round's
+`max_results`, empty and failed query ids, manifest validation state — then
+one result card per new hit:
+
+```text
+[q-01 rank 1] <title>
+  <url> | authors: … | date: … | citations: …
+  tldr: …
+  snippet: …
+```
+
+Cards are the triage surface: they distinguish an actionable method report
+from a pure-theory title before you spend a visit. Backend calls are
+three-state: `success`, `empty` (answered, zero hits), `failed`. An `empty`
+call is a diagnostic failure — check credentials/quota or widen the query. A
+round that produced no hits at all exits nonzero.
+
+`search` prints only the round it just appended. To re-browse a past round's
+cards without touching the record:
+
+```bash
+python tools/search_backends.py results \
+  --manifest <run_dir>/background_retrieval.json [--round r-NN]
+```
+
+`--round` takes `r-NN` or a bare number and defaults to the latest round.
+
+Between rounds, survey the whole record:
+
+```bash
+python tools/search_backends.py status \
+  --manifest <run_dir>/background_retrieval.json
+```
+
+The dashboard reports round/query/result/visit totals, verification tier
+counts, per-dimension result and visit counts (from query targets, past or
+present), high-rank hits not yet visited, and every query that came back
+empty or failed. Use it to pick the next round's questions and the next
+visits.
 
 ## Visits and progressive reading
 
-Read selected sources through the adapter so visits are recorded. Background
-research always uses the `grounding` lane (6000-token budget):
-
 ```bash
 python tools/search_backends.py visit \
-  --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --url <url> --view <head|section|preview|full_text|auto> --section <name>
+  --manifest <run_dir>/background_retrieval.json \
+  --url <url> [--view auto|brief|head|preview|section|full_text] \
+  [--section <name>] [--visit-backend auto|direct|jina-read] \
+  [--frozen-corpus <pinned-corpus.json>]
 ```
 
-Omit `--section` unless `--view section` is used. For papers, triage metadata
-and section maps first, then read relevant method, results, or limitations
-sections. Use `--view auto` for normal DeepXiv-backed arXiv reading: the adapter
-records `head` as triage, ranks up to three available body sections against the
-source's retrieval questions and evidence roles, fetches those sections, and
-falls back to `preview` when no section body can be obtained. The head and body
-receipts share the lane's total retained-content budget. If DeepXiv returns
-metadata but no section or preview body, the visit fails; head-only retrieval
-never grounds a source.
+- For arXiv sources, use the default `--view auto`: the adapter records a
+  `head` triage receipt, ranks up to three available body sections against
+  the source's retrieval questions, fetches them, and falls back to `preview`
+  when no section body can be obtained. Metadata with no body is a failed
+  visit.
+- For other web sources, the adapter reads through the jina reader with a
+  direct HTTP fallback; `--visit-backend direct` skips the reader. Error
+  pages, empty pages, and tiny responses are recorded as failed visits with
+  the reason.
+- `--view section` requires `--section <name>`; in the frozen condition,
+  `--frozen-corpus` replays retained corpus content without network access.
 
-Use explicit `--view head` only for triage and explicit `--view section` when
-you need to override the automatic selection. In the frozen condition, append
-`--frozen-corpus <pinned-corpus.json>` to replay retained content without
-network access. Outside that condition, `auto` uses progressive DeepXiv reading
-for arXiv and a direct HTTP fetch for other sources; Jina visiting is explicit
-via `--visit-backend jina` and remains an optional live-web ablation.
+`visit` stdout is a bounded head view: the first screen of content, a section
+map with character ranges, and the exact continuation command. The full text
+(up to a generous cap) is already stored on disk. Head metadata is triage;
+before a source supports a claim, read enough of the body to state its
+studied scope.
 
-## Runtime web fallback and record-visit
+## Continuation reads
 
-If the local backends miss an evidence class, use targeted `WebSearch` for later
-versions, independent reproductions, official repositories, benchmark records,
-and primary artifacts. Use `WebFetch` only after triage.
-After every successful fetch that will appear in the search-space registry,
-write the returned content to a temporary run-local file and append a receipt
-that retains and hashes that exact content, with `claude-webfetch` as the
-backend name:
+`read` pages through already-stored visit content; it appends no receipt:
 
 ```bash
-python tools/search_backends.py record-visit \
-  --manifest <run_dir>/background_retrieval.json --lane grounding \
-  --backend claude-webfetch --view page --status success \
-  --content-file <temporary-fetched-content> --url <url>
+python tools/search_backends.py read \
+  --manifest <run_dir>/background_retrieval.json \
+  [--visit N | --url <url> [--view <view>]] \
+  [--section <name> | --offset N [--length L]]
 ```
 
-Record failures too, with `--status failed --error "<reason>"`. Never claim a
-source merely because it appeared in a search snippet.
-Delete the temporary file after the receipt is stored.
+With no selector it prints the first 8000-character page of the latest
+successful visit for the URL and the offset for the next page. `--section`
+matches a markdown heading from the visit's section map; a miss lists the
+available names. `--visit N` selects a receipt by index.
 
-## Novelty lane isolation
+## Backend failures
 
-Keep post-hoc novelty search isolated from grounding. The adapter defines a
-smaller `novelty` lane (2048 tokens), but novelty-only visits do not qualify a
-source to support a background claim. Revisit any useful novelty result in the
-grounding lane before using it in a hypothesis.
-
-## Backend failure handling
-
-If all specialized backends fail, continue with your runtime's web-tool
-fallback and record the coverage limitation. Never silently replace missing
-primary evidence with a generic blog summary. The official DeepXiv CLI may
-auto-register its free anonymous token in `~/.env` on first use; never expose
-it in logs or run files. Do not install the package merely to obtain the CLI.
+When a backend fails or answers empty, switch backends, rephrase, or widen
+the query. Never silently replace missing primary evidence with a generic
+blog summary; declare the gap under unresolved evidence instead. The official
+DeepXiv CLI may auto-register its free anonymous token in `~/.env` on first
+use; never expose it in logs or run files. Do not install the package merely
+to obtain the CLI.
 
 ## Source-quality checks while reading
 
@@ -144,9 +176,19 @@ For each promising claim, inspect enough of the actual source to assess:
 - independent support, reproduction, contradiction, or retraction,
 - similarity between the reported setting and this task.
 
-## Grounding-visit requirement
+## Receipts
 
-Every search-space source must have a successful **substantive** grounding-lane
-visit in `background_retrieval.json`: `section`, `preview`, `full_text`, or an
-exact fetched `page`. A `head`/`brief` metadata receipt, search hit, snippet,
-generated TLDR, or novelty-only visit is insufficient.
+A source enters the registry only from this record: a search hit (a snippet
+receipt) or a successful visit. From the record, each source derives a
+verification tier — `snippet_only`, `preview`, `section`, or `full_text` —
+surfaced in `status`. Read deep enough that the claims you register match the
+tier behind them; before the space freezes, citations are spot-checked
+against the recorded content, and one the record does not carry comes back
+for repair or removal.
+
+Finish with:
+
+```bash
+python tools/search_backends.py validate \
+  --manifest <run_dir>/background_retrieval.json
+```

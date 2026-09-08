@@ -229,8 +229,7 @@ subset `S_r ⊆ S`:
   `baseline_hypothesis_id`, so `S_r` restricts the dimension's coordinate to
   the baseline value;
 - `deprioritized` content stays in `S_r` but receives only its configured
-  semantic-admission budget (default one of every five slots);
-  externally `excluded` content was never in any `S_r`.
+  semantic-admission budget (default one of every five slots).
 
 Pruning a dimension pins its baseline rather than changing point arity or
 `space_revision` because arity and the frozen revision are properties of `S`,

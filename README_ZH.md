@@ -182,13 +182,13 @@ step 0+1: tunable-contract-extractor
 
 ### 5.2 background-researcher
 
-证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置子代理）。读取 `TASK.md` / `task.toml` / `prepare.py` 的候选可见接口，并先解析 `space_initialization.dimension_strategy`。默认 `catalog_subset` 从内置目录选取任务相关维度；`llm_induced` 则在检索文献前按需读取 `docs/dimension-induction.md`，直接生成最终的任务维度集 `<run_dir>/dimension_catalog.json`。维度集冻结后，声明的 provided entrypoint 只用于把各维度的 baseline hypothesis 对齐到具体基线，不反过来决定维度划分。随后才分解研究问题并检索证据。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend；DeepXiv 是显式选择的 open-world 学术条件，Jina 仅作为显式 live-web fallback/ablation。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序，再轮询补齐各 query 的覆盖。随后按 grounding lane（6000 tokens）渐进阅读，并同时寻找反证、复现和官方工件。它总是产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`，在 `llm_induced` 下另加维度目录。
+证据感知的文献侦察员，**在设置期间必需一次**（在循环之前；唯一的设置子代理）。读取 `TASK.md` / `task.toml` / `prepare.py` 的候选可见接口，并先解析 `space_initialization.dimension_strategy`。默认 `catalog_subset` 从内置目录选取任务相关维度；`llm_induced` 则按需读取 `docs/dimension-induction.md`，起草任务维度集 `<run_dir>/dimension_catalog.json`（可与检索交错修订，冻结前定稿）。维度集收敛后，声明的 provided entrypoint 只用于把各维度的 baseline hypothesis 对齐到具体基线，不反过来决定维度划分。研究按迭代轮次推进：一轮 search → 读结果卡 → visit 有价值的命中 → 追 query。可复现主条件使用 pinned JSON corpus 的本地 `frozen` backend（`--frozen-corpus` 与 live backend 互斥）；live 检索显式选择 `deepxiv`（学术）与/或 `jina-search`（web，需 `JINA_API_KEY`）。外部 backend 全部模块化且可选，失效或缺失只改变覆盖，不影响本地合约、去重、验证或 frozen replay。结果按 canonical URL / arXiv work 去重，以不同 query 的支持数排序；`status` 仪表盘汇总各维度命中/访问、未读高 rank 命中与 empty/failed query，`read` 按 section/offset 续读已存正文。并同时寻找反证、复现和官方工件。它总是产生 `<run_dir>/background.md` 与访问轨迹 `<run_dir>/background_retrieval.json`，在 `llm_induced` 下另加维度目录。
 
 `background.md` 现在是 schema-3 的语义搜索空间：每个维度复制已解析目录的定义/边界/来源，登记显式任务基线与稳定 `hyp-*` 值；`catalog_subset` 可使用内置目录的子集，`llm_induced` 必须完整、按序使用 run-local 目录。`activates` / `requires` / `excludes` 关系表示条件激活与不兼容组合。标量设置仍属于内层 HPO。人类可读的 Dimension coverage / Dimensions / Relations 与 JSON 层级必须一致。
 
-来源、结构化负面指导 `g-*` 与每个假设继续使用同一组五轴范围：模型家族、数据情境、指标、干预机制、评估协议。只有直接覆盖假设的指导可影响资格；`unverified` / `contested` 负面只能提示。每个非基线假设保存 claim、比较项、重开条件、来源关系与独立文献可信度标签。绑定负面仍必须保留范围外 `scope_probe`，不会删除邻近机制。
+来源、结构化负面指导 `g-*` 与每个假设继续使用同一组五轴范围：模型家族、数据情境、指标、干预机制、评估协议。直接覆盖假设的 `deprioritize` 指导只是先验权重——影响优先级，不影响资格（排除只能由下游按实测做出）；`unverified` / `contested` 负面只能提示。每个非基线假设保存 claim、比较项、重开条件、来源关系与独立文献可信度标签。绑定负面仍必须保留范围外 `scope_probe`，不会删除邻近机制。
 
-Search space registry 中的每个来源必须在 retrieval manifest 中存在成功且包含正文的 grounding visit（`section`、`preview`、`full_text` 或原样抓取的 `page`）；DeepXiv 的 `head` / `brief` 只用于筛选，不能作为证据。DeepXiv 的 `auto` 会先读取 `head`，再按检索问题选择并读取最多三个正文 section，必要时回退到 preview。只出现在搜索摘要或 novelty lane（2048 tokens）中不算访问。Claude 的原生 web 工具仍可作为本地 backend 全部失败时的 fallback，但成功访问必须通过 `record-visit` 写入同一 manifest。
+Search space registry 中的每个来源必须在 retrieval manifest 中有工具记录的 receipt（search 命中即 snippet receipt；成功 visit 提升层级），contract 据此派生 `verification_status`（`snippet_only` / `preview` / `section` / `full_text`）。DeepXiv 的 `auto` 会先读取 `head`，再按检索问题选择并读取最多三个正文 section，必要时回退到 preview；`head` / `brief` 只用于筛选。冻结前 driver 对 source→claim 引用做同步抽查，失实引用退回 researcher 修复或删除。researcher 白名单不含 WebSearch/WebFetch：一切检索流量经 `search_backends.py` 落 manifest。
 
 冻结语料的约定路径是 `tasks/<task>/background_corpus.json`；普通 open-world 开发可不提供，但 frozen / network-disabled 评测必须提供该文件或显式等价路径。
 
@@ -354,11 +354,12 @@ runs/<task-name>/<tag>/loop_state.md
 
 受 Arbor 检索层启发的轻量适配器，但不导入 Arbor runtime：
 
-- 本地 frozen-corpus backend 是可复现条件；DeepXiv / Jina 必须显式启用且单个失败不阻塞其他结果
-- canonical work/URL 去重，统计不同 query 与 backend 的支持数，并平衡每个 query 的候选覆盖
-- `visit` 渐进阅读并自动写 visit receipt；runtime 原生 web fetch 可用 `record-visit` 接入
-- 独立的 `grounding=6000` 与 `novelty=2048` token lane
-- 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash 和访问内容 hash；token 永不进入运行产物
+- manifest schema 4 为 append-only：每次 `search` 追加一个 round（queries、三态 backend call `success`/`empty`/`failed`、去重结果），visit 全局追加，正文外置 `retrieval/`
+- 本地 frozen-corpus backend 是可复现条件（`--frozen-corpus` 与 live backend 互斥）；`deepxiv` / `jina-search` 必须显式启用且单个失败不阻塞其他结果，`jina-search` 需 `JINA_API_KEY`
+- canonical work/URL 去重，按不同 query 的支持数排序；search stdout 输出结果卡（authors/date/citations/tldr/snippet），`--max-results` 默认 50
+- `status` 仪表盘汇总 per-dimension 命中/访问、未 visit 高 rank 命中、empty/failed query 与 verification 层级；`read` 按 section/offset 续读已存正文（不产生新 receipt）
+- `visit` 自动写 visit receipt：arXiv 走 DeepXiv 渐进阅读（head + 至多三个正文 section，preview 兜底），web 走 jina reader（direct 回退），错误页/空页记 failed
+- 保留 raw response、retrieval timestamp、backend/client version、corpus cutoff/hash；visit 正文外置并校验字符数；token 永不进入运行产物
 - `python tools/validate_search_backends.py` 提供完全离线的回归检查
 
 ### 7.7 validate_tasks.py

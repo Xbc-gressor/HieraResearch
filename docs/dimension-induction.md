@@ -3,7 +3,9 @@
 Read this resource only when
 `framework_cfg.json.space_initialization.dimension_strategy` is
 `llm_induced`. It defines how to create the run-local
-`dimension_catalog.json` before literature retrieval begins.
+`dimension_catalog.json` from the task contract. Draft it early; the draft may
+interleave with literature retrieval and be revised as evidence arrives, as
+long as the final version validates before the background does.
 
 ## Inputs and independence
 
@@ -19,8 +21,8 @@ and candidate-visible supporting paths it names, excluding any declared
 provided-baseline implementation until the catalog is final; the resulting
 catalog provenance must cite the packet and this document.
 
-Do not consult `contracts/semantic-dimensions-v1.json` or literature results
-while inducing dimensions. Do not inspect hidden evaluation data, infer a blind
+Do not consult `contracts/semantic-dimensions-v1.json` for the initial draft;
+literature findings may inform later revisions. Do not inspect hidden evaluation data, infer a blind
 task's identity, or treat the fixed evaluator and HieraResearch's own search
 policy as candidate choices. A provided baseline may inform the later baseline
 hypotheses, but it must not determine the decomposition.
@@ -86,6 +88,6 @@ python tools/background_contract.py catalog \
   --path <run_dir>/dimension_catalog.json
 ```
 
-Correct catalog contract errors before retrieving literature. If a valid
+Correct catalog contract errors before the final background validation. If a valid
 catalog cannot be produced, report setup as blocked; do not fall back to the
 built-in catalog.

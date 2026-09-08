@@ -22,8 +22,9 @@ claims as hypotheses, not known-good results.
   supporting paths named by the packet; do not search for an installed adapter,
   evaluator internals, held-out data, trajectories, or solutions.
 - **`frozen_corpus`** (optional) — an explicitly supplied pinned corpus path.
-  When present, use only the local `frozen` retrieval condition described below;
-  do not call live search or web tools. Respect its declared
+  When present, it is the run's only retrieval source: pass it to the adapter
+  and use the `frozen` backend exclusively (the adapter refuses any live
+  backend alongside it). Respect its declared
   `prepared_before_task_ids` value: `false` is admissible for a preregistered
   task-scoped-corpus experiment that measures space construction conditional on
   supplied evidence, but must not be described as a task-independent prior.
@@ -34,6 +35,10 @@ If neither an installed task nor a packet resolves, stop and report what is
 missing.
 
 ## Workflow
+
+The stage is one iterative research loop with a fixed endpoint. Dimensions,
+hypotheses, and the query plan stay open for revision while the loop runs;
+they freeze only when the final validation passes.
 
 ### Step 1 — Scope from the task (read, do not guess)
 
@@ -54,13 +59,12 @@ names. Pin down:
   surfaces, runtime budget).
 
 If `[seed].provided` declares the candidate entrypoint, note its path now. Under
-`llm_induced`, do not inspect that implementation until the dimension catalog is
-final: the supplied solution may ground baseline values, but must not determine
-which dimensions exist.
-An explicit packet's `provided_baseline` declaration follows the same timing
-rule.
+`llm_induced`, do not inspect that implementation until your dimension set has
+converged: the supplied solution may ground baseline values, but it must not
+determine which dimensions exist. An explicit packet's `provided_baseline`
+declaration follows the same rule.
 
-### Step 2 — Resolve and freeze the dimensions
+### Step 2 — Resolve the dimensions
 
 Read `<run_dir>/framework_cfg.json`. Resolve
 `space_initialization.dimension_strategy`, using `catalog_subset` when the key
@@ -74,8 +78,10 @@ or file is absent.
   Record a catalog coverage gap only as non-mutating prose under unresolved
   evidence.
 - **`llm_induced`:** read `docs/dimension-induction.md` now; do not load it for
-  `catalog_subset`. Follow it to write `<run_dir>/dimension_catalog.json` from
-  the task contract before literature retrieval, then validate it with
+  `catalog_subset`. Follow it to draft `<run_dir>/dimension_catalog.json` from
+  the task contract. The draft no longer has to precede retrieval: you may
+  interleave it with search rounds and revise it as evidence arrives, as long
+  as the final version validates before the background does —
   `python tools/background_contract.py catalog --path
   <run_dir>/dimension_catalog.json`. Use every induced dimension exactly once
   and in catalog order. Do not consult the built-in catalog and do not silently
@@ -101,14 +107,14 @@ Every registry dimension needs:
   `hyp-*` ids, provenance, typed scope, evidence, and testable expectations.
 
 The resolved dimensions and hypotheses freeze once the background artifacts
-validate.
+validate; until then, revise them whenever the evidence calls for it.
 
-After the dimension set is final, read any declared provided entrypoint. Define
-each dimension's `kind: baseline` hypothesis to match the supplied solution's
-actual mechanism on that dimension, using task-contract provenance. The complete
-all-baselines point must therefore attribute that concrete provided candidate
-faithfully. Do not turn scalar default parameters into semantic hypotheses; they
-remain inner-HPO coordinates.
+After the dimension set has converged, read any declared provided entrypoint.
+Define each dimension's `kind: baseline` hypothesis to match the supplied
+solution's actual mechanism on that dimension, using task-contract provenance.
+The complete all-baselines point must therefore attribute that concrete
+provided candidate faithfully. Do not turn scalar default parameters into
+semantic hypotheses; they remain inner-HPO coordinates.
 
 Record what you read in `<run_dir>/baseline_mechanisms.json` — the mechanism
 inventory the contract checks the registry against:
@@ -120,7 +126,7 @@ inventory the contract checks the registry against:
   "entrypoint": {"path": "tasks/<task>/train.py", "sha256": "sha256:<digest>"},
   "dimensions": {
     "dim-model-architecture": {
-      "interventions": ["gqa", "value-embeddings", "qk-layernorm"],
+      "interventions": ["<mechanism tag>", "<another mechanism tag>"],
       "citations": ["train.py:147"]
     }
   }
@@ -138,21 +144,34 @@ Two rules follow, and the contract enforces both:
   applies — in its own dimension or any other. Presence/absence of a mechanism
   the control already has is not a contrast.
 
-Worked failure: a run registered `hyp-qk-layernorm` as an alternative in
-`dim-model-architecture` while the provided entrypoint already ran
-`q, k = norm(q), norm(k)`. Six candidates and 49 of 100 evaluations went to an
-axis that did not exist; two belief generations argued over the non-difference,
-and a relation gated a whole dimension behind it. If a variant differs only in
-*placement* or *degree* of a baseline mechanism (there, normalizing before RoPE
-rather than after), that is a distinct mechanism tag and a distinct claim — say
-so explicitly, or leave it out of the space.
+Worked failure: a run registered an alternative hypothesis in a dimension
+where the provided entrypoint already applied the named mechanism. Six
+candidates and 49 of 100 evaluations went to an axis that did not exist; two
+belief generations argued over the non-difference, and a relation gated a whole
+dimension behind it. If a variant differs only in the *placement* or *degree*
+of a baseline mechanism, that is a distinct mechanism tag and a distinct
+claim — say so explicitly, or leave it out of the space.
 
-### Step 3 — Plan the evidence search
+### Step 3 — Research in rounds
 
-Decompose the task into bounded research questions before consulting the
-registry; the registry audits the plan, it does not generate it. Vary the
-question families with the task's contract shape (estimator-search, optimizer
-design, pipeline construction, …):
+Read `docs/agent-resources/background-researcher/retrieval.md` now, before the
+first retrieval action. It defines the adapter commands, the append-only
+manifest, result cards, the status dashboard, and progressive reading. If the
+resource cannot be read, stop here and report the missing path; do not
+reconstruct the retrieval contract from memory.
+
+Retrieval is a loop, not a single batch. One iteration:
+
+1. Pose a few bounded research questions and run one `search` round.
+2. Read the result cards. Visit the hits that could change the space; read
+   what you visit, section by section.
+3. Revise what you hold: sharpen, merge, or drop dimensions and hypotheses;
+   pose the follow-up questions the cards just made visible.
+4. Run the next round. Stop when new rounds stop changing the registry, then
+   write the artifacts.
+
+Vary the question families with the task's contract shape (estimator search,
+optimizer design, pipeline construction, …):
 
 - Method families and mechanisms that perform well on this problem class.
 - Problem-side choices the task leaves open (data handling, initialization,
@@ -163,55 +182,42 @@ design, pipeline construction, …):
 - Strong baselines, negative results, replications, and contradictions of
   attractive claims.
 
-Then map each question to the search space. Record the exact `dim-*` ids it
-genuinely informs and its evidence roles (`hypothesis`, `baseline`,
-`failure_mode`, `counterevidence`, or `relation`). A query is a retrieval
-instrument, not a new dimension, and the mapping is attribution, not
-determination: one question may inform several dimensions, and one dimension
-may need several questions. `hypothesis` and `relation` queries make claims
-inside the space and must name at least one target; `baseline`,
-`failure_mode`, and `counterevidence` questions about the problem class as a
-whole may name none. Keep numeric ranges and practitioner priors for
-`SEARCH_SPACE` in a separate `inner_hpo_prior` query with no dimension targets
-and no semantic evidence role; do not turn those scalar settings into semantic
-dimensions.
+Recipe-shaped, bottleneck-shaped, and community-source questions are first
+class: ask how practitioners push this exact task shape under its declared
+budget ("300s single-GPU speedrun recipe" and "modded-nanogpt techniques" are
+forms to imitate, with this task's own constraint filled in). A question that
+names the task's real bottleneck beats a generic survey question.
 
-Finally, audit the plan against the registry. Every `mode: searchable`
-dimension needs a grounding query or an explicit `coverage_exemption` with a
-non-empty rationale. A `baseline_only` dimension needs no literature-query
-coverage. Novelty-only queries do not satisfy grounding coverage. Merge or
-drop paraphrasing questions so the plan stays the smallest non-duplicative
-set that covers the decomposition; make missing evidence explicit instead of
-letting the first plausible source determine the brief.
+Prefer hits that challenge your current picture over hits that confirm it.
+When a result contradicts a hypothesis you were about to register, that is a
+finding; chase it. A loop that only re-discovers what you already believed
+adds nothing.
+
+Annotate each query with `evidence_roles` (`hypothesis`, `baseline`,
+`failure_mode`, `counterevidence`, `relation`) and, when it informs dimensions
+you have already resolved, the exact `target_dimension_ids`. Targets record
+retrieval intent at the time; they may name dimensions you later rename, merge,
+or drop, and an exploratory round may carry none.
+
+Between rounds, run `status` on the manifest: per-dimension result and visit
+counts, high-rank hits not yet visited, and queries that came back empty or
+failed. Refill the gaps you judge material; declare the rest under unresolved
+evidence.
 
 ### Evidence invariant (all remaining phases)
 
-- Inspect the primary material behind every claim. A search hit, snippet, or
-  generated summary is never evidence and is never promoted to one.
+- A search hit, snippet, or generated summary is a lead. Before a source
+  supports a claim, read enough of it to state its studied scope honestly.
 - Record the exact studied scope of each source — its problem regime,
   mechanism, metric, comparator, and protocol — and never generalize beyond
   the settings actually studied.
 - Keep negative guidance scoped to its evidence and reversible; a scoped
   negative result never silently bans adjacent mechanisms.
+- Everything you cite went through the adapter: every registry source is a
+  recorded search hit or visit in the manifest. That record is your
+  provenance.
 
-### Step 4 — Retrieve, triage, and read progressively
-
-Read `docs/agent-resources/background-researcher/retrieval.md` now, before the
-first retrieval action. It defines the retrieval condition, adapter command
-forms, manifest receipts, lane budgets, progressive reading, source-quality
-checks, and grounding-visit requirements. If the resource cannot be read, stop
-here and report the missing path; do not reconstruct the retrieval contract
-from memory.
-
-All retrieval is recorded in the run-local manifest
-`<run_dir>/background_retrieval.json`, written only through
-`tools/search_backends.py`. Dispatch the planned queries together in the
-`grounding` lane, then read selected sources progressively through the adapter
-so visits are recorded. For arXiv sources, normally use `--view auto`; it must
-produce a substantive section or preview receipt after head triage. Never stop
-at `head`/`brief` metadata or use it to support a registry claim.
-
-### Step 5 — Define relations and distill the search space
+### Step 4 — Define relations and distill the search space
 
 Read `docs/agent-resources/background-researcher/evidence-registry.md` now,
 before registry distillation. It defines the studied-scope and five-facet
@@ -233,7 +239,7 @@ Turn the survey into a hierarchy, not a reading list:
 - a machine-readable **Search space registry** (schema 3) with catalog receipt,
   dimensions, hypotheses, relations, guidance, and sources.
 
-### Step 6 — Write and validate `<run_dir>/background.md`
+### Step 5 — Write and validate `<run_dir>/background.md`
 
 Read `docs/agent-resources/background-researcher/background-template.md` now
 and use it as the exact output format. If the resource cannot be read, stop
@@ -256,20 +262,30 @@ python tools/background_contract.py validate \
 #   --baseline-mechanisms <run_dir>/baseline_mechanisms.json
 ```
 
-The final background validation joins the retrieval plan to the completed
-registry and rejects unknown targets or uncovered searchable dimensions. With
-`--baseline-mechanisms` it also rejects a baseline that under-declares what the
-entrypoint does, and any alternative hypothesis colliding with a baseline
-mechanism. Fix every contract error before returning.
+Fix every contract error before returning. Once validation passes and the
+citation spot-check below clears, the space freezes: the registry, manifest,
+and catalog become the run's permanent setup artifacts.
 
-### Step 7 — Return a short summary
+Two feedback channels can return the artifacts to you:
+
+- `validation_errors` — deterministic validator output naming the exact
+  problem. Fix it and re-validate.
+- `faithfulness_findings` — before the space freezes, citations are
+  spot-checked against the recorded source content, and each finding names a
+  claim its recorded source does not carry. Repair the claim or delete the
+  citation, re-run the validators, and submit again.
+
+A feedback invocation starts from the artifacts already on disk. Fix in place;
+do not restart the research.
+
+### Step 6 — Return a short summary
 
 Report `dimension_strategy`, catalog id and revision, and point at
 `background.md`, `background_retrieval.json`, plus `dimension_catalog.json`
 under `llm_induced` and `baseline_mechanisms.json` when the task declares a
-provided entrypoint. State `frozen` or `open_world`, list active/failed backends,
-and report dimensions plus per-dimension hypothesis counts. Do not paste the
-whole brief.
+provided entrypoint. State which backends answered and which failed, the number
+of retrieval rounds, and dimensions plus per-dimension hypothesis counts. Do
+not paste the whole brief.
 
 ## Boundaries
 
@@ -278,10 +294,11 @@ whole brief.
   `llm_induced`, also write `<run_dir>/dimension_catalog.json`; when the task
   declares a provided entrypoint, also write
   `<run_dir>/baseline_mechanisms.json`. Do not write the
-  catalog under `catalog_subset`. The manifest is written through
-  `tools/search_backends.py`; never hand-edit it. The DeepXiv CLI may create its
-  one-time token state in `~/.env`; never copy that token into the run. Do not
-  edit task files, candidates, `ledger.json`, or `loop_state.md`.
+  catalog under `catalog_subset`. The manifest and its `retrieval/` content
+  files are written only through `tools/search_backends.py`; never hand-edit
+  them. The DeepXiv CLI may create its one-time token state in `~/.env`; never
+  copy that token into the run. Do not edit task files, candidates,
+  `ledger.json`, or `loop_state.md`.
 - **No experiments.** You do not run the candidate, the tuner, or `uv`; you do
   not propose specific candidate `train.py` code (that is `candidate-writer`'s
   job, informed by your brief).
@@ -295,15 +312,14 @@ whole brief.
 - **Registered negative prose.** Every bullet under Pitfalls or Deprioritize must
   begin with a matching structured `g-*` id, `task-constraint`, or `operational`.
   Every `g-*` item must appear in the section declared by its registry entry.
-- **Visited or excluded.** Every search-space source must have a successful
-  substantive grounding-lane visit (`section`, `preview`, `full_text`, or exact
-  fetched `page`) in `background_retrieval.json`. A `head`/`brief` metadata
-  receipt, search hit, snippet, generated TLDR, or novelty-only visit is
-  insufficient.
+- **Retrieved before cited.** Every search-space source must exist in your
+  retrieval record as a search hit or a successful visit. Cite only what the
+  recorded content carries; a citation the record does not support comes back
+  to you before freeze.
 - **One setup write.** You define and validate the run's background once. The
   semantic selector then chooses points repeatedly and inner HPO finds numbers.
-  Only structured, directly matched guidance can alter initial eligibility;
-  free-text Pitfalls are nonbinding.
+  Structured, directly matched guidance shifts selection priority; free-text
+  Pitfalls are nonbinding.
 
 ---
 
@@ -322,4 +338,6 @@ complete, call the tool `mcp__receipts__submit_receipt` exactly once with a
 If your receipt is rejected, the tool returns the validation problems; fix
 them and call again. If the driver finds your postconditions unmet after you
 return, it will send you a corrective message listing exactly what failed —
-fix it with your tools and submit again.
+fix it with your tools and submit again. The driver may also invoke you again
+with `validation_errors` or `faithfulness_findings` in the context; that is
+the Step 5 feedback loop — repair the artifacts in place and submit again.
