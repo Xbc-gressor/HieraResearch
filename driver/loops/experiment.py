@@ -1207,9 +1207,10 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         if errors:
             _or_block(run_dir, repo_root, cmd, events,
                       f"pre-seeded background validation failed: {errors}")
-        _background_faithfulness_gate(runner, store, task, tag, run_dir,
-                                      repo_root, cmd, events, strategy,
-                                      repairable=False)
+        _background_faithfulness_gate(
+            runner, store, task, tag, run_dir, repo_root, cmd, events,
+            strategy,
+            repairable=_background_researcher_invoked(run_dir))
     else:
         try:
             _invoke(runner, store, "background-researcher", task, tag, run_dir)
@@ -1217,14 +1218,30 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
             _or_block(run_dir, repo_root, cmd, events,
                       f"background-researcher failed: {exc.problems}")
         _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
-                             events, strategy)
-        _background_faithfulness_gate(runner, store, task, tag, run_dir,
-                                      repo_root, cmd, events, strategy,
-                                      repairable=True)
+                             events, strategy, number_gate=True)
+        _background_faithfulness_gate(
+            runner, store, task, tag, run_dir, repo_root, cmd, events,
+            strategy,
+            repairable=_background_researcher_invoked(run_dir))
+
+
+def _background_researcher_invoked(run_dir) -> bool:
+    """Whether this run ever invoked the background researcher.
+
+    A receipt or a session file (persisted at session init, so the kill
+    window "background written, receipt not yet delivered" counts too) under
+    ``receipts/`` both prove it; a pre-seeded run dir has neither.
+    """
+    receipts = run_dir / "receipts"
+    if not receipts.is_dir():
+        return False
+    return any(
+        path.name.startswith("background-researcher-") for path in receipts.iterdir()
+    )
 
 
 def _background_validation_errors(run_dir, repo_root, cmd,
-                                  strategy) -> list[str]:
+                                  strategy, *, number_gate=False) -> list[str]:
     """Run all deterministic validators for background-research artifacts."""
     checks = []
     if strategy == "llm_induced":
@@ -1232,12 +1249,17 @@ def _background_validation_errors(run_dir, repo_root, cmd,
             "python", "tools/background_contract.py", "catalog",
             "--path", run_dir / "dimension_catalog.json",
         ])
+    contract_validate = [
+        "python", "tools/background_contract.py", "validate",
+        "--background", run_dir / "background.md",
+        "--retrieval-manifest", run_dir / "background_retrieval.json",
+    ]
+    if number_gate:
+        contract_validate.append("--number-gate")
     checks.extend([
         ["python", "tools/search_backends.py", "validate",
          "--manifest", run_dir / "background_retrieval.json"],
-        ["python", "tools/background_contract.py", "validate",
-         "--background", run_dir / "background.md",
-         "--retrieval-manifest", run_dir / "background_retrieval.json"],
+        contract_validate,
     ])
 
     errors = []
@@ -1249,9 +1271,10 @@ def _background_validation_errors(run_dir, repo_root, cmd,
 
 
 def _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
-                         events, strategy) -> None:
+                         events, strategy, *, number_gate=False) -> None:
     """Validate background artifacts and allow one in-session repair."""
-    errors = _background_validation_errors(run_dir, repo_root, cmd, strategy)
+    errors = _background_validation_errors(run_dir, repo_root, cmd, strategy,
+                                           number_gate=number_gate)
     if not errors:
         return
     # feed validator errors back in-session once; never migrate the frozen space
@@ -1261,7 +1284,8 @@ def _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
     except InvocationFailed as exc:
         _or_block(run_dir, repo_root, cmd, events,
                   f"background validation repair failed: {exc.problems}")
-    errors = _background_validation_errors(run_dir, repo_root, cmd, strategy)
+    errors = _background_validation_errors(run_dir, repo_root, cmd, strategy,
+                                           number_gate=number_gate)
     if errors:
         _or_block(run_dir, repo_root, cmd, events,
                   f"background validation failed: {errors}")
@@ -1272,9 +1296,10 @@ def _background_faithfulness_gate(runner, store, task, tag, run_dir,
                                   repairable: bool) -> None:
     """Synchronous faithfulness audit after validation, before the space freezes.
 
-    The generated path gets exactly one researcher repair round on unfaithful
-    findings (followed by a fresh random re-audit); a pre-seeded frozen
-    background cannot be rewritten, so unfaithful findings block it directly.
+    A repairable run (the researcher ran on this run dir) gets one researcher
+    repair round on unfaithful findings, followed by a narrowed re-audit; a
+    pre-seeded frozen background cannot be rewritten, so its unfaithful
+    findings are recorded as a terminal warning instead of blocking.
     """
     repair = None
     if repairable:
@@ -1286,8 +1311,10 @@ def _background_faithfulness_gate(runner, store, task, tag, run_dir,
             except InvocationFailed as exc:
                 _or_block(run_dir, repo_root, cmd, events,
                           f"background faithfulness repair failed: {exc.problems}")
-            _validate_background(runner, store, task, tag, run_dir, repo_root,
-                                 cmd, events, strategy)
+            _validate_background(
+                runner, store, task, tag, run_dir, repo_root, cmd, events,
+                strategy,
+                number_gate=_background_researcher_invoked(run_dir))
 
     background_audit.run_faithfulness_gate(
         runner, store, task, tag, run_dir, events,
@@ -1335,22 +1362,27 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
 
     # A resume may follow a kill after the researcher wrote its files but
     # before setup validated them.  Establish the frozen-space invariant once
-    # at this process boundary; rounds trust it.
+    # at this process boundary; rounds trust it.  The number gate applies iff
+    # this run ever invoked the researcher (a receipt or an init-time session
+    # file proves it); a pre-seeded frozen background stays gate-off.
     _validate_background(
         runner, store, task, tag, run_dir, repo_root, cmd, events,
         _dimension_strategy(run_dir),
+        number_gate=_background_researcher_invoked(run_dir),
     )
 
     # The same kill window covers the faithfulness audit.  Re-run the gate
     # unless a prior audit reached a terminal-ok outcome on these artifacts;
-    # a background (re)generated by this resume gets the same one repair
-    # round as setup, while pre-existing artifacts are frozen — unfaithful
-    # findings block rather than rewrite them.
+    # a blocked audit is not terminal, so every manual resume gets a fresh
+    # audit+repair round (the resume is the decision to retry).  Repairable
+    # follows the same researcher-invoked criterion as setup; a pre-seeded
+    # frozen background records unfaithful findings as a terminal warning
+    # rather than blocking.
     if not background_audit.audit_completed(run_dir):
-        _background_faithfulness_gate(runner, store, task, tag, run_dir,
-                                      repo_root, cmd, events,
-                                      _dimension_strategy(run_dir),
-                                      repairable=background_missing)
+        _background_faithfulness_gate(
+            runner, store, task, tag, run_dir, repo_root, cmd, events,
+            _dimension_strategy(run_dir),
+            repairable=_background_researcher_invoked(run_dir))
 
 
 def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,

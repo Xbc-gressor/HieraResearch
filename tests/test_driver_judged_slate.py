@@ -65,8 +65,9 @@ def write_completed_audit(run_dir: Path) -> None:
     (run_dir / background_audit.ARTIFACT_NAME).write_text(
         json.dumps(
             {
+                "version": background_audit.ARTIFACT_VERSION,
                 "written_at": "2026-01-01T00:00:00Z",
-                "rounds": [{"attempt": 1, "outcome": "passed", "sample": []}],
+                "rounds": [{"attempt": 1, "outcome": "passed", "batches": []}],
             }
         )
     )

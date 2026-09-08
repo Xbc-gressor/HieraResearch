@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -8,8 +9,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from driver.loops.background_audit import audit_completed  # noqa: E402
 from driver.loops.experiment import run_experiment  # noqa: E402
 from driver.session import FakeSessionRunner  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    background_text,
+    fixture_registry,
+    retrieval_hit_manifest,
+)
 
 
 def write_task(repo: Path, provided: bool = False) -> None:
@@ -158,6 +165,42 @@ def write_background(run_dir: Path) -> None:
     (run_dir / "background_retrieval.json").write_text(
         json.dumps({"schema_version": 4, "rounds": [], "visits": []})
     )
+
+
+def write_audited_background(run_dir: Path) -> None:
+    """Background artifacts carrying real claim mappings the gate will audit."""
+    (run_dir / "background.md").write_text(background_text(fixture_registry()))
+    (run_dir / "background_retrieval.json").write_text(
+        json.dumps(retrieval_hit_manifest())
+    )
+
+
+def judge_entry(unfaithful_ids: set[str]) -> dict:
+    """Script entry for the faithfulness judge: one verdict per presented
+    label, ``unfaithful`` for the named item ids, ``faithful`` otherwise."""
+    entry: dict = {"receipt": {}}
+
+    def effect(ctx) -> None:
+        verdicts = []
+        label = None
+        for line in ctx.inline_payload.splitlines():
+            match = re.fullmatch(r"## (M\d+)", line)
+            if match:
+                label = match.group(1)
+            elif line.startswith("- item: ") and label is not None:
+                ids = re.findall(r"`([^`]+)`", line)
+                verdict = (
+                    "unfaithful"
+                    if any(item_id in unfaithful_ids for item_id in ids)
+                    else "faithful"
+                )
+                verdicts.append({"mapping": label, "verdict": verdict,
+                                 "rationale": f"{label} judged"})
+                label = None
+        entry["receipt"] = {"verdicts": verdicts}
+
+    entry["side_effects"] = effect
+    return entry
 
 
 class ExperimentTests(unittest.TestCase):
@@ -602,6 +645,92 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(runner.calls, [])
         self.assertEqual((cmd.run_dir / "background.md").read_text(),
                          "# frozen\n")
+
+    def test_preseeded_unfaithful_background_records_warning(self) -> None:
+        # repairable=False (no researcher receipt): unfaithful findings are
+        # recorded as a terminal warning, not a block — the frozen background
+        # cannot be rewritten, and blocking would dead-loop every resume.
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, True]
+        cmd.run_dir.mkdir(parents=True, exist_ok=True)
+        write_audited_background(cmd.run_dir)
+        frozen_text = (cmd.run_dir / "background.md").read_text()
+        runner = FakeSessionRunner([
+            judge_entry({"hyp-data-filtered"}),
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep",
+                         "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        roles = [name for name, _ in runner.calls]
+        self.assertEqual(roles, ["background-faithfulness-judge",
+                                 "idea-generator", "candidate-writer",
+                                 "tunable-contract-extractor",
+                                 "tuner-orchestrator"])
+        artifact = json.loads(
+            (cmd.run_dir / "background_faithfulness.json").read_text())
+        self.assertEqual(artifact["rounds"][-1]["outcome"],
+                         "unfaithful_irreparable_warning")
+        self.assertTrue(audit_completed(cmd.run_dir))  # terminal: no re-audit
+        events = [json.loads(line) for line in
+                  (cmd.run_dir / "driver_events.jsonl").read_text().splitlines()]
+        audit_events = [row for row in events
+                        if row.get("kind") == "background_faithfulness_audit"]
+        self.assertEqual(audit_events[-1]["outcome"],
+                         "unfaithful_irreparable_warning")
+        self.assertTrue(audit_events[-1]["findings"])
+        self.assertEqual((cmd.run_dir / "background.md").read_text(),
+                         frozen_text)
+
+    def test_resume_kill_window_audit_gets_repair_round(self) -> None:
+        # Killed after the researcher wrote its files but before the audit:
+        # the init-time session file proves the researcher ran, so the resume
+        # audit is repairable and unfaithful findings get a repair round
+        # instead of a permanent block.
+        write_task(self.repo)
+        run_dir = self.repo / "runs" / "fake-task" / "t1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "framework_cfg.json").write_text(json.dumps(
+            {"max_evaluations": 3, "dimension_strategy": "catalog_subset"}))
+        write_audited_background(run_dir)
+        (run_dir / "ledger.json").write_text(
+            json.dumps({"records": [{"run_id": "000", "status": "keep"}]}))
+        receipts = run_dir / "receipts"
+        receipts.mkdir()
+        (receipts / "background-researcher-0000.session.json").write_text(
+            json.dumps({"session_id": "sess-killed"}))
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [True]
+        runner = FakeSessionRunner([
+            judge_entry({"hyp-data-filtered"}),  # attempt 1: unfaithful
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"}},
+            judge_entry(set()),                    # attempt 2: all faithful
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        roles = [name for name, _ in runner.calls]
+        self.assertEqual(roles, ["background-faithfulness-judge",
+                                 "background-researcher",
+                                 "background-faithfulness-judge"])
+        self.assertIn("faithfulness_findings", runner.calls[1][1].extra)
+        artifact = json.loads(
+            (run_dir / "background_faithfulness.json").read_text())
+        self.assertEqual([r["outcome"] for r in artifact["rounds"]],
+                         ["unfaithful", "passed"])
 
     def test_prepare_runs_in_task_working_dir(self) -> None:
         write_task(self.repo)
