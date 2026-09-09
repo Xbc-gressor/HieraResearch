@@ -63,6 +63,19 @@ def _ledger_score(run_dir: Path, run_id: str) -> float | None:
     return None
 
 
+def _run_best(run_dir: Path) -> float | None:
+    """The best finite score over every candidate in the run (the editor's bar)."""
+    path = run_dir / "ledger.json"
+    if not path.exists():
+        return None
+    scores = []
+    for record in json.loads(path.read_text(encoding="utf-8")).get("records", []):
+        score = _ledger_score(run_dir, str(record.get("run_id")))
+        if score is not None:
+            scores.append(score)
+    return min(scores) if scores else None
+
+
 def status(run_dir, repo_root, cmd) -> dict:
     """The generate-or-optimize switch for this loop iteration."""
     return _round(run_dir, repo_root, cmd, "status")
@@ -100,7 +113,7 @@ def _rewrite_bout(runner, store, task, tag, run_dir, selection, task_toml,
         result = rewrite._run_bout(
             task, tag, run_dir, candidate, bouts, runner, store, metric,
             noise_margin, "full", task_toml, repo_root, cmd, events,
-            reference=reference, confirm=True)
+            reference=reference, confirm=True, run_best=_run_best(run_dir))
     except InvocationFailed as exc:
         # The failed session's edit is already rolled back; one candidate's
         # dead editor session does not stop the run.

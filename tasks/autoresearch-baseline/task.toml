@@ -37,6 +37,8 @@ resource_probe_fn = "resource_probe_config"
 [result]
 metric = "val_bpb"
 required_patterns = ["^val_bpb:", "^peak_vram_mb:"]
+# Ambitious target: the best val_bpb a free-evolution hillclimb run reached.
+target_score = 1.0265
 
 [goal]
 relative_improvement_over_baseline = 0.075

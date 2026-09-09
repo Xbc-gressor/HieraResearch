@@ -15,10 +15,15 @@ than the noise margin; every other outcome is reverted byte-for-byte. So
 from the loop's point of view the only edits that exist are kept ones —
 make every bout an edit that deserves to be kept.
 
-**The bar is 1.0265 — beat it.** A free-evolution hillclimb run on this
-task drove val_bpb from a 1.1094 baseline down to ≈1.0265. Treat that
-number as the target to beat — take this candidate below it. Marginal
-polishing that never threatens the bar is a wasted campaign.
+**The bar is `target_score` — beat it.** `target_score` is the task's
+declared ambitious target on this metric (for a competition task, its
+silver-medal threshold). Validation scores track but do not equal the
+official score, so landing just at the bar is not done — clear it with
+margin. When `target_score` is absent the bar is `run_best` (the best score
+any candidate in this run has reached), and failing that `current_best`.
+Use `run_best` to see where this candidate stands in the run and how far
+the bar still is. Marginal polishing that never threatens the bar is a
+wasted campaign.
 
 Scores are always lower-is-better, and many metrics are negated so this
 holds (e.g. `neg_mean_test_accuracy = -accuracy`: `-0.90` beats `-0.58`).
@@ -149,6 +154,10 @@ Each bout's message is `key: value` lines. Always present: `task`, `tag`,
   `<candidate_dir>/train.py`.
 - `current_best` — the incumbent score your edit is measured against
   (lower is better).
+- `target_score` — the task's declared target on this metric (lower is
+  better); absent when the task declares none.
+- `run_best` — the best score across every candidate in this run (lower is
+  better); absent when the loop has no run-level ledger.
 - `metric` — the metric name. Trust the direction rule, not the name.
 - `last_outcome` — `kept` / `reverted_worse` / `reverted_marginal` /
   `reverted_crash` / `noop`; absent before your first bout.

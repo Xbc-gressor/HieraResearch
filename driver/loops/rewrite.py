@@ -261,12 +261,18 @@ def _setup(task, tag, run_dir, task_toml, repo_root, max_evaluations, timeout,
 
 
 def _editor_extra(candidate: Path, current_best: float, metric: str,
-                  bouts: list[dict]) -> dict:
+                  bouts: list[dict], run_best: float | None = None,
+                  target_score: float | None = None) -> dict:
     extra = {
         "candidate_dir": str(candidate),
         "current_best": current_best,
         "metric": metric,
     }
+    if target_score is not None:
+        # The task-declared ambitious target ([result].target_score).
+        extra["target_score"] = target_score
+    if run_best is not None:
+        extra["run_best"] = run_best
     if bouts:
         last = bouts[-1]
         extra["last_outcome"] = last.get("outcome")
@@ -287,7 +293,7 @@ def _result(status: str, **fields) -> dict:
 def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
               noise_margin, context, task_toml, repo_root, cmd,
               events, *, reference: float | None = None,
-              confirm: bool = False) -> dict:
+              confirm: bool = False, run_best: float | None = None) -> dict:
     """Run one bout.
 
     Returns {"status": "done" | "budget" | "no_reference", "outcome",
@@ -305,7 +311,9 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
         events.emit("candidate_no_reference", candidate=candidate.name)
         return _result("no_reference")
 
-    extra = _editor_extra(candidate, best, metric, bouts)
+    extra = _editor_extra(
+        candidate, best, metric, bouts, run_best=run_best,
+        target_score=(task_toml or {}).get("result", {}).get("target_score"))
     try:
         receipt, inv_id = _editor_session(
             runner, store, task, tag, run_dir, extra,

@@ -21,6 +21,10 @@ environment_preflight_fn = "preflight_environment"
 [result]
 metric = "validation_log_loss"
 required_patterns = ["^score:"]
+# Ambitious target on the metric scale: the competition's silver-medal
+# threshold (mlebench grade-sample, 2026-09-09). Validation scores track but
+# do not equal the private-leaderboard score.
+target_score = 0.26996
 
 [constraints]
 editable_files = ["train.py", "pyproject.toml"]

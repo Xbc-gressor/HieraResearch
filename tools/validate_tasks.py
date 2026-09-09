@@ -165,6 +165,14 @@ def validate_task(task_dir: Path) -> list[str]:
                     re.compile(pattern)
                 except re.error as exc:
                     errors.append(f"{task_toml}: invalid result.required_patterns entry {pattern!r}: {exc}")
+        target = result.get("target_score")
+        if target is not None and (
+            isinstance(target, bool)
+            or not isinstance(target, (int, float))
+            or target != target
+            or target in (float("inf"), float("-inf"))
+        ):
+            errors.append(f"{task_toml}: result.target_score must be a finite number")
     seed = data.get("seed")
     seed_entrypoint = "train.py"
     seed_can_generate_entrypoint = True
