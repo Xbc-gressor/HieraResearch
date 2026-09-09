@@ -15,6 +15,11 @@ Usage:
       [--k-warm <count>]
       [--k-eval <count>]
       [--max-evaluations <count>]
+      [--time-budget <seconds> | --deadline <epoch-seconds>]
+      [--final-reserve <seconds>]
+      [--round-new-candidates N] [--round-rewrite-bouts r]
+      [--round-tune-bouts t] [--round-seconds Q] [--round-noise-margin E]
+      [--round-rewrite-top-k K]
       [--timeout <seconds>]
 
 Example:
@@ -33,6 +38,7 @@ import argparse
 import json
 import math
 import shutil
+import time
 from pathlib import Path
 
 from semantic_space import DEFAULT_DIMENSION_STRATEGY, DIMENSION_STRATEGIES
@@ -57,6 +63,16 @@ SCHEDULER_POLICIES = (
     "v3_2",
     "anchor_challenger_v1",
     "anchor_transfer_challenger_v1",
+    "round_v1",
+)
+#: ``round`` section knobs settable through ``--round-<key>``.
+ROUND_OPTIONS = (
+    "new_candidates",
+    "rewrite_bouts",
+    "tune_bouts",
+    "round_seconds",
+    "noise_margin",
+    "rewrite_top_k",
 )
 INNER_POLICIES = (
     "deferred-random8-hebo10-spsa10-v1",
@@ -70,14 +86,21 @@ INNER_POLICIES = (
     "baseline-hebo-full-v1",
     "legacy",
 )
+# Which inner-benchmark arm proposes/ranks configs inside HEBO bouts; pairs
+# with any inner policy (tuners.inner_policy.PROPOSER_ARMS).
+PROPOSER_ARMS = ("pool_hebo_mace", "explicit_e3u2")
 
 # Defaults for newly initialized experiment runs. Existing runs that omit
 # these keys keep their historical runtime fallbacks; init_run never rewrites
 # an existing run merely because the defaults changed.
 DEFAULT_SEMANTIC_POLICY = "judged_slate"
-DEFAULT_SCHEDULER_POLICY = "anchor_challenger_v1"
+DEFAULT_SCHEDULER_POLICY = "round_v1"
 DEFAULT_INNER_POLICY = "hebo24-hebo20"
+DEFAULT_PROPOSER_ARM = "explicit_e3u2"
 DEFAULT_MAX_EVALUATIONS = 200
+#: The transfer pair stays selectable as an explicit comparison arm.
+TRANSFER_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
+TRANSFER_INNER_POLICY = "hebo24-transfer10-hebo10"
 
 
 def _read_framework_config(path: Path) -> dict:
@@ -120,12 +143,21 @@ def initialize_run(
     semantic_policy: str | None = None,
     scheduler_policy: str | None = None,
     inner_policy: str | None = None,
+    proposer_arm: str | None = None,
     k_warm: int | None = None,
     k_eval: int | None = None,
     max_evaluations: int | None = None,
     per_runtime_limit: float | None = None,
+    time_budget_seconds: float | None = None,
+    deadline: float | None = None,
+    final_reserve_seconds: float | None = None,
+    round_options: dict | None = None,
 ) -> Path:
     repo_root = Path(repo_root).resolve()
+    round_options = {
+        key: value for key, value in (round_options or {}).items()
+        if value is not None
+    }
     run_dir = repo_root / "runs" / task_name / tag
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir.relative_to(repo_root)}")
@@ -158,9 +190,19 @@ def initialize_run(
         if semantic_policy is None:
             semantic_policy = DEFAULT_SEMANTIC_POLICY
         if scheduler_policy is None:
-            scheduler_policy = DEFAULT_SCHEDULER_POLICY
+            scheduler_policy = (
+                TRANSFER_SCHEDULER_POLICY
+                if inner_policy == TRANSFER_INNER_POLICY
+                else DEFAULT_SCHEDULER_POLICY
+            )
         if inner_policy is None:
-            inner_policy = DEFAULT_INNER_POLICY
+            inner_policy = (
+                TRANSFER_INNER_POLICY
+                if scheduler_policy == TRANSFER_SCHEDULER_POLICY
+                else DEFAULT_INNER_POLICY
+            )
+        if proposer_arm is None:
+            proposer_arm = DEFAULT_PROPOSER_ARM
 
     # New runs inherit a task-appropriate limit instead of blindly retaining
     # the generic template's 60 seconds. Existing run-local choices remain
@@ -198,6 +240,10 @@ def initialize_run(
     if inner_policy is not None and inner_policy not in INNER_POLICIES:
         raise ValueError(
             f"inner tuner policy must be one of {list(INNER_POLICIES)}"
+        )
+    if proposer_arm is not None and proposer_arm not in PROPOSER_ARMS:
+        raise ValueError(
+            f"proposer arm must be one of {list(PROPOSER_ARMS)}"
         )
     if (
         k_eval is not None
@@ -242,6 +288,28 @@ def initialize_run(
         )
     ):
         raise ValueError("timeout must be a positive number of seconds")
+    if time_budget_seconds is not None and deadline is not None:
+        raise ValueError("pass either --time-budget or --deadline, not both")
+    for label, value in (("time budget", time_budget_seconds), ("deadline", deadline)):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{label} must be a positive number of seconds")
+    if final_reserve_seconds is not None and (
+        isinstance(final_reserve_seconds, bool)
+        or not isinstance(final_reserve_seconds, (int, float))
+        or not math.isfinite(final_reserve_seconds)
+        or final_reserve_seconds < 0
+    ):
+        raise ValueError("final reserve must be a non-negative number of seconds")
+    unknown_round = sorted(set(round_options) - set(ROUND_OPTIONS))
+    if unknown_round:
+        raise ValueError(f"unknown round options: {unknown_round}")
+    if time_budget_seconds is not None:
+        deadline = time.time() + float(time_budget_seconds)
 
     if (
         dimension_strategy is None
@@ -253,6 +321,9 @@ def initialize_run(
         and k_eval is None
         and max_evaluations is None
         and per_runtime_limit is None
+        and deadline is None
+        and final_reserve_seconds is None
+        and not round_options
     ):
         return run_dir
 
@@ -283,12 +354,20 @@ def initialize_run(
             "hebo24-turbo20-v1",
             "hebo24-hebo20",
         )
-        and effective_scheduler != "anchor_challenger_v1"
+        and effective_scheduler not in ("anchor_challenger_v1", "round_v1")
     ):
         raise ValueError(
             f"{inner_policy} requires scheduler_policy "
-            "anchor_challenger_v1"
+            "anchor_challenger_v1 or round_v1"
         )
+    if scheduler_policy == "round_v1":
+        effective_inner = inner_policy or effective_tuner.get(
+            "inner_policy", DEFAULT_INNER_POLICY
+        )
+        if effective_inner in (TRANSFER_INNER_POLICY, "baseline-hebo-full-v1"):
+            raise ValueError(
+                f"round_v1 cannot pair with inner tuner policy {effective_inner}"
+            )
     if (
         inner_policy == "hebo24-transfer10-hebo10"
         and effective_scheduler != "anchor_transfer_challenger_v1"
@@ -322,9 +401,8 @@ def initialize_run(
     )
 
     # Complete-bout schedulers allocate a finite run-global budget and are
-    # invalid without one.
-    # The maintained template already carries 200; keep initialization valid
-    # even when a deployment intentionally omits the template.
+    # invalid without one. round_v1 is bounded by wall clock; the evaluation
+    # cap is only its fallback when no time budget is given.
     if (
         scheduler_policy in ("v3_2", "anchor_challenger_v1",
                              "anchor_transfer_challenger_v1")
@@ -332,6 +410,18 @@ def initialize_run(
         and config.get("max_evaluations") is None
     ):
         max_evaluations = DEFAULT_MAX_EVALUATIONS
+    if (
+        scheduler_policy == "round_v1"
+        and max_evaluations is None
+        and config.get("max_evaluations") is None
+        and deadline is None
+        and config.get("deadline") is None
+    ):
+        max_evaluations = DEFAULT_MAX_EVALUATIONS
+        print(
+            "round_v1 without --time-budget/--deadline: falling back to "
+            f"max_evaluations={DEFAULT_MAX_EVALUATIONS}"
+        )
 
     if dimension_strategy is not None:
         section = config.get("space_initialization", {})
@@ -489,6 +579,22 @@ def initialize_run(
                     f"deep_tune_per_candidate_cap={int(effective_max)}"
                 )
 
+    if proposer_arm is not None:
+        section = config.get("tuner", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: tuner must be an object")
+        current = section.get("proposer_arm")
+        if current != proposer_arm and existing_artifacts:
+            raise ValueError(
+                "cannot change proposer arm after run artifacts exist: "
+                + ", ".join(existing_artifacts)
+            )
+        if current != proposer_arm:
+            config["tuner"] = {**section, "proposer_arm": proposer_arm}
+            updates.append(f"proposer_arm={proposer_arm}")
+        else:
+            print(f"Proposer arm already set to {proposer_arm}.")
+
     if k_warm is not None:
         section = config.get("tuner", {})
         if not isinstance(section, dict):
@@ -533,6 +639,22 @@ def initialize_run(
     if max_evaluations is not None:
         config["max_evaluations"] = max_evaluations
         updates.append(f"max_evaluations={max_evaluations}")
+
+    if deadline is not None:
+        config["deadline"] = float(deadline)
+        updates.append(f"deadline={float(deadline):.0f}")
+
+    if final_reserve_seconds is not None:
+        config["final_reserve_seconds"] = float(final_reserve_seconds)
+        updates.append(f"final_reserve_seconds={float(final_reserve_seconds)}")
+
+    if round_options:
+        section = config.get("round", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: round must be an object")
+        config["round"] = {**section, **round_options}
+        updates.extend(f"round.{key}={value}" for key, value in
+                       sorted(round_options.items()))
 
     if per_runtime_limit is not None:
         normalized_limit: int | float = per_runtime_limit
@@ -599,6 +721,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--proposer-arm",
+        dest="proposer_arm",
+        choices=PROPOSER_ARMS,
+        help=(
+            "inner-benchmark arm that proposes and ranks configs inside HEBO "
+            f"bouts; new runs default to {DEFAULT_PROPOSER_ARM}"
+        ),
+    )
+    parser.add_argument(
         "--k-warm",
         dest="k_warm",
         type=int,
@@ -629,6 +760,39 @@ def main() -> int:
         metavar="SECONDS",
         help="hard wall-clock limit for each evaluation (must be positive)",
     )
+    parser.add_argument(
+        "--time-budget",
+        dest="time_budget_seconds",
+        type=float,
+        metavar="SECONDS",
+        help="run-level wall-clock budget from now; persisted as an absolute "
+             "deadline in framework_cfg.json",
+    )
+    parser.add_argument(
+        "--deadline",
+        type=float,
+        metavar="EPOCH_SECONDS",
+        help="absolute run deadline (Unix epoch seconds)",
+    )
+    parser.add_argument(
+        "--final-reserve",
+        dest="final_reserve_seconds",
+        type=float,
+        metavar="SECONDS",
+        help="tail of the time budget kept free for finalization/export",
+    )
+    parser.add_argument("--round-new-candidates", type=int, metavar="N",
+                        help="round_v1: new finite candidates per optimization round")
+    parser.add_argument("--round-rewrite-bouts", type=int, metavar="R",
+                        help="round_v1: rewrite bouts per optimization round")
+    parser.add_argument("--round-tune-bouts", type=int, metavar="T",
+                        help="round_v1: tune bouts per optimization round")
+    parser.add_argument("--round-seconds", type=float, metavar="Q",
+                        help="round_v1: wall-clock quota of one optimization round")
+    parser.add_argument("--round-noise-margin", type=float, metavar="E",
+                        help="round_v1: rewrite keep/revert noise margin (>= 0)")
+    parser.add_argument("--round-rewrite-top-k", type=int, metavar="K",
+                        help="round_v1: rewrite eligibility is the top-K by score")
     args = parser.parse_args()
     try:
         initialize_run(
@@ -640,10 +804,22 @@ def main() -> int:
             semantic_policy=args.semantic_policy,
             scheduler_policy=args.scheduler_policy,
             inner_policy=args.inner_policy,
+            proposer_arm=args.proposer_arm,
             k_warm=args.k_warm,
             k_eval=args.k_eval,
             max_evaluations=args.max_evaluations,
             per_runtime_limit=args.per_runtime_limit,
+            time_budget_seconds=args.time_budget_seconds,
+            deadline=args.deadline,
+            final_reserve_seconds=args.final_reserve_seconds,
+            round_options={
+                "new_candidates": args.round_new_candidates,
+                "rewrite_bouts": args.round_rewrite_bouts,
+                "tune_bouts": args.round_tune_bouts,
+                "round_seconds": args.round_seconds,
+                "noise_margin": args.round_noise_margin,
+                "rewrite_top_k": args.round_rewrite_top_k,
+            },
         )
     except ValueError as exc:
         parser.error(str(exc))

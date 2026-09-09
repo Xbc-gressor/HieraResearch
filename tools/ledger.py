@@ -548,6 +548,81 @@ def record_run(
     return record
 
 
+def record_rewrite(
+    ledger_path: Path,
+    task_name: str,
+    run_id: str,
+    *,
+    score: float,
+    report_path: Optional[Path] = None,
+) -> dict:
+    """Commit a kept rewrite: the candidate's code changed and ``score`` is its
+    new measured reference.
+
+    Tuning observations of the old code are void, so the record returns to
+    the untuned state (``tune: false``, ``tuning_bouts: 0``); the rebased
+    Phase-A report (tools/rewrite_rebase.py) supplies the fresh applied
+    incumbent so later children and tuning bouts bind to the new code.
+    Without a report the stale snapshot is dropped rather than kept.
+    """
+    config, data, record = _tuning_target(ledger_path, task_name, run_id)
+    if not math.isfinite(float(score)):
+        raise ValueError("rewrite reference score must be finite")
+    _preserve_descendant_bindings(data, run_id)
+    before_graph_value = (record.get("status"), record.get("final_best_score"))
+
+    value = float(score)
+    record["metric"] = data.get("metric")
+    record["final_best_score"] = value
+    record["best_warm_score"] = value
+    record["status"] = (
+        "keep"
+        if _is_improvement(value, _best_kept_value(data, exclude_run_id=run_id))
+        else "discard"
+    )
+    record["tune"] = False
+    record["tuning_bouts"] = 0
+    record["last_bout_improved"] = None
+    record["phase_c_method"] = None
+    record["applied"] = None
+    record["rewrite_bouts"] = int(record.get("rewrite_bouts") or 0) + 1
+    if report_path is not None:
+        _validate_tuning_report_ownership(ledger_path, run_id, Path(report_path))
+        record["applied_incumbent"] = _applied_incumbent_from_report(
+            Path(report_path)
+        )
+    else:
+        record["applied_incumbent"] = None
+
+    transfer_errors = validate_parameter_transfer_binding(data, record)
+    if transfer_errors:
+        raise ValueError("; ".join(transfer_errors))
+    _capture_transfer_parent_snapshot(data, record)
+    after_graph_value = (record.get("status"), record.get("final_best_score"))
+    if after_graph_value != before_graph_value:
+        _touch_dag_record(data, record)
+    _save_ledger(ledger_path, data)
+    _write_loop_state(ledger_path, data, config)
+    return record
+
+
+def cmd_record_rewrite(args) -> int:
+    ledger_path = Path(args.ledger)
+    task_name = args.task or infer_task_name([ledger_path])
+    try:
+        record = record_rewrite(
+            ledger_path,
+            task_name,
+            args.run_id,
+            score=args.score,
+            report_path=args.tune_report,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    print(json.dumps(record, indent=2))
+    return 0
+
+
 def _capture_task_baseline_item(data: dict, record: dict) -> None:
     """Freeze the task-provided control's screening score as a run-global item.
 
@@ -1070,6 +1145,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--candidate-name")
     run.add_argument("--description")
     run.set_defaults(func=cmd_record_run)
+
+    rewrite = sub.add_parser("record-rewrite", parents=[common],
+                             help="commit a kept rewrite's new reference score")
+    rewrite.add_argument("--run-id", required=True)
+    rewrite.add_argument("--score", required=True, type=float)
+    rewrite.add_argument("--tune-report", type=Path, default=None,
+                         help="the rebased Phase-A report (rewrite_rebase.py)")
+    rewrite.set_defaults(func=cmd_record_rewrite)
 
     unevaluated = sub.add_parser("resolve-unevaluated", parents=[common])
     unevaluated.add_argument("--run-id", required=True)

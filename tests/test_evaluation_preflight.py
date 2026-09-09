@@ -303,7 +303,7 @@ class EvaluationBudgetTests(unittest.TestCase):
                 .splitlines()
             ]
             self.assertEqual(
-                [row["kind"] for row in rows],
+                [row["kind"] for row in rows if row["kind"] == "score_attempt"],
                 ["score_attempt", "score_attempt"],
             )
 

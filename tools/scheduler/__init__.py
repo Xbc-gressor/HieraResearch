@@ -1,8 +1,8 @@
 """Run-global scheduler policies.
 
-The package keeps each policy isolated. New experiment runs persist the
-deterministic ``tuner.scheduler_policy = "anchor_challenger_v1"`` during
-initialization; ``v3_2`` and ``legacy`` / ``legacy_wide`` remain explicit
+The package keeps each policy isolated. New experiment runs persist
+``tuner.scheduler_policy = "round_v1"`` during initialization; the
+deterministic tournaments stay selectable; ``v3_2`` and ``legacy`` / ``legacy_wide`` remain explicit
 CLI-selectable comparison arms (the legacy pair differ
 only in how widely a first-bout non-responder is re-admitted). Historical
 runs that omit the key retain the legacy percentile/alternation fallback in
@@ -32,4 +32,8 @@ statistical model coarse*:
                the deterministic anchor + donor-transfer challenger policy
                (anchor_transfer_challenger_v1 x hebo24-transfer10-hebo10);
                selectable through init_run / driver CLI as an explicit pair.
+``round_policy``
+               ``round_v1`` (new-run default): candidate-count-triggered
+               optimization rounds (rewrite bouts, then tune bouts) under a
+               wall-clock budget; owns the cycle state and both rankings.
 """

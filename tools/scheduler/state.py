@@ -560,11 +560,18 @@ def load_state(
     )
 
 
+#: Stands in for ``remaining_budget`` when the run is bounded by wall clock
+#: alone: no eval-count check binds, the time layer decides admission.
+UNBOUNDED_EVALUATIONS = 10**9
+
+
 def _remaining_budget(run_dir: Path) -> int:
     from evaluation_budget import budget_status
 
     status = budget_status(Path(run_dir))
     remaining = status.get("remaining")
+    if remaining is None and (status.get("time") or {}).get("deadline") is not None:
+        return UNBOUNDED_EVALUATIONS
     if not isinstance(remaining, int):
         # An unbounded run has no scheduling problem to solve: every action
         # is affordable forever, so there is no budget to allocate. Failing

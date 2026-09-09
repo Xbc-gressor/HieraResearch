@@ -8,15 +8,20 @@ deterministic trust anchor around that edit:
 - bouts.jsonl — append-only journal, one entry per adjudicated bout:
   {bout, attempt_id, score, outcome, summary, basis, snapshot};
 - current_best() — the measured reference point: the imported baseline score
-  versus every kept bout's score (lower is better);
+  (or the caller's `--reference`, the ledger score in the experiment loop),
+  moved by every kept bout and by each kept bout's confirmation re-eval;
 - classify() — an improvement only counts when it clears the noise margin;
 - the `finalize` CLI — classify one bout, roll back byte-exactly unless kept,
-  and append the journal entry.
+  and append the journal entry;
+- the `confirm` CLI — after a keep, fold one confirmation score into the
+  reference (mean of the two) so a lucky single sample does not anchor it.
 
 Usage:
     python tools/rewrite_bout.py finalize --candidate <dir> --bout <N> \
         [--score S | --nonfinite] --noise-margin E [--attempt-id A] \
-        --summary "..." --basis "..."
+        [--reference R] --summary "..." --basis "..."
+    python tools/rewrite_bout.py confirm --candidate <dir> --bout <N> \
+        [--score S | --nonfinite] [--attempt-id A]
     python tools/rewrite_bout.py snapshot --candidate <dir> --bout <N>
     python tools/rewrite_bout.py revert --candidate <dir> --snapshot <path>
     python tools/rewrite_bout.py changed --candidate <dir> --snapshot <path>
@@ -102,7 +107,11 @@ def _bouts_path(candidate_dir) -> Path:
     return _rewrite_dir(candidate_dir) / "bouts.jsonl"
 
 
-def load_bouts(candidate_dir) -> list[dict]:
+CONFIRMATION_KIND = "confirmation"
+
+
+def load_entries(candidate_dir) -> list[dict]:
+    """Every journal line in order: bout entries and confirmation entries."""
     path = _bouts_path(candidate_dir)
     if not path.is_file():
         return []
@@ -110,6 +119,14 @@ def load_bouts(candidate_dir) -> list[dict]:
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
+    ]
+
+
+def load_bouts(candidate_dir) -> list[dict]:
+    """Bout entries only (confirmation re-evals are not bouts)."""
+    return [
+        entry for entry in load_entries(candidate_dir)
+        if entry.get("kind") != CONFIRMATION_KIND
     ]
 
 
@@ -128,22 +145,29 @@ def _finite(value) -> bool:
     )
 
 
-def current_best(candidate_dir) -> float:
-    """min(_import.json baseline_score, every kept bout's score).
+def current_best(candidate_dir, baseline: float | None = None) -> float:
+    """The reference point: min(baseline, every kept bout's score), where a
+    kept bout's confirmation entry resets the reference to its mean, in
+    journal order.
 
-    Raises ValueError when neither a finite baseline nor any kept score
-    exists — adjudication without a measured reference is meaningless.
+    ``baseline`` defaults to `_import.json`'s baseline_score. Raises
+    ValueError when no finite reference exists — adjudication without a
+    measured reference is meaningless.
     """
     candidate_dir = Path(candidate_dir)
-    best = None
+    best = float(baseline) if _finite(baseline) else None
     manifest_path = candidate_dir / "_import.json"
-    if manifest_path.is_file():
-        baseline = json.loads(manifest_path.read_text(encoding="utf-8")).get(
+    if best is None and manifest_path.is_file():
+        imported = json.loads(manifest_path.read_text(encoding="utf-8")).get(
             "baseline_score"
         )
-        if _finite(baseline):
-            best = float(baseline)
-    for entry in load_bouts(candidate_dir):
+        if _finite(imported):
+            best = float(imported)
+    for entry in load_entries(candidate_dir):
+        if entry.get("kind") == CONFIRMATION_KIND:
+            if _finite(entry.get("reference")):
+                best = float(entry["reference"])
+            continue
         if entry.get("outcome") != "kept":
             continue
         score = entry.get("score")
@@ -190,16 +214,19 @@ def finalize(
     attempt_id: str | None,
     summary: str,
     basis: str,
+    reference: float | None = None,
 ) -> dict:
     """Adjudicate one bout: roll back unless kept, then journal it.
 
-    Returns {"outcome", "best"} with the post-finalize reference point (the
-    new score when kept, else the unchanged incumbent best).
+    ``reference`` overrides the journal-derived incumbent (the experiment
+    loop passes the ledger's current score). Returns {"outcome", "best"} with
+    the post-finalize reference point (the new score when kept, else the
+    unchanged incumbent best).
     """
     if noise_margin < 0:
         raise ValueError(f"noise_margin must be >= 0, got {noise_margin}")
     candidate_dir = Path(candidate_dir)
-    best = current_best(candidate_dir)
+    best = float(reference) if _finite(reference) else current_best(candidate_dir)
     outcome = classify(best, score, noise_margin)
     snap = _snapshot_path(candidate_dir, bout)
     if outcome != "kept":
@@ -225,6 +252,43 @@ def finalize(
     if outcome == "kept":
         best = stored_score
     return {"outcome": outcome, "best": best}
+
+
+def confirm(
+    candidate_dir,
+    bout: int,
+    score: float | None,
+    attempt_id: str | None,
+) -> dict:
+    """Fold a kept bout's confirmation re-eval into the reference.
+
+    The reference becomes the mean of the kept score and the confirmation
+    score; a non-finite confirmation leaves it at the kept score. The keep
+    itself is never undone here — a real improvement lost to one unlucky
+    sample costs more than a noisy keep.
+    """
+    candidate_dir = Path(candidate_dir)
+    kept = next(
+        (
+            entry for entry in load_bouts(candidate_dir)
+            if entry.get("bout") == bout and entry.get("outcome") == "kept"
+        ),
+        None,
+    )
+    if kept is None or not _finite(kept.get("score")):
+        raise ValueError(f"bout {bout} has no kept score to confirm")
+    kept_score = float(kept["score"])
+    confirmed = float(score) if _finite(score) else None
+    reference = kept_score if confirmed is None else (kept_score + confirmed) / 2
+    entry = {
+        "kind": CONFIRMATION_KIND,
+        "bout": bout,
+        "attempt_id": attempt_id,
+        "score": confirmed,
+        "reference": reference,
+    }
+    append_bout(candidate_dir, entry)
+    return entry
 
 
 def journal(
@@ -274,6 +338,18 @@ def main() -> int:
                           "be recovered; journaled as null")
     fin.add_argument("--summary", required=True)
     fin.add_argument("--basis", required=True)
+    fin.add_argument("--reference", type=float, default=None,
+                     help="reference score to adjudicate against (default: "
+                          "the journal-derived incumbent)")
+    conf = subparsers.add_parser(
+        "confirm", help="fold a kept bout's confirmation re-eval into the reference"
+    )
+    conf.add_argument("--candidate", required=True, type=Path)
+    conf.add_argument("--bout", required=True, type=int)
+    conf_group = conf.add_mutually_exclusive_group(required=True)
+    conf_group.add_argument("--score", type=float)
+    conf_group.add_argument("--nonfinite", action="store_true")
+    conf.add_argument("--attempt-id", default=None)
     snap_p = subparsers.add_parser(
         "snapshot", help="byte-exact pre-edit copy of train.py; prints its path"
     )
@@ -313,10 +389,23 @@ def main() -> int:
                 args.attempt_id,
                 args.summary,
                 args.basis,
+                reference=args.reference,
             )
         except ValueError as exc:
             raise SystemExit(str(exc)) from None
         print(json.dumps(result))
+        return 0
+    if args.command == "confirm":
+        try:
+            entry = confirm(
+                args.candidate,
+                args.bout,
+                None if args.nonfinite else args.score,
+                args.attempt_id,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        print(json.dumps(entry))
         return 0
     if args.command == "snapshot":
         print(snapshot(args.candidate, args.bout))

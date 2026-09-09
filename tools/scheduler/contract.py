@@ -8,8 +8,10 @@ unscheduled B_FIRST/B defaults below encode the historical v3.2 comparison.
 attempt cap. Two rules follow and are enforced here rather than at each
 call site:
 
-* a bout is admitted at full `B` or not at all — no truncation to fit a
-  candidate cap or the tail of the global budget;
+* under an evaluation-count budget a bout is admitted at full `B` or not
+  at all; under a wall-clock budget (``round_v1``) the time layer prices a
+  bout in seconds (`expected_bout_seconds`) and a bout that runs out of
+  quota finalizes with the observations it has;
 * a candidate that has completed `MAX_BOUTS_PER_CANDIDATE` bouts is
   permanently ineligible.
 
@@ -129,6 +131,26 @@ class ResourceContract:
         ):
             return self.transferred_first_bout_trials
         return self.bout_cost(candidate.bouts_used)
+
+    def expected_bout_seconds(
+        self,
+        candidate: "CandidateView",
+        *,
+        mean_eval_seconds: float | None,
+        session_overhead_seconds: float,
+    ) -> float | None:
+        """Wall-clock estimate of this candidate's next bout.
+
+        ``mean_eval_seconds`` is the candidate's observed mean evaluation
+        time (or a run-wide fallback); None means no evaluation has been
+        timed yet and the estimate is unknown.
+        """
+        if mean_eval_seconds is None:
+            return None
+        return (
+            float(mean_eval_seconds) * self.bout_cost_for(candidate)
+            + float(session_overhead_seconds)
+        )
 
     def lifetime_cost(self) -> int:
         """Objective evaluations one candidate spends across its full

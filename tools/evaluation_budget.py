@@ -19,6 +19,7 @@ import json
 import math
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 try:  # POSIX is the supported experiment runtime; keep reads usable elsewhere.
@@ -34,6 +35,14 @@ except ImportError:  # direct ``python tools/evaluation_budget.py`` execution
 
 SCHEMA_VERSION = 1
 ATTEMPT_LOG = "evaluation_attempts.jsonl"
+ATTEMPT_KIND = "score_attempt"
+#: Appended after an admitted attempt finishes: its wall-clock duration.
+#: Never counted against any cap; only the per-candidate eval-time estimate
+#: the round scheduler prices bouts with reads it.
+COMPLETION_KIND = "score_completion"
+#: Written by tools/scheduler/round_policy.py while an optimization phase is
+#: open; ``phase_deadline`` bounds every reservation inside that phase.
+ROUND_STATE_PATH = Path(".scheduler") / "round_state.json"
 
 
 class EvaluationBudgetExhausted(RuntimeError):
@@ -43,7 +52,7 @@ class EvaluationBudgetExhausted(RuntimeError):
         self,
         *,
         used: int,
-        budget: int,
+        budget: int | None,
         run_dir: Path,
         scope: str = "global",
     ):
@@ -52,7 +61,9 @@ class EvaluationBudgetExhausted(RuntimeError):
         self.run_dir = Path(run_dir)
         self.scope = scope
         super().__init__(
-            f"{scope} evaluation budget exhausted before score_fn "
+            f"evaluation cut off by the {scope} budget mid-run (run_dir={run_dir})"
+            if scope.endswith("cutoff")
+            else f"{scope} evaluation budget exhausted before score_fn "
             f"(used={used}, budget={budget}, run_dir={run_dir})"
         )
 
@@ -77,6 +88,75 @@ def _framework_budget(run_dir: Path) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def time_budget(run_dir: Path, *, now: float | None = None) -> dict:
+    """The run-level wall-clock budget view.
+
+    ``deadline`` is an absolute epoch timestamp and ``final_reserve_seconds``
+    the tail kept free for export; ``usable_seconds`` is what new work may
+    still spend. Every field is ``None`` when no deadline is configured.
+    """
+    run_dir = Path(run_dir)
+    path = run_dir / "framework_cfg.json"
+    config = read_framework_cfg(path) if path.is_file() else {}
+    deadline = _finite_number(config.get("deadline"))
+    reserve = _finite_number(config.get("final_reserve_seconds")) or 0.0
+    if deadline is None:
+        return {
+            "deadline": None,
+            "final_reserve_seconds": reserve,
+            "remaining_seconds": None,
+            "usable_seconds": None,
+            "time_reached": None,
+        }
+    now = time.time() if now is None else now
+    remaining = deadline - now
+    usable = remaining - reserve
+    return {
+        "deadline": deadline,
+        "final_reserve_seconds": reserve,
+        "remaining_seconds": remaining,
+        "usable_seconds": usable,
+        "time_reached": usable <= 0,
+    }
+
+
+def phase_quota_remaining(run_dir: Path, *, now: float | None = None) -> float | None:
+    """Seconds left in the open optimization phase, or None when none is open."""
+    path = Path(run_dir) / ROUND_STATE_PATH
+    if not path.is_file():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    deadline = _finite_number(state.get("phase_deadline"))
+    if deadline is None or state.get("phase") != "optimize":
+        return None
+    return deadline - (time.time() if now is None else now)
+
+
+def time_remaining(run_dir: Path) -> float | None:
+    """Seconds a new evaluation may still run: the tighter of the run's usable
+    time and the open phase quota. None when neither is configured."""
+    run_dir = Path(run_dir)
+    values = [
+        value
+        for value in (
+            time_budget(run_dir)["usable_seconds"],
+            phase_quota_remaining(run_dir),
+        )
+        if value is not None
+    ]
+    return min(values) if values else None
 
 
 def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
@@ -175,7 +255,7 @@ def _read_rows(handle) -> list[dict]:
                 f"unsupported {ATTEMPT_LOG} schema on line {line_number}: "
                 f"{row.get('schema_version')!r}"
             )
-        if row.get("kind") != "score_attempt":
+        if row.get("kind") not in (ATTEMPT_KIND, COMPLETION_KIND):
             raise ValueError(
                 f"unsupported {ATTEMPT_LOG} row kind on line {line_number}: "
                 f"{row.get('kind')!r}"
@@ -184,10 +264,35 @@ def _read_rows(handle) -> list[dict]:
     return rows
 
 
+def _attempts(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if row.get("kind") == ATTEMPT_KIND]
+
+
+def _durations(rows: list[dict]) -> tuple[list[float], dict[str, list[float]]]:
+    """Completed attempts' durations, overall and per candidate."""
+    overall: list[float] = []
+    per_candidate: dict[str, list[float]] = {}
+    for row in rows:
+        if row.get("kind") != COMPLETION_KIND:
+            continue
+        seconds = _finite_number(row.get("duration_seconds"))
+        if seconds is None or seconds < 0:
+            continue
+        overall.append(seconds)
+        run_id = row.get("run_id")
+        if isinstance(run_id, str):
+            per_candidate.setdefault(run_id, []).append(seconds)
+    return overall, per_candidate
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
 def _summarize_rows(rows: list[dict]) -> tuple[int, dict[str, int]]:
     total = 0
     per_candidate: Counter[str] = Counter()
-    for row in rows:
+    for row in _attempts(rows):
         total += 1
         run_id = row.get("run_id")
         if isinstance(run_id, str):
@@ -212,7 +317,7 @@ def attempt_log_summary(run_dir: Path) -> dict[str, Any] | None:
     phase_counts: Counter[str] = Counter()
     score_attempts = 0
     unclassified_score_attempts = 0
-    for row in rows:
+    for row in _attempts(rows):
         score_attempts += 1
         phase = row.get("phase")
         if isinstance(phase, str) and phase:
@@ -227,6 +332,7 @@ def attempt_log_summary(run_dir: Path) -> dict[str, Any] | None:
         "phase_counts": dict(sorted(phase_counts.items())),
         "score_attempts": score_attempts,
         "unclassified_score_attempts": unclassified_score_attempts,
+        "mean_eval_seconds": _mean(_durations(rows)[0]),
     }
 
 
@@ -272,6 +378,15 @@ def reserve_evaluation(
                 budget=budget,
                 run_dir=run_dir,
             )
+        if time_budget(run_dir)["time_reached"]:
+            raise EvaluationBudgetExhausted(
+                used=used, budget=budget, run_dir=run_dir, scope="time"
+            )
+        quota = phase_quota_remaining(run_dir)
+        if quota is not None and quota <= 0:
+            raise EvaluationBudgetExhausted(
+                used=used, budget=budget, run_dir=run_dir, scope="round_quota"
+            )
         if str(phase) == "phase_c":
             limits = _deep_tune_limits(run_dir, budget)
             deep_used, deep_per_candidate = _deep_tune_usage(rows)
@@ -294,7 +409,7 @@ def reserve_evaluation(
                 )
         receipt = {
             "schema_version": SCHEMA_VERSION,
-            "kind": "score_attempt",
+            "kind": ATTEMPT_KIND,
             "attempt_id": f"eval-{used + 1:06d}",
             "run_id": run_id,
             "phase": str(phase),
@@ -304,6 +419,29 @@ def reserve_evaluation(
         _append_row(handle, receipt)
         rows.append(receipt)
         return receipt
+
+
+def record_evaluation_completion(
+    ref_path: Any,
+    *,
+    attempt_id: str | None,
+    duration_seconds: float,
+) -> None:
+    """Append the wall-clock duration of one admitted attempt (any outcome)."""
+    run_dir = find_run_dir(ref_path)
+    if run_dir is None or not isinstance(attempt_id, str):
+        return
+    with _locked_log(run_dir) as handle:
+        _append_row(
+            handle,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "kind": COMPLETION_KIND,
+                "attempt_id": attempt_id,
+                "run_id": Path(ref_path).resolve().parent.name,
+                "duration_seconds": round(float(duration_seconds), 3),
+            },
+        )
 
 
 def budget_status(run_dir: Path, *, create: bool = False) -> dict:
@@ -319,15 +457,31 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
     limits = _deep_tune_limits(run_dir, budget)
     deep_used, deep_per_candidate = _deep_tune_usage(rows)
     deep_total_cap = limits["total_cap"]
+    clock = time_budget(run_dir)
+    quota = phase_quota_remaining(run_dir)
+    overall_seconds, seconds_by_candidate = _durations(rows)
+    evals_reached = None if budget is None else total >= budget
+    if clock["time_reached"] is None:
+        reached = evals_reached
+    else:
+        reached = bool(evals_reached) or clock["time_reached"]
     return {
         "schema_version": SCHEMA_VERSION,
         "evaluations_done": total,
         "objective_attempts": total,
         "budget": budget,
         "remaining": None if budget is None else max(0, budget - total),
-        "reached": None if budget is None else total >= budget,
+        "reached": reached,
+        "time": clock,
+        "phase_quota_remaining_seconds": quota,
+        "phase_quota_reached": quota is not None and quota <= 0,
+        "mean_eval_seconds": _mean(overall_seconds),
         "per_candidate": [
-            {"run_id": run_id, "evals": value}
+            {
+                "run_id": run_id,
+                "evals": value,
+                "mean_seconds": _mean(seconds_by_candidate.get(run_id, [])),
+            }
             for run_id, value in sorted(per_candidate.items())
         ],
         "deep_tune": {

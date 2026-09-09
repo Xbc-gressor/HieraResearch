@@ -44,14 +44,9 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 config["semantic_search"]["policy"],
                 "judged_slate",
             )
-            self.assertEqual(
-                config["tuner"]["scheduler_policy"],
-                "anchor_challenger_v1",
-            )
-            self.assertEqual(
-                config["tuner"]["inner_policy"],
-                "hebo24-hebo20",
-            )
+            self.assertEqual(config["tuner"]["scheduler_policy"], "round_v1")
+            self.assertEqual(config["tuner"]["inner_policy"], "hebo24-hebo20")
+            self.assertEqual(config["tuner"]["proposer_arm"], "explicit_e3u2")
             self.assertEqual(config["tuner"]["K_eval"], 3)
             self.assertEqual(config["tuner"]["deep_tune_per_candidate_cap"], 44)
 
@@ -82,6 +77,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                     repo_root,
                     "toy",
                     "selfrank",
+                    scheduler_policy="legacy",
                     inner_policy="selfrank8-hebo10-hebo10",
                 ).name,
                 "selfrank",
@@ -192,14 +188,8 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
 
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["max_evaluations"], 200)
-            self.assertEqual(
-                config["tuner"]["scheduler_policy"],
-                "anchor_challenger_v1",
-            )
-            self.assertEqual(
-                config["tuner"]["inner_policy"],
-                "hebo24-hebo20",
-            )
+            self.assertEqual(config["tuner"]["scheduler_policy"], "round_v1")
+            self.assertEqual(config["tuner"]["inner_policy"], "hebo24-hebo20")
             self.assertEqual(config["tuner"]["deep_tune_per_candidate_cap"], 44)
 
     def test_explicit_induced_strategy_is_persisted(self) -> None:
@@ -597,25 +587,26 @@ class InitRunTransferPolicyTests(unittest.TestCase):
             repo_root = Path(tmp)
             self._repo(repo_root)
 
-            # The template defaults anchor_challenger_v1 x hebo24-hebo20, so
-            # passing only one side of the pair mismatches the other.
-            with self.assertRaisesRegex(
-                ValueError, "requires scheduler_policy anchor_transfer_challenger_v1"
-            ):
-                initialize_run(
-                    repo_root,
-                    "toy",
-                    "inner-only",
-                    inner_policy="hebo24-transfer10-hebo10",
-                )
-            with self.assertRaisesRegex(
-                ValueError, "requires inner tuner policy hebo24-transfer10-hebo10"
-            ):
-                initialize_run(
-                    repo_root,
-                    "toy",
+            # The transfer pair is the new-run default, so passing only one
+            # side resolves the other from the defaults and succeeds.
+            for tag, kwargs in (
+                ("inner-only", {"inner_policy": "hebo24-transfer10-hebo10"}),
+                (
                     "scheduler-only",
-                    scheduler_policy="anchor_transfer_challenger_v1",
+                    {"scheduler_policy": "anchor_transfer_challenger_v1"},
+                ),
+            ):
+                run_dir = initialize_run(repo_root, "toy", tag, **kwargs)
+                config = json.loads(
+                    (run_dir / "framework_cfg.json").read_text()
+                )
+                self.assertEqual(
+                    config["tuner"]["scheduler_policy"],
+                    "anchor_transfer_challenger_v1",
+                )
+                self.assertEqual(
+                    config["tuner"]["inner_policy"],
+                    "hebo24-transfer10-hebo10",
                 )
             with self.assertRaisesRegex(
                 ValueError, "requires scheduler_policy anchor_transfer_challenger_v1"
@@ -638,18 +629,24 @@ class InitRunTransferPolicyTests(unittest.TestCase):
                     inner_policy="hebo24-hebo20",
                 )
 
-    def test_default_pair_is_unchanged(self) -> None:
+    def test_transfer_scheduler_alone_selects_the_transfer_pair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._repo(repo_root)
 
-            run_dir = initialize_run(repo_root, "toy", "default")
+            run_dir = initialize_run(
+                repo_root, "toy", "default",
+                scheduler_policy="anchor_transfer_challenger_v1",
+            )
 
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(
-                config["tuner"]["scheduler_policy"], "anchor_challenger_v1"
+                config["tuner"]["scheduler_policy"],
+                "anchor_transfer_challenger_v1",
             )
-            self.assertEqual(config["tuner"]["inner_policy"], "hebo24-hebo20")
+            self.assertEqual(
+                config["tuner"]["inner_policy"], "hebo24-transfer10-hebo10"
+            )
 
 
 if __name__ == "__main__":

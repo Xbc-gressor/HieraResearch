@@ -48,11 +48,12 @@ def _load_bouts(candidate: Path) -> list[dict]:
     path = candidate / REWRITE_DIR / "bouts.jsonl"
     if not path.is_file():
         return []
-    return [
+    entries = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    return [entry for entry in entries if entry.get("kind") != "confirmation"]
 
 
 def _consecutive_non_kept(bouts: list[dict]) -> int:
@@ -145,19 +146,38 @@ def _journal(candidate: Path, bout: int, outcome: str, receipt: dict,
         repo_root)
 
 
+def _finite(score) -> bool:
+    return (isinstance(score, (int, float)) and not isinstance(score, bool)
+            and math.isfinite(score))
+
+
 def _finalize(candidate: Path, bout: int, payload: dict, noise_margin: float,
-              receipt: dict, repo_root: Path, cmd) -> dict:
+              receipt: dict, repo_root: Path, cmd,
+              reference: float | None = None) -> dict:
     score = payload.get("score")
-    finite = (isinstance(score, (int, float)) and not isinstance(score, bool)
-              and math.isfinite(score))
     args = ["python", "tools/rewrite_bout.py", "finalize",
             "--candidate", candidate, "--bout", str(bout),
             "--noise-margin", str(noise_margin),
             "--summary", receipt["summary"], "--basis", receipt["basis"]]
+    if reference is not None:
+        args += ["--reference", str(reference)]
     attempt_id = payload.get("attempt_id")
     if attempt_id:  # unrecoverable ids are journaled as null
         args += ["--attempt-id", attempt_id]
-    args += ["--score", str(score)] if finite else ["--nonfinite"]
+    args += ["--score", str(score)] if _finite(score) else ["--nonfinite"]
+    proc = cmd(args, repo_root)
+    return json.loads(proc.stdout)
+
+
+def _confirm(candidate: Path, bout: int, payload: dict, repo_root: Path,
+             cmd) -> dict:
+    score = payload.get("score")
+    args = ["python", "tools/rewrite_bout.py", "confirm",
+            "--candidate", candidate, "--bout", str(bout)]
+    attempt_id = payload.get("attempt_id")
+    if attempt_id:
+        args += ["--attempt-id", attempt_id]
+    args += ["--score", str(score)] if _finite(score) else ["--nonfinite"]
     proc = cmd(args, repo_root)
     return json.loads(proc.stdout)
 
@@ -259,17 +279,31 @@ def _editor_extra(candidate: Path, current_best: float, metric: str,
     return extra
 
 
+def _result(status: str, **fields) -> dict:
+    return {"status": status, "outcome": None, "score": None,
+            "reference": None, "attempts": 0, **fields}
+
+
 def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
               noise_margin, context, task_toml, repo_root, cmd,
-              events) -> str:
-    """Run one bout; returns "done" | "budget" | "no_reference"."""
+              events, *, reference: float | None = None,
+              confirm: bool = False) -> dict:
+    """Run one bout.
+
+    Returns {"status": "done" | "budget" | "no_reference", "outcome",
+    "score", "reference", "attempts"}. ``reference`` overrides the
+    journal-derived incumbent (the experiment loop passes the ledger score);
+    ``confirm`` re-evaluates a kept edit once and folds that score into the
+    reference so one lucky sample cannot anchor later adjudications.
+    """
     bout = len(bouts) + 1
     _render_context(candidate, context, repo_root, cmd)
     snapshot = _snapshot(candidate, bout, repo_root, cmd)
-    best = _current_best(candidate, repo_root, cmd)
+    best = reference if reference is not None else _current_best(
+        candidate, repo_root, cmd)
     if best is None:
         events.emit("candidate_no_reference", candidate=candidate.name)
-        return "no_reference"
+        return _result("no_reference")
 
     extra = _editor_extra(candidate, best, metric, bouts)
     try:
@@ -300,12 +334,12 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
         _journal(candidate, bout, "noop", receipt, repo_root, cmd)
         events.emit("bout", candidate=candidate.name, bout=bout,
                     outcome="noop")
-        return "done"
+        return _result("done", outcome="noop", reference=best)
     if not file_changed:
         _journal(candidate, bout, "noop", receipt, repo_root, cmd)
         events.emit("bout", candidate=candidate.name, bout=bout,
                     outcome="noop")
-        return "done"
+        return _result("done", outcome="noop", reference=best)
 
     # Preflight-class gate: preflight, then rewrite_eval's BASE_PARAMS check
     # (both free). One repair resume with the error tail; a second failure
@@ -320,7 +354,7 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
             _revert(candidate, snapshot, repo_root, cmd)
             events.emit("budget_exhausted", candidate=candidate.name,
                         bout=bout)
-            return "budget"
+            return _result("budget", reference=best)
         error_tail = _params_error(payload)
         if error_tail is not None:
             payload = None
@@ -347,7 +381,7 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
                     _revert(candidate, snapshot, repo_root, cmd)
                     events.emit("budget_exhausted", candidate=candidate.name,
                                 bout=bout)
-                    return "budget"
+                    return _result("budget", reference=best)
                 error_tail = _params_error(payload)
                 if error_tail is not None:
                     payload = None
@@ -357,13 +391,28 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
                      cmd)
             events.emit("bout", candidate=candidate.name, bout=bout,
                         outcome="reverted_crash", stage="preflight")
-            return "done"
+            return _result("done", outcome="reverted_crash", reference=best)
 
     result = _finalize(candidate, bout, payload, noise_margin, receipt,
-                       repo_root, cmd)
+                       repo_root, cmd, reference=reference)
     events.emit("bout", candidate=candidate.name, bout=bout,
                 outcome=result["outcome"], score=payload.get("score"))
-    return "done"
+    attempts = 1 if payload.get("attempt_id") else 0
+    new_reference = result["best"]
+    if result["outcome"] == "kept" and confirm:
+        # Confirmation re-eval: the keep stands; only the reference moves.
+        returncode, confirmation = _evaluate(task, candidate, repo_root, cmd,
+                                             task_toml)
+        if returncode != 4:
+            entry = _confirm(candidate, bout, confirmation, repo_root, cmd)
+            new_reference = entry["reference"]
+            attempts += 1 if confirmation.get("attempt_id") else 0
+            events.emit("bout_confirmed", candidate=candidate.name, bout=bout,
+                        score=confirmation.get("score"),
+                        reference=new_reference)
+    return _result("done", outcome=result["outcome"],
+                   score=payload.get("score"), reference=new_reference,
+                   attempts=attempts)
 
 
 # --- status ---------------------------------------------------------------------
@@ -459,10 +508,10 @@ def run_rewrite(task, tag, *, runner, model, noise_margin=0.0, max_bouts=12,
                 events.emit("blocked", reason=stop_condition)
                 halt = True
                 break
-            if result == "budget":
+            if result["status"] == "budget":
                 halt = True
                 break
-            if result == "no_reference":
+            if result["status"] == "no_reference":
                 dead.add(candidate)
 
     return _status(task, tag, run_dir, metric, candidates, stop_condition,

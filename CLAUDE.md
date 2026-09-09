@@ -11,8 +11,17 @@ is retired (deleted in `816690f`).
 
 ```bash
 uv run python -m driver run <task> <tag> --loop experiment \
-  --model <model-id> [--max-evaluations N] [--timeout SECONDS]
+  --model <model-id> --time-budget SECONDS [--final-reserve SECONDS] \
+  [--max-evaluations N] [--timeout SECONDS]
 ```
+
+The default scheduler is `round_v1`: the budget is wall clock
+(`--time-budget` persists an absolute `deadline`); after the seed set, every
+`--round-new-candidates` new candidates trigger one optimization round of
+`--round-rewrite-bouts` rewrite bouts then `--round-tune-bouts` tune bouts
+over the whole pool, each round bounded by `--round-seconds`.
+`--max-evaluations` is an optional safety cap under `round_v1` (and the only
+budget of the older complete-bout schedulers).
 
 `--loop hillclimb` is the comparison baseline and starts the same way.
 `--loop baseline-tune` is the strong tuning baseline: the task-provided

@@ -60,6 +60,9 @@ except ImportError:  # pragma: no cover - non-POSIX hosts have no getrusage.
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from evaluation_budget import (  # noqa: E402
+    find_run_dir,
+    record_evaluation_completion,
+    time_remaining,
     EvaluationBudgetExhausted,
     reserve_evaluation,
 )
@@ -687,12 +690,45 @@ def deep_tune_stage_elapsed(time_budget: dict) -> float:
 
 def read_runtime_limit(ref_path: Any) -> float | None:
     """Top-level `per_runtime_limit` (seconds) from `<run_dir>/framework_cfg.json`
-    (walking up from ref_path). Returns a positive float, else None (no limit).
-    A cfg file that exists but cannot be parsed raises RunConfigError: silently
-    dropping the limit would let an evaluation run unbounded."""
+    (walking up from ref_path), clamped to the time the run has left. Returns
+    a positive float, else None (no limit). A cfg file that exists but cannot
+    be parsed raises RunConfigError: silently dropping the limit would let an
+    evaluation run unbounded."""
     cfg = find_framework_cfg(ref_path)
     if cfg is None:
         return None
+    v = read_framework_cfg(cfg).get("per_runtime_limit")
+    try:
+        v = float(v)
+        limit = v if v > 0 else None
+    except (TypeError, ValueError):
+        limit = None
+    # A run-level deadline (or an open optimization-phase quota) bounds every
+    # evaluation too: an eval may never run past the time it has left.
+    left = time_remaining(cfg.parent)
+    if left is not None:
+        left = max(1.0, left)
+        limit = left if limit is None else min(limit, left)
+    return limit
+
+
+def _time_clamped(ref_path: Any, limit: float | None) -> bool:
+    """Whether ``limit`` is the time budget's remainder rather than the
+    task's per_runtime_limit: a kill at it is the budget ending, not a
+    property of the config."""
+    if limit is None:
+        return False
+    cfg = find_framework_cfg(ref_path)
+    if cfg is None:
+        return False
+    left = time_remaining(cfg.parent)
+    if left is None:
+        return False
+    configured = _configured_runtime_limit(cfg)
+    return configured is None or max(1.0, left) < configured
+
+
+def _configured_runtime_limit(cfg: Path) -> float | None:
     v = read_framework_cfg(cfg).get("per_runtime_limit")
     try:
         v = float(v)
@@ -862,7 +898,43 @@ def timed_eval(
         method=method,
     )
     attempt_id = receipt.get("attempt_id") if receipt else None
+    started = time.monotonic()
+    try:
+        return _timed_eval_body(
+            evaluate,
+            make_model,
+            params,
+            candidate_path,
+            phase=phase,
+            method=method,
+            expected_execution_revision=expected_execution_revision,
+            python_cmd=python_cmd,
+            attempt_id=attempt_id,
+        )
+    finally:
+        # Every admitted attempt — success, crash, or timeout — reports how
+        # long it held the evaluator; the round scheduler prices bouts by it.
+        record_evaluation_completion(
+            candidate_path,
+            attempt_id=attempt_id,
+            duration_seconds=time.monotonic() - started,
+        )
+
+
+def _timed_eval_body(
+    evaluate,
+    make_model,
+    params: dict,
+    candidate_path: Any,
+    *,
+    phase: str,
+    method: str,
+    expected_execution_revision: dict | None,
+    python_cmd: list[str] | None,
+    attempt_id: str | None,
+) -> float:
     runtime_limit = read_runtime_limit(candidate_path)
+    time_clamped = _time_clamped(candidate_path, runtime_limit)
     if runtime_limit is None and python_cmd is None:
         score = float(evaluate(make_model, params))
         if not is_finite_score(score):
@@ -901,6 +973,17 @@ def timed_eval(
                 out=getattr(exc, "partial_stdout", "") or "",
                 err=getattr(exc, "partial_stderr", "") or "",
             )
+            if time_clamped:
+                # The budget ended mid-evaluation. A TimeoutError here would
+                # read as config infeasibility (is_config_infeasible_error)
+                # and teach the sampler / warm cache a false boundary.
+                run_dir = find_run_dir(candidate_path)
+                raise EvaluationBudgetExhausted(
+                    used=0,
+                    budget=None,
+                    run_dir=run_dir if run_dir is not None else Path(candidate_path).parent,
+                    scope="time_cutoff",
+                ) from exc
             raise
     _write_eval_trace(
         candidate_path,

@@ -13,9 +13,13 @@ The high-level lifecycle is:
         -> repeat rounds:
              recover pending candidates
              refresh bounded experience when required
-             generate and evaluate one candidate generation
-             run at most one decoupled tuning bout
-        -> complete on budget exhaustion or quiescence
+             round_v1 (default): generate one candidate generation until the
+               cycle's candidate threshold is met, then run one optimization
+               phase (rewrite bouts, then tune bouts) over the whole pool
+             other schedulers: generate one generation, then at most one
+               decoupled tuning bout
+        -> complete on budget exhaustion (evaluations or wall clock) or
+           quiescence
 
 The helpers below are grouped by responsibility. Recovery policy stays close
 to the operation it recovers, while ``run_experiment`` remains a compact map of
@@ -43,6 +47,7 @@ from ..session import InvocationFailed
 from ..status import budget_status, compact_status
 from . import background_audit
 from . import common
+from . import rounds
 from .common import RunBlocked
 from tools.evaluation_budget import budget_status as objective_budget_status
 from tools.scheduler.contract import (
@@ -1145,8 +1150,19 @@ def _dimension_strategy(run_dir: Path) -> str | None:
 
 def _init_run_extra(dimension_strategy, llm_intelligence_score,
                     semantic_policy, scheduler_policy, inner_policy,
-                    k_warm, k_eval) -> list[str]:
+                    k_warm, k_eval, proposer_arm=None, time_budget=None,
+                    deadline=None, final_reserve=None,
+                    round_options=None) -> list[str]:
     extra = []
+    if time_budget is not None:
+        extra += ["--time-budget", str(time_budget)]
+    if deadline is not None:
+        extra += ["--deadline", str(deadline)]
+    if final_reserve is not None:
+        extra += ["--final-reserve", str(final_reserve)]
+    for key, value in sorted((round_options or {}).items()):
+        if value is not None:
+            extra += [f"--round-{key.replace('_', '-')}", str(value)]
     if dimension_strategy:
         extra += ["--dimension-strategy", dimension_strategy]
     if llm_intelligence_score is not None:
@@ -1157,6 +1173,8 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
         extra += ["--scheduler-policy", scheduler_policy]
     if inner_policy is not None:
         extra += ["--inner-tuner-policy", inner_policy]
+    if proposer_arm is not None:
+        extra += ["--proposer-arm", proposer_arm]
     if k_warm is not None:
         extra += ["--k-warm", str(k_warm)]
     if k_eval is not None:
@@ -1167,7 +1185,9 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
 def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
            events, max_evaluations, timeout, dimension_strategy,
            llm_intelligence_score, semantic_policy, scheduler_policy,
-           inner_policy, k_warm, k_eval, model, cli_path) -> None:
+           inner_policy, k_warm, k_eval, model, cli_path,
+           proposer_arm=None, time_budget=None, deadline=None,
+           final_reserve=None, round_options=None) -> None:
     extra = _init_run_extra(
         dimension_strategy,
         llm_intelligence_score,
@@ -1176,6 +1196,11 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         inner_policy,
         k_warm,
         k_eval,
+        proposer_arm=proposer_arm,
+        time_budget=time_budget,
+        deadline=deadline,
+        final_reserve=final_reserve,
+        round_options=round_options,
     )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
@@ -1553,6 +1578,38 @@ def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
     return actions
 
 
+def _round_step(runner, store, task, tag, run_dir, round_no, task_toml,
+                repo_root, cmd, events, job_runner, model, *,
+                ledger_exists) -> tuple[list[dict], bool]:
+    """One round_v1 iteration: a generation, or an optimization phase.
+
+    The generation phase runs while the cycle's threshold is unmet and the
+    remaining usable time still covers the next optimization quota; otherwise
+    the optimization phase runs on the whole candidate pool and starts the
+    next cycle's count.
+    """
+    view = (rounds.status(run_dir, repo_root, cmd) if ledger_exists
+            else {"generate": True})
+    if view["generate"]:
+        actions = _evaluate_generation(
+            runner, store, task, tag, run_dir, round_no,
+            repo_root, cmd, events, job_runner, model=model,
+        )
+        return actions, False
+    events.emit("round_optimize", round_no=round_no,
+                produced=view.get("produced"), threshold=view.get("threshold"),
+                final_round=view.get("final_round"))
+
+    def tune(no):
+        return _tune(runner, store, task, tag, run_dir, no, repo_root, cmd,
+                     events, job_runner)
+
+    progressed = rounds.optimization_phase(
+        runner, store, task, tag, run_dir, round_no, task_toml, repo_root,
+        cmd, events, tune=tune, config=view["config"])
+    return [], progressed
+
+
 # =============================================================================
 # Public entry point
 # =============================================================================
@@ -1562,7 +1619,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    max_evaluations=None, timeout=None, dimension_strategy=None,
                    llm_intelligence_score=None, semantic_policy=None,
                    scheduler_policy=None, inner_policy=None, k_warm=None,
-                   k_eval=None,
+                   k_eval=None, proposer_arm=None, time_budget=None,
+                   deadline=None, final_reserve=None, round_options=None,
                    cli_path=None, cmd=common.run_cmd,
                    job_runner=execute_driver_job) -> dict:
     """Set up or resume a run, then advance it until blocked or complete."""
@@ -1576,7 +1634,10 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _setup(runner, store, task, tag, run_dir, task_toml, repo_root,
                    cmd, events, max_evaluations, timeout, dimension_strategy,
                    llm_intelligence_score, semantic_policy, scheduler_policy,
-                   inner_policy, k_warm, k_eval, model, cli_path)
+                   inner_policy, k_warm, k_eval, model, cli_path,
+                   proposer_arm=proposer_arm, time_budget=time_budget,
+                   deadline=deadline, final_reserve=final_reserve,
+                   round_options=round_options)
         else:
             # Explicit CLI overrides must never disappear merely because the
             # run directory already exists. init_run applies mutable limits,
@@ -1590,6 +1651,11 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 inner_policy,
                 k_warm,
                 k_eval,
+                proposer_arm=proposer_arm,
+                time_budget=time_budget,
+                deadline=deadline,
+                final_reserve=final_reserve,
+                round_options=round_options,
             )
             if max_evaluations is not None or timeout is not None or extra:
                 common.init_run(
@@ -1647,6 +1713,27 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 _refresh(runner, store, task, tag, run_dir, repo_root, cmd,
                          events)
                 refreshed = True
+
+            # -----------------------------------------------------------------
+            # Round steps 2+3 under round_v1: generate until the cycle's
+            # candidate threshold is met (the whole seed set first, then N new
+            # candidates), then one optimization phase over the full pool.
+            # -----------------------------------------------------------------
+            if _scheduler_policy(run_dir) == rounds.POLICY_ID:
+                actions, tuner_progressed = _round_step(
+                    runner, store, task, tag, run_dir, round_no, task_toml,
+                    repo_root, cmd, events, job_runner, model,
+                    ledger_exists=ledger_exists)
+                progressed = (bool(actions) or tuner_progressed or refreshed
+                              or bool(pending_ids))
+                zero_progress_rounds = 0 if progressed else zero_progress_rounds + 1
+                if zero_progress_rounds >= 2:
+                    events.emit("quiescent", round_no=round_no,
+                                reason="two consecutive zero-progress rounds")
+                    _complete_run(run_dir, repo_root, cmd, events)
+                    break
+                round_no += 1
+                continue
 
             # -----------------------------------------------------------------
             # Round step 2: generate candidates; evaluate each through step 0+1.

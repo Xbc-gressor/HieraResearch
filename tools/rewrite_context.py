@@ -107,6 +107,31 @@ def _run_dir(candidate: Path) -> Path:
     return parent.parent if parent.name == "candidates" else parent
 
 
+def _ledger_manifest(run_dir: Path, run_id: str) -> dict | None:
+    """The import-manifest view of a candidate that lives in the run's own
+    ledger (experiment-loop rewrite bouts have no _import.json)."""
+    ledger = _load_json(run_dir / "ledger.json")
+    if not isinstance(ledger, dict):
+        return None
+    record = next(
+        (r for r in ledger.get("records", []) if str(r.get("run_id")) == run_id),
+        None,
+    )
+    if record is None:
+        return None
+    score = record.get("final_best_score") if record.get("tune") else None
+    if not isinstance(score, (int, float)):
+        score = record.get("best_warm_score")
+    if not isinstance(score, (int, float)):
+        score = record.get("final_best_score")
+    return {
+        "baseline_score": score,
+        "idea": record.get("idea"),
+        "change": record.get("change"),
+        "semantic_point": record.get("semantic_point"),
+    }
+
+
 def _selected_assignments(manifest: dict | None) -> list[dict]:
     point = (manifest or {}).get("semantic_point")
     if not isinstance(point, dict):
@@ -443,8 +468,8 @@ def _source_material_lines(
 def _status_lines(candidate: Path, manifest: dict | None) -> list[str]:
     manifest = manifest or {}
     try:
-        best_text = f"{current_best(candidate):.6g}"
-    except ValueError:
+        best_text = f"{current_best(candidate, manifest.get('baseline_score')):.6g}"
+    except (TypeError, ValueError):
         best_text = NONE
     tune_summary = manifest.get("tune_summary")
     return [
@@ -467,6 +492,8 @@ def render_context(candidate, sections=None) -> str:
     candidate = Path(candidate)
     run_dir = _run_dir(candidate)
     manifest = _load_json(candidate / "_import.json")
+    if manifest is None:
+        manifest = _ledger_manifest(run_dir, candidate.name)
     selected = _selected_assignments(manifest)
     dimension_ids = {assignment.get("dimension_id") for assignment in selected}
     hypothesis_ids = {assignment.get("hypothesis_id") for assignment in selected}

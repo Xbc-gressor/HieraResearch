@@ -160,6 +160,21 @@ donor files, and never adjust the target, regime, or trial cap yourself
 because of a donor score; all three come from `select-candidate` /
 `phase-c-action` exactly as under the other scheduler policies.
 
+**When `tuner.scheduler_policy` is `round_v1`** (the default for new runs,
+paired with a 24+20 inner policy such as `hebo24-hebo20`), the same
+exact-target rule applies: obey the returned `scheduler.action` and `run_id`
+without re-ranking. The driver invokes you only inside an optimization round;
+the policy ranks eligible candidates by expected improvement per unit of
+wall-clock time (score rank against the candidate's mean evaluation time).
+The run is bounded by a wall-clock budget and each round by a time quota, so
+a bout may be cut short: when a reservation is refused mid-bout
+(`budget_exhausted_scope` `time` or `round_quota`), `phase-c-action` answers
+`close_exhausted_stage` — finalize the candidate with the observations it
+has; that truncated bout is a complete, valid bout. A candidate whose code
+was rewritten since its last bout carries a rebased Phase-A-only report
+(one warm row at its current `BASE_PARAMS`); its next bout is an ordinary
+INITIAL bout warm-started from that row.
+
 - **`run_id` is `null`** → no candidate is eligible this round (below
   `N_min`; the top tier is tuned and no continuation responded; every tuned
   candidate is a non-responder; or cap/budget exhaustion). No new bout runs.
@@ -274,6 +289,11 @@ or the report yourself.
      a pure-HEBO or LHS warmup. Deferred warm configs occupy slots inside 24.
      The default `hebo24-hebo20` uses this same `pool_hebo_mace` arm for
      INITIAL and both DEEP segments.
+     Which arm actually proposes and ranks inside a `hebo` bout is the run's
+     `tuner.proposer_arm` (default `explicit_e3u2`: an explorer call proposing
+     3 configs plus an exploiter call proposing 2, merged and MACE-ranked from
+     step 1 with no warmup gate; `pool_hebo_mace` is the single-call
+     alternative). The driver's search script reads it; you never choose it.
    - **Historical CONTINUE** (bout_index 1, 10 trials) — prompt-v2 HEBO (`hebo`):
      one bout-scoped `bench-pool-proposer` session (noise-range notes +
      heterogeneity requirement) generates POOL=5 configs per step; official

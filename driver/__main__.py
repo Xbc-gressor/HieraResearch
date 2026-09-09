@@ -45,11 +45,31 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--scheduler-policy",
         choices=["legacy", "legacy_wide", "v3_2", "anchor_challenger_v1",
-                 "anchor_transfer_challenger_v1"],
+                 "anchor_transfer_challenger_v1", "round_v1"],
         help="tuner scheduler policy; new experiment runs default to "
-             "anchor_challenger_v1. Ignored by --loop baseline-tune, which "
-             "runs without a scheduler",
+             "round_v1 (candidate-count-triggered rewrite+tune rounds under a "
+             "wall-clock budget). Ignored by --loop baseline-tune, which runs "
+             "without a scheduler",
     )
+    run.add_argument(
+        "--time-budget", type=float, metavar="SECONDS",
+        help="run-level wall-clock budget from now (persisted as an absolute "
+             "deadline); the round_v1 default budget unit",
+    )
+    run.add_argument("--deadline", type=float, metavar="EPOCH_SECONDS",
+                     help="absolute run deadline instead of --time-budget")
+    run.add_argument("--final-reserve", type=float, metavar="SECONDS",
+                     help="tail of the time budget kept free for finalization")
+    run.add_argument("--round-new-candidates", type=int, metavar="N",
+                     help="round_v1: new finite candidates per optimization round")
+    run.add_argument("--round-rewrite-bouts", type=int, metavar="R",
+                     help="round_v1: rewrite bouts per optimization round")
+    run.add_argument("--round-tune-bouts", type=int, metavar="T",
+                     help="round_v1: tune bouts per optimization round")
+    run.add_argument("--round-seconds", type=float, metavar="Q",
+                     help="round_v1: wall-clock quota of one optimization round")
+    run.add_argument("--round-rewrite-top-k", type=int, metavar="K",
+                     help="round_v1: rewrite eligibility is the top-K by score")
     run.add_argument(
         "--inner-tuner-policy",
         choices=[
@@ -64,8 +84,15 @@ def build_parser() -> argparse.ArgumentParser:
             "legacy",
         ],
         help="regime-conditioned inner-tuner policy; new experiment runs "
-             "default to hebo24-hebo20. Ignored by --loop baseline-tune, "
-             "which freezes baseline-hebo-full-v1",
+             "default to hebo24-hebo20. Ignored by --loop "
+             "baseline-tune, which freezes baseline-hebo-full-v1",
+    )
+    run.add_argument(
+        "--proposer-arm",
+        choices=["pool_hebo_mace", "explicit_e3u2"],
+        help="inner-benchmark arm that proposes and ranks configs inside "
+             "HEBO bouts; new runs default to explicit_e3u2. Pairs with any "
+             "inner tuner policy",
     )
     run.add_argument(
         "--k-warm",
@@ -84,9 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--noise-margin",
         type=float,
-        default=0.0,
-        help="rewrite loop: a score must beat the candidate's best by more "
-             "than this margin to be kept (0 = strict improvement)",
+        default=None,
+        help="rewrite bouts (rewrite loop and round_v1): a score must beat "
+             "the candidate's reference by more than this margin to be kept "
+             "(default 0 = strict improvement)",
     )
     run.add_argument(
         "--max-bouts",
@@ -116,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "run":
-        if args.noise_margin < 0:
+        if args.noise_margin is not None and args.noise_margin < 0:
             parser.error("--noise-margin must be >= 0")
         import json
 
@@ -152,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.task, args.tag, runner=runner, model=model,
                 max_evaluations=args.max_evaluations, timeout=args.timeout,
                 k_warm=args.k_warm, k_eval=args.k_eval,
+                proposer_arm=args.proposer_arm,
                 cli_path=args.cli_path,
             )
             print(json.dumps(status, indent=2, sort_keys=True))
@@ -162,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
                                       cli_path=args.cli_path)
             status = run_rewrite(
                 args.task, args.tag, runner=runner, model=model,
-                noise_margin=args.noise_margin, max_bouts=args.max_bouts,
+                noise_margin=args.noise_margin or 0.0, max_bouts=args.max_bouts,
                 stall_after=args.stall_after, context=args.context,
                 max_evaluations=args.max_evaluations, timeout=args.timeout,
                 cli_path=args.cli_path,
@@ -182,6 +211,18 @@ def main(argv: list[str] | None = None) -> int:
             inner_policy=args.inner_tuner_policy,
             k_warm=args.k_warm,
             k_eval=args.k_eval,
+            proposer_arm=args.proposer_arm,
+            time_budget=args.time_budget,
+            deadline=args.deadline,
+            final_reserve=args.final_reserve,
+            round_options={
+                "new_candidates": args.round_new_candidates,
+                "rewrite_bouts": args.round_rewrite_bouts,
+                "tune_bouts": args.round_tune_bouts,
+                "round_seconds": args.round_seconds,
+                "noise_margin": args.noise_margin,
+                "rewrite_top_k": args.round_rewrite_top_k,
+            },
             cli_path=args.cli_path,
         )
         print(json.dumps(status, indent=2, sort_keys=True))

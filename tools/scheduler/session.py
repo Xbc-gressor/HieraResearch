@@ -27,6 +27,7 @@ from .reconcile import reconcile_path
 from .rollout import RolloutConfig
 from .state import SchedulerState, load_state
 from .store import SchedulerStore
+from . import round_policy
 from . import tournament
 from . import transfer_tournament
 
@@ -63,7 +64,7 @@ def contract_for(ledger_path: Path) -> ResourceContract:
     tuner = load_run_cfg(Path(ledger_path).parent, "tuner")
     bout_trials = int(tuner.get("bout_trials", ResourceContract.bout_trials))
     scheduler_policy = str(tuner.get("scheduler_policy", "v3_2"))
-    if scheduler_policy == tournament.POLICY_ID:
+    if scheduler_policy in (tournament.POLICY_ID, round_policy.POLICY_ID):
         # Derive the resource schedule from the executable inner policy rather
         # than baking mixup's planned 24/10/10 into the scheduler.  This keeps
         # the scheduler mechanically testable with today's production arms and
@@ -171,7 +172,9 @@ def decide_for_run(
     cursor = store.evidence.cursor()
 
     existing = store.open_decision(snapshot_id, cursor)
-    if existing is not None:
+    # A rewrite decision (round_v1) is closed by the driver, never by a bout;
+    # an open one left by a crash must not stand in for this tune decision.
+    if existing is not None and existing.get("selected_action") != round_policy.REWRITE:
         return _view(existing, state, reconciled, reused=True)
 
     tuning = arrival = None
@@ -179,6 +182,8 @@ def decide_for_run(
         decision = tournament.decide(state)
     elif scheduler_policy == transfer_tournament.POLICY_ID:
         decision = transfer_tournament.decide(state)
+    elif scheduler_policy == round_policy.POLICY_ID:
+        decision = round_policy.decide(state, run_dir)
     else:
         tuning, arrival = models_for(store)
         decision = decide_policy(
@@ -205,6 +210,14 @@ def decide_for_run(
             snapshot_id=snapshot_id,
             decision_id=decision_id,
         )
+    elif scheduler_policy == round_policy.POLICY_ID:
+        receipt = round_policy.receipt(
+            decision,
+            state=state,
+            evidence_cursor=cursor,
+            snapshot_id=snapshot_id,
+            decision_id=decision_id,
+        )
     else:
         receipt = decision.receipt(
             state=state,
@@ -225,6 +238,37 @@ def decide_for_run(
             else None
         ),
     )
+
+
+def select_rewrite_for_run(ledger_path: Path) -> dict:
+    """round_v1: choose (or reuse) this phase's rewrite target and commit it.
+
+    Same commit discipline as `decide_for_run`: reconcile, build the exact
+    state, reuse an open REWRITE decision for the identical state, otherwise
+    decide and append. The driver closes the decision with `record` once the
+    bout has run.
+    """
+    ledger_path = Path(ledger_path)
+    run_dir = ledger_path.parent
+    store = SchedulerStore(run_dir)
+    contract = contract_for(ledger_path)
+    reconciled = reconcile_path(ledger_path, k_eval=contract.k_eval)
+    state = load_state(ledger_path, contract=contract)
+    snapshot_id = store.put_snapshot(state.snapshot())
+    cursor = store.evidence.cursor()
+    existing = store.open_decision(snapshot_id, cursor)
+    if existing is not None and existing.get("selected_action") == round_policy.REWRITE:
+        return _view(existing, state, reconciled, reused=True)
+    decision = round_policy.select_rewrite(state, run_dir)
+    receipt = round_policy.receipt(
+        decision,
+        state=state,
+        evidence_cursor=cursor,
+        snapshot_id=snapshot_id,
+        decision_id=store.next_decision_id(),
+    )
+    store.append_decision(receipt)
+    return _view(receipt, state, reconciled, reused=False)
 
 
 def _view(
@@ -261,4 +305,5 @@ __all__ = [
     "contract_for",
     "decide_for_run",
     "models_for",
+    "select_rewrite_for_run",
 ]

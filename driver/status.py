@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .roles import REPO_ROOT, ledger_brief
@@ -60,7 +61,10 @@ def _derive_state(ledger: dict | None, framework_cfg: dict,
     if not _is_int(budget):
         budget = stored.get("evaluation_budget")
     budget = budget if _is_int(budget) else None
-    if budget is not None and _attempted(records, evaluations_done) >= budget:
+    evaluations_reached = (
+        budget is not None and _attempted(records, evaluations_done) >= budget
+    )
+    if evaluations_reached or _time_reached(framework_cfg):
         lifecycle_terminal = bool(records) and all(
             record.get("status") in LIFECYCLE_TERMINAL_STATUSES
             for record in records
@@ -80,8 +84,22 @@ def _derive_state(ledger: dict | None, framework_cfg: dict,
             return "running", "budget_reached_pending_resolution"
         if stale_experience:
             return "running", "final_experience_refresh_required"
-        return "completed", "evaluation_budget_reached"
+        return "completed", (
+            "evaluation_budget_reached" if evaluations_reached
+            else "time_budget_reached"
+        )
     return "running", "none"
+
+
+def _time_reached(framework_cfg: dict) -> bool:
+    """The wall-clock budget (deadline minus final reserve) has run out."""
+    deadline = framework_cfg.get("deadline")
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+        return False
+    reserve = framework_cfg.get("final_reserve_seconds")
+    reserve = reserve if isinstance(reserve, (int, float)) and not isinstance(
+        reserve, bool) else 0.0
+    return time.time() >= float(deadline) - float(reserve)
 
 
 def derive_phase(ledger: dict | None, framework_cfg: dict,

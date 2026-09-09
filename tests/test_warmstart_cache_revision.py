@@ -50,9 +50,14 @@ class WarmstartCacheRevisionTests(unittest.TestCase):
                 self.assertEqual(warmstart_eval.main(), 0)
 
             attempts = [
-                json.loads(line)
-                for line in (run_dir / "evaluation_attempts.jsonl").read_text().splitlines()
-                if line.strip()
+                row
+                for row in (
+                    json.loads(line)
+                    for line in (run_dir / "evaluation_attempts.jsonl")
+                    .read_text().splitlines()
+                    if line.strip()
+                )
+                if row["kind"] == "score_attempt"
             ]
             self.assertEqual(len(attempts), 2)
             self.assertTrue(all(row["phase"] == "phase_a" for row in attempts))
@@ -451,6 +456,67 @@ def evaluate_config(make_model, params):
                 phase_a["deferred_configs"],
                 [{"params": {"x": 3}}],
             )
+
+    def test_timeout_row_is_nonfatal_and_replayed_on_resume(self) -> None:
+        def slow_for_two(_evaluate, _make_model, params, *_args, **_kwargs):
+            if params["x"] == 2:
+                raise TimeoutError("evaluation exceeded per_runtime_limit=300s")
+            return float(params["x"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate, configs_path, report_path = self._fixture(
+                Path(tmp),
+                provided=False,
+            )
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path",
+                str(candidate),
+                "--configs-json",
+                str(configs_path),
+                "--tune-report-json",
+                str(report_path),
+            ]
+            timed_eval = mock.Mock(side_effect=slow_for_two)
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(warmstart_eval, "timed_eval", timed_eval),
+                mock.patch("sys.stdout", new=io.StringIO()),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                self.assertEqual(warmstart_eval.main(), 0)
+            self.assertEqual(timed_eval.call_count, 2)
+            phase_a = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(phase_a["status"], "ok")
+            self.assertEqual(phase_a["best_warm_params"], {"x": 1})
+            self.assertEqual(phase_a["k_survived"], 1)
+            failed = phase_a["warm_start_configs"][1]
+            self.assertEqual(failed["status"], "failed")
+            self.assertTrue(failed["config_infeasible"])
+            self.assertIn("failure_ref", failed)
+
+            # Same code, same params: both rows replay without an objective call.
+            resumed_eval = mock.Mock(side_effect=slow_for_two)
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(warmstart_eval, "timed_eval", resumed_eval),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                self.assertEqual(warmstart_eval.main(), 0)
+            resumed_eval.assert_not_called()
+
+            # Every selected row infeasible: the crash path, not a diagnosis loop.
+            configs_path.write_text(json.dumps([{"x": 2}, {"x": 2}]))
+            all_slow = mock.Mock(side_effect=slow_for_two)
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(warmstart_eval, "timed_eval", all_slow),
+                mock.patch("sys.stdout", new=io.StringIO()) as out,
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                self.assertEqual(warmstart_eval.main(), warmstart_eval.CRASHED)
+            all_slow.assert_not_called()
+            self.assertEqual(json.loads(out.getvalue())["reason"], "no finite warm row")
 
 
 if __name__ == "__main__":

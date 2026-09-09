@@ -1451,6 +1451,10 @@ def _unresumable_budget_scope(candidate_path: Path) -> tuple[str | None, str]:
     )
     if isinstance(status_view.get("remaining"), int) and status_view["remaining"] <= 0:
         return "global", detail
+    if (status_view.get("time") or {}).get("time_reached"):
+        return "time", detail
+    if status_view.get("phase_quota_reached"):
+        return "round_quota", detail
     if isinstance(deep.get("remaining"), int) and deep["remaining"] <= 0:
         return "deep_tune_total", detail
     if isinstance(candidate_cap, int) and candidate_used >= candidate_cap:

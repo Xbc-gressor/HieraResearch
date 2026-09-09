@@ -150,11 +150,12 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
             "v3_2",
             "anchor_challenger_v1",
             "anchor_transfer_challenger_v1",
+            "round_v1",
         ):
             raise RunConfigError(
                 f"{path}: tuner.scheduler_policy must be 'legacy', "
-                "'legacy_wide', 'v3_2', 'anchor_challenger_v1', or "
-                "'anchor_transfer_challenger_v1'"
+                "'legacy_wide', 'v3_2', 'anchor_challenger_v1', "
+                "'anchor_transfer_challenger_v1', or 'round_v1'"
             )
 
     if "inner_policy" in tuner:
@@ -188,11 +189,11 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
                 "hebo24-hebo20",
             )
             and tuner.get("scheduler_policy", "v3_2")
-            != "anchor_challenger_v1"
+            not in ("anchor_challenger_v1", "round_v1")
         ):
             raise RunConfigError(
                 f"{path}: tuner.inner_policy {value!r} requires "
-                "tuner.scheduler_policy 'anchor_challenger_v1'"
+                "tuner.scheduler_policy 'anchor_challenger_v1' or 'round_v1'"
             )
         if (
             value == "hebo24-transfer10-hebo10"
@@ -211,6 +212,15 @@ def _validate_tuner_config(tuner: dict, path: Path) -> None:
                 f"{path}: tuner.inner_policy {value!r} is the "
                 "baseline-tune loop's single full-budget bout and requires "
                 "tuner.scheduler_policy 'legacy' (no scheduler)"
+            )
+
+    if "proposer_arm" in tuner:
+        # Keep in lockstep with tuners.inner_policy.PROPOSER_ARMS.
+        value = tuner["proposer_arm"]
+        if value not in ("pool_hebo_mace", "explicit_e3u2"):
+            raise RunConfigError(
+                f"{path}: tuner.proposer_arm must be 'pool_hebo_mace' or "
+                "'explicit_e3u2'"
             )
 
     for key in ("scheduler_scenarios", "max_bouts_per_candidate"):
@@ -425,6 +435,59 @@ def _validate_anchor_transfer_challenger(config: dict, tuner: dict, path: Path) 
         )
 
 
+def _validate_round_v1(config: dict, tuner: dict, path: Path) -> None:
+    """The round scheduler is bounded by wall clock (``deadline``), with
+    ``max_evaluations`` as an optional safety cap; its inner policy's first
+    bout must be candidate-independent."""
+    if tuner.get("deep_tune_budget_fraction") is not None:
+        raise RunConfigError(
+            f"{path}: tuner.deep_tune_budget_fraction is incompatible with "
+            "tuner.scheduler_policy 'round_v1'"
+        )
+    inner = tuner.get("inner_policy")
+    if inner in ("hebo24-transfer10-hebo10", "baseline-hebo-full-v1"):
+        raise RunConfigError(
+            f"{path}: tuner.inner_policy {inner!r} cannot pair with "
+            "tuner.scheduler_policy 'round_v1'"
+        )
+
+
+def _validate_round_config(section: dict, path: Path) -> None:
+    """Validate the ``round`` section (round_v1 knobs)."""
+    known = {
+        "new_candidates",
+        "rewrite_bouts",
+        "tune_bouts",
+        "round_seconds",
+        "rewrite_top_k",
+        "rewrite_max_bouts",
+        "rewrite_stall_after",
+        "noise_margin",
+        "session_overhead_seconds",
+    }
+    unknown = sorted(set(section) - known)
+    if unknown:
+        raise RunConfigError(f"{path}: unknown round keys {unknown}")
+    for key in ("new_candidates", "rewrite_top_k", "rewrite_max_bouts",
+                "rewrite_stall_after"):
+        _validate_positive_int_override(section, key, path, label=f"round.{key}")
+    for key in ("rewrite_bouts", "tune_bouts"):
+        if key in section:
+            value = section[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RunConfigError(
+                    f"{path}: round.{key} must be a non-negative integer"
+                )
+    _validate_optional_positive_number(section, "round_seconds", path)
+    for key in ("noise_margin", "session_overhead_seconds"):
+        if key in section:
+            value = section[key]
+            if not _is_finite_number(value) or value < 0:
+                raise RunConfigError(
+                    f"{path}: round.{key} must be a non-negative finite number"
+                )
+
+
 def _validate_judged_slate_config(judged_slate: dict, path: Path) -> None:
     """Validate the judged-slate listwise-judge arm's pool configuration."""
     unknown = sorted(set(judged_slate) - {"pool_size"})
@@ -448,6 +511,19 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
     _validate_optional_positive_int(config, "max_evaluations", path)
     _validate_optional_positive_number(config, "per_runtime_limit", path)
     _validate_optional_positive_number(config, "preflight_runtime_limit", path)
+    _validate_optional_positive_number(config, "deadline", path)
+    if config.get("final_reserve_seconds") is not None:
+        value = config["final_reserve_seconds"]
+        if not _is_finite_number(value) or value < 0:
+            raise RunConfigError(
+                f"{path}: final_reserve_seconds must be a non-negative finite "
+                "number or null"
+            )
+    round_section = config.get("round")
+    if round_section is not None:
+        if not isinstance(round_section, dict):
+            raise RunConfigError(f"{path}: round must be an object")
+        _validate_round_config(round_section, path)
 
     judged_slate = config.get("judged_slate")
     if judged_slate is not None:
@@ -467,6 +543,8 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
         _validate_anchor_challenger(config, tuner, path)
     elif tuner.get("scheduler_policy") == "anchor_transfer_challenger_v1":
         _validate_anchor_transfer_challenger(config, tuner, path)
+    elif tuner.get("scheduler_policy") == "round_v1":
+        _validate_round_v1(config, tuner, path)
 
 
 def read_framework_cfg(path: Any) -> dict:
