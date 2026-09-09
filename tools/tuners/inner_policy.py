@@ -91,12 +91,11 @@ occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
 them as extra trials on top of the bout budget.
 
 The switch is per-run: ``framework_cfg.json`` ``tuner.inner_policy`` —
-``hebo24-hebo20`` (new-experiment default),
+``hebo24-transfer10-hebo10`` (new-experiment default),
 ``deferred-random8-hebo10-spsa10-v1`` (historical missing-key fallback),
 ``localtr8-hebo10-spsa10-v1``, ``localtr8-hebo10-hebo10-v1``,
 ``selfrank8-hebo10-hebo10``, ``mixup24-turbo20-v1``,
-``hebo24-turbo20-v1``, ``hebo24-hebo20``, ``hebo24-transfer10-hebo10``
-(judged-slate transfer pair only),
+``hebo24-turbo20-v1``, ``hebo24-hebo20``,
 ``baseline-hebo-full-v1`` (baseline-tune loop only), or ``legacy`` (the
 pre-policy uniform behavior: every bout runs the CONTINUE rule at
 ``tuner.bout_trials``).
@@ -115,7 +114,6 @@ SELF_RANK_HEBO_POLICY_ID = "selfrank8-hebo10-hebo10"
 MIXUP_TURBO_POLICY_ID = "mixup24-turbo20-v1"
 HEBO_TURBO_POLICY_ID = "hebo24-turbo20-v1"
 HEBO_HEBO_POLICY_ID = "hebo24-hebo20"
-EXPLICIT_E3U2_POLICY_ID = "explicit-e3u2-hebo-v1"
 HEBO_TRANSFER_HEBO_POLICY_ID = "hebo24-transfer10-hebo10"
 BASELINE_HEBO_POLICY_ID = "baseline-hebo-full-v1"
 LEGACY_POLICY_ID = "legacy"
@@ -135,11 +133,19 @@ REGIME_POLICY_IDS = (
     SELF_RANK_HEBO_POLICY_ID,
     *INITIAL24_POLICY_IDS,
     BASELINE_HEBO_POLICY_ID,
-    EXPLICIT_E3U2_POLICY_ID,
 )
 #: Regime policies whose FIRST bout is the inner-benchmark ``local_tr`` arm.
 LOCAL_TR_FIRST_POLICY_IDS = (LOCAL_TR_POLICY_ID, LOCAL_TR_HEBO_POLICY_ID)
 KNOWN_POLICY_IDS = (*REGIME_POLICY_IDS, LEGACY_POLICY_ID)
+
+#: ``tuner.proposer_arm``: which inner-benchmark arm proposes and ranks
+#: configs inside every HEBO bout. Orthogonal to ``inner_policy``, which
+#: only fixes bout sizes and the donor-aware first bout, so any arm pairs
+#: with any schedule. Keep in lockstep with ``tools/run_cfg.py``.
+PROPOSER_ARM_POOL_HEBO_MACE = "pool_hebo_mace"
+PROPOSER_ARM_EXPLICIT_E3U2 = "explicit_e3u2"
+PROPOSER_ARMS = (PROPOSER_ARM_POOL_HEBO_MACE, PROPOSER_ARM_EXPLICIT_E3U2)
+DEFAULT_PROPOSER_ARM = PROPOSER_ARM_EXPLICIT_E3U2
 
 INITIAL = "INITIAL"
 FIRST = "FIRST"  # historical 8/10/10 comparison policies only
@@ -187,6 +193,24 @@ def load_policy_id(ref_path) -> str:
         allowed = " or ".join(repr(item) for item in KNOWN_POLICY_IDS)
         raise ValueError(f"tuner.inner_policy must be {allowed}; got {raw!r}")
     return policy_id
+
+
+def load_proposer_arm(ref_path) -> str:
+    """``tuner.proposer_arm`` from the run's framework_cfg.
+
+    New runs persist ``DEFAULT_PROPOSER_ARM`` through init_run; a missing key
+    keeps the historical single-call arm, as with ``inner_policy``.
+    """
+    from _common import load_run_cfg  # function-level: _common imports us too
+
+    raw = load_run_cfg(ref_path, "tuner").get(
+        "proposer_arm", PROPOSER_ARM_POOL_HEBO_MACE
+    )
+    arm = str(raw)
+    if arm not in PROPOSER_ARMS:
+        allowed = " or ".join(repr(item) for item in PROPOSER_ARMS)
+        raise ValueError(f"tuner.proposer_arm must be {allowed}; got {raw!r}")
+    return arm
 
 
 def _historical_regime_for_bout_index(bout_index: int) -> str:

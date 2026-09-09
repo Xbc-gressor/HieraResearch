@@ -374,14 +374,22 @@ remains explicitly tagged for attribution, but participates normally in
 not change its `semantic_control.status: unverified`. The deep-tuner later
 evaluates the deferred configs FIRST (bo enqueue / grid prepend).
 
-- **exit 0** — every config scored; `BASE_PARAMS` = best finite row;
-  `phase_a` finalized. Go to 3c.
-- **exit 3 (CRASHED)** — the config at `crash_index` in the original
+- **exit 0** — every config has an outcome; `BASE_PARAMS` = best finite row;
+  `phase_a` finalized. A row that exceeded `per_runtime_limit` or ran out of
+  memory is recorded as a failed `config_infeasible` row — a property of that
+  config, not a crash to diagnose or a config to swap for a cheaper one. Go to 3c.
+- **exit 3 (CRASHED)** with `crash_index` — that config in the original
   `_warm_configs.json` raised. Replace a config-invalid value in that same slot;
   do not reorder or resize the list after sampling. Stdout contains its
   frozen `failure_receipt` and `failure_ref`; the full traceback remains in the
   referenced append-only artifact. `phase: preflight` means no objective slot
   was consumed; `phase: a` means an admitted `score_fn` call failed. Go to 3b.
+- **exit 3 (CRASHED)** with `reason: "no finite warm row"` — every selected
+  config was config-infeasible (`failed_rows` lists them); the candidate is too
+  slow or too large at every sampled point. Identical params under identical
+  code are replayed, never re-evaluated, so re-requesting the job unchanged is
+  a no-op. Make one behavior-preserving speedup in `train.py` if one is obvious;
+  otherwise `abandon` (3d). Do not hunt for cheaper configs one slot at a time.
 - **exit 4 (BUDGET EXHAUSTED)** — the strict reservation helper refused entry
   before `score_fn`. Do not diagnose this refusal. If the report contains prior
   objective attempts but no finite score, persist tuning metadata and record the candidate as

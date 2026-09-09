@@ -55,9 +55,9 @@ uv run python -m driver run tabular-model-search <tag> \
   [--inner-tuner-policy POLICY]
 ```
 
-新 experiment run 默认启用 `judged_slate` 语义策略、scheduler `anchor_challenger_v1` 和 inner-tuner `hebo24-hebo20`，即每个入选候选的 24+10+10 三段 `pool_hebo_mace` 合约。无需预建目录或手改 JSON。对照臂可通过 `--scheduler-policy` 和 `--inner-tuner-policy` 显式选择；所有 24+20 inner policy 都必须与 `anchor_challenger_v1` 配对。解析后的选择会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
+新 experiment run 默认启用 `judged_slate` 语义策略、scheduler `anchor_transfer_challenger_v1` 和 inner-tuner `hebo24-transfer10-hebo10`（global-donor 转移对），即每个入选候选的 24+10+10 三段合约；bout 内的 proposer arm 由 `tuner.proposer_arm` 单独指定（默认 `explicit_e3u2`，`--proposer-arm pool_hebo_mace` 切回单调用 proposer），与 inner policy 正交。无需预建目录或手改 JSON。对照臂可通过 `--scheduler-policy` 和 `--inner-tuner-policy` 显式选择；其余 24+20 inner policy 都必须与 `anchor_challenger_v1` 配对。解析后的选择会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
 
-`--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--loop baseline-tune` 是强调优基线：task 提供的 baseline（需要 `[seed].provided`）在 step 0+1 之后，由 driver 确定性地用 ONE 个 HEBO MACE bout 花完整个 `--max-evaluations` 预算（相当于把 INITIAL BOUT 拉长到整个 run；无 ideation、无 scheduler、无 tuner-orchestrator 会话），冻结 `inner_policy=baseline-hebo-full-v1` + `scheduler_policy=legacy`。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations`、`--timeout`、`--semantic-policy`、`--scheduler-policy` 与 `--inner-tuner-policy` 经 `tools/init_run.py` 持久化到 `framework_cfg.json`；`--timeout` 是单次评估时限的别名，不是会话看门狗。`anchor_challenger_v1` 和 `v3_2` 都需要有限的 `max_evaluations`；新 run 模板默认提供 200。
+`--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--loop baseline-tune` 是强调优基线：task 提供的 baseline（需要 `[seed].provided`）在 step 0+1 之后，由 driver 确定性地用 ONE 个 HEBO MACE bout 花完整个 `--max-evaluations` 预算（相当于把 INITIAL BOUT 拉长到整个 run；无 ideation、无 scheduler、无 tuner-orchestrator 会话），冻结 `inner_policy=baseline-hebo-full-v1` + `scheduler_policy=legacy`。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations`、`--timeout`、`--semantic-policy`、`--scheduler-policy` 与 `--inner-tuner-policy` 经 `tools/init_run.py` 持久化到 `framework_cfg.json`；`--timeout` 是单次评估时限的别名，不是会话看门狗。`anchor_challenger_v1`、`anchor_transfer_challenger_v1` 和 `v3_2` 都需要有限的 `max_evaluations`；新 run 模板默认提供 200。
 
 对于并行实验，使用不同的 `tag` 值启动多个进程。
 CPU task 可以真正并行。声明 `[resources].accelerator = "cuda"` 的 task
@@ -153,7 +153,7 @@ step 0+1: tunable-contract-extractor
   深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
 
 - **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
-  - 默认 scheduler `anchor_challenger_v1`：seed roots 到齐后立即给当时最优候选一个 INITIAL bout，在保留 challenger 与两个 DEEP segment 硬预算的前提下继续生成，然后初始化 late challenger 并花两个 DEEP segment。第一段 DEEP 有正收益则继续同一候选，否则切换到另一个已初始化候选。`v3_2` 和 legacy percentile/alternation 调度器作为显式对照臂保留。
+  - 默认 scheduler `anchor_transfer_challenger_v1`：seed roots 到齐后立即给当时最优候选一个 INITIAL bout，在保留 challenger 与两个 DEEP segment 硬预算的前提下继续生成，然后初始化 late challenger 并花两个 DEEP segment。第一段 DEEP 有正收益则继续同一候选，否则切换到另一个已初始化候选。与 `anchor_challenger_v1` 的区别是 global-donor 转移：后续候选从 run-global donor（当时最优的已调优候选，按代冻结为不可变快照）暖启动，global_donor 候选的第一个 bout 是 10-eval TRANSFERRED segment（必备 donor 行已在 Phase A 评估）。该赛程只与 inner policy `hebo24-transfer10-hebo10` 配对，且要求 K_eval >= 3（lineage 与 donor 两个筛选角色）。`anchor_challenger_v1`（无 donor 转移的同一赛程）、`v3_2` 和 legacy percentile/alternation 调度器作为显式对照臂保留。
   - 默认 inner policy `hebo24-hebo20`：INITIAL=24，之后至多两个 DEEP=10 segment；三段都调用同一个 `pool_hebo_mace` 协议（LLM pool POOL=5 + 官方 HEBO MACE），以全部历史 trial 为先验，无 TuRBO 数值维门槛。当前 policy 没有 CONTINUE regime；两个 DEEP segment 的边界只供 scheduler 重新准入或换 candidate。`deferred-random8-hebo10-spsa10-v1`、local-TR 和 TuRBO 等策略作为显式对照臂保留。
   - Finalize：`finalize_tuning.py` 只接受终态 Phase C；随后在 warm incumbent 与**所有 bout 的全部 trial** 上取全局最佳、原子写回 `BASE_PARAMS`，并一次性更新 ledger 中的分数、状态、调优元数据与分级 `evaluation_depth`（**无重新运行**）。被杀死或非终态搜索只保留为部分证据，不得进入下游。
   详见 §5.7。
@@ -252,7 +252,7 @@ Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运�
 
 流程：
 
-1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`，并严格执行返回的 exact target 和 complete-bout 预算。默认 `anchor_challenger_v1` 按 early anchor → 保留硬预算继续生成 → late challenger → 两个 DEEP segment 的确定性赛程选择；`v3_2` 用全剩余预算 rollout 在 TUNE/DEFER 间决策。仅 legacy/legacy_wide 使用 `N_min` + `best_warm_score` 百分位门控与 FIRST/CONTINUE 交替规则。
+1. 选择候选方案：运行 `tools/tuners/tune_tools.py select-candidate`，并严格执行返回的 exact target 和 complete-bout 预算。默认 `anchor_transfer_challenger_v1` 按 early anchor → 保留硬预算继续生成 → late challenger → 两个 DEEP segment 的确定性赛程选择（global_donor 候选首 bout 为 10-eval TRANSFERRED segment）；`v3_2` 用全剩余预算 rollout 在 TUNE/DEFER 间决策。仅 legacy/legacy_wide 使用 `N_min` + `best_warm_score` 百分位门控与 FIRST/CONTINUE 交替规则。
 2. Phase R：冻结策略下从不接受 orchestrator 再热提案（INITIAL 消耗 step 0+1 的 deferred 配置；HEBO bout 自生成 pool，`hebo_bout_has_no_rewarm`；SPSA DEEP bout 拒绝提案，`deep_bout_has_no_rewarm`——pair 必须完整）。仅 `tuner.inner_policy=legacy` 的 continuation action 仍走旧的至多 `tuner.rewarm_proposals`（默认 3）条提案路径
 3. Phase C：按 bout regime 选方法（默认 `hebo24-hebo20`：INITIAL=hebo 24 槽，之后两个 DEEP=hebo 10 槽 segment；没有 CONTINUE regime。`deferred-random8-hebo10-spsa10-v1` 为历史 FIRST/CONTINUE/DEEP 三段的 bo+RandomSampler 8 / hebo 10 / spsa 10 对照臂；其他策略见 `tools/tuners/inner_policy.py`），以全部历史 trial 为先验续搜
 4. Finalize：运行 `tools/finalize_tuning.py`；它验证当前 bout 的 Phase C 已终止，在 warm  incumbent 与**所有 bout 的全部 trial** 上取全局最佳、写回 `BASE_PARAMS`、关闭 report，并一次性更新 ledger（`tuning_bouts`、`last_bout_improved`、分级 `evaluation_depth`；**无重新运行**；可按 bout 安全重试）。若搜索进程被杀死或 report 非终态，则不应用参数且不更新 ledger。
@@ -523,8 +523,8 @@ runs/<task>/<tag>/framework_cfg.json
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）
 - **`space_initialization.dimension_strategy`**：维度来源；默认 `catalog_subset` 使用内置目录，`llm_induced` 让 background researcher 在检索前生成并完整采用通过验证的 `dimension_catalog.json`
 - **`semantic_search.*`**：语义点策略及 gain / uncertainty / cost / coverage 权重；新 run 默认使用 `judged_slate`。`coverage`、`coverage_experience`、`coverage_attempt` 等采集策略对照臂可通过 `--semantic-policy` 显式选择
-- **`tuner.scheduler_policy`**：新 experiment run 默认 `anchor_challenger_v1`；`v3_2` 与旧 percentile/alternation 调度器均通过 `--scheduler-policy` 显式选择；`anchor_transfer_challenger_v1`（global-donor 转移赛程）同样显式选择，且只与 inner policy `hebo24-transfer10-hebo10` 配对
-- **`tuner.inner_policy`**：新 experiment run 默认 `hebo24-hebo20`（24+10+10 三段全程使用 LLM pool + official HEBO MACE）；其他对照臂可通过 `--inner-tuner-policy` 显式选择，包括 `hebo24-turbo20-v1`、`mixup24-turbo20-v1`、`deferred-random8-hebo10-spsa10-v1`、`localtr8-hebo10-spsa10-v1`、`localtr8-hebo10-hebo10-v1`、`selfrank8-hebo10-hebo10` 和 `legacy`；`hebo24-transfer10-hebo10`（TRANSFERRED 首 bout 10 eval，只与 `anchor_transfer_challenger_v1` 配对）也可显式选择
+- **`tuner.scheduler_policy`**：新 experiment run 默认 `anchor_transfer_challenger_v1`（global-donor 转移赛程，只与 inner policy `hebo24-transfer10-hebo10` 配对）；`anchor_challenger_v1`、`v3_2` 与旧 percentile/alternation 调度器均通过 `--scheduler-policy` 显式选择
+- **`tuner.inner_policy`**：新 experiment run 默认 `hebo24-transfer10-hebo10`（24+10+10 三段全程使用 LLM pool + official HEBO MACE；global_donor 候选首 bout 为 10-eval TRANSFERRED segment，只与 `anchor_transfer_challenger_v1` 配对）；其他对照臂可通过 `--inner-tuner-policy` 显式选择，包括 `hebo24-hebo20`、`hebo24-turbo20-v1`、`mixup24-turbo20-v1`、`deferred-random8-hebo10-spsa10-v1`、`localtr8-hebo10-spsa10-v1`、`localtr8-hebo10-hebo10-v1`、`selfrank8-hebo10-hebo10` 和 `legacy`
 - **`tuner.*`**：内层 HPO 调优器参数（热启动配置数量、深度调优门控阈值、BO 试验预算、patience 等）。其中 `tuner.K`（每个候选提出的热启动配置数，默认 5）和 `tuner.K_eval`（step 0+1 实际评估的条数，默认 3）分别通过 `--k-warm` / `--k-eval` 暴露；deferred 配置数 = K − K_eval，两者都在 run 产物生成后冻结
 - **`max_evaluations`**：全局停止预算（所有候选方案的试验总和）
 - **`per_runtime_limit`**：单次评估超时（秒）（超时配置被强制终止）

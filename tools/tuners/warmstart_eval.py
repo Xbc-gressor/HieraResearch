@@ -21,11 +21,16 @@ time without re-evaluating what already passed:
    not-yet-scored config that raises, record it (original proposed index + FULL
    traceback) and STOP — exit `3` (CRASHED). The caller diagnoses it
    (config-invalid → edit that slot in `_warm_configs.json`; code-incompatible →
-   edit `train.py`), then re-runs this to resume.
-3. When every selected config has a score (no crash), pick the best finite warm
+   edit `train.py`), then re-runs this to resume. A config-infeasible failure
+   (runtime-limit timeout, out of memory) is a property of that config, not a
+   crash to diagnose: it is persisted as a failed `config_infeasible` row, the
+   remaining configs still run, and a resume under the same code revision
+   replays it instead of spending another objective slot on it.
+3. When every selected config has an outcome, pick the best finite warm
    row, including an inherited config-0 control when it wins, write it into
    `BASE_PARAMS`, finalize `phase_a` (warm_start_configs +
-   best_warm_score + best_warm_params + search_space), exit `0`.
+   best_warm_score + best_warm_params + search_space), exit `0`. When no
+   selected row is finite, exit `3` with `reason: "no finite warm row"`.
 
 An optional task-owned preflight runs before each score attempt in an isolated
 subprocess. It is a real-shape feasibility check, not a smoke score, and never
@@ -73,6 +78,7 @@ from _common import (  # noqa: E402
     timed_eval,
     timed_preflight,
     cast_params_to_search_space,
+    is_config_infeasible_error,
     is_finite_score,
     load_candidate_modules,
     read_tune_report,
@@ -653,7 +659,13 @@ def _restore_warm_score_cache(
     candidate_code_revision: dict,
     parameter_transfer: dict | None,
 ) -> tuple[dict[str, dict], dict[str, float], bool]:
-    """Recover only scores bound to the current code and transfer revision."""
+    """Recover only outcomes bound to the current code and transfer revision.
+
+    A finite score and a config-infeasible failure (timeout / OOM) are both
+    deterministic outcomes of (code revision, params); either is replayed
+    rather than re-evaluated.  Other failures are never cached: the caller
+    fixes and re-runs them.
+    """
     phase_revision_matches = (
         previous_phase_a.get("candidate_code_revision")
         == candidate_code_revision
@@ -665,19 +677,20 @@ def _restore_warm_score_cache(
     cache_rows: dict[str, dict] = {}
 
     def admit(trial: dict) -> None:
-        if (
-            not isinstance(trial, dict)
-            or not isinstance(trial.get("params"), dict)
-            or not is_finite_score(trial.get("score"))
-        ):
+        if not isinstance(trial, dict) or not isinstance(trial.get("params"), dict):
             return
         key = _params_key(trial["params"])
         if key not in current_param_keys:
             return
-        cache_rows[key] = {
-            "params": trial["params"],
-            "score": trial["score"],
-        }
+        if is_finite_score(trial.get("score")):
+            cache_rows[key] = {
+                "params": trial["params"],
+                "score": trial["score"],
+            }
+        elif trial.get("status") == "failed" and trial.get("config_infeasible"):
+            cache_rows[key] = {
+                k: v for k, v in trial.items() if k not in ("proposed_index", "role")
+            }
 
     if phase_revision_matches:
         previous_rows = previous_phase_a.get("warm_start_configs", [])
@@ -710,7 +723,11 @@ def _restore_warm_score_cache(
     elif previous_transfer is not None:
         cache_rows = {}
 
-    cache = {key: row["score"] for key, row in cache_rows.items()}
+    cache = {
+        key: row["score"]
+        for key, row in cache_rows.items()
+        if is_finite_score(row["score"])
+    }
     return cache_rows, cache, phase_revision_matches
 
 
@@ -1230,11 +1247,11 @@ def _finish_budget_exhausted(
             run.search_space,
         )
         remaining_key = _params_key(remaining_params)
-        if remaining_key in run.cache:
+        cached = run.cache_rows.get(remaining_key)
+        if cached is not None:
             recovered.append(
                 {
-                    "params": remaining_params,
-                    "score": run.cache[remaining_key],
+                    **cached,
                     **_trial_receipt(
                         run,
                         run.selected_indices[position],
@@ -1331,20 +1348,26 @@ def _record_objective_failure(
         error=error,
         traceback_text=tb,
     )
-    run.warm_rows.append(
-        {
-            "params": params,
-            "score": None,
-            "status": "failed",
-            **trial_receipt,
-            **failure,
-        }
-    )
+    # Timeout / OOM is a property of this config (same predicate Phase C uses
+    # for sampler constraints): a terminal observation, not a crash to fix.
+    config_infeasible = is_config_infeasible_error(error)
+    failed_row = {
+        "params": params,
+        "score": None,
+        "status": "failed",
+        "config_infeasible": config_infeasible,
+        **failure,
+    }
+    run.warm_rows.append({**failed_row, **trial_receipt})
     run.phase_a["warm_start_configs"] = run.warm_rows
+    if config_infeasible:
+        run.cache_rows[_params_key(params)] = failed_row
+        run.phase_a["warm_score_cache"] = _cache_receipt(run)
     _stamp_donor_facts(run)
-    if not fatal:
+    if not fatal or config_infeasible:
         # The donor row's crash is the transfer observation, not a candidate
-        # crash; the remaining selected rows still get evaluated (§4.3).
+        # crash; the remaining selected rows still get evaluated (§4.3).  A
+        # config-infeasible row likewise leaves the remaining rows to run.
         write_tune_report(run.report_path, run.report)
         return None
     run.phase_a["status"] = "crashed"
@@ -1366,7 +1389,7 @@ def _finish_phase_a(run: WarmstartRun) -> int:
     """Apply the best finite row and persist the successful Phase A."""
     selectable = finite_warm_incumbent_rows(run.warm_rows)
     if not selectable:
-        # Reachable only when every selected row failed non-fatally (the
+        # Every selected row failed non-fatally (config-infeasible rows, or the
         # donor-only treatment path); the candidate follows the crash path.
         run.phase_a["warm_start_configs"] = run.warm_rows
         run.phase_a["status"] = "crashed"
@@ -1379,6 +1402,14 @@ def _finish_phase_a(run: WarmstartRun) -> int:
                 "reason": "no finite warm row",
                 "k_evaluated": len(run.configs),
                 "trials_attempted": run.trials_attempted,
+                "failed_rows": [
+                    {
+                        "proposed_index": row.get("proposed_index"),
+                        "config_infeasible": bool(row.get("config_infeasible")),
+                        "error": row.get("error"),
+                    }
+                    for row in run.warm_rows
+                ],
             }
         )
         return CRASHED
@@ -1394,7 +1425,7 @@ def _finish_phase_a(run: WarmstartRun) -> int:
             "best_warm_score": best_warm_score,
             "best_warm_params": best_params,
             "k_evaluated": len(run.configs),
-            "k_survived": len(run.warm_rows),
+            "k_survived": len(selectable),
             "k_deferred": len(run.deferred),
             "elapsed_seconds": round(elapsed, 1),
             "status": "ok",
@@ -1409,7 +1440,7 @@ def _finish_phase_a(run: WarmstartRun) -> int:
         "phase": "a",
         "status": "ok",
         "k_evaluated": len(run.configs),
-        "k_survived": len(run.warm_rows),
+        "k_survived": len(selectable),
         "trials_attempted": run.trials_attempted,
         "warm_config_selection": run.selection,
         **(
@@ -1467,14 +1498,11 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
             continue
 
         key = _params_key(params)
-        if key in run.cache:
-            run.warm_rows.append(
-                {
-                    "params": params,
-                    "score": run.cache[key],
-                    **trial_receipt,
-                }
-            )
+        cached = run.cache_rows.get(key)
+        if cached is not None:
+            # Replays a finite score or a config-infeasible failure recorded
+            # under this same code revision; neither costs an objective slot.
+            run.warm_rows.append({**cached, **trial_receipt})
         else:
             try:
                 score = timed_eval(

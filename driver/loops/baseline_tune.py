@@ -150,7 +150,8 @@ def _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
 
 def run_baseline_tune(task, tag, *, runner, model, repo_root=REPO_ROOT,
                       max_evaluations=None, timeout=None, k_warm=None,
-                      k_eval=None, cli_path=None, cmd=common.run_cmd,
+                      k_eval=None, proposer_arm=None, cli_path=None,
+                      cmd=common.run_cmd,
                       job_runner=execute_driver_job) -> dict:
     """Set up or resume the run, then spend the whole budget on one bout."""
     run_dir = repo_root / "runs" / task / tag
@@ -174,10 +175,11 @@ def run_baseline_tune(task, tag, *, runner, model, repo_root=REPO_ROOT,
             _setup(runner, store, task, tag, run_dir, task_toml, repo_root,
                    cmd, events, max_evaluations, timeout, None, None,
                    None, "legacy", BASELINE_INNER_POLICY, k_warm, k_eval,
-                   model, cli_path)
+                   model, cli_path, proposer_arm=proposer_arm)
         else:
             extra = _init_run_extra(None, None, None, "legacy",
-                                    BASELINE_INNER_POLICY, k_warm, k_eval)
+                                    BASELINE_INNER_POLICY, k_warm, k_eval,
+                                    proposer_arm=proposer_arm)
             if max_evaluations is not None or timeout is not None or extra:
                 common.init_run(task, tag, repo_root, cmd, max_evaluations,
                                 timeout, extra=extra)

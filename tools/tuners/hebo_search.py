@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 import sys
 import traceback
@@ -894,11 +893,11 @@ def main() -> int:
             extras=extras,
             emit=emit,
         )
-        arm_override = os.environ.get("INNER_ARM_OVERRIDE", "")
+        # ``ARM`` (pool_hebo_mace) stays a module attribute: tests swap it.
+        proposer_arm = inner_policy.load_proposer_arm(args.candidate_path)
         selected_arm = (
             EXPLICIT_E3U2_ARM
-            if policy_id == inner_policy.EXPLICIT_E3U2_POLICY_ID
-               or arm_override == "explicit_e3u2"
+            if proposer_arm == inner_policy.PROPOSER_ARM_EXPLICIT_E3U2
             else ARM
         )
         gen = selected_arm.run(ctx)
