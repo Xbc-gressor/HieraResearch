@@ -816,6 +816,27 @@ class ExperimentTests(unittest.TestCase):
         roles = [name for name, _ in runner.calls]
         self.assertNotIn("idea-generator", roles)
 
+    def test_resume_does_not_forward_time_budget_when_deadline_exists(self) -> None:
+        self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
+        cfg_path = self.repo / "runs" / "fake-task" / "t1" / "framework_cfg.json"
+        cfg = json.loads(cfg_path.read_text())
+        cfg["deadline"] = 1_800_000_000
+        cfg_path.write_text(json.dumps(cfg))
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [True]
+        runner = FakeSessionRunner([])
+        run_experiment(
+            "fake-task", "t1", runner=runner, model="m",
+            repo_root=self.repo, cmd=cmd, time_budget=3600,
+            max_evaluations=3,
+        )
+        init_calls = [c for c in cmd.calls if "init_run.py" in c]
+        self.assertTrue(init_calls)
+        for call in init_calls:
+            self.assertNotIn("--time-budget", call)
+            self.assertNotIn("--deadline", call)
+            self.assertIn("--max-evaluations 3", call)
+
 
 if __name__ == "__main__":
     unittest.main()

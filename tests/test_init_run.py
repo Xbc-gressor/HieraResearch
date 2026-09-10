@@ -495,6 +495,39 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(config["max_evaluations"], 400)
             self.assertEqual(config["per_runtime_limit"], 90)
 
+    def test_existing_deadline_is_frozen_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._repo(repo_root)
+            original = 1_800_000_000.0
+            run_dir = initialize_run(
+                repo_root, "toy", "timed", deadline=original,
+            )
+            config_path = run_dir / "framework_cfg.json"
+            self.assertEqual(
+                json.loads(config_path.read_text())["deadline"], original,
+            )
+
+            initialize_run(
+                repo_root, "toy", "timed", time_budget_seconds=3600,
+            )
+            self.assertEqual(
+                json.loads(config_path.read_text())["deadline"], original,
+            )
+
+            initialize_run(repo_root, "toy", "timed", deadline=original)
+            self.assertEqual(
+                json.loads(config_path.read_text())["deadline"], original,
+            )
+
+            with self.assertRaisesRegex(ValueError, "cannot change deadline"):
+                initialize_run(
+                    repo_root, "toy", "timed", deadline=original + 1,
+                )
+            self.assertEqual(
+                json.loads(config_path.read_text())["deadline"], original,
+            )
+
     def test_run_limits_must_be_positive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

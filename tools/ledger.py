@@ -805,6 +805,7 @@ def cmd_set_phase(args) -> int:
     """Persist a blocked/running state; completion is budget-derived only."""
     ledger_path = Path(args.ledger)
     data = _load_ledger(ledger_path)
+    time_budget_configured = False
     if args.phase == "completed":
         try:
             refresh = _experience_refresh_status(data)
@@ -830,17 +831,34 @@ def cmd_set_phase(args) -> int:
         # (it refuses to close a running stage while remaining > 0).
         leftover_ok = bool(getattr(args, "terminal_leftover", False)) \
             and budget is not None and 0 < budget - attempted < 2
-        if budget is None or (attempted < budget and not leftover_ok):
+        # Time-budget runs persist max_evaluations=null; deadline is the
+        # stop. Refusing completed when budget is None blocked those runs
+        # after the clock ran out. An evaluation cap, when present, still
+        # has to be spent (or leftover_ok) before completion.
+        if budget is not None and attempted < budget and not leftover_ok:
             raise SystemExit(
                 "cannot mark completed before a configured evaluation budget is reached "
                 f"(attempted={attempted}, budget={budget})"
             )
+        time_view = budget_status(ledger_path.parent).get("time", {})
+        time_budget_configured = (
+            budget is None
+            and isinstance(time_view, dict)
+            and time_view.get("deadline") is not None
+        )
+    else:
+        budget = None
     if args.phase == "blocked" and not args.stop_condition:
         raise SystemExit("--stop-condition is required for phase=blocked")
+    default_stop_condition = (
+        "time_budget_reached"
+        if time_budget_configured
+        else "evaluation_budget_reached"
+    )
     data["run_state"] = {
         "phase": args.phase,
         "active_stop_condition": args.stop_condition or (
-            "evaluation_budget_reached" if args.phase == "completed" else "none"
+            default_stop_condition if args.phase == "completed" else "none"
         ),
     }
     if args.phase == "completed" and budget is not None:

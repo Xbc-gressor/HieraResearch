@@ -281,6 +281,56 @@ entrypoint = "train.py"
             self.assertEqual(stored["run_state"]["evaluation_budget"], 2)
             self.assertIn("phase: completed", (ledger_path.parent / "loop_state.md").read_text())
 
+    def test_time_budget_run_may_complete_without_evaluation_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger_path = run_dir / "ledger.json"
+            ledger_path.write_text(json.dumps({
+                "records": [{
+                    "run_id": "001", "status": "keep", "op": "fresh",
+                    "final_best_score": 0.2,
+                }],
+                "search_space_state": empty_search_space_state(),
+            }))
+            (run_dir / "evaluation_attempts.jsonl").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "kind": "score_attempt",
+                    "attempt_id": "eval-000001",
+                    "run_id": "001",
+                    "phase": "phase_a",
+                    "method": "warmstart",
+                    "params": {"x": 1},
+                })
+                + "\n"
+            )
+            (run_dir / "framework_cfg.json").write_text(json.dumps({
+                "max_evaluations": None,
+                "deadline": 1_800_000_000,
+            }))
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "ledger.py"), "set-phase",
+                 "--ledger", str(ledger_path), "--phase", "completed"],
+                check=True, capture_output=True, text=True,
+            )
+            stored = json.loads(ledger_path.read_text())
+            self.assertEqual(stored["run_state"]["phase"], "completed")
+            self.assertNotIn("evaluation_budget", stored["run_state"])
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["phase"], "completed")
+            self.assertNotIn("evaluation_budget", payload)
+
+            (run_dir / "framework_cfg.json").write_text(json.dumps({
+                "max_evaluations": 4,
+            }))
+            refused = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "ledger.py"), "set-phase",
+                 "--ledger", str(ledger_path), "--phase", "completed"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("attempted=1, budget=4", refused.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

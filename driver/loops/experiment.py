@@ -1642,7 +1642,19 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # Explicit CLI overrides must never disappear merely because the
             # run directory already exists. init_run applies mutable limits,
             # accepts idempotent frozen values, and rejects policy/space
-            # changes once their artifacts exist.
+            # changes once their artifacts exist. An existing deadline is
+            # frozen: do not re-pass --time-budget (that would be now+budget).
+            cfg_path = run_dir / "framework_cfg.json"
+            existing_deadline = None
+            try:
+                existing_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_cfg = {}
+            raw_deadline = existing_cfg.get("deadline") if isinstance(
+                existing_cfg, dict) else None
+            if isinstance(raw_deadline, (int, float)) and not isinstance(
+                    raw_deadline, bool):
+                existing_deadline = float(raw_deadline)
             extra = _init_run_extra(
                 dimension_strategy,
                 llm_intelligence_score,
@@ -1652,8 +1664,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 k_warm,
                 k_eval,
                 proposer_arm=proposer_arm,
-                time_budget=time_budget,
-                deadline=deadline,
+                time_budget=None if existing_deadline is not None else time_budget,
+                deadline=None if existing_deadline is not None else deadline,
                 final_reserve=final_reserve,
                 round_options=round_options,
             )

@@ -308,7 +308,26 @@ def initialize_run(
     unknown_round = sorted(set(round_options) - set(ROUND_OPTIONS))
     if unknown_round:
         raise ValueError(f"unknown round options: {unknown_round}")
-    if time_budget_seconds is not None:
+    existing_deadline = None
+    if target_existed and target.exists():
+        existing_cfg = _read_framework_config(target)
+        raw_deadline = existing_cfg.get("deadline")
+        if isinstance(raw_deadline, (int, float)) and not isinstance(
+            raw_deadline, bool
+        ) and math.isfinite(raw_deadline):
+            existing_deadline = float(raw_deadline)
+    if existing_deadline is not None:
+        if deadline is not None and deadline != existing_deadline:
+            raise ValueError(
+                "cannot change deadline after it is written; pass the "
+                "existing --deadline or omit --time-budget/--deadline"
+            )
+        # Frozen: resume must not rewrite now+budget over the original
+        # wall-clock stop. --time-budget on an already-deadlined run is a
+        # no-op for the timestamp.
+        time_budget_seconds = None
+        deadline = None
+    elif time_budget_seconds is not None:
         deadline = time.time() + float(time_budget_seconds)
 
     if (
