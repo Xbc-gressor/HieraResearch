@@ -282,3 +282,17 @@ def test_union_mode_rejects_initial_suggest_extra_combo() -> None:
     )
     assert proc.returncode != 0
     assert "mutually exclusive" in proc.stdout
+
+
+def test_row_to_params_snaps_upcast_numeric_categorical() -> None:
+    # Mixed-dtype ``DataFrame.iloc`` upcasts an int64 categorical column to
+    # float64 when a float64 column is present; the suggestion must snap back
+    # to the declared option's exact type (production categorical membership
+    # is type-exact: 4.0 is not 4).
+    space = {"C": ["float", 0.0001, 100.0, "log"], "stride": ["categorical", [2, 4]]}
+    df = pd.DataFrame({"C": [1.0], "stride": [4]})
+    params = suggest_mod._row_to_params(df.iloc[0], space)
+    assert type(params["stride"]) is int and params["stride"] == 4
+    # A genuinely out-of-space value matches no option and falls through.
+    df_out = pd.DataFrame({"C": [1.0], "stride": [3]})
+    assert suggest_mod._row_to_params(df_out.iloc[0], space)["stride"] == 3.0

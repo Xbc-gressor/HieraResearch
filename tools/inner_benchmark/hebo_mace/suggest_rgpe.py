@@ -474,7 +474,9 @@ def _row_to_params(row, search_space: dict) -> dict:
         elif kind == "float":
             params[name] = float(value)
         else:
-            params[name] = value
+            # Mixed-dtype ``DataFrame.iloc`` rows upcast numeric categories;
+            # snap back to the declared option (see suggest.py).
+            params[name] = next((o for o in entry[1] if o == value), value)
     return params
 
 

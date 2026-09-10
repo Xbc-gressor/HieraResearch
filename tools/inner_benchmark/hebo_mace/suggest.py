@@ -378,7 +378,12 @@ def _row_to_params(row, search_space: dict) -> dict:
         elif kind == "float":
             params[name] = float(value)
         else:
-            params[name] = value
+            # A row pulled via ``DataFrame.iloc`` from a mixed-dtype frame
+            # upcasts numeric categories (int64 column + float64 columns ->
+            # float64 row); snap back to the declared option so type-exact
+            # categorical checks downstream see the declared type. A value
+            # matching no option falls through unchanged and stays rejectable.
+            params[name] = next((o for o in entry[1] if o == value), value)
     return params
 
 
