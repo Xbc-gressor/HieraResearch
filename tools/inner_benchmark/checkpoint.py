@@ -103,7 +103,7 @@ class TaskSpec:
     """
 
     score_fn: str
-    preflight_fn: str
+    preflight_fn: str | None  # None: task declares no per-config preflight
     per_runtime_limit: float | None
     project: str | None = None
     relative_improvement_over_baseline: float | None = None
@@ -308,8 +308,10 @@ def _task_spec(path: Path, raw) -> TaskSpec:
     preflight_fn = raw.get("preflight_fn")
     if not isinstance(score_fn, str) or not score_fn:
         raise ValueError(f"{path}: task.score_fn must be a non-empty string")
-    if not isinstance(preflight_fn, str) or not preflight_fn:
-        raise ValueError(f"{path}: task.preflight_fn must be a non-empty string")
+    if preflight_fn is not None and (
+        not isinstance(preflight_fn, str) or not preflight_fn
+    ):
+        raise ValueError(f"{path}: task.preflight_fn must be a non-empty string or null")
     limit = raw.get("per_runtime_limit")
     if limit is not None:
         limit = _finite_number(limit, f"{path}: task.per_runtime_limit")

@@ -220,8 +220,12 @@ def _task_block(run_dir: Path, framework_cfg: dict) -> dict:
     preflight_fn = evaluation.get("preflight_fn")
     if not isinstance(score_fn, str) or not score_fn:
         raise ValueError(f"{toml_path}: [evaluation].score_fn missing")
-    if not isinstance(preflight_fn, str) or not preflight_fn:
-        raise ValueError(f"{toml_path}: [evaluation].preflight_fn missing")
+    if preflight_fn is not None and (
+        not isinstance(preflight_fn, str) or not preflight_fn
+    ):
+        raise ValueError(f"{toml_path}: [evaluation].preflight_fn must be a string")
+    # No declaration = production's direct-evaluation behavior (no per-config
+    # preflight); the cell runner skips the probe when this is null.
     # The authoritative source for the evaluation environment is the task's
     # own declaration (same field the production loops read), not the
     # run-dir layout.

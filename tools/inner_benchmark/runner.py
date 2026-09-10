@@ -367,13 +367,18 @@ def run_cell(
             continue
 
         # Task preflight (no-score feasibility probe; never consumes budget).
-        preflight = preflight_fn(
-            checkpoint.candidate_path,
-            cast,
-            preflight_fn=checkpoint.task.preflight_fn,
-            per_runtime_limit=checkpoint.task.per_runtime_limit,
-            python_cmd=python_cmd,
-        )
+        # A task without a declared preflight_fn evaluates directly, as in
+        # production.
+        if checkpoint.task.preflight_fn is None:
+            preflight = objective.PreflightOutcome(status="ok", detail=None)
+        else:
+            preflight = preflight_fn(
+                checkpoint.candidate_path,
+                cast,
+                preflight_fn=checkpoint.task.preflight_fn,
+                per_runtime_limit=checkpoint.task.per_runtime_limit,
+                python_cmd=python_cmd,
+            )
         if preflight.status != "ok":
             counts["task_preflight_rejected"] += 1
             consecutive_rejects += 1
