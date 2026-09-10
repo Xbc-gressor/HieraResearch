@@ -14,6 +14,7 @@ import importlib
 ARM_MODULES = {
     "current": "arms.current",
     "random_search": "arms.random_search",
+    "tpe_only": "arms.tpe_only",
     "grid": "arms.grid",
     "llm_hillclimb": "arms.llm_hillclimb",
     "active_set": "arms.active_set",
