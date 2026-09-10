@@ -237,10 +237,13 @@ class BoutSession:
     successful invocation via ReceiptStore — the production hillclimb
     chaining pattern. Construction starts nothing (lazy). Only successful
     calls advance the resume chain: after ``InvocationFailed`` the next
-    ``ask`` resumes from the last good invocation. Instances hold no
-    global state; multiple bouts (even over one run_dir/store) chain
-    independently — invocation ids come from the shared store, session
-    files are keyed by (role, invocation_id).
+    ``ask`` resumes from the last good invocation. A later ask whose
+    previous session is not resumable (resume guard: ended on error)
+    starts a fresh SDK session and re-sends ``first_extras`` so the
+    contract (search_space / protocol / budget) is not lost. Instances
+    hold no global state; multiple bouts (even over one run_dir/store)
+    chain independently — invocation ids come from the shared store,
+    session files are keyed by (role, invocation_id).
     """
 
     def __init__(
@@ -284,10 +287,13 @@ class BoutSession:
     def ask(self, extra: dict | None = None) -> dict:
         """Run one invocation in this bout's session; return the accepted receipt.
 
-        The first call merges ``first_extras`` under ``extra`` (``extra``
-        wins key collisions); later calls send only ``extra``.
-        ``InvocationFailed`` propagates to the caller (arms map it to
-        ArmError per their own rules).
+        The first call of a resumable chain merges ``first_extras`` under
+        ``extra`` (``extra`` wins key collisions). Later calls on the same
+        SDK session send only ``extra``. If the previous session is not
+        resumable, this call is a new SDK session and ``first_extras`` are
+        merged again so a lost chain still carries the search-space
+        contract. ``InvocationFailed`` propagates to the caller (arms map
+        it to ArmError per their own rules).
         """
         invocation_id = self._store.next_invocation_id()
         resume = None
@@ -296,7 +302,7 @@ class BoutSession:
                 self.role.name, self._last_invocation_id
             )
         message_extras = dict(extra or {})
-        if self._last_invocation_id is None:
+        if resume is None:
             message_extras = {**self.first_extras, **message_extras}
         ctx = InvocationContext(
             task=self.task,

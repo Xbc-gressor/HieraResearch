@@ -211,9 +211,11 @@ class SDKSessionRunner:
                     # resume this exact conversation via resume=<session_id>.
                     store.persist_session_id(role.name, ctx.invocation_id, session_id)
             elif isinstance(msg, ResultMessage):
-                result_info = {"is_error": msg.is_error, "subtype": msg.subtype}
+                is_error = self._result_is_error(msg.is_error, interrupted,
+                                                 breaker)
+                result_info = {"is_error": is_error, "subtype": msg.subtype}
                 store.mark_session_ended(role.name, ctx.invocation_id,
-                                         not msg.is_error, msg.subtype)
+                                         not is_error, msg.subtype)
                 self.events.emit(
                     "session_end",
                     role=role.name,
@@ -236,12 +238,14 @@ class SDKSessionRunner:
                 if session_id:
                     store.persist_session_id(role.name, ctx.invocation_id, session_id)
             elif hasattr(msg, "num_turns"):
+                is_error = self._result_is_error(msg.is_error, interrupted,
+                                                 breaker)
                 result_info = {
-                    "is_error": msg.is_error,
+                    "is_error": is_error,
                     "subtype": getattr(msg, "subtype", None),
                 }
                 store.mark_session_ended(role.name, ctx.invocation_id,
-                                         not msg.is_error,
+                                         not is_error,
                                          getattr(msg, "subtype", None))
                 self.events.emit(
                     "session_end",
@@ -281,6 +285,20 @@ class SDKSessionRunner:
                         # interrupt must not fail the invocation.
                         pass
         return result_info
+
+    @staticmethod
+    def _result_is_error(is_error: bool, interrupted: bool, breaker: dict) -> bool:
+        """The CLI reports a turn we interrupted after receipt acceptance as
+        ``error_during_execution`` (``errors=["[ede_diagnostic] ..."]``): the
+        abort lands mid tool-use, so its last message is not a clean stop.
+        That is our own stop signal, not a poisoned session — treating it as
+        an error would skip corrective turns and, via the resume guard, turn
+        every driver_job / repair continuation into a fresh session. A
+        breaker-tripped interrupt keeps the error verdict: that context IS
+        degenerate."""
+        if interrupted and breaker["tripped"] is None:
+            return False
+        return bool(is_error)
 
     @staticmethod
     def _latest_receipt(store: ReceiptStore, role: RoleDefinition,

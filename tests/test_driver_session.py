@@ -202,7 +202,10 @@ class EarlyInterruptTests(unittest.TestCase):
             # The in-process MCP tool runs between streamed messages.
             self.accepted.append({"edited": True, "summary": "ok"})
             yield object()  # post-acceptance assistant message: pure waste
-            yield FakeResultMessage()
+            # The CLI reports an interrupt that lands mid tool-use as an
+            # error result ("[ede_diagnostic] ... stop_reason=tool_use").
+            yield FakeResultMessage(is_error=True,
+                                    subtype="error_during_execution")
 
         async def interrupt(self):
             self.interrupt_calls += 1
@@ -214,15 +217,47 @@ class EarlyInterruptTests(unittest.TestCase):
             runner = SDKSessionRunner(model="m", events=events)
             accepted: list[dict] = []
             client = self.InterruptibleFakeClient(accepted)
-            asyncio.run(runner._drain(client, SIMPLE_ROLE, make_ctx(run_dir),
-                                      ReceiptStore(run_dir), accepted))
+            ctx = make_ctx(run_dir)
+            store = ReceiptStore(run_dir)
+            result = asyncio.run(runner._drain(client, SIMPLE_ROLE, ctx,
+                                               store, accepted))
             self.assertEqual(client.interrupt_calls, 1)
+            # Our own stop signal is not an error: the session stays a valid
+            # resume anchor and the caller may still send corrective turns.
+            self.assertFalse(result["is_error"])
+            self.assertEqual(store.load_session_id(SIMPLE_ROLE.name,
+                                                   ctx.invocation_id),
+                             "sess-fake")
             rows = [json.loads(line)
                     for line in (run_dir / "driver_events.jsonl")
                     .read_text().splitlines()]
             ends = [r for r in rows if r.get("kind") == "session_end"]
             self.assertEqual(len(ends), 1)
             self.assertEqual(ends[0]["usage"], {"input_tokens": 10})
+            self.assertTrue(ends[0]["is_error"])
+            session = json.loads(
+                store.session_path(SIMPLE_ROLE.name, ctx.invocation_id)
+                .read_text())
+            self.assertEqual(session["ended"], "ok")
+            self.assertEqual(session["subtype"], "error_during_execution")
+
+    def test_breaker_interrupt_keeps_error_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            events = EventsLog(run_dir)
+            runner = SDKSessionRunner(model="m", events=events)
+            accepted: list[dict] = []
+            client = self.InterruptibleFakeClient(accepted)
+            ctx = make_ctx(run_dir)
+            store = ReceiptStore(run_dir)
+            breaker = new_breaker()
+            breaker["tripped"] = "Bash invoked 3x with identical input"
+            result = asyncio.run(runner._drain(client, SIMPLE_ROLE, ctx,
+                                               store, accepted, breaker))
+            self.assertEqual(client.interrupt_calls, 1)
+            self.assertTrue(result["is_error"])
+            self.assertIsNone(store.load_session_id(SIMPLE_ROLE.name,
+                                                    ctx.invocation_id))
 
     def test_no_acceptance_no_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

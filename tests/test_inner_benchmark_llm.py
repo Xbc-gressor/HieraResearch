@@ -231,6 +231,29 @@ def test_first_ask_fresh_second_ask_resumes(tmp_path) -> None:
 
 
 @needs_driver_session
+def test_ask_reinjects_first_extras_when_resume_is_none(tmp_path) -> None:
+    from driver.receipts import ReceiptStore
+
+    runner = FakeSessionRunner([
+        {"receipt": {"configs": [{"depth": 2}]}},
+        {"receipt": {"configs": [{"depth": 3}]}},
+    ])
+    session = make_bout(runner, tmp_path,
+                        first_extras={"search_space": "SS", "budget": "10"})
+    assert session.ask() == {"configs": [{"depth": 2}]}
+    ReceiptStore(tmp_path).mark_session_ended(
+        session.role.name, session._last_invocation_id, ok=False,
+        subtype="error_during_execution")
+    assert session.ask(extra={llm.OUTCOME_KEY: "O"}) == {"configs": [{"depth": 3}]}
+
+    (_, ctx1), (_, ctx2) = runner.calls
+    assert ctx1.resume_session_id is None
+    assert ctx2.resume_session_id is None
+    assert ctx2.extra["search_space"] == "SS" and ctx2.extra["budget"] == "10"
+    assert ctx2.extra[llm.OUTCOME_KEY] == "O"
+
+
+@needs_driver_session
 def test_ask_extra_wins_first_extras_collision(tmp_path) -> None:
     runner = FakeSessionRunner([{"receipt": {}}])
     session = make_bout(runner, tmp_path, first_extras={"k": "first"})

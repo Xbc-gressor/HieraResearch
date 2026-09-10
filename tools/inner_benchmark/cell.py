@@ -104,8 +104,8 @@ class BenchSessionRunner(SDKSessionRunner):
     (see module docstring). Every editor invocation carries the path in its
     extras, so the hook is built per invocation with the exact file."""
 
-    def _build_options(self, role, ctx, server):
-        options = super()._build_options(role, ctx, server)
+    def _build_options(self, role, ctx, server, breaker=None):
+        options = super()._build_options(role, ctx, server, breaker)
         if role.name == EDITOR_ROLE:
             from claude_agent_sdk import HookMatcher
 
