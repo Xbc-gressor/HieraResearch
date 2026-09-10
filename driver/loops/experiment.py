@@ -1162,7 +1162,10 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
         extra += ["--final-reserve", str(final_reserve)]
     for key, value in sorted((round_options or {}).items()):
         if value is not None:
-            extra += [f"--round-{key.replace('_', '-')}", str(value)]
+            flag = key.replace("_", "-")
+            if not flag.startswith("round-"):
+                flag = f"round-{flag}"
+            extra += [f"--{flag}", str(value)]
     if dimension_strategy:
         extra += ["--dimension-strategy", dimension_strategy]
     if llm_intelligence_score is not None:
