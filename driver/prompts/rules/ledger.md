@@ -106,7 +106,7 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `tuning_bouts` | completed progressive-tuning bouts; 0 for screening-only or legacy untuned records, 1 for legacy one-shot-tuned records |
 | `last_bout_improved` | whether the last bout produced a trial strictly better than its pre-bout incumbent; null when unknown/never tuned |
 | `status` | `pending`, `keep`, `discard`, `crash`, or evidence-neutral terminal `unevaluated` |
-| `unevaluated_receipt` | helper-owned exhausted-budget/zero-attempt proof; present only for `unevaluated` |
+| `unevaluated_receipt` | helper-owned stop-condition/zero-attempt proof; present only for `unevaluated` |
 | `best_warm_score`, `final_best_score` | inner-HPO and final candidate observations |
 | `n_dims`, `warm_start_K`, `warm_percentile` | tuning metadata, unrelated to semantic dimensions |
 | `phase_b_decision`, `phase_c_method`, `trials_completed`, `trials_attempted`, `elapsed_seconds`, `applied` | objective/tuning metadata; completed counts finite scores and attempted counts every admitted config→score call |

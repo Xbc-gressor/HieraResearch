@@ -2,16 +2,25 @@
 
 Every ``N`` newly produced candidates (the first cycle waits for the whole
 seed set) the driver runs one optimization phase over the full candidate
-pool: ``r`` rewrite bouts, then ``t`` tune bouts. The budget is wall clock:
+pool: ``r`` rewrite climbs, then ``t`` tune bouts. The budget is wall clock:
 a run-level ``deadline`` plus a per-phase quota ``round_seconds``. This
 module owns the deterministic parts — the cycle state under
 ``<run_dir>/.scheduler/round_state.json``, the generation/optimization
 switch, and both eligibility rankings; ``driver/loops`` only sequences.
 
+One REWRITE decision opens one *climb* on the selected candidate: the
+driver hillclimbs it step by step (edit -> evaluate -> keep/revert, each
+step a journaled bout) until the candidate stalls, hits its bout cap, or
+the phase quota runs out. The ``expected_seconds`` priced here is the
+climb's admission ticket — its first step (one adjudication eval plus the
+confirmation re-eval after a keep, plus session overhead); the driver
+re-checks the quota between steps.
+
 Rewrite eligibility: finite reference score, no in-flight tuning bout,
 under the rewrite bout cap, not stalled, top-``k`` by current best. Among
 those the candidate with the fewest rewrite bouts (then the best score)
-gets the bout, so attention rotates inside the top-``k``.
+gets the climb, so attention rotates inside the top-``k`` once the
+previously climbed candidate has spent its chain.
 
 Tune eligibility: ``contract.eligible()`` plus a tune report that matches
 the candidate on disk (a kept rewrite rebases the report; a failed rebase
@@ -31,7 +40,7 @@ from .state import SchedulerState, candidate_score
 from .store import STORE_DIRNAME
 
 POLICY_ID = "round_v1"
-POLICY_VERSION = "scheduler-round-v1"
+POLICY_VERSION = "scheduler-round-v2"
 ROUND_STATE_FILENAME = "round_state.json"
 REWRITE = "REWRITE"
 OVERHEAD_WINDOW = 20
@@ -293,7 +302,8 @@ def select_rewrite(
         if facts["consecutive_non_kept"] >= int(config["rewrite_stall_after"]):
             reasons.append("stalled")
         mean = per_candidate.get(candidate.run_id, overall)
-        # One adjudication eval plus the confirmation re-eval after a keep.
+        # The climb's admission price — its first step: one adjudication
+        # eval plus the confirmation re-eval after a keep.
         expected = None if mean is None else 2.0 * float(mean) + overhead
         rows.append({
             "run_id": candidate.run_id,

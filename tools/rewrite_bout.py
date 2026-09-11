@@ -14,7 +14,9 @@ deterministic trust anchor around that edit:
 - the `finalize` CLI — classify one bout, roll back byte-exactly unless kept,
   and append the journal entry;
 - the `confirm` CLI — after a keep, fold one confirmation score into the
-  reference (mean of the two) so a lucky single sample does not anchor it.
+  reference (mean of the two) so a lucky single sample does not anchor it;
+- the `params-equal` CLI — reject pure tuner moves, while allowing tuner
+  parameters and declarations to change alongside implementation code.
 
 Usage:
     python tools/rewrite_bout.py finalize --candidate <dir> --bout <N> \
@@ -25,9 +27,10 @@ Usage:
     python tools/rewrite_bout.py snapshot --candidate <dir> --bout <N>
     python tools/rewrite_bout.py revert --candidate <dir> --snapshot <path>
     python tools/rewrite_bout.py changed --candidate <dir> --snapshot <path>
+    python tools/rewrite_bout.py params-equal --candidate <dir> --snapshot <path>
     python tools/rewrite_bout.py current-best --candidate <dir>
     python tools/rewrite_bout.py journal --candidate <dir> --bout <N> \
-        --outcome noop|reverted_crash --summary "..." --basis "..."
+        --outcome noop|reverted_crash|reverted_params --summary "..." --basis "..."
 
 finalize stdout: {"outcome", "best"} — best is the post-finalize reference
 point; a negative --noise-margin is rejected. snapshot prints the snapshot
@@ -36,14 +39,19 @@ bout was interrupted mid-edit) it restores train.py from the snapshot instead
 of re-snapshotting the possibly dirty file;
 changed exits 0 when train.py is byte-identical to the snapshot and 1
 otherwise (a missing file or snapshot is exit 1 with a message);
+params-equal exits 1 when a search-space declaration or space-named
+BASE_PARAMS value changed without implementation code changing, 0 otherwise
+or when a needed piece is unparseable (the
+literal-form failure belongs to the evaluation stage's repair path);
 current-best prints the float (fails when there is no finite reference);
-journal appends a non-scored entry (score/attempt_id null) for noop and
-preflight-class-failure bouts.
+journal appends a non-scored entry (score/attempt_id null) for noop,
+preflight-class-failure, and params-contract-violation bouts.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 from pathlib import Path
@@ -101,6 +109,102 @@ def changed(candidate_dir, snap) -> bool:
     if not snap.is_file():
         raise ValueError(f"snapshot missing: {snap}")
     return target.read_bytes() != snap.read_bytes()
+
+
+def _parse(path: Path) -> ast.Module | None:
+    try:
+        return ast.parse(Path(path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+
+CONTRACT_NAMES = frozenset(("PARAM_SCHEMA", "SEARCH_SPACE", "BASE_PARAMS"))
+
+
+def _literal_dict(tree: ast.Module, name: str) -> dict | None:
+    """The module-level ``name`` assignment as a plain dict, or None when it
+    is missing or not a pure literal dict (same acceptance set as
+    rewrite_eval.read_base_params)."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            target = node.targets[0] if len(node.targets) == 1 else None
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        else:
+            target = None
+        if not (isinstance(target, ast.Name) and target.id == name):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            return None
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return None
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def _code_shape(tree: ast.Module) -> str:
+    """AST shape with contract declarations removed.
+
+    Formatting and comments do not count as implementation movement. This
+    lets a rewrite change a tuner value when it also changes code. This is
+    a structural check; the editor remains responsible for the change's merit.
+    """
+    body = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = {target.id for target in node.targets
+                     if isinstance(target, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = {node.target.id}
+        else:
+            names = set()
+        if names & CONTRACT_NAMES:
+            continue
+        body.append(node)
+    return ast.dump(ast.Module(body=body, type_ignores=[]), include_attributes=False)
+
+
+def params_equal(candidate_dir, snap) -> bool | None:
+    """Allow implementation changes, reject edits confined to tuning.
+
+    Parameters outside the declared space may move independently. A change
+    to tuner values or declarations needs an accompanying code AST change.
+    Returns None for unreadable BASE_PARAMS, which the params repair path
+    handles. Without a readable space, compare the whole BASE_PARAMS dict.
+    """
+    before = _parse(Path(snap))
+    after = _parse(Path(candidate_dir) / TRAIN_PY)
+    if before is None or after is None:
+        return None
+    before_params = _literal_dict(before, "BASE_PARAMS")
+    after_params = _literal_dict(after, "BASE_PARAMS")
+    if before_params is None or after_params is None:
+        return None
+    if _code_shape(before) != _code_shape(after):
+        return True
+    params_changed = before_params != after_params
+    before_space = _literal_dict(before, "SEARCH_SPACE")
+    after_space = _literal_dict(after, "SEARCH_SPACE")
+    if before_space is None or after_space is None:
+        # Without a readable space, ownership is unknowable: require an
+        # implementation change for any parameter-only edit.
+        contract_changed = params_changed or before_space != after_space
+    else:
+        tuner_keys = set(before_space) | set(after_space)
+        missing = object()
+        tuner_params_changed = any(
+            before_params.get(key, missing) != after_params.get(key, missing)
+            for key in tuner_keys
+        )
+        contract_changed = (
+            before_space != after_space
+            or _literal_dict(before, "PARAM_SCHEMA") != _literal_dict(
+                after, "PARAM_SCHEMA")
+            or tuner_params_changed
+        )
+    return not contract_changed
 
 
 def _bouts_path(candidate_dir) -> Path:
@@ -298,13 +402,16 @@ def journal(
     summary: str,
     basis: str,
 ) -> dict:
-    """Append a non-scored bout entry (noop or preflight-class failure).
+    """Append a non-scored bout entry (noop, preflight-class failure, or
+    params-contract violation).
 
     Same entry shape as finalize's with score/attempt_id null; these bouts
     never reached evaluation, so there is nothing to adjudicate.
     """
-    if outcome not in ("noop", "reverted_crash"):
-        raise ValueError(f"journal outcome must be noop|reverted_crash, got {outcome!r}")
+    if outcome not in ("noop", "reverted_crash", "reverted_params"):
+        raise ValueError(
+            f"journal outcome must be noop|reverted_crash|reverted_params, "
+            f"got {outcome!r}")
     candidate_dir = Path(candidate_dir)
     entry = {
         "bout": bout,
@@ -365,16 +472,25 @@ def main() -> int:
     )
     chg.add_argument("--candidate", required=True, type=Path)
     chg.add_argument("--snapshot", required=True, type=Path)
+    peq = subparsers.add_parser(
+        "params-equal",
+        help="exit 1 for tuner-only edits without implementation changes, "
+             "0 otherwise or when params need repair",
+    )
+    peq.add_argument("--candidate", required=True, type=Path)
+    peq.add_argument("--snapshot", required=True, type=Path)
     best_p = subparsers.add_parser(
         "current-best", help="print the current reference score"
     )
     best_p.add_argument("--candidate", required=True, type=Path)
     jrnl = subparsers.add_parser(
-        "journal", help="append a non-scored bout entry (noop / reverted_crash)"
+        "journal", help="append a non-scored bout entry "
+                        "(noop / reverted_crash / reverted_params)"
     )
     jrnl.add_argument("--candidate", required=True, type=Path)
     jrnl.add_argument("--bout", required=True, type=int)
-    jrnl.add_argument("--outcome", required=True, choices=["noop", "reverted_crash"])
+    jrnl.add_argument("--outcome", required=True,
+                      choices=["noop", "reverted_crash", "reverted_params"])
     jrnl.add_argument("--summary", required=True)
     jrnl.add_argument("--basis", required=True)
     args = parser.parse_args()
@@ -419,6 +535,8 @@ def main() -> int:
         except ValueError as exc:
             raise SystemExit(str(exc)) from None
         return 1 if differs else 0
+    if args.command == "params-equal":
+        return 0 if params_equal(args.candidate, args.snapshot) is not False else 1
     if args.command == "current-best":
         try:
             print(current_best(args.candidate))

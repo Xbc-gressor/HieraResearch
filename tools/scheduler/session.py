@@ -160,6 +160,7 @@ def decide_for_run(
         load_run_cfg(run_dir, "tuner").get("scheduler_policy", "v3_2")
     )
 
+
     # Evidence first: the models must see every bout and arrival the run's
     # artifacts already record, whether or not anything reported them. This
     # also closes the decision the previous round executed, which is what
@@ -240,6 +241,19 @@ def decide_for_run(
     )
 
 
+def peek_tune_for_run(ledger_path: Path) -> dict:
+    """Select a round_v1 tune target without persisting scheduler state."""
+    ledger_path = Path(ledger_path)
+    run_dir = ledger_path.parent
+    contract = contract_for(ledger_path)
+    state = load_state(ledger_path, contract=contract)
+    decision = round_policy.select_tune(state, run_dir)
+    return {"action": decision.action, "run_id": decision.run_id,
+            "reason": decision.reason,
+            "evidence_mode": decision.evidence_mode,
+            "reference": (decision.evidence_mode or {}).get("reference")}
+
+
 def select_rewrite_for_run(ledger_path: Path) -> dict:
     """round_v1: choose (or reuse) this phase's rewrite target and commit it.
 
@@ -304,6 +318,7 @@ __all__ = [
     "config_from_scenarios",
     "contract_for",
     "decide_for_run",
+    "peek_tune_for_run",
     "models_for",
     "select_rewrite_for_run",
 ]

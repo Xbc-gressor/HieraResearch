@@ -18,8 +18,14 @@ uv run python -m driver run <task> <tag> --loop experiment \
 The default scheduler is `round_v1`: the budget is wall clock
 (`--time-budget` persists an absolute `deadline`); after the seed set, every
 `--round-new-candidates` new candidates trigger one optimization round of
-`--round-rewrite-bouts` rewrite bouts then `--round-tune-bouts` tune bouts
-over the whole pool, each round bounded by `--round-seconds`.
+`--round-rewrite-bouts` rewrite climbs then `--round-tune-bouts` tune bouts
+over the whole pool, each round bounded by `--round-seconds`. One climb
+hillclimbs the selected candidate step by step (edit -> evaluate ->
+keep/revert) until it stalls, hits its bout cap, or the round quota ends.
+Rewrite may adjust tuner parameters or introduce dimensions alongside an
+implementation change. A bout that only changes tuner values or declarations
+is reverted unevaluated (`reverted_params`); kept rewrites rebase tuning onto
+the current implementation and contract.
 `--max-evaluations` is an optional safety cap under `round_v1` (and the only
 budget of the older complete-bout schedulers).
 

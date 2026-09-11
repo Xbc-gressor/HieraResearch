@@ -115,13 +115,21 @@ def run_phase(
     attempted = evaluations_done(data, ledger_path)["evaluations_done"]
     if state.get("phase") == "blocked":
         return "blocked", str(state.get("active_stop_condition") or "unspecified_blocker")
-    if budget is not None and attempted >= budget:
+    evaluations_reached = budget is not None and attempted >= budget
+    time_reached = False
+    if not evaluations_reached and budget is None and budget_override is None:
+        clock = budget_status(Path(ledger_path).parent).get("time") or {}
+        time_reached = clock.get("time_reached") is True
+    if evaluations_reached or time_reached:
         refresh = experience_refresh_status(data)
         if not refresh["all_records_terminal"]:
             return "running", "budget_reached_pending_resolution"
         if refresh["semantic_admission_blocked"]:
             return "running", "final_experience_refresh_required"
-        return "completed", "evaluation_budget_reached"
+        return "completed", (
+            "evaluation_budget_reached" if evaluations_reached
+            else "time_budget_reached"
+        )
     return "running", "none"
 
 
@@ -169,6 +177,16 @@ def brief(data: dict, ledger_path: Path, *, budget_override: int | None = None) 
         data,
         budget_override=budget_override,
     )
+    evaluations_reached = budget is not None and attempted >= budget
+    time_reached = False
+    if budget is None and budget_override is None:
+        clock = budget_status(Path(ledger_path).parent).get("time") or {}
+        time_reached = clock.get("time_reached") is True
+    reached = (
+        True
+        if evaluations_reached or time_reached
+        else (None if budget is None else False)
+    )
     experience = data.get("experience") if isinstance(data.get("experience"), dict) else {}
     state = data.get("search_space_state")
     state = state if isinstance(state, dict) else empty_search_space_state()
@@ -214,7 +232,7 @@ def brief(data: dict, ledger_path: Path, *, budget_override: int | None = None) 
         ),
         "budget": budget,
         "remaining": None if budget is None else max(0, budget - attempted),
-        "reached": None if budget is None else attempted >= budget,
+        "reached": reached,
         "experience_updated_at_run": experience.get("updated_at_run"),
         "experience_generation": experience.get("generation"),
         "dag_revision": refresh["dag_revision"],

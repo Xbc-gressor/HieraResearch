@@ -46,6 +46,7 @@ if __package__ in (None, ""):  # direct script invocation
     from tools.scheduler.session import (  # noqa: E402
         decide_for_run,
         models_for,
+        peek_tune_for_run,
         select_rewrite_for_run,
     )
     from tools.scheduler.state import state_from_snapshot  # noqa: E402
@@ -57,7 +58,7 @@ else:  # pragma: no cover - imported as a package
     from . import transfer_tournament
     from .policy import PolicyConfig, decide as decide_policy
     from .rollout import RolloutConfig
-    from .session import decide_for_run, models_for, select_rewrite_for_run
+    from .session import decide_for_run, models_for, peek_tune_for_run, select_rewrite_for_run
     from .state import state_from_snapshot
     from .store import SchedulerStore
 
@@ -214,7 +215,9 @@ def cmd_round(args) -> int:
     elif args.round_command == "overhead":
         view = round_policy.record_overhead(run_dir, args.kind, args.seconds)
     elif args.round_command == "select":
-        if args.kind == "rewrite":
+        if args.peek and args.kind == "tune":
+            view = peek_tune_for_run(ledger)
+        elif args.kind == "rewrite":
             view = select_rewrite_for_run(ledger)
         else:
             view = decide_for_run(ledger)
@@ -271,6 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
     rnd_sub.add_parser("end", help="close the phase; next cycle counts from now")
     sel = rnd_sub.add_parser("select", help="choose the next rewrite/tune target")
     sel.add_argument("--kind", required=True, choices=("rewrite", "tune"))
+    sel.add_argument("--peek", action="store_true")
     ovh = rnd_sub.add_parser("overhead", help="record one bout's non-eval seconds")
     ovh.add_argument("--kind", required=True, choices=("rewrite", "tune"))
     ovh.add_argument("--seconds", required=True, type=float)

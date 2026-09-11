@@ -1,0 +1,33 @@
+name = "mle-nomad2018"
+description = "NOMAD 2018 Predicting Transparent Conductors: public-training validation RMSLE over formation energy and band gap, with a separate final submission."
+
+[env]
+type = "uv"
+project = "tasks/mle-nomad2018"
+
+[run]
+working_dir = "tasks/mle-nomad2018"
+timeout_seconds = 300
+
+[seed]
+target_count = 1
+provided = ["train.py"]
+entrypoint = "train.py"
+
+[evaluation]
+score_fn = "evaluate_config"
+environment_preflight_fn = "preflight_environment"
+
+[result]
+metric = "mean_rmsle"
+required_patterns = ["^score:"]
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true
+
+[mlebench]
+competition_id = "nomad2018-predict-transparent-conductors"
+public_data_env = "MLEBENCH_PUBLIC_DATA"
+submission = "submission.csv"

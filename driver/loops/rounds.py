@@ -1,4 +1,4 @@
-"""round_v1 optimization phase: rewrite bouts, then tune bouts.
+"""round_v1 optimization phase: rewrite climbs, then tune bouts.
 
 The experiment loop alternates a generation phase (judged-slate generations
 until the round's candidate threshold is met) with this optimization phase
@@ -6,6 +6,13 @@ over the whole candidate pool. Every decision lives tool-side
 (``tools/scheduler/cli.py round ...``); this module sequences the bouts,
 reuses the rewrite loop's bout runner, and commits a kept rewrite through
 ``tools/rewrite_rebase.py`` and ``tools/ledger.py record-rewrite``.
+
+One REWRITE decision is one *climb* on the selected candidate: repeated
+edit -> evaluate -> keep/revert steps (each journaled as its own bout, the
+editor session and the adjudication reference chained across steps) until
+the candidate stalls, reaches its bout cap, or the phase quota / run
+budget runs out. Depth on one candidate is where hillclimbing's kept
+chains come from; rotating single edits across candidates never climbs.
 
 GPU work is strictly serial: each bout's evaluations run under the task
 resource lease, one at a time.
@@ -97,42 +104,126 @@ def _overhead(run_dir, repo_root, cmd, kind, run_id, started, evals_before):
            "--seconds", str(max(0.0, wall - eval_seconds)))
 
 
-def _rewrite_bout(runner, store, task, tag, run_dir, selection, task_toml,
-                  noise_margin, repo_root, cmd, events) -> dict:
-    """One rewrite bout on the selected candidate; commits a kept edit."""
+def _tune_reserve(run_dir: Path, repo_root: Path, cmd,
+                  *, enabled: bool) -> float:
+    """Return the currently selected tune bout's priced cost.
+
+    Rewrite runs first, so keep one tune bout's admission ticket aside. The
+    peek selection is read-only; the actual tune selection is repeated after
+    rewrite, when the candidate pool may have changed.
+    """
+    if not enabled:
+        return 0.0
+    selection = _round(run_dir, repo_root, cmd, "select", "--kind", "tune", "--peek")
+    if selection.get("action") != "TUNE":
+        return 0.0
+    mode = selection.get("evidence_mode") or {}
+    ranked = mode.get("ranked") or []
+    run_id = str(selection.get("run_id"))
+    row = next((row for row in ranked if str(row.get("run_id")) == run_id), None)
+    expected = row.get("expected_seconds") if row else None
+    try:
+        return max(0.0, float(expected)) if expected is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rewrite_climb(runner, store, task, tag, run_dir, selection, task_toml,
+                   config, repo_root, cmd, events, *, tune_reserve=0.0) -> dict:
+    """One scheduler REWRITE decision: hillclimb the selected candidate.
+
+    Repeated edit -> evaluate -> keep/revert steps, each journaled as its
+    own bout and each kept step committed, until the candidate stalls
+    (``rewrite_stall_after`` consecutive non-kept steps), reaches its
+    ``rewrite_max_bouts`` cap, or the phase quota / run budget runs out.
+    The adjudication reference chains across steps, so every step is
+    measured against the candidate's current best. The decision is
+    recorded once, with the climb's total attempts and reference gain.
+    """
     run_id = str(selection["run_id"])
     candidate = run_dir / "candidates" / run_id
-    reference = selection.get("reference")
-    if reference is None:
-        reference = _ledger_score(run_dir, run_id)
     metric = task_toml["result"]["metric"]
+    noise_margin = float(config["noise_margin"])
+    max_bouts = int(config["rewrite_max_bouts"])
+    stall_after = int(config["rewrite_stall_after"])
+    overhead = float((selection.get("evidence_mode") or {}).get(
+        "overhead_seconds") or config["session_overhead_seconds"])
+    initial_reference = selection.get("reference")
+    if initial_reference is None:
+        initial_reference = _ledger_score(run_dir, run_id)
+    reference = initial_reference
+    steps = 0
+    kept = 0
+    attempts = 0
     bouts = rewrite._load_bouts(candidate)
-    started = time.monotonic()
-    evals_before, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
-    try:
-        result = rewrite._run_bout(
-            task, tag, run_dir, candidate, bouts, runner, store, metric,
-            noise_margin, "full", task_toml, repo_root, cmd, events,
-            reference=reference, confirm=True, run_best=_run_best(run_dir))
-    except InvocationFailed as exc:
-        # The failed session's edit is already rolled back; one candidate's
-        # dead editor session does not stop the run.
-        events.emit("rewrite_editor_failed", run_id=run_id,
-                    problems=[str(p) for p in exc.problems])
-        _record(run_dir, repo_root, cmd, selection["decision_id"], run_id,
-                consumed=0, status="infra_failure")
-        return {"status": "failed", "outcome": None}
-    if result["outcome"] == "kept":
-        _commit_kept(run_dir, run_id, candidate, len(bouts) + 1, result,
-                     repo_root, cmd, events)
+    # Seed the stall streak from the journal so a climb resumed after a
+    # kill does not re-spend the non-kept steps it already paid for.
+    streak = rewrite._consecutive_non_kept(bouts)
+    status = "done"
+    stop = None
+    while stop is None:
+        if len(bouts) >= max_bouts:
+            stop = "bout_cap"
+            break
+        if streak >= stall_after:
+            stop = "stalled"
+            break
+        view = budget_status(run_dir, repo_root, cmd)
+        if view.get("reached"):
+            status, stop = "budget", "run_budget"
+            break
+        quota = view.get("phase_quota_remaining_seconds")
+        _, mean = _eval_seconds(run_dir, repo_root, cmd, run_id)
+        expected = None if mean is None else 2.0 * float(mean) + overhead
+        available = None if quota is None else max(0.0, quota - tune_reserve)
+        if available is not None and (
+                available <= 0 or (expected is not None and expected > available)):
+            stop = "round_quota"
+            break
+        started = time.monotonic()
+        evals_before, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
+        try:
+            result = rewrite._run_bout(
+                task, tag, run_dir, candidate, bouts, runner, store, metric,
+                noise_margin, "full", task_toml, repo_root, cmd, events,
+                reference=reference, confirm=True,
+                run_best=_run_best(run_dir))
+        except InvocationFailed as exc:
+            # The failed session's edit is already rolled back; one
+            # candidate's dead editor session does not stop the run.
+            events.emit("rewrite_editor_failed", run_id=run_id,
+                        problems=[str(p) for p in exc.problems])
+            status, stop = "failed", "editor_failed"
+            break
+        _overhead(run_dir, repo_root, cmd, "rewrite", run_id, started,
+                  evals_before)
+        steps += 1
+        attempts += result["attempts"]
+        if result["status"] == "budget":
+            status, stop = "budget", "run_budget"
+            break
+        if result["status"] == "no_reference":
+            stop = "no_reference"
+            break
+        if result["outcome"] == "kept":
+            kept += 1
+            streak = 0
+            _commit_kept(run_dir, run_id, candidate, len(bouts) + 1, result,
+                         repo_root, cmd, events)
+        else:
+            streak += 1
+        if result["reference"] is not None:
+            reference = result["reference"]
+        bouts = rewrite._load_bouts(candidate)
     _record(run_dir, repo_root, cmd, selection["decision_id"], run_id,
-            consumed=result["attempts"],
-            status="valid" if result["status"] == "done" else "infra_failure",
-            gain=(None if result["outcome"] != "kept" or reference is None
-                  or result["reference"] is None
-                  else reference - result["reference"]))
-    _overhead(run_dir, repo_root, cmd, "rewrite", run_id, started, evals_before)
-    return result
+            consumed=attempts,
+            status="valid" if steps > 0 else "infra_failure",
+            gain=(None if kept == 0 or initial_reference is None
+                  or reference is None else initial_reference - reference))
+    events.emit("rewrite_climb", run_id=run_id, steps=steps, kept=kept,
+                attempts=attempts, stop=stop, reference=reference)
+    return {"status": status, "steps": steps, "kept": kept,
+            "attempts": attempts, "stop": stop, "reference": reference}
 
 
 def _commit_kept(run_dir, run_id, candidate, bout, result, repo_root, cmd,
@@ -183,10 +274,14 @@ def optimization_phase(runner, store, task, tag, run_dir, round_no, task_toml,
                         reason=selection.get("reason"))
             if selection["action"] != "REWRITE":
                 break
-            result = _rewrite_bout(runner, store, task, tag, run_dir, selection,
-                                   task_toml, float(config["noise_margin"]),
-                                   repo_root, cmd, events)
-            progressed = progressed or result["status"] == "done"
+            tune_reserve = _tune_reserve(
+                run_dir, repo_root, cmd,
+                enabled=int(config["tune_bouts"]) > 0,
+            )
+            result = _rewrite_climb(runner, store, task, tag, run_dir,
+                                    selection, task_toml, config, repo_root,
+                                    cmd, events, tune_reserve=tune_reserve)
+            progressed = progressed or result["steps"] > 0
             if result["status"] == "budget":
                 break
         for _ in range(int(config["tune_bouts"])):

@@ -15,7 +15,7 @@ The high-level lifecycle is:
              refresh bounded experience when required
              round_v1 (default): generate one candidate generation until the
                cycle's candidate threshold is met, then run one optimization
-               phase (rewrite bouts, then tune bouts) over the whole pool
+               phase (rewrite climbs, then tune bouts) over the whole pool
              other schedulers: generate one generation, then at most one
                decoupled tuning bout
         -> complete on budget exhaustion (evaluations or wall clock) or
@@ -1024,7 +1024,7 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
         extractor_inv = exc.invocation_id
 
     # Branch on durable evidence (spec Error handling):
-    # 1. budget exhausted + zero attempts → resolve-unevaluated (call+catch)
+    # 1. stop condition reached + zero attempts → resolve-unevaluated (call+catch)
     if budget_status(run_dir, repo_root, cmd).get("reached") and \
             _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
         return

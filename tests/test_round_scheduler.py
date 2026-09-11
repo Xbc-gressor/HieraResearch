@@ -256,8 +256,16 @@ class KeptRewriteTests(unittest.TestCase):
             (candidate / "tune_report.json").write_text(json.dumps(report))
 
             # Adjudicate against the ledger reference, then confirm.
-            rewrite_bout.snapshot(candidate, 1)
-            (candidate / "train.py").write_text(TRAIN_PY + "# better\n")
+            snapshot = rewrite_bout.snapshot(candidate, 1)
+            # A structural rewrite may introduce a new tunable dimension.
+            (candidate / "train.py").write_text(
+                'PARAM_SCHEMA = {"x": "float", "offset": "float"}\n'
+                'SEARCH_SPACE = {"x": ("float", 0.0, 1.0), '
+                '"offset": ("float", 0.0, 2.0)}\n'
+                'BASE_PARAMS: dict = {"x": 0.7, "offset": 1.0}\n'
+                'def make_model(params):\n'
+                '    return params["x"] + params["offset"]\n')
+            self.assertTrue(rewrite_bout.params_equal(candidate, snapshot))
             result = rewrite_bout.finalize(
                 candidate, 1, 0.8, 0.0, "eval-000001", "edit", "basis",
                 reference=1.0)
@@ -272,6 +280,9 @@ class KeptRewriteTests(unittest.TestCase):
             self.assertTrue(Path(rebased["archived"]).is_file())
             fresh = json.loads((candidate / "tune_report.json").read_text())
             self.assertEqual(fresh["phase_c"], {"stages": []})
+            self.assertEqual(fresh["phase_a"]["best_warm_params"],
+                             {"x": 0.7, "offset": 1.0})
+            self.assertIn("offset", fresh["phase_a"]["search_space"])
             self.assertAlmostEqual(fresh["phase_a"]["best_warm_score"], 0.85)
             self.assertTrue(round_policy.tune_report_current(run_dir, "000"))
 
@@ -284,6 +295,218 @@ class KeptRewriteTests(unittest.TestCase):
             self.assertEqual(record["rewrite_bouts"], 1)
             self.assertEqual(record["applied_incumbent"]["source"], "applied_phase_a")
             self.assertAlmostEqual(record["applied_incumbent"]["score"], 0.85)
+
+
+class ClimbCmd:
+    """The round_v1 tool surface scripted for one rewrite climb.
+
+    rewrite_bout.py dispatches to the real CLI in-process; everything else
+    is canned. ``eval_script`` holds the rewrite_eval scores in call order
+    (adjudication eval and the confirmation re-eval are separate calls).
+    """
+
+    V = ['BASE_PARAMS = {"x": 0.5}\n# v1\n',
+         'BASE_PARAMS = {"x": 0.5}\n# v2\n',
+         'BASE_PARAMS = {"x": 0.5}\n# v3\n',
+         'BASE_PARAMS = {"x": 0.5}\n# v4\n']
+
+    def __init__(self, repo: Path, run_dir: Path, eval_script: list[float],
+                 quota: float | None = None):
+        self.repo = repo
+        self.run_dir = run_dir
+        self.eval_script = list(eval_script)
+        self.quota = quota
+        self.reserved = 0
+        self.calls: list[list[str]] = []
+        self.selects = 0
+
+    def _real_bout_cli(self, args: list[str]) -> "subprocess.CompletedProcess":
+        import subprocess
+        idx = next(i for i, a in enumerate(args) if a.endswith("rewrite_bout.py"))
+        old_argv = sys.argv
+        sys.argv = ["rewrite_bout.py"] + args[idx + 1:]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = rewrite_bout.main()
+        except SystemExit as exc:
+            return subprocess.CompletedProcess(
+                args, exc.code if isinstance(exc.code, int) else 1,
+                buf.getvalue(), "" if isinstance(exc.code, int) else str(exc.code))
+        finally:
+            sys.argv = old_argv
+        return subprocess.CompletedProcess(args, code, buf.getvalue(), "")
+
+    def __call__(self, args, repo_root, check=True, capture=True, **kw):
+        import subprocess
+        args = [str(a) for a in args]
+        self.calls.append(args)
+        joined = " ".join(args)
+        ok = lambda stdout="": subprocess.CompletedProcess(args, 0, stdout, "")
+
+        if "evaluation_budget.py" in joined:
+            return ok(json.dumps({
+                "evaluations_done": self.reserved, "reached": False,
+                "phase_quota_remaining_seconds": self.quota,
+                "phase_quota_reached": (self.quota is not None
+                                        and self.quota <= 0),
+                "per_candidate": []}))
+        if "rewrite_bout.py" in joined:
+            return self._real_bout_cli(args)
+        if "scheduler/cli.py" in joined:
+            if " begin" in joined:
+                return ok(json.dumps({"cycle": 0, "phase": "optimize",
+                                      "phase_deadline": None}))
+            if "select" in joined and "rewrite" in joined:
+                self.selects += 1
+                return ok(json.dumps({
+                    "action": "REWRITE", "run_id": "000",
+                    "reason": "scripted", "decision_id": "dec-r1",
+                    "reference": 1.0,
+                    "evidence_mode": {"overhead_seconds": 10.0}}))
+            if "select" in joined:
+                return ok(json.dumps({"action": "STOP", "run_id": None,
+                                      "reason": "no eligible",
+                                      "decision_id": "dec-t1"}))
+            if " end" in joined:
+                return ok(json.dumps({"cycle": 1, "cycle_start_count": 1}))
+            return ok(json.dumps({"ok": True}))  # record / overhead
+        if "rewrite_context.py" in joined:
+            candidate = Path(args[args.index("--candidate") + 1])
+            (candidate / "_rewrite").mkdir(exist_ok=True)
+            (candidate / "_rewrite" / "context.md").write_text("# ctx\n")
+            return ok(json.dumps({"context_md": "context.md"}))
+        if "rewrite_eval.py" in joined:
+            self.reserved += 1
+            attempt_id = f"eval-{self.reserved:06d}"
+            score = self.eval_script.pop(0) if self.eval_script else 0.0
+            return ok(json.dumps({"attempt_id": attempt_id, "score": score,
+                                  "error": None, "stage": "eval"}))
+        if "preflight_candidate.py" in joined:
+            return ok("")
+        # rewrite_rebase.py, ledger.py record-rewrite, uv sync, ...
+        return ok("{}")
+
+
+class RewriteClimbTests(unittest.TestCase):
+    """One REWRITE decision is one climb: stepped hillclimbing on the
+    selected candidate until it stalls, with a single decision record."""
+
+    def _setup_run(self, tmp: Path):
+        run_dir = tmp / "runs" / "fake-task" / "t1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "ledger.json").write_text(json.dumps({
+            "records": [_record("000", 1.0)]}))
+        candidate = run_dir / "candidates" / "000"
+        candidate.mkdir(parents=True)
+        (candidate / "train.py").write_text(ClimbCmd.V[0])
+        (candidate / "tune_report.json").write_text(json.dumps({
+            "phase_a": {"best_warm_score": 1.0}, "phase_c": {"stages": []}}))
+        return run_dir, candidate
+
+    def _events(self, run_dir: Path) -> list[dict]:
+        path = run_dir / "driver_events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()
+                if line.strip()]
+
+    def test_climb_kept_then_stalls_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = self._setup_run(Path(tmp))
+            cmd = ClimbCmd(Path(tmp), run_dir,
+                           eval_script=[0.9, 0.9, 0.95, 0.95])
+            from driver.events import EventsLog
+            from driver.loops import rounds
+            from driver.receipts import ReceiptStore
+            runner = FakeSessionRunner([
+                {"receipt": {"edited": True, "summary": "lever a",
+                             "basis": "hyp-1"},
+                 "side_effects": lambda ctx: (candidate / "train.py")
+                 .write_text(ClimbCmd.V[1])},
+                {"receipt": {"edited": True, "summary": "lever b",
+                             "basis": "hyp-1"},
+                 "side_effects": lambda ctx: (candidate / "train.py")
+                 .write_text(ClimbCmd.V[2])},
+                {"receipt": {"edited": True, "summary": "lever c",
+                             "basis": "hyp-1"},
+                 "side_effects": lambda ctx: (candidate / "train.py")
+                 .write_text(ClimbCmd.V[3])},
+            ])
+            config = {**round_policy.DEFAULTS, "rewrite_bouts": 1,
+                      "tune_bouts": 1, "rewrite_stall_after": 2,
+                      "noise_margin": 0.0}
+            progressed = rounds.optimization_phase(
+                runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir, 1,
+                {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
+                EventsLog(run_dir), tune=lambda no: {"tuned": False},
+                config=config)
+
+            self.assertTrue(progressed)
+            self.assertEqual(cmd.selects, 1)  # one decision for the climb
+            # step 1 kept (1.0 -> 0.9, confirmation folds to 0.9), steps 2
+            # and 3 reverted_worse: stall_after=2 ends the climb
+            bouts = rewrite_bout.load_bouts(candidate)
+            self.assertEqual([b["outcome"] for b in bouts],
+                             ["kept", "reverted_worse", "reverted_worse"])
+            self.assertEqual([b["bout"] for b in bouts], [1, 2, 3])
+            self.assertEqual((candidate / "train.py").read_text(),
+                             ClimbCmd.V[1])
+            # one decision record: 4 attempts (adjudication + confirmation
+            # for the kept step), gain measured against the initial reference
+            record = next(call for call in cmd.calls
+                          if "record" in call and "scheduler" in " ".join(call))
+            self.assertIn("dec-r1", record)
+            self.assertEqual(record[record.index("--consumed") + 1], "4")
+            self.assertEqual(record[record.index("--status") + 1], "valid")
+            self.assertAlmostEqual(
+                float(record[record.index("--gain") + 1]), 0.1)
+            # the editor session persisted and resumed across steps
+            calls = [ctx for name, ctx in runner.calls
+                     if name == "rewrite-editor"]
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(calls[1].resume_session_id, "fake-sess-0001")
+            self.assertEqual(calls[2].extra["current_best"], 0.9)
+            self.assertEqual(calls[2].extra["last_outcome"], "reverted_worse")
+            # the kept step was committed; the climb event names the stop
+            self.assertTrue(any("record-rewrite" in " ".join(call)
+                                for call in cmd.calls))
+            climb = next(e for e in self._events(run_dir)
+                         if e.get("kind") == "rewrite_climb")
+            self.assertEqual((climb["steps"], climb["kept"], climb["stop"]),
+                             (3, 1, "stalled"))
+            # one rewrite select, then the tune select, per-step overheads
+            overheads = [call for call in cmd.calls if "overhead" in call]
+            self.assertEqual(len(overheads), 3)
+
+    def test_climb_stops_before_first_step_when_quota_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = self._setup_run(Path(tmp))
+            cmd = ClimbCmd(Path(tmp), run_dir, eval_script=[], quota=0.0)
+            from driver.events import EventsLog
+            from driver.loops import rounds
+            from driver.receipts import ReceiptStore
+            runner = FakeSessionRunner([])
+            config = {**round_policy.DEFAULTS, "rewrite_bouts": 1,
+                      "tune_bouts": 1, "noise_margin": 0.0}
+            progressed = rounds.optimization_phase(
+                runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir, 1,
+                {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
+                EventsLog(run_dir), tune=lambda no: {"tuned": False},
+                config=config)
+
+            # the selection was already committed, but no step fits the
+            # quota: zero-step climb, no editor session, no journal
+            self.assertFalse(progressed)
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((candidate / "_rewrite" / "bouts.jsonl").exists())
+            record = next(call for call in cmd.calls
+                          if "record" in call and "scheduler" in " ".join(call))
+            self.assertEqual(record[record.index("--consumed") + 1], "0")
+            self.assertEqual(record[record.index("--status") + 1],
+                             "infra_failure")
+            climb = next(e for e in self._events(run_dir)
+                         if e.get("kind") == "rewrite_climb")
+            self.assertEqual((climb["steps"], climb["stop"]),
+                             (0, "round_quota"))
 
 
 class RoundCmd(ExperimentCmd):

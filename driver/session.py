@@ -169,6 +169,16 @@ class SDKSessionRunner:
             kwargs["resume"] = ctx.resume_session_id
         if role.max_turns is not None:
             kwargs["max_turns"] = role.max_turns
+        env = {"IS_SANDBOX": "1"}
+        task_toml = REPO_ROOT / "tasks" / ctx.task / "task.toml"
+        if task_toml.is_file():
+            import tomllib
+            with task_toml.open("rb") as stream:
+                mlebench = tomllib.load(stream).get("mlebench") or {}
+            public_env = mlebench.get("public_data_env")
+            if isinstance(public_env, str) and public_env:
+                env[public_env] = "/mnt/mle-public"
+                env["MLEBENCH_NAMESPACE_READY"] = "1"
         return ClaudeAgentOptions(
             system_prompt=self._system_prompt(role, ctx),
             cwd=REPO_ROOT,
@@ -177,7 +187,7 @@ class SDKSessionRunner:
             # Claude Code refuses bypassPermissions under root unless it is
             # told the session runs in a sandbox; our runs do (dedicated
             # server/container). Harmless for non-root users.
-            env={"IS_SANDBOX": "1"},
+            env=env,
             setting_sources=[],
             disallowed_tools=list(role.disallowed),
             mcp_servers={"receipts": server},

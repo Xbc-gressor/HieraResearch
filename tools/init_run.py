@@ -803,7 +803,9 @@ def main() -> int:
     parser.add_argument("--round-new-candidates", type=int, metavar="N",
                         help="round_v1: new finite candidates per optimization round")
     parser.add_argument("--round-rewrite-bouts", type=int, metavar="R",
-                        help="round_v1: rewrite bouts per optimization round")
+                        help="round_v1: rewrite climbs per optimization round "
+                             "(one climb hillclimbs one candidate until it "
+                             "stalls, caps out, or the round quota ends)")
     parser.add_argument("--round-tune-bouts", type=int, metavar="T",
                         help="round_v1: tune bouts per optimization round")
     parser.add_argument("--round-seconds", type=float, metavar="Q",

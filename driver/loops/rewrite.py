@@ -11,6 +11,12 @@ the loop compares train.py against the bout snapshot (rewrite_bout
 changed). When receipt and file disagree the bout is journaled noop — a
 dirty file is reverted first — and never reaches preflight/eval.
 
+Rewrite may change tuner-owned values or declarations when executable code
+changes in the same bout. A contract-only edit is reverted unevaluated and
+journaled reverted_params; parameters outside the declared space may move
+without that additional code change. A broken literal form is a different
+failure — it goes through the stage-"params" repair path instead.
+
 One bout never spends budget before the candidate is known runnable:
 preflight and rewrite_eval's BASE_PARAMS literal check both run ahead of
 any reservation, so their failures cost nothing (revert + reverted_crash).
@@ -122,6 +128,14 @@ def _changed(candidate: Path, snapshot: str, repo_root: Path, cmd) -> bool:
     """True when train.py differs byte-wise from the bout snapshot (the
     changed CLI's exit 1); a missing file/snapshot also reads as changed."""
     proc = cmd(["python", "tools/rewrite_bout.py", "changed",
+                "--candidate", candidate, "--snapshot", snapshot],
+               repo_root, check=False)
+    return proc.returncode != 0
+
+
+def _params_only(candidate: Path, snapshot: str, repo_root: Path, cmd) -> bool:
+    """True for a tuner-only edit; malformed params go to the repair path."""
+    proc = cmd(["python", "tools/rewrite_bout.py", "params-equal",
                 "--candidate", candidate, "--snapshot", snapshot],
                repo_root, check=False)
     return proc.returncode != 0
@@ -349,6 +363,15 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
                     outcome="noop")
         return _result("done", outcome="noop", reference=best)
 
+    # Parameter changes may accompany implementation changes. A pure tuner
+    # move is reverted before spending evaluation budget.
+    if _params_only(candidate, snapshot, repo_root, cmd):
+        _revert(candidate, snapshot, repo_root, cmd)
+        _journal(candidate, bout, "reverted_params", receipt, repo_root, cmd)
+        events.emit("bout", candidate=candidate.name, bout=bout,
+                    outcome="reverted_params")
+        return _result("done", outcome="reverted_params", reference=best)
+
     # Preflight-class gate: preflight, then rewrite_eval's BASE_PARAMS check
     # (both free). One repair resume with the error tail; a second failure
     # reverts and journals reverted_crash without spending budget.
@@ -380,6 +403,15 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
             raise
         _save_session_inv(candidate, inv_id)
         if receipt["edited"]:
+            # Apply the same rule after repair, against the original snapshot.
+            if _params_only(candidate, snapshot, repo_root, cmd):
+                _revert(candidate, snapshot, repo_root, cmd)
+                _journal(candidate, bout, "reverted_params", receipt,
+                         repo_root, cmd)
+                events.emit("bout", candidate=candidate.name, bout=bout,
+                            outcome="reverted_params")
+                return _result("done", outcome="reverted_params",
+                               reference=best)
             error_tail = _preflight(task, candidate, repo_root, cmd,
                                     task_toml)
             if error_tail is None:

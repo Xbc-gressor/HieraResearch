@@ -1743,25 +1743,33 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     f"{where}.unevaluated_receipt has an invalid shape"
                 )
             else:
+                receipt_kind = unevaluated_receipt.get("kind")
                 receipt_budget = unevaluated_receipt.get("budget")
                 receipt_done = unevaluated_receipt.get("evaluations_done")
-                if (
-                    unevaluated_receipt.get("schema_version") != 1
-                    or unevaluated_receipt.get("kind")
-                    != "budget_exhausted_before_candidate_attempt"
-                    or unevaluated_receipt.get("candidate_objective_attempts") != 0
-                    or not isinstance(receipt_budget, int)
-                    or isinstance(receipt_budget, bool)
-                    or receipt_budget <= 0
-                    or not isinstance(receipt_done, int)
-                    or isinstance(receipt_done, bool)
-                    or receipt_done < receipt_budget
-                    or unevaluated_receipt.get("attempt_log")
-                    != "evaluation_attempts.jsonl"
-                ):
+                common_ok = (
+                    unevaluated_receipt.get("schema_version") == 1
+                    and unevaluated_receipt.get("candidate_objective_attempts") == 0
+                    and isinstance(receipt_done, int)
+                    and not isinstance(receipt_done, bool)
+                    and receipt_done >= 0
+                    and unevaluated_receipt.get("attempt_log")
+                    == "evaluation_attempts.jsonl"
+                )
+                evals_ok = (
+                    receipt_kind == "budget_exhausted_before_candidate_attempt"
+                    and isinstance(receipt_budget, int)
+                    and not isinstance(receipt_budget, bool)
+                    and receipt_budget > 0
+                    and receipt_done >= receipt_budget
+                )
+                time_ok = (
+                    receipt_kind == "time_budget_reached_before_candidate_attempt"
+                    and receipt_budget is None
+                )
+                if not common_ok or not (evals_ok or time_ok):
                     errors.append(
-                        f"{where}.unevaluated_receipt is not a valid exhausted-"
-                        "budget zero-attempt receipt"
+                        f"{where}.unevaluated_receipt is not a valid "
+                        "stop-condition zero-attempt receipt"
                     )
             if record.get("final_best_score") is not None or int(
                 record.get("trials_attempted") or 0

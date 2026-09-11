@@ -268,6 +268,97 @@ def test_changed_cli_missing_train_py(tmp_path, monkeypatch, capsys) -> None:
             "changed", "--candidate", str(candidate), "--snapshot", str(snap)])
 
 
+def test_params_equal_cli(tmp_path, monkeypatch, capsys) -> None:
+    candidate = _make_candidate(tmp_path)
+    (candidate / "train.py").write_text('BASE_PARAMS = {"x": 1}\n# v1\n')
+    snap = rewrite_bout.snapshot(candidate, 1)
+
+    def params_equal_code():
+        code, _ = _run_cli(monkeypatch, capsys, [
+            "params-equal", "--candidate", str(candidate),
+            "--snapshot", str(snap)])
+        return code
+
+    # a code-only edit leaves the parsed dict untouched: exit 0
+    (candidate / "train.py").write_text('BASE_PARAMS = {"x": 1}\n# v2\n')
+    assert params_equal_code() == 0
+    # same dict, reformatted: the comparison is semantic, not byte-wise
+    (candidate / "train.py").write_text('BASE_PARAMS = {\n    "x": 1,\n}\n')
+    assert params_equal_code() == 0
+    # a moved value is the contract violation: exit 1
+    (candidate / "train.py").write_text('BASE_PARAMS = {"x": 2}\n')
+    assert params_equal_code() == 1
+    # an added key moves the dict too
+    (candidate / "train.py").write_text('BASE_PARAMS = {"x": 1, "y": 2}\n')
+    assert params_equal_code() == 1
+    # a broken literal form is not this check's failure: exit 0, the
+    # evaluation stage's repair path owns it
+    (candidate / "train.py").write_text('BASE_PARAMS = dict(DEFAULTS)\n')
+    assert params_equal_code() == 0
+
+
+def test_params_equal_scoped_to_the_search_space(tmp_path, monkeypatch,
+                                                 capsys) -> None:
+    """The boundary is the tuner's range, not the whole dict: space-named
+    values and the space declarations are off-limits; parameters the space
+    does not name are the editor's ground."""
+    before = (
+        'PARAM_SCHEMA = {"x": ("float", "log")}\n'
+        'SEARCH_SPACE = {"x": ("float", 0.1, 1.0, "log")}\n'
+        'BASE_PARAMS = {"x": 0.5, "warmup": 4}\n'
+    )
+    candidate = _make_candidate(tmp_path)
+    (candidate / "train.py").write_text(before)
+    snap = rewrite_bout.snapshot(candidate, 1)
+
+    def params_equal_code(source: str):
+        (candidate / "train.py").write_text(source)
+        code, _ = _run_cli(monkeypatch, capsys, [
+            "params-equal", "--candidate", str(candidate),
+            "--snapshot", str(snap)])
+        return code
+
+    # a parameter the space does not name may move: exit 0
+    assert params_equal_code(before.replace('"warmup": 4', '"warmup": 2')) == 0
+    # a space-named value may not: exit 1
+    assert params_equal_code(before.replace('"x": 0.5', '"x": 0.7')) == 1
+    # a tuner value may move together with executable implementation code
+    assert params_equal_code(
+        before.replace('"x": 0.5', '"x": 0.7') +
+        'def make_model(params):\n    return {**params, "changed": True}\n'
+    ) == 0
+    # neither may the space declaration itself
+    assert params_equal_code(before.replace('0.1, 1.0', '0.1, 2.0')) == 1
+    assert params_equal_code(before.replace('"float", "log"', '"float", "linear"')) == 1
+    # breaking or deleting a formerly readable declaration is a violation too
+    assert params_equal_code(before.replace(
+        'SEARCH_SPACE = {"x": ("float", 0.1, 1.0, "log")}',
+        'SEARCH_SPACE = make_space()')) == 1
+
+
+def test_params_equal_accepts_annotated_contract_with_code_change(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    before = (
+        'PARAM_SCHEMA = {"x": "float"}\n'
+        'SEARCH_SPACE = {"x": ("float", 0.0, 1.0)}\n'
+        'BASE_PARAMS = {"x": 0.5}\n'
+        'def make_model(params):\n    return params\n'
+    )
+    candidate = _make_candidate(tmp_path)
+    (candidate / "train.py").write_text(before)
+    snap = rewrite_bout.snapshot(candidate, 1)
+    (candidate / "train.py").write_text(
+        before.replace('BASE_PARAMS = {"x": 0.5}',
+                       'BASE_PARAMS: dict = {"x": 0.7}')
+        .replace('return params', 'return {**params, "changed": True}')
+    )
+    code, _ = _run_cli(monkeypatch, capsys, [
+        "params-equal", "--candidate", str(candidate),
+        "--snapshot", str(snap)])
+    assert code == 0
+
+
 def test_current_best_cli_fails_without_reference(tmp_path, monkeypatch, capsys) -> None:
     candidate = tmp_path / "candidate"
     candidate.mkdir()

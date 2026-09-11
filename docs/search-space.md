@@ -195,10 +195,12 @@ that fact through the helper-owned `direct_comparator_capability` receipt;
 runtime evidence therefore abstains rather than manufacturing a signed
 semantic delta.
 
-At a strict budget boundary, `ledger.py resolve-unevaluated` resolves a pending
-candidate with zero objective attempts. It proves global exhaustion and zero
-candidate attempts, stores an `unevaluated_receipt` pinned to the exact attempt
-log, and advances the lifecycle DAG cursor without creating score evidence.
+At a stop-condition boundary (exhausted `max_evaluations`, or a reached
+wall-clock deadline with `max_evaluations` unset), `ledger.py resolve-unevaluated`
+resolves a pending candidate with zero objective attempts. It proves the stop
+and zero candidate attempts, stores an `unevaluated_receipt` pinned to the
+exact attempt log, and advances the lifecycle DAG cursor without creating
+score evidence. A time-budget receipt does not invent a fake evaluation cap.
 Final completion still waits for the resulting per-round experience refresh.
 
 ## Persisted edges are attribution deltas

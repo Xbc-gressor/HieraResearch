@@ -668,13 +668,15 @@ def resolve_unevaluated(
     task_name: str,
     run_id: str,
 ) -> dict:
-    """Resolve one unstarted admission when the strict objective cap is full.
+    """Resolve one unstarted admission after the run's stop condition landed.
 
     This is deliberately separate from ``record-run``: ``unevaluated`` is not
-    a model-authored outcome and carries no score.  The helper proves both that
-    the global budget is exhausted and that this candidate owns zero objective
-    attempts, snapshots the strict accounting log, then records an
-    evidence-neutral terminal lifecycle state.
+    a model-authored outcome and carries no score.  The helper proves that a
+    stop condition has been reached (exhausted evaluation cap, or reached
+    wall-clock budget) and that this candidate owns zero objective attempts,
+    snapshots the strict accounting log, then records an evidence-neutral
+    terminal lifecycle state.  A time-budget run does not invent a fake
+    ``max_evaluations``.
     """
     config = load_task_config(task_name)
     ledger_path = Path(ledger_path)
@@ -692,12 +694,18 @@ def resolve_unevaluated(
     _preserve_descendant_bindings(data, run_id)
 
     strict = budget_status(ledger_path.parent, create=True)
-    if strict.get("reached") is not True or not isinstance(
-        strict.get("budget"), int
-    ):
+    budget = strict.get("budget")
+    evals_exhausted = (
+        isinstance(budget, int)
+        and not isinstance(budget, bool)
+        and strict.get("reached") is True
+        and int(strict.get("evaluations_done") or 0) >= budget
+    )
+    time_exhausted = (strict.get("time") or {}).get("time_reached") is True
+    if not evals_exhausted and not time_exhausted:
         raise ValueError(
-            "unevaluated resolution requires a configured, exhausted "
-            "objective budget"
+            "unevaluated resolution requires an exhausted evaluation budget "
+            "or a reached time budget"
         )
     candidate_attempts = next(
         (
@@ -718,10 +726,15 @@ def resolve_unevaluated(
         )
 
     attempt_log = Path(strict["attempt_log"])
+    kind = (
+        "budget_exhausted_before_candidate_attempt"
+        if evals_exhausted
+        else "time_budget_reached_before_candidate_attempt"
+    )
     receipt = {
         "schema_version": 1,
-        "kind": "budget_exhausted_before_candidate_attempt",
-        "budget": strict["budget"],
+        "kind": kind,
+        "budget": budget if evals_exhausted else None,
         "evaluations_done": strict["evaluations_done"],
         "candidate_objective_attempts": 0,
         "attempt_log": attempt_log.name,

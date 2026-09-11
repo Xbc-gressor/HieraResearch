@@ -104,6 +104,16 @@ class DerivePhaseTests(unittest.TestCase):
         self.assertEqual(
             derive_phase(ledger, {"max_evaluations": "3"}, 100), "running")
 
+    def test_completed_from_deadline_without_evaluation_cap(self) -> None:
+        ledger = {"records": [{"run_id": "001", "status": "keep"}]}
+        cfg = {"deadline": 1.0, "final_reserve_seconds": 0}
+        self.assertEqual(derive_phase(ledger, cfg, 0), "completed")
+
+    def test_deadline_with_pending_record_stays_running(self) -> None:
+        ledger = {"records": [{"run_id": "001", "status": "pending"}]}
+        self.assertEqual(
+            derive_phase(ledger, {"deadline": 1.0}, 0), "running")
+
 
 def _fake_cmd(budget: dict, brief: dict):
     def cmd(argv, repo_root):

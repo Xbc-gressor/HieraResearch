@@ -43,8 +43,11 @@ prepare_command = "uv run python prepare.py"
 
 
 V1 = 'BASE_PARAMS = {"x": 1}\n# v1\n'
-V2 = 'BASE_PARAMS = {"x": 2}\n# v2\n'
-V3 = 'BASE_PARAMS = {"x": 3}\n# v3\n'
+V2 = 'BASE_PARAMS = {"x": 1}\n# v2\n'
+V3 = 'BASE_PARAMS = {"x": 1}\n# v3\n'
+# An edit that moves BASE_PARAMS: the params contract violation the loop
+# reverts unevaluated (parameter values are the tuner's search surface).
+PARAMS_MOVED = 'BASE_PARAMS = {"x": 2}\n# v1\n'
 
 
 class FakeCmd:
@@ -299,6 +302,34 @@ class RewriteLoopTests(unittest.TestCase):
         self.assertEqual(status["steps_done"], 0)
         # noop counts toward the stall derivation: the loop stopped here
         self.assertEqual(len(self.editor_calls(runner)), 1)
+        self.assertEqual(status["candidates"]["src-001"]["consecutive_non_kept"], 1)
+
+    def test_base_params_edit_reverted_unevaluated(self) -> None:
+        cmd = FakeCmd(self.repo, eval_script=[])
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "moved x", "basis": "hyp-1"},
+             "side_effects": edit_train_py(PARAMS_MOVED)},
+        ])
+        status = run_rewrite(
+            "fake-task", "t1", runner=runner, model="m", repo_root=self.repo,
+            cmd=cmd, stall_after=1, max_evaluations=10,
+        )
+
+        # BASE_PARAMS is the tuner's search surface: the edit is reverted
+        # byte-exactly and journaled reverted_params before preflight/eval —
+        # no budget spent, no repair resume
+        self.assertEqual((self.candidate() / "train.py").read_text(), V1)
+        bouts = self.bouts()
+        self.assertEqual(len(bouts), 1)
+        self.assertEqual(bouts[0]["outcome"], "reverted_params")
+        self.assertEqual(bouts[0]["summary"], "moved x")
+        self.assertIsNone(bouts[0]["score"])
+        self.assertIsNone(bouts[0]["attempt_id"])
+        self.assertEqual(cmd.reserved, 0)
+        self.assertFalse(any("preflight_candidate.py" in " ".join(call)
+                             for call in cmd.calls))
+        self.assertEqual(len(self.editor_calls(runner)), 1)
+        self.assertEqual(status["steps_done"], 0)
         self.assertEqual(status["candidates"]["src-001"]["consecutive_non_kept"], 1)
 
     def test_invocation_failed_reverts_to_bout_snapshot(self) -> None:

@@ -47,6 +47,10 @@ Work this fixed discipline, in order:
      score); the file was rolled back to the last good code. **Crash repair
      outranks all polish**: read the stderr tail in the trace and fix the
      cause from the good code. Broken code has no potential.
+   - `reverted_params` — the last edit changed tuner-owned parameters or
+     declarations without also changing executable implementation code; the
+     file was rolled back without being evaluated. Combine the parameter
+     change with the implementation change that gives it semantic meaning.
    - `reverted_worse` — unproven, not refuted: the step may simply have
      been too large, or the execution flawed. The only forbidden move is a
      verbatim repeat of the same change. Standard follow-ups: halve along
@@ -114,20 +118,23 @@ Choose the bout's lever by these five rules:
    delivers, or delivers wrongly, is the highest-value target — the point
    has never had a fair test.
 2. **Structural constants are the primary hunting ground.** Once fidelity
-   is clean, the main hunting ground is the freedom *inside* this point:
-   schedule split points and ratios (warmup start, full-length fraction),
-   window spans, width/depth ratios, optimizer/LR scaling constants, and
-   similar implementation details. Advance systematically with search
-   patterns — bracket, halve, interpolate, reverse — not one-shot guesses.
+   is clean, the main hunting ground is the freedom *inside* this point
+   that the search space does not name: schedule split points and ratios
+   (warmup start, full-length fraction), window spans, width/depth ratios,
+   pipeline structure, and similar implementation details — including
+   parameters the space does not name. A structural change may also require
+   adjusting tuner values or adding dimensions; change these together. Advance
+   systematically with search patterns — bracket, halve, interpolate,
+   reverse — not one-shot guesses.
 3. **Boundary: hold this point's invariants.** A sibling hypothesis is a
    different semantic point; structural changes that implement it do not
    belong in this `train.py` — coarse-grained moves are the outer
    operators' job (`fresh`/`improve`/`crossover`), which is what keeps
    attribution correct. If you come to believe a sibling hypothesis is the
    right one, declare that belief in `basis` — a declaration is a report,
-   not a permission. Structural constants and implementation details the
-   space does not name are this point's legal search space; record them in
-   `basis` as well.
+   not a permission. If the only change you can justify is retuning an
+   existing dimension, report it in `basis` for the tuner. Describe coupled
+   implementation and parameter changes together in `basis`.
 4. **Pitfall checklist.** Check each matched guidance entry (pitfall /
    caution first) against the implementation, one by one. The source
    material's algorithm-level details are the reference for getting the
@@ -139,11 +146,22 @@ Choose the bout's lever by these five rules:
 
 ## Evaluation precondition
 
-The driver reads the parameters it evaluates from the module-level
-`BASE_PARAMS` dict in `train.py`, so **`BASE_PARAMS` must stay a pure
-literal dict** — literals only, no expressions or imported names. Changing
-its values is a legitimate lever; breaking its literal form makes your edit
-unevaluable and wastes the bout.
+The driver measures every bout at the module-level `BASE_PARAMS` dict in
+`train.py`, so **`BASE_PARAMS` must stay a pure literal dict** — literals
+only, no expressions or imported names. Breaking its literal form makes
+your edit unevaluable and wastes the bout.
+
+The tuner owns the declared dimensions, but rewrite may change them when the
+edit also changes executable implementation code. A parameter-only change is
+not a rewrite hypothesis: the driver compares the implementation with the
+pre-bout snapshot and reverts that edit unevaluated (`reverted_params`).
+Parameters and constants outside the declared space may change on their own.
+When a rewrite changes the tuning contract, the driver rebinds the tuning
+report to the new contract after the kept edit.
+Keep `PARAM_SCHEMA`, `SEARCH_SPACE`, and `BASE_PARAMS` consistent when adding
+or removing tuner dimensions. Put non-tuner implementation constants in code
+or a separate configuration mapping; tuner evaluation and parameter application
+operate on the declared dimensions.
 
 ## Invocation context
 
@@ -160,7 +178,8 @@ Each bout's message is `key: value` lines. Always present: `task`, `tag`,
   better); absent when the loop has no run-level ledger.
 - `metric` — the metric name. Trust the direction rule, not the name.
 - `last_outcome` — `kept` / `reverted_worse` / `reverted_marginal` /
-  `reverted_crash` / `noop`; absent before your first bout.
+  `reverted_crash` / `reverted_params` / `noop`; absent before your first
+  bout.
 - `last_score` — the score your last edit produced (null on a crash).
 - `last_trace` — path to the newest attempt's trace under `_traces/`.
 - `preflight_error` — repair resume only: the preflight/BASE_PARAMS error tail your last edit produced; fix it.

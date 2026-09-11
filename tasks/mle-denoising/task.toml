@@ -1,0 +1,33 @@
+name = "mle-denoising"
+description = "Denoising Dirty Documents: public image-to-image validation RMSE and a separate final MLE-bench submission."
+
+[env]
+type = "uv"
+project = "tasks/mle-denoising"
+
+[run]
+working_dir = "tasks/mle-denoising"
+timeout_seconds = 300
+
+[seed]
+target_count = 1
+provided = ["train.py"]
+entrypoint = "train.py"
+
+[evaluation]
+score_fn = "evaluate_config"
+environment_preflight_fn = "preflight_environment"
+
+[result]
+metric = "pixel_rmse"
+required_patterns = ["^score:"]
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true
+
+[mlebench]
+competition_id = "denoising-dirty-documents"
+public_data_env = "MLEBENCH_PUBLIC_DATA"
+submission = "submission.csv"

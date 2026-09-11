@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -1467,6 +1468,150 @@ class LedgerIntegrationTests(unittest.TestCase):
                 self.assertEqual(cmd_set_phase(phase_args), 0)
             completed = json.loads(ledger_path.read_text())
             self.assertEqual(completed["run_state"]["phase"], "completed")
+
+    def test_time_budget_resolves_zero_attempt_candidate_without_evidence(
+        self,
+    ) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        terminal = record(
+            "000", "fresh", [], baseline, score=0.5, status="keep"
+        )
+        terminal["dag_revision"] = 1
+        pending = record(
+            "001",
+            "improve",
+            ["000"],
+            baseline,
+            score=float("inf"),
+            status="pending",
+            prior_records=[terminal],
+        )
+        pending["final_best_score"] = None
+        ledger = {
+            "task": "hard-interactions",
+            "tag": "time-budget-unevaluated",
+            "metric": "validation_loss",
+            "search_space": space_receipt(registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 1,
+            "records": [terminal, pending],
+            "experience": {
+                **empty_experience("000"),
+                "dag_revision": 0,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger_path = run_dir / "ledger.json"
+            background_path = run_dir / "background.md"
+            replacement_path = run_dir / "experience.json"
+            (run_dir / "evaluation_attempts.jsonl").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": "score_attempt",
+                        "attempt_id": "eval-000001",
+                        "run_id": "000",
+                        "phase": "phase_a",
+                        "method": "warmstart",
+                        "params": {"x": 0},
+                    }
+                )
+                + "\n"
+            )
+            ledger_path.write_text(json.dumps(ledger))
+            background_path.write_text(background_text(registry))
+
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": None,
+                        "deadline": time.time() + 3600,
+                    }
+                )
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "exhausted evaluation budget or a reached time budget",
+            ):
+                resolve_unevaluated(
+                    ledger_path, "hard-interactions", "001"
+                )
+
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps(
+                    {
+                        "max_evaluations": None,
+                        "deadline": time.time() - 10,
+                    }
+                )
+            )
+            brief_args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                budget=None,
+            )
+            brief_out = io.StringIO()
+            with contextlib.redirect_stdout(brief_out):
+                self.assertEqual(cmd_brief(brief_args), 0)
+            view = json.loads(brief_out.getvalue())
+            self.assertTrue(view["reached"])
+            self.assertIsNone(view["budget"])
+            self.assertEqual(view["phase"], "running")
+            self.assertEqual(
+                view["active_stop_condition"],
+                "budget_reached_pending_resolution",
+            )
+
+            resolved = resolve_unevaluated(
+                ledger_path,
+                "hard-interactions",
+                "001",
+            )
+            self.assertEqual(resolved["status"], "unevaluated")
+            self.assertIsNone(resolved["final_best_score"])
+            receipt = resolved["unevaluated_receipt"]
+            self.assertEqual(
+                receipt["kind"],
+                "time_budget_reached_before_candidate_attempt",
+            )
+            self.assertIsNone(receipt["budget"])
+            self.assertEqual(receipt["candidate_objective_attempts"], 0)
+            self.assertEqual(receipt["evaluations_done"], 1)
+            stored = json.loads(ledger_path.read_text())
+            self.assertEqual(stored["dag_revision"], 2)
+
+            replacement_path.write_text(
+                json.dumps(empty_experience("000", generation=0))
+            )
+            refresh_args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                background=str(background_path),
+                catalog=None,
+                from_json=replacement_path,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_experience(refresh_args), 0)
+
+            phase_args = types.SimpleNamespace(
+                ledger=str(ledger_path),
+                task="hard-interactions",
+                phase="completed",
+                stop_condition=None,
+                budget=None,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_phase(phase_args), 0)
+            completed = json.loads(ledger_path.read_text())
+            self.assertEqual(completed["run_state"]["phase"], "completed")
+            self.assertEqual(
+                completed["run_state"]["active_stop_condition"],
+                "time_budget_reached",
+            )
+            self.assertNotIn("evaluation_budget", completed["run_state"])
 
 
 class StateAwareSelectionLifecycleTests(unittest.TestCase):
