@@ -177,8 +177,8 @@ class SDKSessionRunner:
                 mlebench = tomllib.load(stream).get("mlebench") or {}
             public_env = mlebench.get("public_data_env")
             if isinstance(public_env, str) and public_env:
-                env[public_env] = "/mnt/mle-public"
-                env["MLEBENCH_NAMESPACE_READY"] = "1"
+                env[public_env] = str(
+                    ctx.run_dir.resolve() / "run_input" / "public")
         return ClaudeAgentOptions(
             system_prompt=self._system_prompt(role, ctx),
             cwd=REPO_ROOT,

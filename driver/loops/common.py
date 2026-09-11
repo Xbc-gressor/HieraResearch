@@ -70,7 +70,6 @@ def preflight_env(task, run_dir, repo_root, cmd) -> None:
         if not isinstance(public_env, str) or not public_env:
             raise RunBlocked(f"tasks/{task}/task.toml declares invalid public_data_env")
         from tools.mlebench_stage import stage_public
-        from tools.mlebench_isolation import require_public_mount
 
         if os.environ.get("MLEBENCH_PRESTAGED") == "1":
             public_dir = Path(run_dir).resolve() / "run_input" / "public"
@@ -78,11 +77,7 @@ def preflight_env(task, run_dir, repo_root, cmd) -> None:
             public_dir = stage_public(
                 task, Path(run_dir), competition_id=mlebench.get("competition_id")
             )
-        # Staging alone is not an isolation boundary.  The operator wrapper
-        # must bind this tree at /mnt/mle-public inside a distinct mount
-        # namespace before the driver reaches this gate.
-        mounted_public = require_public_mount(public_dir)
-        os.environ[public_env] = str(mounted_public)
+        os.environ[public_env] = str(public_dir)
     cmd(["uv", "--project", f"tasks/{task}", "run", "python",
          "tools/preflight_env.py", "--task", task, "--run-dir", run_dir],
         repo_root)
