@@ -624,11 +624,6 @@ def _slate_plan_problems(plan, slot: dict, route_arm: int) -> list[str]:
         if not isinstance(plan.get(field_name), str) \
                 or not plan[field_name].strip():
             problems.append(f"plan needs a non-empty {field_name}")
-    if slot["carrier"]["op"] == "fresh":
-        expected = f"from scratch at {slot['point_id']}"
-        if isinstance(plan.get("change"), str) \
-                and plan["change"].strip() != expected:
-            problems.append(f"fresh-seat change must be {expected!r}")
     if route_arm and not isinstance(plan.get("route_provenance"), dict):
         problems.append(
             "route arm is active: plan needs a route_provenance object")
@@ -1084,6 +1079,47 @@ def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str,
     return receipt
 
 
+def _phase_c_recover_close(run_dir: Path, run_id: str, repo_root: Path, cmd,
+                           task: str) -> dict | None:
+    """Close/finalize a terminal Phase-C report using deterministic actions.
+
+    A tuner receipt is a session handoff and may truthfully say ``tuned=false``
+    even though the objective job exhausted its bout.  The report/action pair
+    is authoritative for deciding whether that bout can be closed.
+    """
+    candidate_dir = run_dir / "candidates" / str(run_id)
+    action_cmd = ["python", "tools/tuners/tune_tools.py", "phase-c-action",
+                  "--candidate-path", candidate_dir / "train.py",
+                  "--tune-report-json", candidate_dir / "tune_report.json"]
+    action = cmd(action_cmd, repo_root, check=False)
+    if getattr(action, "returncode", 1) != 0:
+        return None
+    decision = json.loads(action.stdout)
+    if decision.get("action") == "close_exhausted_stage":
+        closed = cmd(["python", "tools/tuners/tune_tools.py",
+                      "close-exhausted-stage",
+                      "--candidate-path", candidate_dir / "train.py",
+                      "--tune-report-json", candidate_dir / "tune_report.json"],
+                     repo_root, check=False)
+        if getattr(closed, "returncode", 1) != 0:
+            return None
+        action = cmd(action_cmd, repo_root, check=False)
+        if getattr(action, "returncode", 1) != 0:
+            return None
+        decision = json.loads(action.stdout)
+    if decision.get("action") != "finalize":
+        return None
+    result = cmd(["python", "tools/finalize_tuning.py",
+                  "--candidate-path", candidate_dir / "train.py",
+                  "--tune-report-json", candidate_dir / "tune_report.json",
+                  "--ledger", run_dir / "ledger.json",
+                  "--run-id", str(run_id), "--task", task],
+                 repo_root, check=False)
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    return json.loads(result.stdout)
+
+
 def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
           events, job_runner=execute_driver_job) -> dict:
     """Run the decoupled tuning step; return the effective tuner receipt."""
@@ -1101,8 +1137,19 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             problems = getattr(exc, "problems", [str(exc)])
             _or_block(run_dir, repo_root, cmd, events,
                       f"tuner reconciliation failed: {problems}")
-    # contradiction: receipt claims applied but the ledger disagrees
     tuned_id = receipt.get("tuned_run_id", "none")
+    # The receipt is only a handoff.  If it names a candidate, consult the
+    # deterministic phase-C action even when tuned=false; an exhausted bout
+    # must be closed and applied before the round can end.
+    if tuned_id != "none" and not _tune_flag(run_dir, tuned_id):
+        finalized = _phase_c_recover_close(
+            run_dir, tuned_id, repo_root, cmd, task)
+        if finalized is not None:
+            receipt = {**receipt, **finalized, "tuned": True,
+                       "tuned_run_id": tuned_id, "ledger_updated": True}
+        else:
+            events.emit("tuning_driver_finalize_deferred", run_id=tuned_id)
+    # contradiction: receipt claims applied but the ledger still disagrees
     if receipt.get("tuned") and tuned_id != "none" and \
             not _tune_flag(run_dir, tuned_id):
         note = (f"receipt claims tuned {tuned_id} but ledger has tune: false.")

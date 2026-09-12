@@ -35,8 +35,9 @@ Produce:
   deliberations or repeat hypothesis ids verbatim;
 - `change`: a parent-relative implementation delta — what to retain, add,
   remove, replace, or reconcile in the carrier parent's code. For a `fresh`
-  carrier (no parent code) use exactly `from scratch at <point-id>` with the
-  seat's point id. For `improve`, name the retained foundation and the
+  carrier (no parent code), describe the implementation you would build from
+  scratch; the driver derives the canonical fresh change marker from the
+  structured carrier. For `improve`, name the retained foundation and the
   concrete alteration. For `crossover`, state per parent what to inherit or
   modify and how those parts form one coherent implementation;
 - `candidate_name`: a stable short name hint.

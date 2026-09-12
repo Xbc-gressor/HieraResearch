@@ -247,12 +247,17 @@ class SlateAdmissionTests(unittest.TestCase):
         plans = self.gen / "plans"
         plans.mkdir(exist_ok=True)
         for slot in self.manifest["slate"]:
+            change = (
+                f"from scratch at {slot['point_id']}; implement the selected mechanism"
+                if slot["carrier"]["op"] == "fresh"
+                else f"Fixture change for slot {slot['slot']}."
+            )
             (plans / f"slot-{slot['slot']}.json").write_text(
                 json.dumps(
                     {
                         "slot": slot["slot"],
                         "idea": f"Fixture slate idea for {slot['run_id']}.",
-                        "change": f"Fixture change for slot {slot['slot']}.",
+                        "change": change,
                         "candidate_name": f"slate_{slot['run_id']}",
                     }
                 )
@@ -289,6 +294,10 @@ class SlateAdmissionTests(unittest.TestCase):
             self.assertEqual(
                 record["candidate_name"], f"slate_{slot['run_id']}"
             )
+            if slot["carrier"]["op"] == "fresh":
+                self.assertEqual(
+                    record["change"], f"from scratch at {slot['point_id']}"
+                )
             receipt = record["policy_receipt"]
             self.assertEqual(receipt["schema_version"], 8)
             self.assertEqual(receipt["policy"]["name"], "judged_slate")

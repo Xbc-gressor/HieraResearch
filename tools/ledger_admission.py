@@ -443,6 +443,18 @@ def _load_slate_plan(request: SlateAdmissionRequest, slot: int) -> dict:
     return plan
 
 
+def _change_for_slate_seat(slot: dict, plan: dict) -> str:
+    """Derive the persisted change contract from the frozen carrier.
+
+    The planner may describe a fresh implementation in natural language, but
+    fresh has no parent-relative delta.  That structural fact belongs to the
+    manifest, so admission supplies the canonical ledger value.
+    """
+    if slot["carrier"]["op"] == "fresh":
+        return f"from scratch at {slot['point_id']}"
+    return plan["change"]
+
+
 def _validate_judge_binding(
     data: dict, request: SlateAdmissionRequest, registry: dict
 ) -> tuple[dict, str]:
@@ -689,7 +701,7 @@ def admit_slate_atomic(data: dict, request: SlateAdmissionRequest) -> list[dict]
         record.update(
             kind="optimization",
             idea=plan["idea"],
-            change=plan["change"],
+            change=_change_for_slate_seat(slot, plan),
             source_run_ids=parents,
             op=op,
             semantic_point=slot["point"],
