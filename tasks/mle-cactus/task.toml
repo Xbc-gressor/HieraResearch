@@ -9,10 +9,6 @@ project = "envs/mle"
 working_dir = "tasks/mle-cactus"
 timeout_seconds = 300
 
-[seed]
-target_count = 1
-provided = ["train.py"]
-entrypoint = "train.py"
 
 [evaluation]
 score_fn = "evaluate_config"

@@ -42,7 +42,3 @@ Feature columns contain missing values; fit imputers and any learned
 preprocessing on training rows only. Set random states for stochastic models.
 The per-evaluation limit is 300 seconds; the cell's total runtime also includes
 agent calls, setup and final refitting. Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed; `train.py` is the candidate implementation.
-
-The supplied impute + one-hot logistic-regression control supports the
-`baseline-tune` loop. It is a repository-provided control, not a published
-Kaggle baseline.

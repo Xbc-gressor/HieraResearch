@@ -35,5 +35,3 @@ geometry directories. Training and test IDs are the per-split IDs created by
 the official MLE-bench preparation. This task has a 300 second
 per-evaluation limit. Dependencies are supplied by the shared `envs/mle` uv environment;
 `prepare.py` is fixed and read-only and `train.py` is the candidate file.
-
-The supplied regularized linear control supports the `baseline-tune` loop.

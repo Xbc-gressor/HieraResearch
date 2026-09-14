@@ -58,6 +58,3 @@ against other processes using the device later.
 The default per-evaluation limit is 300 seconds; the run's total runtime also
 includes agent calls, setup and final refitting. Dependencies are supplied by the shared `envs/mle` uv environment.
 `prepare.py` is evaluator-owned; `train.py` is the candidate implementation.
-
-The supplied word TF-IDF/naive-Bayes control supports the `baseline-tune` loop.
-It is a repository-provided control, not a published Kaggle baseline.

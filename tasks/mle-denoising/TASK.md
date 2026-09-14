@@ -33,8 +33,7 @@ dependency needs for installation into this shared environment before execution.
 `MLEBENCH_PUBLIC_DATA` points to a read-only directory containing only the
 prepared public `train/`, `train_cleaned/`, `test/` and `sampleSubmission.csv`.
 The public split is the one produced by the pinned MLE-bench preparation script;
-raw Kaggle archives and private `answers.csv` must not be accessed. The supplied
-affine pixel control in `train.py` supports the `baseline-tune` loop.
+raw Kaggle archives and private `answers.csv` must not be accessed.
 
 Images are decoded and cached by the evaluator. Dependencies are supplied by
 the shared `envs/mle` environment. `prepare.py` is fixed; `train.py` is the candidate
