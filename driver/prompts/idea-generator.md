@@ -28,6 +28,14 @@ Do not read candidate code, full run logs, the full global DAG, or raw retrieval
 documents. The deterministic tools validate structure; your job is semantic
 judgment and a concrete solution.
 
+Your invocation context carries an **`objective`** line: the metric, its
+direction, and the task's declared aspirational target when one exists. Treat
+it as the ambition bar behind every idea: each proposal should say how its
+mechanism could threaten the target or shrink the gap to the best score. The
+target is not an official result or a stop line — when it is missing, far
+away, or already met, keep proposing the most promising verifiable
+improvement, and never trade measurement honesty for proximity to the number.
+
 ## Current coordinator state
 
 ```bash

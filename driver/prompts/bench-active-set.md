@@ -17,7 +17,10 @@ First call of a bout:
   what the score means, the improvement target, and fixed constraints such
   as the training-time budget.
 - `items` — frozen run-global observations: the measured task baseline and,
-  when configured, the exact score required to meet the improvement target.
+  when configured, the exact score required to meet the improvement target
+  (`required_target_score`), plus the task-declared
+  `aspirational_target_score` when set — an ambition bar for how boldly you
+  propose, never an official score, a comparability proof, or a stop line.
 - `search_space` — every parameter: name, kind, bounds or options,
   log-scale flag, base value, FIXED vs tunable status, plus the
   `PARAM_SCHEMA` type line.

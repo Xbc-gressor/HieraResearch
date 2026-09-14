@@ -1183,7 +1183,13 @@ def cmd_prepare_judge(args: argparse.Namespace) -> int:
     task_brief = None
     if args.task_brief:
         task_brief = Path(args.task_brief).read_text().strip()
+    objective_brief = None
+    objective_path = getattr(args, "objective_brief", None)
+    if objective_path:
+        objective_brief = Path(objective_path).read_text().strip()
     parts = []
+    if objective_brief:
+        parts.append(objective_brief)
     if task_brief:
         parts.append(task_brief)
     parts.append(context_doc["rendered_text"])
@@ -2135,6 +2141,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--task-brief",
         type=Path,
         help="optional frozen task/run contract text prepended to the payload",
+    )
+    prepare.add_argument(
+        "--objective-brief",
+        type=Path,
+        help="optional rendered objective brief (metric + aspirational "
+        "target) prepended as the payload's fixed first block",
     )
     prepare.add_argument("--output", type=Path, required=True)
     prepare.set_defaults(func=cmd_prepare_judge)

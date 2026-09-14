@@ -12,6 +12,9 @@ service dependency.
 
 - `setup` — run directory initialized (`task`, `tag`); emitted by the
   hillclimb loop on fresh runs.
+- `objective_brief` — the run's `objective_brief.json` was written
+  (`metric`, `aspirational_target_score`, `target_source`); the declared
+  aspiration bar is diagnostic only and never a decision input.
 - `session_start` — a role SDK session opened (`role`, `invocation_id`,
   `resume`).
 - `session_end` — the session returned (`role`, `invocation_id`,

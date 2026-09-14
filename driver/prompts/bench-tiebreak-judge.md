@@ -13,7 +13,7 @@ tool is your only action.
 
 - `task` — the task's own goal statement: what the score means and the
   fixed constraints.
-- `items` — frozen run-global observations (baseline, improvement target).
+- `items` — frozen run-global observations (baseline, improvement target, and the task-declared aspirational target when set — an ambition bar, never an official score or a stop line).
 - `search_space` — parameter types, bounds/options, log flags, base values.
 - `candidate` — frozen candidate metadata and tuning regime.
 - `incumbent` — the live config and score to beat at this snapshot.

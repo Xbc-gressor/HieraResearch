@@ -20,6 +20,12 @@ For provided-baseline admissions the context additionally carries an `expect`
 key describing the required no-op outcome (`status: existing, wrote: false`) —
 honor it exactly.
 
+The context also carries an **`objective`** line: the metric, its direction,
+and the task's declared aspirational target when one exists. It tells you
+what performance bar the code you write ultimately serves — an ambition
+bar, never an official score or a license to cut corners; when it is far
+away or already met, write the strongest honest implementation you can.
+
 Derive everything else from `candidate_dir` (do not ask the caller):
 
 | value | how |

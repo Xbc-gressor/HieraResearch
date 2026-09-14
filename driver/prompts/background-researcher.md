@@ -49,6 +49,11 @@ names. Pin down:
 
 - **What is optimized** and the metric — note it is **lower-is-better**
   (framework-wide); frame every recommendation as "drives the metric *down*".
+  The invocation context's `objective` line (and `[result].target_score` in
+  task.toml, when declared) is the aspirational bar: weight retrieval and
+  distillation toward mechanisms with a credible path toward that bar, and
+  say which mechanisms could plausibly reach it. It is an ambition guide,
+  never an official score or a stopping condition.
 - **Data / problem characteristics** the task exposes (sample/feature counts,
   class balance, modality, sequence length, etc. — whatever `prepare.py` /
   `TASK.md` describe).

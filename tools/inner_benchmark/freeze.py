@@ -140,6 +140,7 @@ import apply_base_params  # noqa: E402
 import arm_api  # noqa: E402
 import checkpoint as checkpoint_mod  # noqa: E402
 import objective as objective_mod  # noqa: E402
+import objective_brief  # noqa: E402
 import space as space_mod  # noqa: E402
 import tune_tools  # noqa: E402
 from _common import _to_native, params_identity as _raw_identity  # noqa: E402
@@ -251,6 +252,9 @@ def _task_block(run_dir: Path, framework_cfg: dict) -> dict:
                 f"{toml_path}: [goal].relative_improvement_over_baseline "
                 "must be a finite number in [0, 1)"
             )
+    aspirational_target = objective_brief.validated_target(
+        task_toml.get("result")
+    )
     return {
         "score_fn": score_fn,
         "preflight_fn": preflight_fn,
@@ -259,6 +263,7 @@ def _task_block(run_dir: Path, framework_cfg: dict) -> dict:
         "relative_improvement_over_baseline": (
             float(relative_target) if relative_target is not None else None
         ),
+        "aspirational_target_score": aspirational_target,
     }
 
 

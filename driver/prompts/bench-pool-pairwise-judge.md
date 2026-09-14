@@ -12,7 +12,10 @@ only action.
   what the score means, the improvement target, and fixed constraints such
   as the training-time budget.
 - `items` — frozen run-global observations: the measured task baseline and,
-  when configured, the exact score required to meet the improvement target.
+  when configured, the exact score required to meet the improvement target
+  (`required_target_score`), plus the task-declared
+  `aspirational_target_score` when set — an ambition bar for how boldly you
+  propose, never an official score, a comparability proof, or a stop line.
 - `search_space` — parameter types, bounds/options, log flags, base values,
   and fixed versus tunable dimensions.
 - `candidate` — frozen candidate metadata and tuning regime.

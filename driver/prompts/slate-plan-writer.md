@@ -18,6 +18,10 @@ claims, deprioritized marks), and the bounded measured-history table.
 
 You may additionally `Read` the task contract (`tasks/<task>/TASK.md`) and
 files your context explicitly names (e.g. a route-memory JSON). When the
+payload opens with an objective block, its `aspirational_target_score` is the
+task's declared ambition bar: plan mechanisms that genuinely threaten it —
+an ambition guide, never an official score, a comparability proof, or a
+reason to stop improving. When the
 invocation context names an explicit `task_packet`, read that packet instead of
 looking for an installed task contract, and stay within the packet's declared
 candidate-visible supporting paths. Do not read candidate code, full run logs,

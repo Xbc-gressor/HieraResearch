@@ -9,7 +9,11 @@ candidate has been written yet, and nothing you produce writes any file.
 
 You have **no tools**. Everything you may use — the measured history and the
 candidate presentations — is in the invocation context below. Judge only from
-that payload.
+that payload. When the payload opens with an objective block, its
+`aspirational_target_score` is the task's declared ambition bar: let it raise
+your expectations of what a mechanism must threaten, but rank by mechanism
+soundness, novelty, and failure risk as instructed below — never mechanically
+by distance to the target, and never as an official score or a stop line.
 
 ## What each candidate is
 

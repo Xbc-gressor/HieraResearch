@@ -51,6 +51,10 @@ job:
 - **`bootstrap`** — the task ships no metric-emitting entrypoint, so no
   working copy exists yet. Create the initial `train.py` per the task
   contract's tiny-driver fallback (below).
+- **`objective`** — the metric, its direction, and the task's declared
+  aspirational target when one exists: the bar this code ultimately serves.
+  An ambition bar only — not an official score or a stop line; chase it with
+  real improvements whether it is far away or already met.
 - **`diagnosis_verdict`** — the driver's read-only diagnosis session
   classified the failure your last edit caused (`config_invalid` /
   `code_incompatible`). Apply that fix: a minimal repair of `train.py` that

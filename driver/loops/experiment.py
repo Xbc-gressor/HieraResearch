@@ -51,6 +51,12 @@ from . import common
 from . import rounds
 from .common import RunBlocked
 from tools.evaluation_budget import budget_status as objective_budget_status
+from tools.objective_brief import (
+    build_brief,
+    compact_line,
+    ensure_brief,
+    render_block,
+)
 from tools.scheduler.contract import (
     DEFAULT_K_EVAL,
     MIN_GENERATION_K_EVAL,
@@ -74,6 +80,21 @@ _RECONCILE_GUIDANCE = (
 # =============================================================================
 # Shared artifact and role-session helpers
 # =============================================================================
+
+
+def _objective_line(task_toml: dict, **scores) -> str:
+    """The one-line objective view every proposing/implementing role sees."""
+    return compact_line(build_brief(task_toml, **scores))
+
+
+def _objective_block(run_dir: Path) -> str | None:
+    """The rendered brief block for payload prefixes, when the run wrote one."""
+    try:
+        brief = json.loads(
+            (run_dir / "objective_brief.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return render_block(brief) if isinstance(brief, dict) else None
 
 
 def _brief(run_dir: Path, repo_root: Path, cmd) -> dict:
@@ -270,15 +291,18 @@ def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
 
 
 def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
-            events) -> list[dict]:
+            events, task_toml=None) -> list[dict]:
     """Generate one action batch and ensure every returned action was admitted."""
+    objective = _objective_line(task_toml or {})
+
     def admitted_missing(actions: list[dict]) -> list[str]:
         admitted = {r.get("run_id") for r in _ledger_records(run_dir)}
         return [a.get("run_id") for a in actions if a.get("run_id") not in admitted]
 
     try:
         receipt, _ = _invoke(runner, store, "idea-generator", task, tag,
-                             run_dir, round_no=round_no)
+                             run_dir, round_no=round_no,
+                             extra={"objective": objective})
     except InvocationFailed:
         receipt = None
     if receipt is not None and not admitted_missing(receipt.get("actions", [])):
@@ -289,6 +313,7 @@ def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             "Records already admitted for this generation stand; never "
             "re-admit them. Complete only the missing work.",
         "admitted_run_ids": [r.get("run_id") for r in _ledger_records(run_dir)],
+        "objective": objective,
     }
     try:
         receipt, _ = _invoke(runner, store, "idea-generator", task, tag,
@@ -481,6 +506,9 @@ def _invoke_slate_judge(runner, store, task, tag, run_dir, gen_dir, stage, *,
     task_brief = repo_root / "tasks" / task / "TASK.md"
     if task_brief.is_file():
         args += ["--task-brief", task_brief]
+    objective_path = run_dir / "objective_brief.json"
+    if objective_path.is_file():
+        args += ["--objective-brief", objective_path]
     _slate_cmd(run_dir, repo_root, cmd, events, args, f"prepare-judge {stage}")
     prompt_text = json.loads(input_path.read_text(encoding="utf-8"))[
         "prompt_text"]
@@ -633,11 +661,14 @@ def _slate_plan_problems(plan, slot: dict, route_arm: int) -> list[str]:
 
 
 def _slate_plan_payload(slot: dict, pool_doc: dict, context_doc: dict,
-                        route_memory_path) -> str:
+                        route_memory_path, objective_text: str | None = None) -> str:
     """The bounded plan input, bound to the manifest's point and carrier."""
     entry = next(entry for entry in pool_doc["pool"]
                  if entry["label"] == slot["label"])
-    parts = [
+    parts = []
+    if objective_text:
+        parts.append(objective_text)
+    parts.extend([
         "Frozen slot assignment (binding; the slate decision is final):",
         json.dumps({
             "slot": slot["slot"],
@@ -651,11 +682,12 @@ def _slate_plan_payload(slot: dict, pool_doc: dict, context_doc: dict,
         "Candidate summary exactly as the judges saw it:",
         json.dumps(entry["summary"], indent=2),
         str(context_doc.get("rendered_text") or ""),
-    ]
+    ])
     if route_memory_path is not None:
         parts.append(
             f"Route memory for this seat (read before planning routes): "
-            f"{route_memory_path}")
+            f"{route_memory_path}"
+        )
     return "\n\n".join(parts) + "\n"
 
 
@@ -668,6 +700,7 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
     pool_doc = json.loads((gen_dir / "pool.json").read_text(encoding="utf-8"))
     context_doc = json.loads(
         (gen_dir / "context.json").read_text(encoding="utf-8"))
+    objective_text = _objective_block(run_dir)
     for slot in manifest["slate"]:
         plan_path = plans_dir / f"slot-{slot['slot']}.json"
         if plan_path.exists():
@@ -700,7 +733,8 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
                 runner, store, "slate-plan-writer", task, tag, run_dir,
                 run_id=slot["run_id"], round_no=round_no, extra=extra,
                 inline_payload=_slate_plan_payload(
-                    slot, pool_doc, context_doc, route_memory_path))
+                    slot, pool_doc, context_doc, route_memory_path,
+                    objective_text=objective_text))
         except InvocationFailed as exc:
             _or_block(run_dir, repo_root, cmd, events,
                       f"slate-plan-writer failed for slot {slot['slot']}: "
@@ -998,22 +1032,24 @@ def _extractor_extra(run_dir: Path, run_id: str, candidate_dir: Path,
 
 
 def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
-                         cmd, events, job_runner=execute_driver_job) -> None:
+                          cmd, events, job_runner=execute_driver_job,
+                          task_toml=None) -> None:
     """candidate-writer + extractor with evidence-branched escalation."""
     candidate_dir = run_dir / "candidates" / run_id
+    objective = _objective_line(task_toml or common.load_task_toml(task, repo_root))
+    writer_extra = {"candidate_dir": str(candidate_dir), "objective": objective}
     # Resolved once per candidate implementation so every extractor retry of
     # this candidate sees the identical donor binding.
     donor_extra = _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events)
     try:
         _, writer_inv = _invoke(runner, store, "candidate-writer", task, tag,
-                                run_dir, run_id=run_id,
-                                extra={"candidate_dir": str(candidate_dir)})
+                                run_dir, run_id=run_id, extra=writer_extra)
     except InvocationFailed as exc:
         # invocation failure: no crash evidence exists — retry once, then block
         try:
             _, writer_inv = _invoke(runner, store, "candidate-writer", task,
                                     tag, run_dir, run_id=run_id,
-                                    extra={"candidate_dir": str(candidate_dir)})
+                                    extra=writer_extra)
         except InvocationFailed as retry_exc:
             _or_block(run_dir, repo_root, cmd, events,
                       f"candidate-writer failed for {run_id}: "
@@ -1303,6 +1339,12 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         _or_block(run_dir, repo_root, cmd, events, str(exc))
     common.preflight_env(task, run_dir, repo_root, cmd)
     write_metadata(run_dir, model, cli_path)
+    brief = ensure_brief(run_dir, task_toml)
+    events.emit("objective_brief", path=str(run_dir / "objective_brief.json"),
+                metric=brief.get("metric"),
+                aspirational_target_score=brief.get(
+                    "aspirational_target_score"),
+                target_source=brief.get("target_source"))
 
     # background-researcher runs ONCE, never in the loop. A run dir pre-seeded
     # with a frozen background (background.md + retrieval manifest) skips
@@ -1310,6 +1352,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     # failure blocks rather than letting the researcher rewrite the frozen
     # artifacts.
     strategy = _dimension_strategy(run_dir)
+    objective = _objective_line(task_toml)
     preseeded = (
         (run_dir / "background.md").exists()
         and (run_dir / "background_retrieval.json").exists()
@@ -1326,7 +1369,8 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
             repairable=_background_researcher_invoked(run_dir))
     else:
         try:
-            _invoke(runner, store, "background-researcher", task, tag, run_dir)
+            _invoke(runner, store, "background-researcher", task, tag, run_dir,
+                    extra={"objective": objective})
         except InvocationFailed as exc:
             _or_block(run_dir, repo_root, cmd, events,
                       f"background-researcher failed: {exc.problems}")
@@ -1471,7 +1515,7 @@ def _background_faithfulness_gate(runner, store, task, tag, run_dir,
 
 
 def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
-                  model, cli_path) -> None:
+                  model, cli_path, task_toml=None) -> None:
     """Finish any interrupted setup work and restore a runnable phase."""
     metadata_path = run_dir / "run_metadata.json"
     if metadata_path.exists():
@@ -1480,6 +1524,7 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
     else:
         # The run was killed before fresh setup reached write_metadata().
         write_metadata(run_dir, model, cli_path)
+    ensure_brief(run_dir, task_toml or common.load_task_toml(task, repo_root))
 
     common.preflight_env(task, run_dir, repo_root, cmd)
 
@@ -1500,7 +1545,9 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
         # The run was killed while the one-time background-research step was
         # in progress. Resume that setup phase before entering ideation.
         try:
-            _invoke(runner, store, "background-researcher", task, tag, run_dir)
+            _invoke(runner, store, "background-researcher", task, tag, run_dir,
+                    extra={"objective": _objective_line(
+                        task_toml or common.load_task_toml(task, repo_root))})
         except InvocationFailed as exc:
             _or_block(run_dir, repo_root, cmd, events,
                       f"background-researcher failed: {exc.problems}")
@@ -1686,14 +1733,15 @@ def _resume_pending_candidates(runner, store, task, tag, run_dir, brief,
 
 def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
                          repo_root, cmd, events,
-                         job_runner=execute_driver_job, model=None) -> list[dict]:
+                         job_runner=execute_driver_job, model=None,
+                         task_toml=None) -> list[dict]:
     """Generate one bounded action batch and take each action through step 0+1."""
     if _semantic_policy(run_dir) == "judged_slate":
         return _evaluate_judged_generation(runner, store, task, tag, run_dir,
                                            round_no, repo_root, cmd, events,
                                            model, job_runner)
     actions = _ideate(runner, store, task, tag, run_dir, round_no,
-                      repo_root, cmd, events)
+                      repo_root, cmd, events, task_toml or {})
     for action in actions:
         if budget_status(run_dir, repo_root, cmd).get("reached"):
             break
@@ -1720,6 +1768,7 @@ def _round_step(runner, store, task, tag, run_dir, round_no, task_toml,
         actions = _evaluate_generation(
             runner, store, task, tag, run_dir, round_no,
             repo_root, cmd, events, job_runner, model=model,
+            task_toml=task_toml,
         )
         return actions, False
     events.emit("round_optimize", round_no=round_no,
@@ -1806,7 +1855,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     extra=extra,
                 )
             _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd,
-                          events, model, cli_path)
+                          events, model, cli_path, task_toml=task_toml)
 
         # Applies to both fresh setup and resume. A kill between init_run and
         # add-record must not let a provided control silently become seedless.
@@ -1882,6 +1931,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             actions = _evaluate_generation(
                 runner, store, task, tag, run_dir, round_no,
                 repo_root, cmd, events, job_runner, model=model,
+                task_toml=task_toml,
             )
 
             # -----------------------------------------------------------------

@@ -186,4 +186,25 @@ def compact_status(task: str, tag: str, run_dir: Path,
                     "last_status", "active_stop_condition"):
             if key in brief:
                 status[key] = brief[key]
+        objective = _objective_view(run_dir, status.get("best_score"))
+        if objective is not None:
+            status["objective_target"] = objective
     return status
+
+
+def _objective_view(run_dir: Path, best_score) -> dict | None:
+    """Diagnostic-only target view: declared bar + current lower-is-better
+    gap. Never a decision input; absent when the run stored no brief."""
+    brief = _load_json(run_dir / "objective_brief.json")
+    target = brief.get("aspirational_target_score") if isinstance(brief, dict) else None
+    if not isinstance(target, (int, float)) or isinstance(target, bool):
+        return None
+    view = {
+        "aspirational_target_score": target,
+        "target_source": brief.get("target_source"),
+        "target_semantics": brief.get("target_semantics"),
+    }
+    if isinstance(best_score, (int, float)) and not isinstance(best_score, bool):
+        view["run_best"] = best_score
+        view["gap_to_target"] = best_score - target  # lower-is-better
+    return view

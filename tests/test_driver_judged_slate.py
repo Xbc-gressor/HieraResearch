@@ -249,6 +249,11 @@ class JudgedCmd(ExperimentCmd):
                         if "--task-brief" in args
                         else None
                     ),
+                    objective_brief=(
+                        Path(self._opt(args, "--objective-brief"))
+                        if "--objective-brief" in args
+                        else None
+                    ),
                     output=Path(self._opt(args, "--output")),
                 )
             )

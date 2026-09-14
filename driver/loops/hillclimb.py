@@ -18,6 +18,7 @@ from ..roles import REPO_ROOT, ROLES, InvocationContext
 from ..session import InvocationFailed
 from ..status import budget_status
 from . import common
+from tools.objective_brief import build_brief, compact_line
 
 TSV_HEADER = "step\tscore\tstatus\tdescription\n"
 
@@ -296,11 +297,14 @@ def _restore_best(run_dir, events) -> None:
 
 
 def _editor_session(runner, store, task, tag, run_dir, extra=None,
-                    resume_from: int | None = None) -> int:
+                    resume_from: int | None = None,
+                    objective: str | None = None) -> int:
     inv_id = store.next_invocation_id()
     resume = None
     if resume_from is not None:
         resume = store.load_session_id("hillclimb-editor", resume_from)
+    if objective:
+        extra = {**(extra or {}), "objective": objective}
     ctx = InvocationContext(task=task, tag=tag, run_dir=run_dir,
                             invocation_id=inv_id, extra=extra or {},
                             resume_session_id=resume)
@@ -320,6 +324,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
     task_toml = common.load_task_toml(task, repo_root)
     metric = task_toml["result"]["metric"]
     required_patterns = task_toml["result"].get("required_patterns", [])
+    objective = compact_line(build_brief(task_toml))
     stop_condition = "none"
 
     if fresh:
@@ -365,7 +370,8 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
             last_editor = _editor_session(
                 runner, store, task, tag, run_dir,
                 extra={"bootstrap": "create the initial working copy per the "
-                                     "task contract's tiny-driver fallback"})
+                                     "task contract's tiny-driver fallback"},
+                objective=objective)
         except InvocationFailed as exc:
             stop_condition = f"editor bootstrap failed: {exc.problems}"
             events.emit("blocked", reason=stop_condition)
@@ -413,7 +419,8 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
             try:
                 last_editor = _editor_session(runner, store, task, tag, run_dir,
                                               extra=extra,
-                                              resume_from=last_editor)
+                                              resume_from=last_editor,
+                                              objective=objective)
             except InvocationFailed:
                 # One bounded retry with a FRESH session. Errored anchors are
                 # refused by the resume guard anyway, and the repetition
@@ -422,7 +429,8 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 try:
                     last_editor = _editor_session(runner, store, task, tag,
                                                   run_dir, extra=extra,
-                                                  resume_from=None)
+                                                  resume_from=None,
+                                                  objective=objective)
                 except InvocationFailed as exc:
                     stop_condition = f"editor invocation failed: {exc.problems}"
                     events.emit("blocked", reason=stop_condition)
@@ -463,7 +471,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 last_editor = _editor_session(
                     runner, store, task, tag, run_dir,
                     extra={"diagnosis_verdict": verdict},
-                    resume_from=last_editor)
+                    resume_from=last_editor, objective=objective)
             except InvocationFailed as exc:
                 stop_condition = f"editor repair failed: {exc.problems}"
                 events.emit("blocked", reason=stop_condition)
@@ -522,7 +530,7 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                         runner, store, task, tag, run_dir,
                         extra={"diagnosis_verdict": verdict,
                                "failure_evidence": evidence},
-                        resume_from=last_editor)
+                        resume_from=last_editor, objective=objective)
                 except InvocationFailed:
                     break
                 try:

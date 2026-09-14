@@ -149,6 +149,7 @@ def build_admitted_generation(
                 stage=stage,
                 labels=None,
                 task_brief=None,
+                objective_brief=None,
                 output=judgments / f"{stage}.input.json",
             ),
         )

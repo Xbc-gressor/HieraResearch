@@ -66,6 +66,7 @@ from tune_tools import (  # noqa: E402
     _read_literal_mapping,
 )
 from validate_tasks import ROOT, parse_task_toml  # noqa: E402
+import objective_brief  # noqa: E402
 
 import arm_api  # noqa: E402
 import checkpoint as checkpoint_mod  # noqa: E402
@@ -125,6 +126,14 @@ def _configured_score_fn(candidate_path: Path) -> str:
 def _configured_preflight_fn(candidate_path: Path) -> str | None:
     name = _task_section(candidate_path, "evaluation").get("preflight_fn")
     return name if isinstance(name, str) and name else None
+
+
+def _configured_target_score(candidate_path: Path) -> float | None:
+    # Keep local-tr checkpoints aligned with hebo_search: the task-declared
+    # aspiration is context for LLM arms, never a scheduling input.
+    return objective_brief.validated_target(
+        _task_section(candidate_path, "result")
+    )
 
 
 def _best_so_far(report_path: Path, search_space: dict) -> tuple[dict, float] | None:
@@ -265,6 +274,7 @@ def _build_checkpoint(
             preflight_fn=_configured_preflight_fn(candidate_path) or "preflight_config",
             per_runtime_limit=read_runtime_limit(candidate_path),
             project=_task_section(candidate_path, "env").get("project"),
+            aspirational_target_score=_configured_target_score(candidate_path),
         ),
         incumbent=checkpoint_mod.Incumbent(
             params=dict(incumbent_params), score=float(incumbent_score)

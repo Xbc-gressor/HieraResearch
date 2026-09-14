@@ -32,7 +32,8 @@ Schema (required unless noted)::
                "preflight_fn": "preflight_config",
                "per_runtime_limit": 900,                   # number or null
                "project": "tasks/<task>",                  # optional; see below
-               "relative_improvement_over_baseline": 0.075}, # optional
+               "relative_improvement_over_baseline": 0.075,    # optional
+               "aspirational_target_score": 1.0265},           # optional
       "items": {"task_baseline": {"...": "frozen run item"}},
       "incumbent": {"params": {...}, "score": 1.23},
       "incumbent_is_inherited_control": false,
@@ -107,6 +108,9 @@ class TaskSpec:
     per_runtime_limit: float | None
     project: str | None = None
     relative_improvement_over_baseline: float | None = None
+    # Task-declared aspirational target ([result].target_score): an
+    # anti-slop ambition bar for the LLM arms, never a decision input.
+    aspirational_target_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -327,12 +331,18 @@ def _task_spec(path: Path, raw) -> TaskSpec:
             raise ValueError(
                 f"{path}: task.relative_improvement_over_baseline must be in [0, 1)"
             )
+    aspirational = raw.get("aspirational_target_score")
+    if aspirational is not None:
+        aspirational = _finite_number(
+            aspirational, f"{path}: task.aspirational_target_score"
+        )
     return TaskSpec(
         score_fn=score_fn,
         preflight_fn=preflight_fn,
         per_runtime_limit=limit,
         project=project,
         relative_improvement_over_baseline=target,
+        aspirational_target_score=aspirational,
     )
 
 

@@ -39,6 +39,7 @@ from ..roles import REPO_ROOT, ROLES, InvocationContext
 from ..session import InvocationFailed
 from ..status import budget_status
 from . import common
+from tools.objective_brief import ensure_brief, validated_target
 
 SETUP_GUARD = "_rewrite_setup_done"
 REWRITE_DIR = "_rewrite"
@@ -274,6 +275,7 @@ def _setup(task, tag, run_dir, task_toml, repo_root, max_evaluations, timeout,
     copy — imported candidates carry their own train.py."""
     events.emit("setup", task=task, tag=tag)
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout)
+    ensure_brief(run_dir, task_toml or {})
     cmd(["uv", "--project", common.task_project(task, task_toml), "sync"], repo_root)
     common.run_prepare(task, task_toml, repo_root, cmd)
     common.preflight_env(task, run_dir, repo_root, cmd)
@@ -337,7 +339,8 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
 
     extra = _editor_extra(
         candidate, best, metric, bouts, run_best=run_best,
-        target_score=(task_toml or {}).get("result", {}).get("target_score"))
+        target_score=validated_target(
+            (task_toml or {}).get("result")))
     try:
         receipt, inv_id = _editor_session(
             runner, store, task, tag, run_dir, extra,

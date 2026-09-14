@@ -84,6 +84,7 @@ from tune_tools import (  # noqa: E402
     _read_literal_mapping,
 )
 from validate_tasks import ROOT, parse_task_toml  # noqa: E402
+import objective_brief  # noqa: E402
 
 import arm_api  # noqa: E402
 import checkpoint as checkpoint_mod  # noqa: E402
@@ -180,6 +181,14 @@ def _configured_relative_improvement(candidate_path: Path) -> float | None:
             "a finite number in [0, 1)"
         )
     return float(value)
+
+
+def _configured_target_score(candidate_path: Path) -> float | None:
+    # The task-declared aspirational target ([result].target_score) the
+    # brief renders to every inner LLM arm; None when the task sets none.
+    return objective_brief.validated_target(
+        _task_section(candidate_path, "result")
+    )
 
 
 def _run_global_items(
@@ -472,6 +481,7 @@ def _build_checkpoint(
             per_runtime_limit=read_runtime_limit(candidate_path),
             project=_task_section(candidate_path, "env").get("project"),
             relative_improvement_over_baseline=relative_improvement,
+            aspirational_target_score=_configured_target_score(candidate_path),
         ),
         incumbent=checkpoint_mod.Incumbent(
             params=dict(incumbent_params), score=float(incumbent_score)

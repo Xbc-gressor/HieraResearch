@@ -605,6 +605,15 @@ def _experiment_items(checkpoint: "_checkpoint.Checkpoint") -> str:
             f"required_relative_improvement: {relative}",
             f"required_target_score: {target}",
         ])
+    aspirational = checkpoint.task.aspirational_target_score
+    if aspirational is not None:
+        lines.extend([
+            f"aspirational_target_score: {aspirational}",
+            "aspirational_target_semantics: task-declared ambition bar "
+            "(lower-is-better) — aim proposals at mechanisms that threaten "
+            "it; it is not an official score, a comparability proof, or a "
+            "stop line, and a met or distant target never stops improvement",
+        ])
     return "\n".join(lines)
 
 

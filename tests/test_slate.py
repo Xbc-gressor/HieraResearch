@@ -789,6 +789,7 @@ class CliPipelineTests(unittest.TestCase):
                         stage=stage,
                         labels=None,
                         task_brief=None,
+                        objective_brief=None,
                         output=judgments / f"{stage}.input.json",
                     )
                 )
@@ -893,6 +894,7 @@ class CliPipelineTests(unittest.TestCase):
                         stage="boundary",
                         labels=",".join(union),
                         task_brief=None,
+                        objective_brief=None,
                         output=judgments / "boundary.input.json",
                     )
                 )
@@ -948,6 +950,7 @@ class CliPipelineTests(unittest.TestCase):
                         stage="regular-0",
                         labels=None,
                         task_brief=None,
+                        objective_brief=None,
                         output=judgments / "regular-0.input.json",
                     )
                 )
