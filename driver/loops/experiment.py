@@ -37,6 +37,7 @@ from ..events import EventsLog
 from ..jobs import DriverJobError, execute_driver_job
 from ..metadata import warn_on_mismatch, write_metadata
 from ..receipts import ReceiptStore
+from ..resources import ResourceUnavailable
 from ..roles import (
     REPO_ROOT,
     ROLES,
@@ -201,7 +202,8 @@ def _invoke_with_driver_jobs(
                 receipt["driver_job"],
                 repo_root=repo_root,
             )
-        except (DriverJobError, OSError, subprocess.SubprocessError) as exc:
+        except (DriverJobError, OSError, subprocess.SubprocessError,
+                ResourceUnavailable) as exc:
             result = {
                 "kind": receipt["driver_job"].get("kind"),
                 "accepted": False,
@@ -1254,7 +1256,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
-    cmd(["uv", "--directory", f"tasks/{task}", "sync"], repo_root)
+    cmd(["uv", "--directory", common.task_project(task, task_toml), "sync"], repo_root)
     # the protocol gates this on "required assets absent"; the task
     # contract exposes no deterministic signal for that, so a declared
     # prepare command runs on fresh setup (same choice as the hillclimb

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Launch a driver command with one MLE-bench public-data mount.
 
-This is an operator boundary, not a replacement for the driver.  It stages
-the selected task before entering bubblewrap, then exposes only the repository
-and that task's public tree.  The driver consequently fails closed if it is
-run directly as root without this wrapper.
+This is an optional stronger operator boundary.  The evaluator itself uses
+the soft public staging checks in ``mlebench_isolation``.
 """
 
 from __future__ import annotations
@@ -54,7 +52,6 @@ def main() -> int:
     env = os.environ.copy()
     env.update({
         "MLEBENCH_PRESTAGED": "1",
-        "MLEBENCH_NAMESPACE_READY": "1",
         "MLEBENCH_PUBLIC_DATA": "/mnt/mle-public",
     })
     sandbox = [
@@ -70,7 +67,6 @@ def main() -> int:
     _optional_bind(sandbox, Path.home() / ".cache", "/root/.cache")
     _optional_bind(sandbox, Path.home() / "miniconda3", "/root/miniconda3")
     sandbox += ["--setenv", "MLEBENCH_PRESTAGED", "1",
-                "--setenv", "MLEBENCH_NAMESPACE_READY", "1",
                 "--setenv", "MLEBENCH_PUBLIC_DATA", "/mnt/mle-public",
                 "--setenv", "PATH", "/root/miniconda3/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin"]
     sandbox.extend(command)

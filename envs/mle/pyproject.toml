@@ -1,0 +1,22 @@
+[project]
+name = "mle-evaluation-runtime"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    "pillow>=10,<12",
+    "scikit-learn==1.6.1",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "transformers==4.49.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true

@@ -101,3 +101,63 @@ def export_submission(make_model, params: dict, output: Path) -> None:
     temporary = output.with_suffix(".tmp")
     submission.to_csv(temporary, index=False)
     temporary.replace(output)
+
+
+def evaluate_protocol(artifact: Path, params: dict, *, stage: str = "protocol",
+                      fidelity: str = "full") -> dict:
+    """Score a candidate-produced protocol artifact in the evaluator process.
+
+    The candidate only writes ``torch_outputs.npz``; this function owns the
+    public split labels and independently validates both prediction streams.
+    It never imports candidate code or opens files under the candidate source
+    tree.
+    """
+    artifact = Path(artifact)
+    output = artifact / "torch_outputs.npz" if artifact.is_dir() else artifact
+    if not output.is_file():
+        raise ValueError(f"protocol output is missing: {output}")
+    values = np.load(output, allow_pickle=False)
+    dataset, holdout_texts, holdout_labels = _split()
+    frame = _training_data()
+    _, valid_frame = train_test_split(
+        frame, test_size=0.2, stratify=frame.author, random_state=42,
+    )
+    test = pd.read_csv(public_dir() / "test.csv")
+    expected_holdout = np.asarray(values["holdout_ids"])
+    canonical_holdout = valid_frame.id.to_numpy()
+    if expected_holdout.tolist() != canonical_holdout.tolist():
+        raise ValueError("protocol holdout IDs do not match task split")
+    if len(expected_holdout) != len(holdout_labels) or len(set(expected_holdout)) != len(expected_holdout):
+        raise ValueError("protocol holdout IDs have the wrong cardinality")
+    holdout_ids = list(expected_holdout.tolist())
+    test_ids = list(np.asarray(values["test_ids"]).tolist())
+    if test_ids != list(test.id.to_numpy()):
+        raise ValueError("protocol test IDs do not match public test.csv")
+    holdout_predictions = np.asarray(values["holdout_predictions"], dtype=float)
+    test_predictions = np.asarray(values["test_submission"], dtype=float)
+    if holdout_predictions.shape != (len(holdout_ids), len(CLASSES)):
+        raise ValueError("invalid protocol holdout prediction shape")
+    if test_predictions.shape != (len(test_ids), len(CLASSES)):
+        raise ValueError("invalid protocol test prediction shape")
+    if not np.isfinite(holdout_predictions).all() or not np.isfinite(test_predictions).all():
+        raise ValueError("protocol predictions contain non-finite values")
+    if not np.allclose(holdout_predictions.sum(axis=1), 1, atol=1e-6) or not np.allclose(test_predictions.sum(axis=1), 1, atol=1e-6):
+        raise ValueError("protocol probabilities must sum to one")
+    # Canonicalize harmless float32 summation drift before scoring and
+    # persisting the evaluator output manifest.
+    holdout_predictions = holdout_predictions / holdout_predictions.sum(axis=1, keepdims=True)
+    test_predictions = test_predictions / test_predictions.sum(axis=1, keepdims=True)
+    score = float(log_loss(holdout_labels, holdout_predictions, labels=list(CLASSES)))
+    return {
+        "expected_holdout_ids": holdout_ids,
+        "holdout_predictions": dict(zip(holdout_ids, holdout_predictions.tolist())),
+        "expected_test_ids": test_ids,
+        "test_submission": dict(zip(test_ids, test_predictions.tolist())),
+        "score": score,
+    }
+
+
+def evaluate_official(artifact: Path, params: dict, *, stage: str = "official",
+                      fidelity: str = "full") -> dict:
+    """Validate the finalized artifact through the task protocol."""
+    return evaluate_protocol(artifact, params, stage=stage, fidelity=fidelity)

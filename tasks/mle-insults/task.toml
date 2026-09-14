@@ -3,7 +3,7 @@ description = "Detecting Insults in Social Commentary: public-training validatio
 
 [env]
 type = "uv"
-project = "tasks/mle-insults"
+project = "envs/mle"
 
 [run]
 working_dir = "tasks/mle-insults"
@@ -17,6 +17,12 @@ entrypoint = "train.py"
 [evaluation]
 score_fn = "evaluate_config"
 environment_preflight_fn = "preflight_environment"
+
+[resources]
+accelerator = "cuda"
+devices = 1
+lease_wait_timeout = 600
+min_memory_gib = 8
 
 [result]
 metric = "one_minus_auc"

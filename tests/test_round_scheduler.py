@@ -219,6 +219,56 @@ class RoundPolicyTests(unittest.TestCase):
             self.assertEqual(round_policy.decide(state, run_dir).action, "DEFER")
 
 
+class LedgerViewTests(unittest.TestCase):
+    def test_run_best_materializes_one_view_for_all_candidates(self) -> None:
+        import os
+        from unittest import mock
+
+        import tools.evaluation_records as evaluation_records
+        from tools.evaluation_records import EvaluationRecord, append_record
+
+        from driver.loops import rounds as driver_rounds
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "unit" / "view"
+            run_dir.mkdir(parents=True)
+            records = []
+            for candidate, scores in (("001", (0.5, 0.4)), ("002", (0.3, 0.2))):
+                record_path = run_dir / f"{candidate}.jsonl"
+                digests = []
+                for score in scores:
+                    row = EvaluationRecord(
+                        task_id="unit", candidate_id=candidate,
+                        input_revision="r", output_artifact_digest="o",
+                        contract_version="1", stage="proxy", fidelity="fast",
+                        metric_name="loss", score=score).to_dict()
+                    append_record(record_path, row)
+                    digests.append(row["record_digest"])
+                records.append({
+                    "run_id": candidate,
+                    "evaluation_record_digests": digests,
+                    "evaluation_record_paths": {
+                        digest: str(record_path) for digest in digests},
+                })
+            (run_dir / "ledger.json").write_text(json.dumps(
+                {"records": records}))
+            calls = []
+            real_read = evaluation_records.read_records
+
+            def counting_read(path):
+                calls.append(str(path))
+                return real_read(path)
+
+            with mock.patch.object(evaluation_records, "read_records",
+                                   counting_read), \
+                 mock.patch.dict(os.environ, {
+                     "EVALUATION_STAGE": "proxy",
+                     "EVALUATION_FIDELITY": "fast"}):
+                self.assertEqual(driver_rounds._run_best(run_dir), 0.2)
+            # One read per candidate file, not one per (record, digest).
+            self.assertEqual(len(calls), 2)
+
+
 class KeptRewriteTests(unittest.TestCase):
     def test_confirmation_rebase_and_ledger_commit(self) -> None:
         registry = fixture_registry()

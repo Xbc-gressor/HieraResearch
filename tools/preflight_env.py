@@ -58,6 +58,18 @@ def run_preflight(task_name: str, run_dir: Path) -> dict:
         {"name": "prepare_import", "status": "ok"},
         {"name": "score_surface", "status": "ok", "symbol": score_name},
     ]
+    if config.get("resources", {}).get("accelerator") == "cuda":
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("task requires CUDA, but the evaluation environment cannot use it")
+        checks.append({
+            "name": "cuda_runtime",
+            "status": "ok",
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "visible_devices": torch.cuda.device_count(),
+        })
     hook_result = None
     hook_name = evaluation.get("environment_preflight_fn")
     if hook_name is not None:

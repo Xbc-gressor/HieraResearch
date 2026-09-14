@@ -25,6 +25,7 @@ import math
 from pathlib import Path
 import subprocess
 import time
+import os
 
 from ..session import InvocationFailed
 from ..status import budget_status
@@ -51,33 +52,66 @@ def _record(run_dir, repo_root, cmd, decision_id, run_id, *, consumed,
     cmd(args, repo_root)
 
 
-def _ledger_score(run_dir: Path, run_id: str) -> float | None:
-    """The candidate's current best, tuned score first (like the scheduler)."""
+def _load_ledger_view(run_dir: Path) -> dict | None:
+    """One ledger load with evaluator records materialized; None when the
+    view cannot be built (missing ledger or unreadable records)."""
     path = run_dir / "ledger.json"
     if not path.exists():
         return None
-    for record in json.loads(path.read_text(encoding="utf-8")).get("records", []):
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        from tools.scheduler.state import materialize_evaluation_records
+        ledger = materialize_evaluation_records(ledger)
+    except (ImportError, OSError, ValueError, TypeError):
+        return None
+    return ledger
+
+
+def _record_score(record: dict) -> float | None:
+    """One record's current best, tuned score first (like the scheduler)."""
+    stage = os.environ.get("EVALUATION_STAGE")
+    fidelity = os.environ.get("EVALUATION_FIDELITY")
+    if stage or fidelity:
+        if not stage or not fidelity:
+            return None
+        try:
+            from tools.evaluation_records import best_score
+            value = best_score(record.get("evaluation_records", ()),
+                               stage=stage, fidelity=fidelity)
+        except (ImportError, ValueError):
+            return None
+        return float(value) if value is not None and math.isfinite(float(value)) else None
+    keys = ["best_warm_score", "final_best_score"]
+    if record.get("tune"):
+        keys.insert(0, "final_best_score")
+    for key in keys:
+        value = record.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and math.isfinite(value):
+            return float(value)
+    return None
+
+
+def _ledger_score(run_dir: Path, run_id: str) -> float | None:
+    """The candidate's current best, tuned score first (like the scheduler)."""
+    ledger = _load_ledger_view(run_dir)
+    if ledger is None:
+        return None
+    for record in ledger.get("records", []):
         if str(record.get("run_id")) != run_id:
             continue
-        keys = ["best_warm_score", "final_best_score"]
-        if record.get("tune"):
-            keys.insert(0, "final_best_score")
-        for key in keys:
-            value = record.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool) \
-                    and math.isfinite(value):
-                return float(value)
+        return _record_score(record)
     return None
 
 
 def _run_best(run_dir: Path) -> float | None:
     """The best finite score over every candidate in the run (the editor's bar)."""
-    path = run_dir / "ledger.json"
-    if not path.exists():
+    ledger = _load_ledger_view(run_dir)
+    if ledger is None:
         return None
     scores = []
-    for record in json.loads(path.read_text(encoding="utf-8")).get("records", []):
-        score = _ledger_score(run_dir, str(record.get("run_id")))
+    for record in ledger.get("records", []):
+        score = _record_score(record)
         if score is not None:
             scores.append(score)
     return min(scores) if scores else None
@@ -85,7 +119,14 @@ def _run_best(run_dir: Path) -> float | None:
 
 def status(run_dir, repo_root, cmd) -> dict:
     """The generate-or-optimize switch for this loop iteration."""
-    return _round(run_dir, repo_root, cmd, "status")
+    stage = os.environ.get("EVALUATION_STAGE")
+    fidelity = os.environ.get("EVALUATION_FIDELITY")
+    args = ["status"]
+    if stage or fidelity:
+        if not stage or not fidelity:
+            raise RuntimeError("EVALUATION_STAGE and EVALUATION_FIDELITY must be set together")
+        args += ["--stage", stage, "--fidelity", fidelity]
+    return _round(run_dir, repo_root, cmd, *args)
 
 
 def _eval_seconds(run_dir, repo_root, cmd, run_id) -> tuple[int, float | None]:
@@ -302,7 +343,12 @@ def optimization_phase(runner, store, task, tag, run_dir, round_no, task_toml,
             _overhead(run_dir, repo_root, cmd, "tune", run_id, started,
                       evals_before)
     finally:
-        ended = _round(run_dir, repo_root, cmd, "end")
+        args = ["end"]
+        stage = os.environ.get("EVALUATION_STAGE")
+        fidelity = os.environ.get("EVALUATION_FIDELITY")
+        if stage or fidelity:
+            args += ["--stage", stage, "--fidelity", fidelity]
+        ended = _round(run_dir, repo_root, cmd, *args)
         events.emit("round_end", round_no=round_no, cycle=ended.get("cycle"),
                     cycle_start_count=ended.get("cycle_start_count"))
     return progressed

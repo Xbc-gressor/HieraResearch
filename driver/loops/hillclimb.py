@@ -13,7 +13,7 @@ from pathlib import Path
 from ..events import EventsLog
 from ..metadata import warn_on_mismatch, write_metadata
 from ..receipts import ReceiptStore
-from ..resources import task_resource_lease
+from ..resources import ResourceUnavailable, task_resource_lease
 from ..roles import REPO_ROOT, ROLES, InvocationContext
 from ..session import InvocationFailed
 from ..status import budget_status
@@ -53,6 +53,14 @@ def _record(run_dir: Path, step: int, score: float, status: str, desc: str) -> N
     rendered = "inf" if not math.isfinite(score) else f"{score:.6f}"
     with _tsv_path(run_dir).open("a", encoding="utf-8") as fh:
         fh.write(f"{step}\t{rendered}\t{status}\t{desc}\n")
+
+
+def _resource_block(events, *, stage: str, exc: Exception) -> str:
+    """A transient host shortage blocks the run, never the candidate."""
+    events.emit("resource_unavailable", stage=stage, reason=str(exc))
+    reason = f"resource unavailable ({stage}): {exc}"
+    events.emit("blocked", reason=reason)
+    return reason
 
 
 def _record_keep(run_dir: Path, step: int, score: float, desc: str) -> None:
@@ -118,7 +126,7 @@ def _revert(run_dir: Path) -> None:
 def _preflight(task, run_dir, repo_root, cmd, task_toml=None):
     owner = {"task": task, "run_dir": str(run_dir), "kind": "candidate_preflight"}
     with task_resource_lease(task_toml or {}, owner=owner):
-        return cmd(["uv", "--project", f"tasks/{task}", "run", "python",
+        return cmd(["uv", "--project", common.task_project(task, task_toml), "run", "python",
                     repo_root / "tools" / "preflight_candidate.py",
                     "--candidate-path", run_dir / "train.py"],
                    repo_root, check=False)
@@ -134,19 +142,35 @@ def _reserve(run_dir, repo_root, cmd) -> bool:
 
 def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd,
                     task_toml=None) -> tuple[Path, int]:
+    """One entrypoint run; the caller holds the task's resource lease."""
     log_path = run_dir / "run.log"
     entrypoint = run_dir / "train.py"
     if per_runtime_limit:
-        argv = ["uv", "--project", f"tasks/{task}", "run", "python",
+        argv = ["uv", "--project", common.task_project(task, task_toml), "run", "python",
                 repo_root / "tools" / "timed_run.py", str(per_runtime_limit),
                 "python", entrypoint]
     else:
-        argv = ["uv", "--project", f"tasks/{task}", "run", "python", entrypoint]
-    lease_owner = {"task": task, "run_dir": str(run_dir), "kind": "hillclimb"}
-    with task_resource_lease(task_toml or {}, owner=lease_owner):
-        with log_path.open("w", encoding="utf-8") as fh:
-            result = cmd(argv, repo_root, check=False, capture=False, stdout=fh)
+        argv = ["uv", "--project", common.task_project(task, task_toml), "run", "python", entrypoint]
+    with log_path.open("w", encoding="utf-8") as fh:
+        result = cmd(argv, repo_root, check=False, capture=False, stdout=fh)
     return log_path, result.returncode
+
+
+def _reserve_and_run(task, run_dir, per_runtime_limit, repo_root, cmd,
+                     task_toml) -> tuple[Path, int] | None:
+    """Admit and run one entrypoint under a single resource lease.
+
+    The lease is acquired before the budget reservation, so a host that
+    cannot grant the declared resources never charges an evaluation.  A
+    transient shortage propagates as ``ResourceUnavailable``; ``None``
+    means the reservation was refused (normal budget completion).
+    """
+    owner = {"task": task, "run_dir": str(run_dir), "kind": "hillclimb"}
+    with task_resource_lease(task_toml or {}, owner=owner):
+        if not _reserve(run_dir, repo_root, cmd):
+            return None
+        return _run_entrypoint(task, run_dir, per_runtime_limit, repo_root,
+                               cmd, task_toml)
 
 
 def _evaluate_outcome(log_path: Path, returncode: int, metric: str,
@@ -182,7 +206,7 @@ def _setup(task, tag, run_dir, task_toml, repo_root, max_evaluations, timeout,
         source = task_dir / editable
         if source.exists():
             shutil.copy(source, run_dir / editable)
-    cmd(["uv", "--project", f"tasks/{task}", "sync"], repo_root)
+    cmd(["uv", "--project", common.task_project(task, task_toml), "sync"], repo_root)
     common.run_prepare(task, task_toml, repo_root, cmd)
     common.preflight_env(task, run_dir, repo_root, cmd)
     _tsv_path(run_dir).write_text(TSV_HEADER, encoding="utf-8")
@@ -350,9 +374,15 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
 
     # Baseline: exactly one evaluation of the unmodified copy.
     if not _tsv_rows(run_dir):
-        if _reserve(run_dir, repo_root, cmd):
-            log, rc = _run_entrypoint(task, run_dir, per_runtime_limit,
-                                      repo_root, cmd, task_toml)
+        try:
+            baseline = _reserve_and_run(task, run_dir, per_runtime_limit,
+                                        repo_root, cmd, task_toml)
+        except ResourceUnavailable as exc:
+            stop_condition = _resource_block(events, stage="baseline", exc=exc)
+            return _status(task, tag, run_dir, metric, stop_condition,
+                           repo_root, cmd)
+        if baseline is not None:
+            log, rc = baseline
             score = _evaluate_outcome(log, rc, metric, required_patterns)
             if math.isfinite(score):
                 _record_keep(run_dir, 0, score, "baseline")
@@ -399,7 +429,13 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     break
         needs_editor = True  # a fresh idea next round starts from best.py
 
-        proc = _preflight(task, run_dir, repo_root, cmd, task_toml)
+        try:
+            proc = _preflight(task, run_dir, repo_root, cmd, task_toml)
+        except ResourceUnavailable as exc:
+            # The edit is unjudged; restore the incumbent and block the run.
+            _revert(run_dir)
+            stop_condition = _resource_block(events, stage="preflight", exc=exc)
+            break
         if proc.returncode != 0:
             # Preflight failures consume no slot; one diagnosis cycle, else
             # abandon the idea (restore best) and move on. The diagnosis is a
@@ -432,7 +468,16 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 stop_condition = f"editor repair failed: {exc.problems}"
                 events.emit("blocked", reason=stop_condition)
                 break
-            if _preflight(task, run_dir, repo_root, cmd, task_toml).returncode != 0:
+            try:
+                still_failing = _preflight(task, run_dir, repo_root, cmd,
+                                           task_toml).returncode != 0
+            except ResourceUnavailable as exc:
+                _revert(run_dir)
+                stop_condition = _resource_block(events,
+                                                 stage="preflight_repair",
+                                                 exc=exc)
+                break
+            if still_failing:
                 _revert(run_dir)
                 outcome_note = ("your repaired edit still failed candidate "
                                 "preflight and the idea was abandoned (no "
@@ -440,15 +485,24 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                                 "copy was reverted to the incumbent")
                 continue
 
-        if not _reserve(run_dir, repo_root, cmd):
+        try:
+            run = _reserve_and_run(task, run_dir, per_runtime_limit,
+                                   repo_root, cmd, task_toml)
+        except ResourceUnavailable as exc:
+            # Nothing was charged and the edit is unjudged: restore the
+            # incumbent and block instead of recording a candidate crash.
+            _revert(run_dir)
+            stop_condition = _resource_block(events, stage="run", exc=exc)
+            break
+        if run is None:
             break  # normal budget completion (exit 4), never a crash
-        log, rc = _run_entrypoint(task, run_dir, per_runtime_limit,
-                                  repo_root, cmd, task_toml)
+        log, rc = run
         score = _evaluate_outcome(log, rc, metric, required_patterns)
         step = len(_tsv_rows(run_dir))
         if not math.isfinite(score):
             _record(run_dir, step, math.inf, "crash", "run produced no metric")
             repaired = False
+            resource_shortage = None
             for _ in range(crash_repairs):
                 # Give the fresh diagnosis session the log path (it can Read
                 # the full file) plus the tail as a starting point.
@@ -471,9 +525,22 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                         resume_from=last_editor)
                 except InvocationFailed:
                     break
-                if _preflight(task, run_dir, repo_root, cmd, task_toml).returncode == 0:
+                try:
+                    preflight_ok = _preflight(task, run_dir, repo_root, cmd,
+                                              task_toml).returncode == 0
+                except ResourceUnavailable as exc:
+                    # The repaired edit is unjudged: block the run instead of
+                    # burning another editor session on a short-handed host.
+                    resource_shortage = _resource_block(
+                        events, stage="crash_repair", exc=exc)
+                    break
+                if preflight_ok:
                     repaired = True
                     break
+            if resource_shortage is not None:
+                _revert(run_dir)
+                stop_condition = resource_shortage
+                break
             if not repaired:
                 _revert(run_dir)
                 outcome_note = ("your last edit CRASHED (no valid metric, "

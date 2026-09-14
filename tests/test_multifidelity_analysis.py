@@ -399,3 +399,15 @@ def test_duplicate_matrix_result_is_rejected(tmp_path):
         analyze_recall.analyze(
             EXPERIMENT, [pool_a, pool_b], jobs_dir, judges_dir, layer="N",
         )
+
+def test_resource_contract_runtime_limit_by_stage_and_fidelity():
+    from tools.scheduler.contract import ResourceContract
+    c=ResourceContract(fidelity_limits={'proxy/fast': 10, 'protocol/full': 100})
+    assert c.runtime_limit('proxy','fast') == 10
+    assert c.runtime_limit('official','full', 7) == 7
+
+def test_build_state_can_select_same_evaluation_domain():
+    from tools.scheduler.state import build_state
+    row={'run_id':'c','status':'keep','evaluation_records':[{'stage':'proxy','fidelity':'fast','selection_visible':True,'status':'success','score':.3,'input_revision':'i','output_artifact_digest':'o','direction':'min'}]}
+    s=build_state({'records':[row]}, remaining_budget=2, evaluation_stage='proxy', evaluation_fidelity='fast')
+    assert len(s.candidates)==1 and s.candidates[0].best_score==.3

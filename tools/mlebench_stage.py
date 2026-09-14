@@ -79,6 +79,12 @@ def stage_public(task: str, run_dir: Path, *, data_root: Path | None = None,
     staging_root = run_dir / "run_input"
     public = staging_root / "public"
     if public.exists():
+        for path in sorted(public.rglob("*"), reverse=True):
+            try:
+                path.chmod(0o755 if path.is_dir() else 0o644)
+            except OSError:
+                pass
+        public.chmod(0o755)
         shutil.rmtree(public)
     public.mkdir(parents=True)
     records = []
@@ -91,6 +97,8 @@ def stage_public(task: str, run_dir: Path, *, data_root: Path | None = None,
         dst = public / relative
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+        # Candidate processes receive a public snapshot, not a writable cache.
+        dst.chmod(0o444)
         records.append({
             "path": relative.as_posix(),
             "bytes": dst.stat().st_size,
@@ -109,6 +117,8 @@ def stage_public(task: str, run_dir: Path, *, data_root: Path | None = None,
     temporary = staging_root / "staging_manifest.json.tmp"
     temporary.write_text(json.dumps(manifest, indent=2) + "\n")
     temporary.replace(staging_root / "staging_manifest.json")
+    for directory in (public, *[p for p in public.rglob("*") if p.is_dir()]):
+        directory.chmod(0o555)
     return public
 
 

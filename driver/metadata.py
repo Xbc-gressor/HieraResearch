@@ -25,8 +25,14 @@ def code_identity(repo_root: Path) -> dict:
     def git(*args):
         return subprocess.run(["git", "-C", str(repo_root), *args],
                               capture_output=True, text=True, check=True).stdout.strip()
-    return {"commit": git("rev-parse", "HEAD"),
-            "dirty": bool(git("status", "--porcelain", "--untracked-files=all"))}
+    try:
+        commit = git("rev-parse", "HEAD")
+        dirty = bool(git("status", "--porcelain", "--untracked-files=all"))
+    except (OSError, subprocess.CalledProcessError):
+        # Tar/rsync deployments intentionally omit .git.  Preserve provenance
+        # without making an execution environment depend on VCS metadata.
+        return {"commit": "unversioned", "dirty": True}
+    return {"commit": commit, "dirty": dirty}
 
 
 def _sha256(path: Path) -> str:

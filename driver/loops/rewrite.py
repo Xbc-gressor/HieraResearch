@@ -34,7 +34,7 @@ from pathlib import Path
 from ..events import EventsLog
 from ..metadata import warn_on_mismatch, write_metadata
 from ..receipts import ReceiptStore
-from ..resources import task_resource_lease
+from ..resources import ResourceUnavailable, task_resource_lease
 from ..roles import REPO_ROOT, ROLES, InvocationContext
 from ..session import InvocationFailed
 from ..status import budget_status
@@ -202,7 +202,7 @@ def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
     owner = {"task": task, "run_dir": str(candidate),
              "kind": "candidate_preflight"}
     with task_resource_lease(task_toml or {}, owner=owner):
-        proc = cmd(["uv", "--project", f"tasks/{task}", "run", "python",
+        proc = cmd(["uv", "--project", common.task_project(task, task_toml), "run", "python",
                     repo_root / "tools" / "preflight_candidate.py",
                     "--candidate-path", candidate / "train.py"],
                    repo_root, check=False)
@@ -228,6 +228,16 @@ def _evaluate(task: str, candidate: Path, repo_root: Path, cmd,
                    "error": "unparseable rewrite_eval output: "
                             + (proc.stdout or "")[-200:]}
     return proc.returncode, payload
+
+
+def _leased(step, candidate: Path, snapshot, repo_root: Path, cmd):
+    """Run one leased step; a transient host shortage reverts the unjudged
+    edit and propagates instead of being journaled as a candidate failure."""
+    try:
+        return step()
+    except ResourceUnavailable:
+        _revert(candidate, snapshot, repo_root, cmd)
+        raise
 
 
 def _params_error(payload: dict) -> str | None:
@@ -264,7 +274,7 @@ def _setup(task, tag, run_dir, task_toml, repo_root, max_evaluations, timeout,
     copy — imported candidates carry their own train.py."""
     events.emit("setup", task=task, tag=tag)
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout)
-    cmd(["uv", "--project", f"tasks/{task}", "sync"], repo_root)
+    cmd(["uv", "--project", common.task_project(task, task_toml), "sync"], repo_root)
     common.run_prepare(task, task_toml, repo_root, cmd)
     common.preflight_env(task, run_dir, repo_root, cmd)
     cmd(["python", "tools/evaluation_budget.py", "status",
@@ -375,11 +385,14 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
     # Preflight-class gate: preflight, then rewrite_eval's BASE_PARAMS check
     # (both free). One repair resume with the error tail; a second failure
     # reverts and journals reverted_crash without spending budget.
-    error_tail = _preflight(task, candidate, repo_root, cmd, task_toml)
+    error_tail = _leased(
+        lambda: _preflight(task, candidate, repo_root, cmd, task_toml),
+        candidate, snapshot, repo_root, cmd)
     payload = None
     if error_tail is None:
-        returncode, payload = _evaluate(task, candidate, repo_root, cmd,
-                                        task_toml)
+        returncode, payload = _leased(
+            lambda: _evaluate(task, candidate, repo_root, cmd, task_toml),
+            candidate, snapshot, repo_root, cmd)
         if returncode == 4:
             # Budget exhausted: the unverified edit must not survive.
             _revert(candidate, snapshot, repo_root, cmd)
@@ -412,11 +425,13 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
                             outcome="reverted_params")
                 return _result("done", outcome="reverted_params",
                                reference=best)
-            error_tail = _preflight(task, candidate, repo_root, cmd,
-                                    task_toml)
+            error_tail = _leased(
+                lambda: _preflight(task, candidate, repo_root, cmd, task_toml),
+                candidate, snapshot, repo_root, cmd)
             if error_tail is None:
-                returncode, payload = _evaluate(task, candidate, repo_root,
-                                                cmd, task_toml)
+                returncode, payload = _leased(
+                    lambda: _evaluate(task, candidate, repo_root, cmd, task_toml),
+                    candidate, snapshot, repo_root, cmd)
                 if returncode == 4:
                     _revert(candidate, snapshot, repo_root, cmd)
                     events.emit("budget_exhausted", candidate=candidate.name,
@@ -441,8 +456,16 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
     new_reference = result["best"]
     if result["outcome"] == "kept" and confirm:
         # Confirmation re-eval: the keep stands; only the reference moves.
-        returncode, confirmation = _evaluate(task, candidate, repo_root, cmd,
-                                             task_toml)
+        try:
+            returncode, confirmation = _evaluate(task, candidate, repo_root,
+                                                 cmd, task_toml)
+        except ResourceUnavailable as exc:
+            # The keep is already journaled: skip only the reference move.
+            events.emit("resource_unavailable", candidate=candidate.name,
+                        stage="confirm", reason=str(exc))
+            return _result("done", outcome=result["outcome"],
+                           score=payload.get("score"),
+                           reference=new_reference, attempts=attempts)
         if returncode != 4:
             entry = _confirm(candidate, bout, confirmation, repo_root, cmd)
             new_reference = entry["reference"]
@@ -543,6 +566,16 @@ def run_rewrite(task, tag, *, runner, model, noise_margin=0.0, max_bouts=12,
                 result = _run_bout(task, tag, run_dir, candidate, bouts,
                                    runner, store, metric, noise_margin,
                                    context, task_toml, repo_root, cmd, events)
+            except ResourceUnavailable as exc:
+                # Transient host shortage: the unjudged edit was reverted and
+                # no budget was spent.  Block instead of retrying, so a host
+                # without a free device cannot burn editor sessions.
+                stop_condition = f"resource unavailable: {exc}"
+                events.emit("resource_unavailable", candidate=candidate.name,
+                            reason=str(exc))
+                events.emit("blocked", reason=stop_condition)
+                halt = True
+                break
             except InvocationFailed as exc:
                 stop_condition = f"editor invocation failed: {exc.problems}"
                 events.emit("blocked", reason=stop_condition)

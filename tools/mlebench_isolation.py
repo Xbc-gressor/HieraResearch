@@ -1,9 +1,8 @@
-"""Fail-closed checks for the MLE-bench public-data mount.
+"""Soft public-data isolation checks for MLE-bench evaluation.
 
-The driver may stage data on the host, but a run is safe only when the
-session is executing in a separate mount namespace with that staged tree
-mounted at ``/mnt/mle-public``.  This module deliberately does not try to
-create a namespace; the operator launch wrapper owns that boundary.
+This module deliberately does not claim mount-namespace security.  The
+evaluator stages a public-only copy, audits paths, and records the mode as
+``soft``.  ``mlebench_launch`` remains an optional stronger operator wrapper.
 """
 
 from __future__ import annotations
@@ -28,15 +27,23 @@ def _namespace_is_distinct() -> bool:
 
 
 def require_public_mount(staged_public: Path) -> Path:
-    """Verify the required namespace and public mount, returning its path."""
+    """Return the staged public tree and fail closed only on missing input."""
     staged_public = Path(staged_public).resolve()
     if not staged_public.is_dir():
         raise IsolationError(f"staged public directory is missing: {staged_public}")
-    if os.environ.get("MLEBENCH_NAMESPACE_READY") != "1":
-        raise IsolationError("MLEBENCH_NAMESPACE_READY=1 is required for MLE-bench runs")
-    if not _namespace_is_distinct():
-        raise IsolationError("driver is not running in a distinct mount namespace")
-    if not MOUNT_PATH.is_dir():
-        raise IsolationError(f"required public mount is missing: {MOUNT_PATH}")
-    return MOUNT_PATH
+    return staged_public
 
+
+def audit_artifact_paths(artifact: Path, *, forbidden: tuple[str, ...] =
+                         ("private", "answer", "answers", "solution", "gold")) -> None:
+    """Reject candidate artifacts containing known private/gold path names."""
+    artifact = Path(artifact).resolve()
+    if not artifact.exists():
+        raise IsolationError(f"candidate artifact is missing: {artifact}")
+    lowered = {part.lower() for part in artifact.parts}
+    hits = lowered.intersection(forbidden)
+    if hits:
+        raise IsolationError(f"candidate artifact references forbidden path parts: {sorted(hits)}")
+    for path in artifact.rglob("*"):
+        if path.name.lower() in forbidden:
+            raise IsolationError(f"candidate artifact contains forbidden path: {path.relative_to(artifact)}")

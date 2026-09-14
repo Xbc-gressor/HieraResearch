@@ -190,17 +190,11 @@ docs.
 3. Fill in `TASK.md` (human brief plus the `## Evaluation Contract` section —
    the prose semantics and hard rules for how a candidate trains, scores, and
    reports) and `task.toml` (machine config: the single `[evaluation].score_fn`
-   — the one `config → score` function — plus metric, required patterns,
-   optional candidate overrides, file constraints). The split is deliberate:
-   the function name is config in `task.toml`; its semantics are prose in
-   `TASK.md`. There is no separate official run — warm-start eval and Phase C
-   tuning both call `score_fn(make_model, params) -> float`, and its return
-   value is the candidate's score.
-   **Scores are always lower-is-better.** The framework minimizes everywhere
-   (keep/discard, percentile, every tuner) and tracks no direction flag — a
-   higher-is-better metric must be negated or complemented inside the task's own
-   `score_fn` (see `tabular-model-search`, which reports
-   `neg_mean_test_accuracy`). A crash scores `+inf`, the worst.
+   compatibility surface, plus metric, required patterns, candidate
+   overrides, and file constraints). The current tuning pipeline calls this
+   scalar score function for warm-start evaluation and Phase C tuning; scores
+   are lower-is-better and crashes remain worst-case observations. The staged
+   evaluator helpers are not yet the production selection surface.
 4. Run `python tools/validate_tasks.py`.
 
 ## Adding A Role

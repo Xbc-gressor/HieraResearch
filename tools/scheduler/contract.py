@@ -67,6 +67,9 @@ class ResourceContract:
     # Some inner policies switch to a numeric-only kernel before the generic
     # DEEP boundary. None means no additional policy-specific requirement.
     numeric_required_from_bout_index: int | None = None
+    # Runtime/charge limits are keyed by the independent evaluation domain,
+    # e.g. ``{"proxy/fast": 300, "protocol/full": 1800}``.
+    fidelity_limits: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         for name in ("bout_trials", "max_bouts", "k_eval", "first_bout_trials"):
@@ -103,6 +106,16 @@ class ResourceContract:
             raise ValueError(
                 "numeric_required_from_bout_index must be a valid bout index"
             )
+        if self.fidelity_limits is not None:
+            for key, value in self.fidelity_limits.items():
+                if not isinstance(key, str) or "/" not in key or not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                    raise ValueError("fidelity_limits keys must be stage/fidelity and values positive")
+
+    def runtime_limit(self, stage: str, fidelity: str, default: float | None = None) -> float | None:
+        """Return the limit for one stage/fidelity domain."""
+        if self.fidelity_limits is None:
+            return default
+        return self.fidelity_limits.get(f"{stage}/{fidelity}", default)
 
     def bout_cost(self, bouts_used: int) -> int:
         """Objective evaluations one complete bout charges (design §2:

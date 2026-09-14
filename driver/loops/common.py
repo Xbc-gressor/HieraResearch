@@ -51,6 +51,11 @@ def load_task_toml(task: str, repo_root: Path) -> dict:
         return tomllib.load(fh)
 
 
+def task_project(task: str, task_toml: dict | None) -> str:
+    """Resolve the shared or task-local evaluation environment."""
+    return (task_toml or {}).get("env", {}).get("project", f"tasks/{task}")
+
+
 def init_run(task, tag, repo_root, cmd, max_evaluations=None, timeout=None, extra=()):
     args = ["python", "tools/init_run.py", task, tag]
     if max_evaluations is not None:
@@ -78,7 +83,7 @@ def preflight_env(task, run_dir, repo_root, cmd) -> None:
                 task, Path(run_dir), competition_id=mlebench.get("competition_id")
             )
         os.environ[public_env] = str(public_dir)
-    cmd(["uv", "--project", f"tasks/{task}", "run", "python",
+    cmd(["uv", "--project", task_project(task, task_cfg), "run", "python",
          "tools/preflight_env.py", "--task", task, "--run-dir", run_dir],
         repo_root)
 

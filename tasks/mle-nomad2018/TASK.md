@@ -22,11 +22,18 @@ order. Private labels and raw competition archives are never loaded.
 
 ## Data and resources
 
+All MLE tasks use the same `envs/mle` environment, supplying sklearn,
+CUDA-enabled torch/torchvision and transformers. Execution reserves one GPU
+through the project device lease, with an 8 GiB free-memory preflight minimum
+and a 600 second lease-wait limit. CPU-based models are also allowed;
+GPU use is available, not a model-family restriction. Declare additional
+dependency needs for installation into this shared environment before execution.
+
 `MLEBENCH_PUBLIC_DATA` points to a read-only directory containing prepared
 public `train.csv`, `test.csv`, `sample_submission.csv`, and the public
 geometry directories. Training and test IDs are the per-split IDs created by
-the official MLE-bench preparation. This CPU task has a 300 second
-per-evaluation limit. Dependencies belong to this task's uv project;
+the official MLE-bench preparation. This task has a 300 second
+per-evaluation limit. Dependencies are supplied by the shared `envs/mle` uv environment;
 `prepare.py` is fixed and read-only and `train.py` is the candidate file.
 
 The supplied regularized linear control supports the `baseline-tune` loop.

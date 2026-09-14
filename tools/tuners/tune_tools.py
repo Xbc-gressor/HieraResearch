@@ -927,6 +927,25 @@ def lint_schema(train_path: Path) -> dict:
     }
 
 
+def lint_artifact_contract(train_path: Path) -> dict:
+    """Validate a free-form candidate without requiring PARAM_SCHEMA.
+
+    Free-form candidates are measured by the task evaluator; they may expose
+    any callable named ``run`` or ``evaluate`` and are not forced through the
+    parameterized tuner contract.
+    """
+    path = Path(train_path)
+    try:
+        tree = ast.parse(path.read_text(errors="replace"))
+    except SyntaxError as exc:
+        return {"ok": False, "entrypoints": [], "errors": [{"code": "syntax_error", "detail": str(exc)}]}
+    bindings = _module_bindings(tree)
+    entrypoints = [name for name in ("run", "evaluate", "fit_predict")
+                   if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in bindings.get(name, []))]
+    errors = [] if entrypoints else [{"code": "missing_entrypoint", "detail": "free-form candidate needs run, evaluate, or fit_predict"}]
+    return {"ok": not errors, "entrypoints": entrypoints, "errors": errors}
+
+
 # =============================================================================
 # Trial selection and tuning lifecycle
 # =============================================================================
@@ -1958,6 +1977,9 @@ def _candidate_execution_revision(candidate_path: Path) -> dict:
         "search_space_keys": list(search_space),
         "prepare_sha256": _file_sha256(prepare_path),
         "evaluation_contract": evaluation_contract,
+        # Keep the task-side evaluator in the execution identity even when a
+        # candidate is inspected outside a runs/<task>/ directory.
+        "task_evaluator_sha256": evaluation_contract.get("task_toml_sha256"),
     }
     return revision
 

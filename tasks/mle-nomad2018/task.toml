@@ -3,7 +3,7 @@ description = "NOMAD 2018 Predicting Transparent Conductors: public-training val
 
 [env]
 type = "uv"
-project = "tasks/mle-nomad2018"
+project = "envs/mle"
 
 [run]
 working_dir = "tasks/mle-nomad2018"
@@ -17,6 +17,12 @@ entrypoint = "train.py"
 [evaluation]
 score_fn = "evaluate_config"
 environment_preflight_fn = "preflight_environment"
+
+[resources]
+accelerator = "cuda"
+devices = 1
+lease_wait_timeout = 600
+min_memory_gib = 8
 
 [result]
 metric = "mean_rmsle"

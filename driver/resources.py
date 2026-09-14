@@ -15,9 +15,11 @@ pool size, so a single-GPU box still runs (the task itself then fails or
 regresses exactly as it would without pinning).
 
 The device pool is the operator-set ``CUDA_VISIBLE_DEVICES`` when present,
-else every device reported by ``nvidia-smi``.  There is deliberately no
-timeout: callers wait for free devices, then run.  CPU tasks do not acquire
-any lease.
+else every device reported by ``nvidia-smi``.  Callers may set
+``lease_wait_timeout`` (default 600 seconds) to bound queueing for a free
+device; an expired queue and an under-provisioned device both raise
+``ResourceUnavailable``, which callers treat as transient.  CPU tasks do not
+acquire any lease.
 """
 
 from __future__ import annotations
@@ -35,6 +37,18 @@ _LOCK_DIR_ENV = "SHANHAI_CUDA_LOCK_DIR"
 _DEFAULT_LOCK_DIR = Path("/tmp")
 _LOCK_NAME = "shanhai-objective-cuda-{dev}.lock"
 _POLL_SECONDS = 1.0
+
+
+class ResourceUnavailable(RuntimeError):
+    """The host cannot currently grant the task's declared resources.
+
+    Transient by construction: callers retry or defer.  It is never a
+    candidate observation and must not be recorded as one.
+    """
+
+
+class ResourcePreflightError(ResourceUnavailable):
+    """A leased device does not satisfy the task's declared resources."""
 
 
 def _lock_dir() -> Path:
@@ -98,6 +112,31 @@ def _write_record(handle, record: dict) -> None:
     handle.flush()
 
 
+def check_gpu_memory(min_gib: float, *, device: str | None = None) -> dict:
+    """Check free memory after a lease has been acquired.
+
+    This is a preflight observation, not a hard guarantee against processes
+    outside the lease.  It intentionally runs after ``CUDA_VISIBLE_DEVICES``
+    is pinned by :func:`task_resource_lease`.
+    """
+    if min_gib < 0:
+        raise ValueError("min_gib must be >= 0")
+    query = ["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"]
+    if device is not None:
+        query[1:1] = ["-i", str(device)]
+    try:
+        probe = subprocess.run(query, capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ResourcePreflightError("unable to query GPU memory") from exc
+    if probe.returncode != 0 or not probe.stdout.strip():
+        raise ResourcePreflightError("nvidia-smi returned no memory data")
+    free_mib, total_mib = (float(part.strip()) for part in probe.stdout.splitlines()[0].split(",", 1))
+    result = {"free_gib": free_mib / 1024.0, "total_gib": total_mib / 1024.0, "min_gib": float(min_gib)}
+    if result["free_gib"] < min_gib:
+        raise ResourcePreflightError(f"GPU free memory {result['free_gib']:.2f} GiB below {min_gib:.2f} GiB")
+    return result
+
+
 @contextmanager
 def task_resource_lease(task_toml: dict, *, owner: dict | None = None):
     resources = task_toml.get("resources", {})
@@ -114,11 +153,24 @@ def task_resource_lease(task_toml: dict, *, owner: dict | None = None):
     pool = _visible_devices()
     want = min(devices, len(pool))
     _lock_dir().mkdir(parents=True, exist_ok=True)
+    wait_timeout = resources.get("lease_wait_timeout", 600)
+    try:
+        wait_timeout = float(wait_timeout)
+    except (TypeError, ValueError):
+        raise ValueError("[resources].lease_wait_timeout must be a number")
+    if wait_timeout < 0:
+        raise ValueError("[resources].lease_wait_timeout must be >= 0")
+    started_wait = time.monotonic()
     while True:
         held = _try_acquire(pool, want)
         if held:
             break
-        time.sleep(_POLL_SECONDS)
+        waited = time.monotonic() - started_wait
+        if waited >= wait_timeout:
+            raise ResourceUnavailable(
+                f"timed out waiting {waited:.3f}s for {want} CUDA device lease"
+            )
+        time.sleep(min(_POLL_SECONDS, max(0.01, wait_timeout - waited)))
 
     leased = [dev for dev, _ in held]
     for dev, handle in held:
@@ -134,7 +186,11 @@ def task_resource_lease(task_toml: dict, *, owner: dict | None = None):
     previous_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(leased)
     try:
-        yield
+        result = {"devices": leased, "lease_wait_seconds": time.monotonic() - started_wait}
+        minimum = resources.get("min_memory_gib")
+        if minimum is not None:
+            result["memory"] = check_gpu_memory(float(minimum), device=leased[0])
+        yield result
     finally:
         if previous_cvd is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)

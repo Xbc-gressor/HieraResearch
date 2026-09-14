@@ -3,7 +3,7 @@ description = "Spooky Author Identification: public-training validation log loss
 
 [env]
 type = "uv"
-project = "tasks/mle-spooky"
+project = "envs/mle"
 
 [run]
 working_dir = "tasks/mle-spooky"
@@ -15,8 +15,20 @@ provided = ["train.py"]
 entrypoint = "train.py"
 
 [evaluation]
+# Versioned task-native surface. ``score_fn`` remains the compatibility
+# adapter; the staged evaluator owns protocol and official output checks.
+version = "1"
 score_fn = "evaluate_config"
+proxy = "evaluate_config"
+protocol = "evaluate_protocol"
+data_version = "public-v1"
 environment_preflight_fn = "preflight_environment"
+
+[resources]
+accelerator = "cuda"
+devices = 1
+lease_wait_timeout = 600
+min_memory_gib = 8
 
 [result]
 metric = "validation_log_loss"

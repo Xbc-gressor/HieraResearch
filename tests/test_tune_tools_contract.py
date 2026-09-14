@@ -531,3 +531,9 @@ class SearchSpaceBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def test_artifact_contract_allows_free_form_candidate(tmp_path):
+    from tools.tuners.tune_tools import lint_artifact_contract
+    p = tmp_path / 'train.py'; p.write_text('def run(artifact, params):\n    return {}\n')
+    result = lint_artifact_contract(p)
+    assert result['ok'] and result['entrypoints'] == ['run']

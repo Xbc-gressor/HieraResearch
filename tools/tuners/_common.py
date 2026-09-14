@@ -73,6 +73,63 @@ from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 REQUIRED_SYMBOLS = ("BASE_PARAMS", "SEARCH_SPACE", "make_model")
 DEFAULT_SCORE_FN = "evaluate_config"
 DEFAULT_PREFLIGHT_LIMIT = 180.0
+
+
+def _index_evaluation_records(candidate_path: Path, record_path: Path | None) -> None:
+    """Publish evaluator-owned JSONL digests through the ledger CLI."""
+    if record_path is None or not record_path.is_file():
+        return
+    run_dir = find_run_dir(candidate_path)
+    ledger = run_dir / "ledger.json" if run_dir is not None else None
+    if ledger is None or not ledger.is_file():
+        return
+    run_id = Path(candidate_path).parent.name
+    subprocess.run([sys.executable, str(ROOT / "tools" / "ledger.py"),
+                    "append-evaluation", "--ledger", str(ledger),
+                    "--run-id", run_id, "--record", str(record_path)],
+                   cwd=ROOT, capture_output=True, text=True, check=False)
+
+
+def _task_name(candidate_path: Path) -> str:
+    parts = Path(candidate_path).resolve().parts
+    return next(
+        (parts[i + 1] for i, part in enumerate(parts[:-1]) if part == "runs"),
+        "unknown",
+    )
+
+
+def _publish_legacy_score(candidate_path: Path, params: dict, score: float,
+                          attempt_id: str | None) -> None:
+    """Index one legacy scalar evaluation into the evaluator-owned JSONL.
+
+    Runs in the evaluator process; the candidate never receives the record
+    path, so it can neither forge nor read facts it must not see.  A failure
+    here must never change the evaluation's score semantics.
+    """
+    try:
+        run_dir = find_run_dir(candidate_path)
+        if run_dir is None:
+            return
+        from evaluation_records import append_record, legacy_score_record
+        stem = Path(candidate_path).parent.name
+        record_dir = run_dir / ".evaluation_records"
+        record_dir.mkdir(parents=True, exist_ok=True)
+        record_path = record_dir / f"{stem}.jsonl"
+        artifact = record_dir / f"{stem}.{attempt_id or 'latest'}.score.json"
+        artifact.write_text(
+            json.dumps({"score": score, "params": params}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        append_record(record_path, legacy_score_record(
+            task_id=_task_name(candidate_path), candidate_id=stem,
+            input_revision=str(candidate_path), score=score,
+            metric_name=os.environ.get("EVALUATION_METRIC", "score"),
+            output_artifact=artifact))
+        _index_evaluation_records(candidate_path, record_path)
+    except Exception as exc:  # the bridge must never alter score semantics
+        print(f"RECORD_WARNING:{type(exc).__name__}:{exc}", file=sys.stderr)
+
+
 DEEP_TUNE_INVOCATION_STARTED_AT = "invocation_started_at_epoch_seconds"
 PHASE_C_LOCK_FILENAME = ".phase_c.lock"
 
@@ -939,6 +996,7 @@ def _timed_eval_body(
         score = float(evaluate(make_model, params))
         if not is_finite_score(score):
             raise ValueError(f"evaluation returned non-finite score: {score!r}")
+        _publish_legacy_score(Path(candidate_path), params, score, attempt_id)
         return score
     eval_one = str(Path(__file__).resolve().parent / "_eval_one.py")
     command = [
@@ -977,11 +1035,10 @@ def _timed_eval_body(
                 # The budget ended mid-evaluation. A TimeoutError here would
                 # read as config infeasibility (is_config_infeasible_error)
                 # and teach the sampler / warm cache a false boundary.
-                run_dir = find_run_dir(candidate_path)
                 raise EvaluationBudgetExhausted(
                     used=0,
                     budget=None,
-                    run_dir=run_dir if run_dir is not None else Path(candidate_path).parent,
+                    run_dir=find_run_dir(candidate_path) or Path(candidate_path).parent,
                     scope="time_cutoff",
                 ) from exc
             raise
@@ -1008,6 +1065,7 @@ def _timed_eval_body(
             ) from None
         if not is_finite_score(score):
             raise ValueError(f"evaluation returned non-finite score: {score!r}")
+        _publish_legacy_score(Path(candidate_path), params, score, attempt_id)
         return score
 
     detail = err.strip()

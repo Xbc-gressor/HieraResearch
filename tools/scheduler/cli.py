@@ -198,7 +198,12 @@ def cmd_evidence(args) -> int:
 
 def _ledger_doc(ledger: Path) -> dict:
     if Path(ledger).is_file():
-        return json.loads(Path(ledger).read_text(encoding="utf-8"))
+        doc = json.loads(Path(ledger).read_text(encoding="utf-8"))
+        try:
+            from .state import materialize_evaluation_records
+        except ImportError:
+            from scheduler.state import materialize_evaluation_records
+        return materialize_evaluation_records(doc)
     return {"records": []}
 
 
@@ -206,12 +211,22 @@ def cmd_round(args) -> int:
     """round_v1 driver entry points; every subcommand prints one JSON view."""
     ledger = Path(args.ledger)
     run_dir = ledger.parent
+    stage = getattr(args, "stage", None)
+    fidelity = getattr(args, "fidelity", None)
+    if (stage is None) != (fidelity is None):
+        raise SystemExit("--stage and --fidelity must be supplied together")
+    if stage == "official":
+        raise SystemExit("official evaluations are reporting-only and cannot drive round scheduling")
     if args.round_command == "status":
-        view = round_policy.round_status(run_dir, _ledger_doc(ledger))
+        view = round_policy.round_status(
+            run_dir, _ledger_doc(ledger), stage=stage, fidelity=fidelity
+        )
     elif args.round_command == "begin":
         view = round_policy.begin_optimization(run_dir)
     elif args.round_command == "end":
-        view = round_policy.end_optimization(run_dir, _ledger_doc(ledger))
+        view = round_policy.end_optimization(
+            run_dir, _ledger_doc(ledger), stage=stage, fidelity=fidelity
+        )
     elif args.round_command == "overhead":
         view = round_policy.record_overhead(run_dir, args.kind, args.seconds)
     elif args.round_command == "select":
@@ -269,9 +284,13 @@ def build_parser() -> argparse.ArgumentParser:
     rnd = sub.add_parser("round", help="round_v1 phase state and selections.")
     rnd.add_argument("--ledger", required=True, type=Path)
     rnd_sub = rnd.add_subparsers(dest="round_command", required=True)
-    rnd_sub.add_parser("status", help="generate-or-optimize switch")
+    status = rnd_sub.add_parser("status", help="generate-or-optimize switch")
+    status.add_argument("--stage", choices=("proxy", "protocol", "official"))
+    status.add_argument("--fidelity")
     rnd_sub.add_parser("begin", help="open an optimization phase (sets the quota)")
-    rnd_sub.add_parser("end", help="close the phase; next cycle counts from now")
+    end = rnd_sub.add_parser("end", help="close the phase; next cycle counts from now")
+    end.add_argument("--stage", choices=("proxy", "protocol", "official"))
+    end.add_argument("--fidelity")
     sel = rnd_sub.add_parser("select", help="choose the next rewrite/tune target")
     sel.add_argument("--kind", required=True, choices=("rewrite", "tune"))
     sel.add_argument("--peek", action="store_true")

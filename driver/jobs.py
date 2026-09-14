@@ -25,7 +25,7 @@ import signal
 import subprocess
 import time
 
-from .resources import task_resource_lease
+from .resources import ResourceUnavailable, task_resource_lease
 from .roles import InvocationContext, REPO_ROOT
 
 
@@ -384,7 +384,7 @@ def execute_driver_job(
                     raise
                 finally:
                     _live_children.remove(proc)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, ResourceUnavailable) as exc:
         record.update(
             status="launch_failed",
             error=str(exc),

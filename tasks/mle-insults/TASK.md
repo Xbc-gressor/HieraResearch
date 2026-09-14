@@ -22,12 +22,18 @@ answer file is never loaded by this task surface.
 
 ## Data and resources
 
+All MLE tasks use the same `envs/mle` environment, supplying sklearn,
+CUDA-enabled torch/torchvision and transformers. Execution reserves one GPU
+through the project device lease, with an 8 GiB free-memory preflight minimum
+and a 600 second lease-wait limit. CPU-based models are also allowed;
+GPU use is available, not a model-family restriction. Declare additional
+dependency needs for installation into this shared environment before execution.
+
 `MLEBENCH_PUBLIC_DATA` points to a read-only directory containing only the
 prepared public `train.csv`, `test.csv`, and `sample_submission_null.csv`.
 The test has `Date,Comment`; the sample has `Insult,Date,Comment`. Do not
 look for private test labels, raw competition archives, or prior submissions.
-This CPU task has a 300 second per-evaluation limit. Dependencies belong to
-this task's uv project. `prepare.py` is fixed and read-only; `train.py` is the
+This task has a 300 second per-evaluation limit. Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed and read-only; `train.py` is the
 candidate implementation.
 
 The supplied word TF-IDF logistic-regression control supports the

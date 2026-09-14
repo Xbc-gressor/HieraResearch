@@ -363,7 +363,12 @@ def _unresolved_descendant_ids(ledger: dict) -> set[str]:
     return blocked
 
 
-def candidate_score(record: dict) -> float | None:
+def candidate_score(
+    record: dict,
+    *,
+    stage: str | None = None,
+    fidelity: str | None = None,
+) -> float | None:
     """The candidate's current best: its tuned score, else its warm score.
 
     `final_best_score` is only comparable to `best_warm_score` after a bout
@@ -373,6 +378,19 @@ def candidate_score(record: dict) -> float | None:
     per-candidate state variable feeding a transition, not a cross-candidate
     ranking key, and the global best it feeds is the run's own raw best.
     """
+    # New task-native records are authoritative whenever a comparison domain
+    # is requested.  A record without a matching domain is deliberately
+    # invisible instead of falling back to a score from another stage.
+    if stage is not None or fidelity is not None:
+        if not stage or not fidelity:
+            raise ValueError("stage and fidelity must be supplied together")
+        try:
+            from evaluation_records import best_score
+        except ImportError:  # pragma: no cover
+            from tools.evaluation_records import best_score
+        rows = record.get("evaluation_records", ())
+        value = best_score(rows, stage=stage, fidelity=fidelity)
+        return float(value) if value is not None and is_finite_score(value) else None
     if record.get("tune") and is_finite_score(record.get("final_best_score")):
         return float(record["final_best_score"])
     if is_finite_score(record.get("best_warm_score")):
@@ -439,6 +457,8 @@ def build_state(
     initialization_facts: dict[str, dict] | None = None,
     diagnostics: dict | None = None,
     n_seed: int = 0,
+    evaluation_stage: str | None = None,
+    evaluation_fidelity: str | None = None,
 ) -> SchedulerState:
     """Assemble the exact mechanical state from the ledger and budget."""
     contract = contract or ResourceContract()
@@ -451,7 +471,9 @@ def build_state(
     candidates = []
     for record in ledger.get("records", []):
         run_id = str(record.get("run_id"))
-        score = candidate_score(record)
+        score = candidate_score(
+            record, stage=evaluation_stage, fidelity=evaluation_fidelity
+        ) if evaluation_stage is not None or evaluation_fidelity is not None else candidate_score(record)
         if score is None:
             # No finite observation yet: not a scheduler-visible candidate.
             continue
@@ -512,16 +534,48 @@ def previous_gains(run_dir: Path, ledger: dict) -> dict[str, float]:
     return {run_id: gain for run_id, (_, gain) in latest.items()}
 
 
+def materialize_evaluation_records(ledger: dict) -> dict:
+    """Load digest-indexed evaluator facts into a ledger view for projection."""
+    try:
+        from ..evaluation_records import read_records
+    except ImportError:
+        from evaluation_records import read_records
+    for row in ledger.get("records", []):
+        paths = row.get("evaluation_record_paths", {}) or {}
+        digests = row.get("evaluation_record_digests", ()) or ()
+        if not digests:
+            continue
+        # Every digest of one candidate shares a JSONL path: read each
+        # distinct file once, then project rows by digest.
+        by_digest: dict[str, dict] = {}
+        for path in dict.fromkeys(paths[d] for d in digests if d in paths):
+            try:
+                for record in read_records(Path(path)):
+                    by_digest.setdefault(record.get("record_digest"), record)
+            except (OSError, ValueError, TypeError):
+                continue
+        loaded = [by_digest[d] for d in digests if d in by_digest]
+        if loaded:
+            row["evaluation_records"] = loaded
+    return ledger
+
+
 def load_state(
     ledger_path: Path,
     *,
     contract: ResourceContract | None = None,
     diagnostics: dict | None = None,
+    evaluation_stage: str | None = None,
+    evaluation_fidelity: str | None = None,
 ) -> SchedulerState:
     """Build the state for a live run directory."""
     ledger_path = Path(ledger_path)
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     run_dir = ledger_path.parent
+    # Materialize evaluator facts from ledger digest indexes before building
+    # scheduler state.  The ledger stores references; JSONL remains the
+    # evaluator-owned source of truth.
+    materialize_evaluation_records(ledger)
     remaining = _remaining_budget(run_dir)
     from run_cfg import load_run_cfg
     from tuners.inner_policy import (
@@ -557,6 +611,8 @@ def load_state(
         initialization_facts=initialization_facts(run_dir, ledger),
         diagnostics=diagnostics,
         n_seed=seed_quota(run_dir),
+        evaluation_stage=evaluation_stage,
+        evaluation_fidelity=evaluation_fidelity,
     )
 
 

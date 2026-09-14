@@ -101,12 +101,15 @@ def save_round_state(run_dir: Path, state: dict) -> None:
     tmp.replace(path)
 
 
-def finite_candidate_count(ledger: dict) -> int:
+def finite_candidate_count(
+    ledger: dict, *, stage: str | None = None, fidelity: str | None = None
+) -> int:
     """Admitted candidates with a finite score; crashed slate seats do not count."""
     return sum(
         1
         for record in ledger.get("records", [])
-        if record.get("status") != "crash" and candidate_score(record) is not None
+        if record.get("status") != "crash"
+        and candidate_score(record, stage=stage, fidelity=fidelity) is not None
     )
 
 
@@ -117,7 +120,14 @@ def generation_threshold(config: dict, state: dict, n_seed: int) -> int:
     return int(config["new_candidates"])
 
 
-def round_status(run_dir: Path, ledger: dict, *, now: float | None = None) -> dict:
+def round_status(
+    run_dir: Path,
+    ledger: dict,
+    *,
+    now: float | None = None,
+    stage: str | None = None,
+    fidelity: str | None = None,
+) -> dict:
     """The driver's generate-or-optimize switch for this iteration."""
     from evaluation_budget import time_budget
     from .state import seed_quota
@@ -125,7 +135,7 @@ def round_status(run_dir: Path, ledger: dict, *, now: float | None = None) -> di
     run_dir = Path(run_dir)
     config = load_config(run_dir)
     state = load_round_state(run_dir)
-    count = finite_candidate_count(ledger)
+    count = finite_candidate_count(ledger, stage=stage, fidelity=fidelity)
     produced = count - int(state.get("cycle_start_count", 0))
     threshold = generation_threshold(config, state, seed_quota(run_dir))
     usable = time_budget(run_dir, now=now)["usable_seconds"]
@@ -141,6 +151,11 @@ def round_status(run_dir: Path, ledger: dict, *, now: float | None = None) -> di
         "usable_seconds": usable,
         "final_round": final_round,
         "generate": produced < threshold and not final_round,
+        "evaluation_domain": (
+            {"stage": stage, "fidelity": fidelity}
+            if stage is not None or fidelity is not None
+            else None
+        ),
     }
 
 
@@ -162,11 +177,19 @@ def begin_optimization(run_dir: Path, *, now: float | None = None) -> dict:
     return state
 
 
-def end_optimization(run_dir: Path, ledger: dict) -> dict:
+def end_optimization(
+    run_dir: Path,
+    ledger: dict,
+    *,
+    stage: str | None = None,
+    fidelity: str | None = None,
+) -> dict:
     run_dir = Path(run_dir)
     state = load_round_state(run_dir)
     state["cycle"] = int(state.get("cycle", 0)) + 1
-    state["cycle_start_count"] = finite_candidate_count(ledger)
+    state["cycle_start_count"] = finite_candidate_count(
+        ledger, stage=stage, fidelity=fidelity
+    )
     state["phase"] = "generate"
     state["phase_started_at"] = None
     state["phase_deadline"] = None

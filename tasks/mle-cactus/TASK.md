@@ -1,8 +1,7 @@
 # Aerial Cactus Identification
 
 Predict whether each 32x32 aerial image contains a columnar cactus. Pursue the
-strongest generalization possible within the available runtime. This task uses
-CPU; no GPU is required.
+strongest generalization possible within the available runtime. One CUDA GPU is available; choose the model and algorithm that best use the budget.
 
 ## Evaluation Contract
 
@@ -26,6 +25,13 @@ scores and medal thresholds must not be used for further candidate selection.
 
 ## Data and resources
 
+All MLE tasks use the same `envs/mle` environment, supplying sklearn,
+CUDA-enabled torch/torchvision and transformers. Execution reserves one GPU
+through the project device lease, with an 8 GiB free-memory preflight minimum
+and a 600 second lease-wait limit. CPU-based models are also allowed;
+GPU use is available, not a model-family restriction. Declare additional
+dependency needs for installation into this shared environment before execution.
+
 `MLEBENCH_PUBLIC_DATA` points to a read-only directory containing only the
 official prepared public `train.csv`, `train.zip`, `test.zip` and
 `sample_submission.csv`. The zip archives hold bare 32x32 JPEG filenames; the
@@ -37,8 +43,7 @@ labels, private answers, prior runs or submissions.
 Images are decoded once and cached in each evaluator process. Fit any learned
 preprocessing on training images only. Set random states for stochastic models.
 The per-evaluation limit is 300 seconds; the cell's total runtime also includes
-agent calls, setup and final refitting. Dependencies belong to this task's uv
-project. `prepare.py` is fixed; `train.py` is the candidate implementation.
+agent calls, setup and final refitting. Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed; `train.py` is the candidate implementation.
 
 The supplied raw-pixel logistic-regression control supports the
 `baseline-tune` loop. It is a repository-provided control, not a published

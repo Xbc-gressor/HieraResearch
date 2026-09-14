@@ -3,11 +3,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from driver.loops import hillclimb  # noqa: E402
 from driver.loops.hillclimb import run_hillclimb  # noqa: E402
 from driver.receipts import ReceiptStore  # noqa: E402
 from driver.session import FakeSessionRunner  # noqa: E402
@@ -415,6 +417,19 @@ class HillclimbTests(unittest.TestCase):
                          "# baseline implementation\n")
         self.assertEqual((run_dir / "history" / "001.py").read_text(),
                          (run_dir / "best.py").read_text())
+
+
+class ResourceShortageTests(unittest.TestCase):
+    @mock.patch("driver.loops.hillclimb._reserve")
+    @mock.patch("driver.loops.hillclimb.task_resource_lease")
+    def test_shortage_is_never_charged_as_an_evaluation(self, lease, reserve):
+        from driver import resources
+        lease.side_effect = resources.ResourceUnavailable("no free device")
+        with self.assertRaises(resources.ResourceUnavailable):
+            hillclimb._reserve_and_run(
+                "fake-task", Path("/tmp/nowhere"), None, Path("/tmp/nowhere"),
+                lambda *args, **kwargs: None, {})
+        reserve.assert_not_called()
 
 
 if __name__ == "__main__":

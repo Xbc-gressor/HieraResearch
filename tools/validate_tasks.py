@@ -129,6 +129,12 @@ def validate_task(task_dir: Path) -> list[str]:
             errors.append(
                 f"{task_toml}: resources.accelerator must be 'cuda' when set"
             )
+        elif isinstance(resources, dict):
+            for key in ("devices", "lease_wait_timeout", "min_memory_gib"):
+                if key in resources and (isinstance(resources[key], bool) or not isinstance(resources[key], (int, float)) or resources[key] < 0):
+                    errors.append(f"{task_toml}: resources.{key} must be a non-negative number")
+            if "devices" in resources and (not isinstance(resources["devices"], int) or resources["devices"] < 1):
+                errors.append(f"{task_toml}: resources.devices must be a positive integer")
 
     run = data.get("run", {})
     if isinstance(run, dict):

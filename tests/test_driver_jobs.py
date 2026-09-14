@@ -53,6 +53,29 @@ def test_warmstart_job_argv_is_foreground_and_driver_derived(tmp_path: Path) -> 
     assert "--donor-snapshot" not in argv
 
 
+def test_shared_environment_used_by_preflight_and_evaluation(tmp_path: Path) -> None:
+    import subprocess
+    from driver.loops import common, hillclimb, rewrite
+
+    repo, ctx = _fixture(tmp_path)
+    project = "envs/mle"
+    (repo / "tasks/toy/task.toml").write_text(f'[env]\nproject = "{project}"\n')
+    config = common.load_task_toml("toy", repo)
+    cmd = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    common.preflight_env("toy", ctx.run_dir, repo, cmd)
+    hillclimb._preflight("toy", ctx.run_dir, repo, cmd, config)
+    hillclimb._run_entrypoint("toy", ctx.run_dir, 300, repo, cmd, config)
+    rewrite._preflight("toy", ctx.run_dir / "candidates/007", repo, cmd, config)
+    for call in cmd.call_args_list:
+        argv = call.args[0]
+        assert argv[argv.index("--project") + 1] == project
+    argv, _, _ = build_driver_job(
+        "tunable-contract-extractor", ctx,
+        {"kind": "warmstart", "run_id": "007", "k_eval": 2}, repo_root=repo,
+    )
+    assert argv[argv.index("--project") + 1] == project
+
+
 def test_warmstart_job_passes_the_bound_donor_snapshot(tmp_path: Path) -> None:
     repo, ctx = _fixture(tmp_path)
     ctx.extra["donor_binding"] = "bound"

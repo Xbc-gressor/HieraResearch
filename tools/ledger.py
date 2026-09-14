@@ -764,6 +764,38 @@ def cmd_record_run(args) -> int:
     return 0
 
 
+def cmd_append_evaluation(args) -> int:
+    """Index an evaluator-owned record digest without copying its facts."""
+    ledger_path = Path(args.ledger)
+    data = _load_ledger(ledger_path)
+    record_path = Path(args.record)
+    try:
+        from evaluation_records import read_records
+    except ImportError:
+        from tools.evaluation_records import read_records
+    try:
+        rows = read_records(record_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid evaluation record JSONL: {exc}") from exc
+    if not rows:
+        raise SystemExit("evaluation record JSONL is empty")
+    target = next((r for r in data["records"] if str(r.get("run_id")) == args.run_id), None)
+    if target is None:
+        raise SystemExit(f"unknown run id: {args.run_id}")
+    digests = target.setdefault("evaluation_record_digests", [])
+    paths = target.setdefault("evaluation_record_paths", {})
+    for row in rows:
+        digest = row.get("record_digest")
+        if not isinstance(digest, str) or not digest:
+            raise SystemExit("evaluation record must contain record_digest")
+        if digest not in digests:
+            digests.append(digest)
+        paths[digest] = str(record_path.resolve())
+    _save_ledger(ledger_path, data)
+    print(json.dumps({"run_id": args.run_id, "record_digest": digest}))
+    return 0
+
+
 def cmd_resolve_unevaluated(args) -> int:
     task_name = args.task or infer_task_name([Path(args.ledger)])
     if not task_name:
@@ -1176,6 +1208,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--candidate-name")
     run.add_argument("--description")
     run.set_defaults(func=cmd_record_run)
+
+    evaluation = sub.add_parser("append-evaluation", parents=[common])
+    evaluation.add_argument("--run-id", required=True)
+    evaluation.add_argument("--record", required=True, type=Path,
+                            help="evaluator-owned JSON record; only its digest is indexed")
+    evaluation.set_defaults(func=cmd_append_evaluation)
 
     rewrite = sub.add_parser("record-rewrite", parents=[common],
                              help="commit a kept rewrite's new reference score")
