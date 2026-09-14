@@ -257,7 +257,8 @@ python tools/search_backends.py validate \
   --manifest <run_dir>/background_retrieval.json
 python tools/background_contract.py validate \
   --background <run_dir>/background.md \
-  --retrieval-manifest <run_dir>/background_retrieval.json
+  --retrieval-manifest <run_dir>/background_retrieval.json \
+  --number-gate
 # Add this flag whenever the task declares a provided entrypoint:
 #   --baseline-mechanisms <run_dir>/baseline_mechanisms.json
 ```

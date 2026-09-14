@@ -2081,6 +2081,10 @@ _ARXIV_ID_RE = re.compile(r"\d{4}\.\d{4,5}(?:v\d+)?")
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?\\*%?")
 _RANGE_SEPARATOR_RE = re.compile(r"[-–~]")
 _TOKEN_EDGE_PUNCT = "\"'`“”‘’.,;:!?()[]{}<>*_#$-–~"
+# HTML tags are delimiters: deepxiv stores table cells as ``<td>0.839</td>``.
+# Pin the tag shape; a bare ``<...>`` also spans comparison and LaTeX intervals
+# (``<0.05; RUS: -0.004, p>``, ``$\\mu<1.4$ ... $>``) and swallows their numbers.
+_NUMBER_SPLIT_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^>]*)?/?>|\s+")
 
 
 def audit_text(item: dict[str, Any]) -> str:
@@ -2143,10 +2147,14 @@ def _number_tokens(raw: str) -> list[str]:
 
 
 def extract_result_numbers(text: str) -> list[str]:
-    """Result-type number tokens in ``text``, deduped in first-appearance order."""
+    """Result-type number tokens in ``text``, deduped in first-appearance order.
+
+    HTML tags are delimiters, so a number glued inside markup (``<td>0.839</td>``)
+    still counts as retained content.
+    """
     tokens: list[str] = []
     seen: set[str] = set()
-    for raw in text.split():
+    for raw in _NUMBER_SPLIT_RE.split(text):
         for token in _number_tokens(raw):
             if token not in seen:
                 seen.add(token)

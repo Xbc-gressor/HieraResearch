@@ -1140,6 +1140,16 @@ class NumberPrecheckTests(unittest.TestCase):
             extract_result_numbers(text), ["38.43%", "94%", "95%", "0.3843"]
         )
         self.assertEqual(extract_result_numbers("no result numbers, 42 plain"), [])
+        self.assertEqual(
+            extract_result_numbers(
+                "<table><tr><td>0.839</td><td>0.816</td></tr></table> and 3.1"
+            ),
+            ["0.839", "0.816", "3.1"],
+        )
+        self.assertEqual(
+            extract_result_numbers("<0.05; RUS: -0.004, p>"),
+            ["0.05", "0.004"],
+        )
 
     def test_mapping_number_presence_present_absent_none(self) -> None:
         registry = self._registry()
@@ -1383,6 +1393,15 @@ class NumberGateTests(unittest.TestCase):
         manifest = self._manifest(
             (self.url, "full_text", "A qualitative discussion without decimals."),
             (sibling["url"], "preview", "The ablation reaches 0.3843 accuracy."),
+        )
+        self.assertEqual(self._errors(manifest, number_gate=True), [])
+
+    def test_gate_passes_when_the_number_sits_inside_an_html_table_cell(self) -> None:
+        self.registry["guidance"][0]["claim"] = (
+            "GloVe reaches 0.839 accuracy on this split."
+        )
+        manifest = self._manifest(
+            (self.url, "full_text", "<table><tr><td>0.839</td><td>0.816</td></tr></table>")
         )
         self.assertEqual(self._errors(manifest, number_gate=True), [])
 

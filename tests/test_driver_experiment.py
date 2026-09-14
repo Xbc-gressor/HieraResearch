@@ -10,7 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from driver.loops.background_audit import audit_completed  # noqa: E402
-from driver.loops.experiment import run_experiment  # noqa: E402
+from driver.loops.experiment import (  # noqa: E402
+    _validator_error_messages,
+    run_experiment,
+)
 from driver.session import FakeSessionRunner  # noqa: E402
 from tests.fixtures import (  # noqa: E402
     background_text,
@@ -52,6 +55,7 @@ class ExperimentCmd:
         self.brief_queue: list[dict] = []
         self.reached: list[bool] = []
         self.fail_next: set[str] = set()
+        self.fail_payload: dict[str, tuple[int, str, str]] = {}
         self.raise_once: set[str] = set()
 
     @property
@@ -74,6 +78,10 @@ class ExperimentCmd:
             if marker in joined:
                 self.fail_next.discard(marker)
                 return subprocess.CompletedProcess(args, 1, "", "boom")
+        for marker, payload in self.fail_payload.items():
+            if marker in joined:
+                code, stdout, stderr = payload
+                return subprocess.CompletedProcess(args, code, stdout, stderr)
         for marker in list(self.raise_once):
             if marker in joined:
                 self.raise_once.discard(marker)
@@ -201,6 +209,27 @@ def judge_entry(unfaithful_ids: set[str]) -> dict:
 
     entry["side_effects"] = effect
     return entry
+
+
+class ValidatorErrorMessageTests(unittest.TestCase):
+    def test_stdout_json_errors_win_over_empty_stderr(self) -> None:
+        result = subprocess.CompletedProcess(
+            [], 1,
+            json.dumps({"ok": False, "errors": [
+                "hypothesis hyp-x number 0.839 is missing",
+            ]}),
+            "",
+        )
+        self.assertEqual(
+            _validator_error_messages(result),
+            ["hypothesis hyp-x number 0.839 is missing"],
+        )
+
+    def test_stderr_is_the_fallback_when_stdout_is_not_named_json(self) -> None:
+        result = subprocess.CompletedProcess([], 1, "", "boom")
+        self.assertEqual(_validator_error_messages(result), ["boom"])
+        empty = subprocess.CompletedProcess([], 1, "", "")
+        self.assertEqual(_validator_error_messages(empty), ["validation failed"])
 
 
 class ExperimentTests(unittest.TestCase):
@@ -630,6 +659,45 @@ class ExperimentTests(unittest.TestCase):
             1)
         self.assertEqual((cmd.run_dir / "background.md").read_text(),
                          frozen_text)
+
+    def test_generation_validation_repair_receives_stdout_json_errors(self) -> None:
+        # Validators print named errors on stdout JSON and leave stderr empty.
+        # The repair extra and the block reason must carry those strings, not
+        # the collapsed fallback "validation failed".
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        named = (
+            "hypothesis hyp-glove-embedding number 0.839 is in no cited "
+            "source's retained content at preview tier or better "
+            "(candidates: src-02); visit a cited source containing the "
+            "number, cite a different source that carries it, or downgrade "
+            "the claim to a qualitative statement"
+        )
+        payload = json.dumps({"ok": False, "errors": [named]})
+        cmd.fail_payload = {
+            "background_contract.py validate": (1, payload, ""),
+        }
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(
+            [name for name, _ in runner.calls],
+            ["background-researcher", "background-researcher"],
+        )
+        extra = runner.calls[1][1].extra
+        self.assertIn("0.839", extra["validation_errors"])
+        self.assertIn("hyp-glove-embedding", extra["validation_errors"])
+        self.assertNotIn("validation failed", extra["validation_errors"])
+        events = (cmd.run_dir / "driver_events.jsonl").read_text()
+        self.assertIn("0.839", events)
+        self.assertNotIn("['validation failed']", events)
 
     def test_invalid_preseeded_background_blocks_without_repair(self) -> None:
         write_task(self.repo)

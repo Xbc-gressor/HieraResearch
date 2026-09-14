@@ -1317,6 +1317,38 @@ def _background_researcher_invoked(run_dir) -> bool:
     )
 
 
+def _validator_error_messages(result) -> list[str]:
+    """Named validator errors for in-session repair and the block reason.
+
+    ``background_contract.py validate`` and ``search_backends.py validate``
+    print JSON with an ``errors`` list on stdout and leave stderr empty on a
+    clean reject.  Prefer those named strings; stderr is only a supplement
+    (or the fallback when stdout is not that JSON).
+    """
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    named: list[str] = []
+    if stdout:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = None
+        else:
+            if isinstance(payload, dict):
+                raw = payload.get("errors")
+                if isinstance(raw, list):
+                    named = [str(item) for item in raw if str(item).strip()]
+    if named:
+        if stderr:
+            named.append(stderr)
+        return named
+    if stderr:
+        return [stderr]
+    if stdout:
+        return [stdout]
+    return ["validation failed"]
+
+
 def _background_validation_errors(run_dir, repo_root, cmd,
                                   strategy, *, number_gate=False) -> list[str]:
     """Run all deterministic validators for background-research artifacts."""
@@ -1343,7 +1375,7 @@ def _background_validation_errors(run_dir, repo_root, cmd,
     for check_args in checks:
         result = cmd(check_args, repo_root, check=False)
         if result.returncode != 0:
-            errors.append(result.stderr or "validation failed")
+            errors.extend(_validator_error_messages(result))
     return errors
 
 
