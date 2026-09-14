@@ -819,9 +819,19 @@ def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
 # =============================================================================
 
 
-def _failure_evidence(candidate_dir: Path) -> str | None:
+def _failure_evidence(candidate_dir: Path,
+                      problems: list[str] | None = None) -> str | None:
+    """The diagnosis input: the durable report path when it exists, plus the
+    failed invocation's own problems, so the diagnoser sees both the artifact
+    and why the session could not finish."""
     report = candidate_dir / "tune_report.json"
-    return str(report) if report.exists() else None
+    if not report.exists():
+        return None
+    evidence = str(report)
+    if problems:
+        evidence += ("\n\nextractor invocation problems:\n"
+                     + "\n".join(f"- {p}" for p in problems))
+    return evidence
 
 
 def _resolve_unevaluated(run_dir, run_id, repo_root, cmd) -> bool:
@@ -1004,9 +1014,11 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             _, writer_inv = _invoke(runner, store, "candidate-writer", task,
                                     tag, run_dir, run_id=run_id,
                                     extra={"candidate_dir": str(candidate_dir)})
-        except InvocationFailed:
+        except InvocationFailed as retry_exc:
             _or_block(run_dir, repo_root, cmd, events,
-                      f"candidate-writer failed for {run_id}: {exc.problems}")
+                      f"candidate-writer failed for {run_id}: "
+                      f"retry: {retry_exc.problems}; "
+                      f"first attempt: {exc.problems}")
     try:
         _, extractor_inv = _invoke_with_driver_jobs(
             runner, store, "tunable-contract-extractor", task, tag, run_dir,
@@ -1026,7 +1038,7 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
         return
     # 2. actual failure receipt → crash diagnosis
-    evidence = _failure_evidence(candidate_dir)
+    evidence = _failure_evidence(candidate_dir, problems)
     if evidence:
         try:
             verdict = common.crash_diagnose(
@@ -1082,19 +1094,30 @@ def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str,
 
 
 def _phase_c_recover_close(run_dir: Path, run_id: str, repo_root: Path, cmd,
-                           task: str) -> dict | None:
+                           events, task: str) -> dict | None:
     """Close/finalize a terminal Phase-C report using deterministic actions.
 
     A tuner receipt is a session handoff and may truthfully say ``tuned=false``
     even though the objective job exhausted its bout.  The report/action pair
-    is authoritative for deciding whether that bout can be closed.
+    is authoritative for deciding whether that bout can be closed.  Every
+    no-op return first emits ``tuning_driver_finalize_deferred`` with the
+    refusing step's own detail, so a persistent refusal is diagnosable.
     """
     candidate_dir = run_dir / "candidates" / str(run_id)
+
+    def defer(what: str, proc=None) -> None:
+        detail = ""
+        if proc is not None:
+            detail = (proc.stderr or proc.stdout or "").strip()[-1500:]
+        events.emit("tuning_driver_finalize_deferred", run_id=run_id,
+                    reason=f"{what}: {detail}" if detail else what)
+
     action_cmd = ["python", "tools/tuners/tune_tools.py", "phase-c-action",
                   "--candidate-path", candidate_dir / "train.py",
                   "--tune-report-json", candidate_dir / "tune_report.json"]
     action = cmd(action_cmd, repo_root, check=False)
     if getattr(action, "returncode", 1) != 0:
+        defer("phase-c-action refused", action)
         return None
     decision = json.loads(action.stdout)
     if decision.get("action") == "close_exhausted_stage":
@@ -1104,12 +1127,15 @@ def _phase_c_recover_close(run_dir: Path, run_id: str, repo_root: Path, cmd,
                       "--tune-report-json", candidate_dir / "tune_report.json"],
                      repo_root, check=False)
         if getattr(closed, "returncode", 1) != 0:
+            defer("close-exhausted-stage refused", closed)
             return None
         action = cmd(action_cmd, repo_root, check=False)
         if getattr(action, "returncode", 1) != 0:
+            defer("phase-c-action re-check refused", action)
             return None
         decision = json.loads(action.stdout)
     if decision.get("action") != "finalize":
+        defer(f"phase-c-action decided {decision.get('action')!r}")
         return None
     result = cmd(["python", "tools/finalize_tuning.py",
                   "--candidate-path", candidate_dir / "train.py",
@@ -1118,6 +1144,7 @@ def _phase_c_recover_close(run_dir: Path, run_id: str, repo_root: Path, cmd,
                   "--run-id", str(run_id), "--task", task],
                  repo_root, check=False)
     if getattr(result, "returncode", 1) != 0:
+        defer("finalize_tuning refused", result)
         return None
     return json.loads(result.stdout)
 
@@ -1130,47 +1157,56 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
         receipt, tuner_inv = _invoke_with_driver_jobs(
             runner, store, "tuner-orchestrator", task, tag, run_dir,
             round_no=round_no, repo_root=repo_root, job_runner=job_runner)
-    except (InvocationFailed, DriverJobError):
+    except (InvocationFailed, DriverJobError) as exc:
+        # The reconcile session is the recovery path: hand it the first
+        # session's problems, and keep them for the block reason too.
+        first_problems = [str(p) for p in
+                          getattr(exc, "problems", [str(exc)])]
         try:
-            receipt = _tuner_reconcile(runner, store, task, tag, run_dir,
-                                       round_no, "tuner session failed.",
-                                       repo_root, job_runner)
+            receipt = _tuner_reconcile(
+                runner, store, task, tag, run_dir, round_no,
+                "tuner session failed: " + "; ".join(first_problems),
+                repo_root, job_runner)
         except (InvocationFailed, DriverJobError) as exc:
-            problems = getattr(exc, "problems", [str(exc)])
+            problems = [str(p) for p in
+                        getattr(exc, "problems", [str(exc)])]
             _or_block(run_dir, repo_root, cmd, events,
-                      f"tuner reconciliation failed: {problems}")
+                      f"tuner session failed: {first_problems}; "
+                      f"reconciliation failed: {problems}")
     tuned_id = receipt.get("tuned_run_id", "none")
     # The receipt is only a handoff.  If it names a candidate, consult the
     # deterministic phase-C action even when tuned=false; an exhausted bout
     # must be closed and applied before the round can end.
     if tuned_id != "none" and not _tune_flag(run_dir, tuned_id):
         finalized = _phase_c_recover_close(
-            run_dir, tuned_id, repo_root, cmd, task)
+            run_dir, tuned_id, repo_root, cmd, events, task)
         if finalized is not None:
             receipt = {**receipt, **finalized, "tuned": True,
                        "tuned_run_id": tuned_id, "ledger_updated": True}
-        else:
-            events.emit("tuning_driver_finalize_deferred", run_id=tuned_id)
     # contradiction: receipt claims applied but the ledger still disagrees
     if receipt.get("tuned") and tuned_id != "none" and \
             not _tune_flag(run_dir, tuned_id):
         note = (f"receipt claims tuned {tuned_id} but ledger has tune: false.")
         # spec: corrective follow-up in the SAME tuner session first
         corrected = None
+        reconcile_note = note
         try:
             corrected, _ = _invoke_with_driver_jobs(
                 runner, store, "tuner-orchestrator", task, tag, run_dir,
                 round_no=round_no, resume_from=tuner_inv,
                 extra={"reconcile_note": note + _RECONCILE_GUIDANCE},
                 repo_root=repo_root, job_runner=job_runner)
-        except InvocationFailed:
+        except InvocationFailed as exc:
             corrected = None
+            reconcile_note = note + (
+                " The same-session corrective attempt failed: "
+                + "; ".join(str(p) for p in exc.problems))
         if corrected is None or (corrected.get("tuned") and not _tune_flag(
                 run_dir, corrected.get("tuned_run_id", "none"))):
             try:
                 corrected = _tuner_reconcile(
-                    runner, store, task, tag, run_dir, round_no, note,
-                    repo_root, job_runner)
+                    runner, store, task, tag, run_dir, round_no,
+                    reconcile_note, repo_root, job_runner)
             except (InvocationFailed, DriverJobError) as exc:
                 problems = getattr(exc, "problems", [str(exc)])
                 _or_block(run_dir, repo_root, cmd, events,
@@ -1564,35 +1600,41 @@ def _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
     candidate_dir = run_dir / "candidates" / run_id
     try:
         _invoke_with_driver_jobs(
-            runner, store, "tunable-contract-extractor", task, tag,
-            run_dir, run_id=run_id,
+            runner, store, "tunable-contract-extractor", task, tag, run_dir,
+            run_id=run_id,
             extra={"candidate_dir": str(candidate_dir)}, repo_root=repo_root,
             job_runner=job_runner)
         return
-    except InvocationFailed:
-        evidence = _failure_evidence(candidate_dir)
-        if evidence:
+    except InvocationFailed as exc:
+        problems = [str(p) for p in exc.problems]
+    evidence = _failure_evidence(candidate_dir, problems)
+    repair_problems = None
+    if evidence:
+        try:
+            verdict = common.crash_diagnose(
+                runner, store, task, tag, run_dir, evidence)["verdict"]
+        except InvocationFailed as exc:
+            events.emit("crash_diagnosis_failed", run_id=run_id,
+                        problems=exc.problems)
+            verdict = "abandon"
+        if verdict != "abandon":
             try:
-                verdict = common.crash_diagnose(
-                    runner, store, task, tag, run_dir, evidence)["verdict"]
+                _invoke_with_driver_jobs(
+                    runner, store, "tunable-contract-extractor", task,
+                    tag, run_dir, run_id=run_id,
+                    extra={"candidate_dir": str(candidate_dir),
+                           "diagnosis_verdict": verdict},
+                    repo_root=repo_root, job_runner=job_runner)
+                return
             except InvocationFailed as exc:
-                events.emit("crash_diagnosis_failed", run_id=run_id,
-                            problems=exc.problems)
-                verdict = "abandon"
-            if verdict != "abandon":
-                try:
-                    _invoke_with_driver_jobs(
-                        runner, store, "tunable-contract-extractor", task,
-                        tag, run_dir, run_id=run_id,
-                        extra={"candidate_dir": str(candidate_dir),
-                               "diagnosis_verdict": verdict},
-                        repo_root=repo_root, job_runner=job_runner)
-                    return
-                except InvocationFailed:
-                    pass
-        _record_crash(run_dir, run_id, repo_root, cmd)
-        _or_block(run_dir, repo_root, cmd, events,
-                  "provided baseline could not be evaluated; crash recorded")
+                repair_problems = [str(p) for p in exc.problems]
+    _record_crash(run_dir, run_id, repo_root, cmd)
+    detail = "; ".join(problems)
+    if repair_problems:
+        detail += f"; repair failed: {'; '.join(repair_problems)}"
+    _or_block(run_dir, repo_root, cmd, events,
+              "provided baseline could not be evaluated; crash recorded: "
+              + detail)
 
 
 def _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,

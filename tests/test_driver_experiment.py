@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from driver.loops.background_audit import audit_completed  # noqa: E402
 from driver.loops.experiment import (  # noqa: E402
+    _phase_c_recover_close,
     _validator_error_messages,
     run_experiment,
 )
@@ -605,6 +606,54 @@ class ExperimentTests(unittest.TestCase):
         self.assertIsNone(tuner_calls[1].resume_session_id)
         self.assertIsNone(tuner_calls[2].resume_session_id)
         self.assertIn("reconcile_note", tuner_calls[1].extra)
+        self.assertIn("tuner session died",
+                      tuner_calls[1].extra["reconcile_note"])
+
+    def test_provided_baseline_extractor_failure_blocks_with_detail(self) -> None:
+        write_task(self.repo, provided=True)
+        cmd = ExperimentCmd(self.repo)
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
+            {"receipt": {"status": "existing", "wrote": False,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"fail": ["no accepted receipt",
+                      "session ended with error result: error_max_turns"]},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        events = (cmd.run_dir / "driver_events.jsonl").read_text()
+        self.assertIn("provided baseline could not be evaluated", events)
+        self.assertIn("no accepted receipt", events)
+        self.assertIn("error_max_turns", events)
+        self.assertTrue(any("record-run" in c and "--status crash" in c
+                            for c in cmd.calls))
+
+    def test_phase_c_recover_close_reports_refusal_detail(self) -> None:
+        run_dir = self.repo / "runs" / "fake-task" / "t1"
+        candidate = run_dir / "candidates" / "000"
+        candidate.mkdir(parents=True)
+
+        def refusing_cmd(args, repo_root, check=True, capture=True, **kw):
+            return subprocess.CompletedProcess(
+                [], 1, "", "stage still running: remaining > 0")
+
+        emitted = []
+
+        class RecordingEvents:
+            def emit(self, kind, **fields):
+                emitted.append((kind, fields))
+
+        result = _phase_c_recover_close(
+            run_dir, "000", self.repo, refusing_cmd, RecordingEvents(),
+            "fake-task")
+        self.assertIsNone(result)
+        self.assertEqual(emitted[0][0], "tuning_driver_finalize_deferred")
+        self.assertIn("phase-c-action refused", emitted[0][1]["reason"])
+        self.assertIn("stage still running", emitted[0][1]["reason"])
 
     def test_resume_missing_background_reruns_researcher(self) -> None:
         self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
