@@ -1,5 +1,11 @@
 # autoresearch-automl
 
+For MLE-bench final delivery, use `tools/mlebench_finalize.py` with the
+driver's absolute deadline after the search process exits. Its submission
+command must write `{run_dir}/submission.csv` before that deadline; the grader
+command starts afterward and is recorded outside the agent budget. This keeps
+driver and AIBuildAI runs on the same timing boundary.
+
 Multi-task autoresearch harness. Autonomous loops edit run-local candidate
 `train.py` files and minimize the task's configured metric. The `driver/`
 Python package is the sole runtime: a deterministic driver sequencing Claude
