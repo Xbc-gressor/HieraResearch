@@ -63,6 +63,18 @@ candidate code, raw retrieval material, or logs by default.
    `available_comparator_coverage` as if omitted edge ids had been cited. If a
    necessary target was omitted by the global caps, rerun with repeated
    `--target-id <exact-id>` before authoring its belief.
+   Each hypothesis block also returns `carrier_contexts`: the independent
+   negative and positive carrier contexts, as parent run id lists, that the
+   recommendation gate keys on. They are computed over exactly that block's
+   `evidence_edge_ids`, and `complete` reports whether those edges reach every
+   carrier edge this target has. Treat the lists as authoritative only when
+   `complete` is true. A context counts only when every carrier delta in it
+   agrees in sign, so a truncated subset can turn a mixed context unanimous and
+   *add* contexts: citing fewer edges never lowers these lists, it can only
+   inflate them. Do not recompute or adjust them from the per-edge
+   observations — deciding whether a child *adds* the hypothesis and whether a
+   matched semantic control supersedes a raw delta is not derivable from the
+   bounded edge rows.
 4. Preserve the prior belief payload byte-for-byte when the new DAG delta does
    not change a supported belief. A processed delta may therefore be a belief
    no-op: update `updated_at_run`, keep `generation` unchanged, and do not invent
@@ -201,6 +213,14 @@ cost. Explain that reasoning in `claim` and preserve the main caveat in
 the cited evidence meets the carrier rule (≥2 independent negative contexts,
 zero positive), the consistency requirement is satisfied and `unpromising` is
 the right call even without comparator coverage.
+
+Read the carrier rule off the block's `carrier_contexts`: the rule is met when
+its `negative` list has two or more entries and its `positive` list is empty.
+The two demotion paths are independent, so a target whose
+`comparator_coverage` shows only confounded or crash edges — a failing depth
+bar — can still pass on the carrier path. `score_basis:
+independently_tuned_final` on an edge marks it confounded for the strict path
+and does not disqualify it as a carrier context.
 
 An entry only recommends. The helper derives and validates the actual
 append-only `search_space_state` transitions under their own two-stage,

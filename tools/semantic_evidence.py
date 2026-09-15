@@ -828,6 +828,7 @@ def hypothesis_carriers(
     allowed = None if edge_ids is None else {str(value) for value in edge_ids}
     records = _records_by_id(ledger)
     contexts: dict[str, list[float]] = {}
+    contributing: set[str] = set()
     for record in ledger.get("records", []):
         if not isinstance(record, dict):
             continue
@@ -862,6 +863,7 @@ def hypothesis_carriers(
             if delta is None or abs(delta) <= 1e-12:
                 continue
             contexts.setdefault(str(receipt.get("parent_run_id")), []).append(delta)
+            contributing.add(str(receipt.get("edge_id")))
     negative = sorted(
         parent_id
         for parent_id, deltas in contexts.items()
@@ -877,6 +879,11 @@ def hypothesis_carriers(
         "positive": len(positive),
         "negative_contexts": negative,
         "positive_contexts": positive,
+        # Every carrier edge that reached a context, regardless of the context's
+        # sign.  A caller that reads the counts over a *subset* of these needs
+        # this to know whether the subset is the whole picture: the rule is
+        # defined over the complete set, and a subset can only add contexts.
+        "contributing_edge_ids": sorted(contributing),
     }
 
 
@@ -2035,7 +2042,7 @@ def _target_block(
         target_id=target_id,
     )
     omitted = {key: available[key] - coverage[key] for key in COVERAGE_KEYS}
-    return {
+    block = {
         "target_id": target_id,
         "evaluation_state": target_evaluation_state(
             ledger,
@@ -2051,6 +2058,30 @@ def _target_block(
         "omitted_edge_counts": omitted,
         "edges": [edge_observation(ledger, edge_id) for edge_id in edge_ids],
     }
+    if target_kind == "hypothesis":
+        # The carrier rule is a hypothesis-only demotion path independent of the
+        # coverage depth bar, and the recommendation validator keys on exactly
+        # these counts.  Deriving them from the bounded edge list is not
+        # something a reader can do: it needs which child *adds* the hypothesis
+        # and whether a matched semantic control supersedes the raw delta.
+        #
+        # A context counts only when *every* carrier delta in it agrees in sign,
+        # so the rule is sound only over the target's complete carrier edge set.
+        # Over a truncated subset it is not: dropping the sibling that disagrees
+        # can turn a mixed context into a unanimous one, which *adds* contexts
+        # rather than removing them.  `complete` therefore reports whether the
+        # cited edges reach every carrier edge of this target; the counts below
+        # are authoritative only when it holds.
+        carriers = hypothesis_carriers(ledger, target_id=target_id, edge_ids=edge_ids)
+        every_carrier_edge = set(
+            hypothesis_carriers(ledger, target_id=target_id)["contributing_edge_ids"]
+        )
+        block["carrier_contexts"] = {
+            "negative": list(carriers["negative_contexts"]),
+            "positive": list(carriers["positive_contexts"]),
+            "complete": every_carrier_edge <= set(map(str, edge_ids)),
+        }
+    return block
 
 
 def render_target_evidence(

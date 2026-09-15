@@ -25,6 +25,11 @@ RECEIPT_NAME = "environment_preflight.json"
 
 
 def _load_prepare(path: Path):
+    # prepare.py may import evaluator helpers as ``tools.*``; those resolve
+    # from the repo root, not from the task directory.
+    root = str(ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
     sys.path.insert(0, str(path.parent))
     spec = importlib.util.spec_from_file_location("prepare", path)
     if spec is None or spec.loader is None:

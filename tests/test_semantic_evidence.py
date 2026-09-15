@@ -1230,6 +1230,82 @@ class TargetEvidenceViewTests(unittest.TestCase):
         )
         self.assertEqual(block["evaluation_state"], "comparator_covered")
 
+    def test_hypothesis_block_discloses_carrier_contexts(self) -> None:
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append_plain(records, "001", ["000"], filtered, status="discard", score=0.50, dag_revision=2)
+        _append_plain(records, "002", [], baseline, status="keep", score=0.41, dag_revision=3)
+        _append_plain(records, "003", ["002"], filtered, status="discard", score=0.52, dag_revision=4)
+        ledger = {"records": records, "dag_revision": 4}
+
+        view = render_target_evidence(registry, ledger, target_ids=["hyp-data-filtered"])
+        (block,) = view["hypothesis_targets"]
+        # The gate's carrier path is met here (>=2 negative, 0 positive) even
+        # though these screening edges cannot clear the coverage depth bar.
+        self.assertEqual(
+            block["carrier_contexts"],
+            {"negative": ["000", "002"], "positive": [], "complete": True},
+        )
+        self.assertEqual(block["comparator_coverage"]["direct_tuned_edges"], 0)
+
+        # Counts are over the block's own cited edges, matching what the
+        # recommendation validator recomputes from the same list.
+        self.assertEqual(
+            hypothesis_carriers(
+                ledger,
+                target_id="hyp-data-filtered",
+                edge_ids=block["evidence_edge_ids"],
+            )["negative_contexts"],
+            block["carrier_contexts"]["negative"],
+        )
+
+        # The carrier rule is hypothesis-only; dimension blocks stay unchanged.
+        dim_view = render_target_evidence(
+            registry, ledger, target_ids=["dim-data-curation"]
+        )
+        (dim_block,) = dim_view["dimension_targets"]
+        self.assertNotIn("carrier_contexts", dim_block)
+
+    def test_truncated_carrier_subset_is_flagged_incomplete(self) -> None:
+        # A context counts only when every carrier delta in it agrees in sign,
+        # so dropping the disagreeing sibling can turn a mixed context unanimous.
+        # A subset therefore *adds* contexts; the view must say when it is one.
+        registry = fixture_registry()
+        baseline = complete_point(registry)
+        filtered = complete_point(registry, {"dim-data-curation": "hyp-data-filtered"})
+        records: list[dict] = []
+        _append_plain(records, "000", [], baseline, status="keep", score=0.40, dag_revision=1)
+        _append_plain(records, "001", ["000"], filtered, status="discard", score=0.50, dag_revision=2)
+        _append_plain(records, "002", ["000"], filtered, status="keep", score=0.30, dag_revision=3)
+        _append_plain(records, "003", [], baseline, status="keep", score=0.41, dag_revision=4)
+        _append_plain(records, "004", ["003"], filtered, status="discard", score=0.51, dag_revision=5)
+        _append_plain(records, "005", ["003"], filtered, status="keep", score=0.31, dag_revision=6)
+        ledger = {"records": records}
+        full = hypothesis_carriers(ledger, target_id="hyp-data-filtered")
+        self.assertEqual((full["negative"], full["positive"]), (0, 0))
+        self.assertEqual(len(full["contributing_edge_ids"]), 4)
+
+        worse_only = ["sedge-000-001", "sedge-003-004"]
+        subset = hypothesis_carriers(
+            ledger, target_id="hyp-data-filtered", edge_ids=worse_only
+        )
+        # Over the subset the gate would open; over the whole set it is closed.
+        self.assertEqual((subset["negative"], subset["positive"]), (2, 0))
+
+        # A bounded view holding at most two edges cannot cite all four carrier
+        # edges, and must disclose that its lists are not authoritative.
+        view = render_target_evidence(
+            registry,
+            ledger,
+            target_ids=["hyp-data-filtered"],
+            max_edges_per_target=2,
+        )
+        (block,) = view["hypothesis_targets"]
+        self.assertFalse(block["carrier_contexts"]["complete"])
+
     def test_explicit_target_ids_bypass_target_caps(self) -> None:
         registry = fixture_registry()
         ledger = _mixed_ledger(registry)
