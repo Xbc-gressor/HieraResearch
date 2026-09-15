@@ -17,6 +17,7 @@ import sys
 import traceback
 
 from validate_tasks import ROOT, parse_task_toml
+from hardware import snapshot as hardware_snapshot
 
 
 SCHEMA_VERSION = 1
@@ -100,6 +101,7 @@ def run_preflight(task_name: str, run_dir: Path) -> dict:
         "objective_calls": 0,
         "checks": checks,
         "hook_result": hook_result,
+        "hardware": hardware_snapshot(),
         "runtime": {
             "python": platform.python_version(),
             "platform": platform.platform(),

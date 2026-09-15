@@ -75,6 +75,7 @@ from _common import (  # noqa: E402
     EvaluationBudgetExhausted,
     resolve_score_fn,
     resolve_preflight_fn,
+    resolve_resource_probe_fn,
     timed_eval,
     timed_preflight,
     cast_params_to_search_space,
@@ -405,6 +406,7 @@ class WarmstartRun:
     make_model: Callable[..., Any]
     evaluate: Callable[..., float]
     preflight_enabled: bool
+    preflight_mode: str
     report: dict
     preflight_report: dict
     cache_rows: dict[str, dict]
@@ -951,6 +953,11 @@ def _prepare_run(
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
     preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
+    preflight_mode = (
+        "resource"
+        if resolve_resource_probe_fn(prepare_module, args.candidate_path) is not None
+        else "preflight"
+    )
 
     # Resume cache: configs already scored in a prior run, keyed by params. A
     # config the caller edited (config-invalid fix) gets new params → cache miss
@@ -1123,6 +1130,7 @@ def _prepare_run(
         make_model=make_model,
         evaluate=evaluate,
         preflight_enabled=preflight_enabled,
+        preflight_mode=preflight_mode,
         report=report,
         preflight_report=preflight_report,
         cache_rows=cache_rows,
@@ -1163,6 +1171,7 @@ def _preflight_config(
             params,
             run.candidate_path,
             expected_execution_revision=run.candidate_code_revision,
+            probe_mode=run.preflight_mode,
         )
     except Exception as exc:
         tb = traceback.format_exc()

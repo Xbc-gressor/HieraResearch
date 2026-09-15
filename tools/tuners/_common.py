@@ -1621,13 +1621,39 @@ def is_config_infeasible_error(exc: BaseException) -> bool:
 
 
 def _env_total_vram_mb(ref_path: Any) -> float | None:
-    """Total VRAM (MB) recorded by the run's environment preflight, if any."""
+    """Total VRAM for the actual lease, falling back to run preflight.
+
+    A run-level snapshot can describe a different device from the one later
+    leased on a heterogeneous host. Successful lease telemetry is therefore
+    authoritative; the environment receipt remains a useful fallback for
+    runs whose probe happened before a lease was acquired.
+    """
     cfg = find_framework_cfg(ref_path)
     if cfg is None:
         return None
+    run_dir = cfg.parent
+    lease_path = run_dir / "resource_leases.jsonl"
+    try:
+        latest: dict | None = None
+        for line in lease_path.read_text().splitlines():
+            row = json.loads(line)
+            if row.get("status") == "acquired":
+                latest = row
+        gpus = ((latest or {}).get("hardware") or {}).get("gpus") or []
+        totals = [float(gpu["total_vram_mb"]) for gpu in gpus
+                  if float(gpu.get("total_vram_mb", 0)) > 0]
+        if totals:
+            return min(totals)
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        pass
     env_path = cfg.parent / "environment_preflight.json"
     try:
         data = json.loads(env_path.read_text())
+        hardware_gpus = data.get("hardware", {}).get("gpus", [])
+        totals = [float(gpu["total_vram_mb"]) for gpu in hardware_gpus
+                  if float(gpu.get("total_vram_mb", 0)) > 0]
+        if totals:
+            return min(totals)
         value = float(data["hook_result"]["total_vram_mb"])
         return value if value > 0 else None
     except (OSError, KeyError, TypeError, ValueError):

@@ -19,6 +19,8 @@ proxy = "evaluate_config"
 protocol = "evaluate_protocol"
 data_version = "public-v1"
 environment_preflight_fn = "preflight_environment"
+preflight_fn = "preflight_config"
+resource_probe_fn = "resource_probe_config"
 
 [resources]
 accelerator = "cuda"

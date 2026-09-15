@@ -32,6 +32,8 @@ from pathlib import Path
 import subprocess
 import time
 
+from tools.hardware import snapshot as hardware_snapshot
+
 
 _LOCK_DIR_ENV = "SHANHAI_CUDA_LOCK_DIR"
 _DEFAULT_LOCK_DIR = Path("/tmp")
@@ -112,6 +114,34 @@ def _write_record(handle, record: dict) -> None:
     handle.flush()
 
 
+def _run_dir_for_owner(owner: dict | None) -> Path | None:
+    """Resolve the enclosing run directory for any lease caller."""
+    raw = (owner or {}).get("run_dir")
+    if not raw:
+        return None
+    path = Path(str(raw)).resolve()
+    if (path / "framework_cfg.json").is_file():
+        return path
+    for ancestor in (path, *path.parents):
+        if (ancestor / "framework_cfg.json").is_file():
+            return ancestor
+    return None
+
+
+def _append_lease_event(run_dir: Path | None, event: dict) -> None:
+    """Append one lease observation without making telemetry fatal."""
+    if run_dir is None:
+        return
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with (run_dir / "resource_leases.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, sort_keys=True) + "\n")
+    except OSError:
+        # Resource accounting must never turn a successful evaluation into a
+        # candidate failure. The lock itself remains authoritative.
+        return
+
+
 def check_gpu_memory(min_gib: float, *, device: str | None = None) -> dict:
     """Check free memory after a lease has been acquired.
 
@@ -173,6 +203,7 @@ def task_resource_lease(task_toml: dict, *, owner: dict | None = None):
         time.sleep(min(_POLL_SECONDS, max(0.01, wait_timeout - waited)))
 
     leased = [dev for dev, _ in held]
+    run_dir = _run_dir_for_owner(owner)
     for dev, handle in held:
         _write_record(
             handle,
@@ -185,13 +216,48 @@ def task_resource_lease(task_toml: dict, *, owner: dict | None = None):
         )
     previous_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(leased)
+    lease_event = {
+        "schema_version": 1,
+        "status": "acquired",
+        "devices": leased,
+        "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        **(owner or {}),
+    }
     try:
-        result = {"devices": leased, "lease_wait_seconds": time.monotonic() - started_wait}
+        result = {
+            "devices": leased,
+            "lease_wait_seconds": time.monotonic() - started_wait,
+        }
         minimum = resources.get("min_memory_gib")
         if minimum is not None:
-            result["memory"] = check_gpu_memory(float(minimum), device=leased[0])
+            memory = [
+                check_gpu_memory(float(minimum), device=device)
+                for device in leased
+            ]
+            result["memory"] = memory[0] if len(memory) == 1 else {
+                "devices": memory,
+            }
+        result["hardware"] = hardware_snapshot(devices=leased)
+        lease_event.update(
+            {
+                "lease_wait_seconds": result["lease_wait_seconds"],
+                "memory": result.get("memory"),
+                "hardware": result["hardware"],
+            }
+        )
+        _append_lease_event(run_dir, lease_event)
         yield result
     finally:
+        _append_lease_event(
+            run_dir,
+            {
+                "schema_version": 1,
+                "status": "released",
+                "devices": leased,
+                "released_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                **(owner or {}),
+            },
+        )
         if previous_cvd is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:

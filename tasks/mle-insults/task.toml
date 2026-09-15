@@ -13,6 +13,8 @@ timeout_seconds = 300
 [evaluation]
 score_fn = "evaluate_config"
 environment_preflight_fn = "preflight_environment"
+preflight_fn = "preflight_config"
+resource_probe_fn = "resource_probe_config"
 
 [resources]
 accelerator = "cuda"

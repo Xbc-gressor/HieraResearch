@@ -80,3 +80,25 @@ def test_cpu_task_leases_nothing(pool_env, monkeypatch):
     )
     with resources.task_resource_lease({"resources": {}}):
         pass
+
+
+def test_lease_persists_hardware_observation(pool_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(resources, "_visible_devices", lambda: ["0"])
+    monkeypatch.setattr(
+        resources,
+        "hardware_snapshot",
+        lambda *, devices: {"gpus": [{"index": devices[0], "total_vram_mb": 12288}]},
+    )
+    run_dir = tmp_path / "runs" / "task" / "tag"
+    run_dir.mkdir(parents=True)
+    (run_dir / "framework_cfg.json").write_text("{}")
+    with resources.task_resource_lease(
+        CUDA_TOML, owner={"run_dir": str(run_dir), "kind": "test"}
+    ):
+        pass
+    events = [
+        __import__("json").loads(line)
+        for line in (run_dir / "resource_leases.jsonl").read_text().splitlines()
+    ]
+    assert [event["status"] for event in events] == ["acquired", "released"]
+    assert events[0]["hardware"]["gpus"][0]["total_vram_mb"] == 12288

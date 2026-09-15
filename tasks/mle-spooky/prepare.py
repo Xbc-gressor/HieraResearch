@@ -11,6 +11,8 @@ import pandas as pd
 from sklearn.metrics import log_loss
 from sklearn.model_selection import train_test_split
 
+from tools.mle_resource_probe import run_resource_probe
+
 CLASSES = ("EAP", "HPL", "MWS")
 
 
@@ -84,6 +86,16 @@ def preflight_environment() -> dict:
         raise ValueError("public training and test IDs overlap")
     _split()
     return {"train_rows": len(frame), "test_rows": len(test), "gpu_required": False}
+
+
+def preflight_config(make_model, params: dict) -> dict:
+    """No-score full training-shape feasibility probe."""
+    return run_resource_probe(make_model, params, _split()[0])
+
+
+def resource_probe_config(make_model, params: dict) -> dict:
+    """No-score resource envelope for tuner search-space clamping."""
+    return run_resource_probe(make_model, params, _split()[0])
 
 
 def export_submission(make_model, params: dict, output: Path) -> None:

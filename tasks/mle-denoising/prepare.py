@@ -11,6 +11,8 @@ import pandas as pd
 from PIL import Image
 from sklearn.model_selection import train_test_split
 
+from tools.mle_resource_probe import run_resource_probe
+
 
 IMAGE_SUFFIX = ".png"
 
@@ -116,6 +118,16 @@ def preflight_environment() -> dict:
         "test_pixels": len(sample),
         "gpu_required": False,
     }
+
+
+def preflight_config(make_model, params: dict) -> dict:
+    """No-score full training-shape feasibility probe."""
+    return run_resource_probe(make_model, params, _split()[0])
+
+
+def resource_probe_config(make_model, params: dict) -> dict:
+    """No-score resource envelope for tuner search-space clamping."""
+    return run_resource_probe(make_model, params, _split()[0])
 
 
 def _submission_values(model, names: tuple[str, ...]) -> dict[str, float]:

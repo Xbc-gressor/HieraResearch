@@ -361,7 +361,13 @@ def execute_driver_job(
         "status": "running",
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    owner = {"task": ctx.task, "tag": ctx.tag, "run_id": run_id, "kind": request["kind"]}
+    owner = {
+        "task": ctx.task,
+        "tag": ctx.tag,
+        "run_id": run_id,
+        "run_dir": str(ctx.run_dir),
+        "kind": request["kind"],
+    }
     try:
         with task_resource_lease(task_cfg, owner=owner):
             with log_path.open("w", encoding="utf-8") as log:
