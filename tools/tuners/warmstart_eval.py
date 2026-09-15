@@ -32,9 +32,14 @@ time without re-evaluating what already passed:
    best_warm_score + best_warm_params + search_space), exit `0`. When no
    selected row is finite, exit `3` with `reason: "no finite warm row"`.
 
-An optional task-owned preflight runs before each score attempt in an isolated
-subprocess. It is a real-shape feasibility check, not a smoke score, and never
-reserves an objective slot. There is no `base_score`. Run from the task uv env:
+An optional task-owned smoke preflight runs before each score attempt in an
+isolated subprocess. It is a seconds-scale construct-and-fit check that never
+reserves an objective slot; a rejection is a per-point observation (a
+``preflight_rejected`` row with score None), and the remaining selected
+configs still run. Envelope feasibility belongs to the per-point runtime
+limit on the score surface. Two consecutive config-infeasible rows stop the
+remaining warm configs for this invocation (they move to the deferred set,
+params-only). Run from the task uv env:
 `uv --project tasks/<task> run python tools/tuners/warmstart_eval.py ...`
 (`--project` selects the task env without chdir, so repo-relative paths resolve;
 `--directory` would chdir into the task dir and break them).
@@ -75,7 +80,6 @@ from _common import (  # noqa: E402
     EvaluationBudgetExhausted,
     resolve_score_fn,
     resolve_preflight_fn,
-    resolve_resource_probe_fn,
     timed_eval,
     timed_preflight,
     cast_params_to_search_space,
@@ -106,6 +110,7 @@ from tune_tools import (  # noqa: E402
 
 CRASHED = 3  # a not-yet-scored config raised; the caller diagnoses + fixes + resumes
 BUDGET_EXHAUSTED = 4  # no score_fn call was started; coordinator ends the run
+CONSECUTIVE_INFEASIBLE_LIMIT = 2  # circuit breaker: stop the remaining warm configs
 
 
 # =============================================================================
@@ -406,7 +411,6 @@ class WarmstartRun:
     make_model: Callable[..., Any]
     evaluate: Callable[..., float]
     preflight_enabled: bool
-    preflight_mode: str
     report: dict
     preflight_report: dict
     cache_rows: dict[str, dict]
@@ -779,6 +783,13 @@ def _global_donor_observation(run: WarmstartRun) -> dict | None:
                 "score": row["score"],
                 "failure_ref": None,
             }
+        if row.get("status") == "preflight_rejected":
+            return {
+                "warm_config_index": index,
+                "status": "preflight_rejected",
+                "score": None,
+                "failure_ref": row.get("failure_ref"),
+            }
         return {
             "warm_config_index": index,
             "status": "crash",
@@ -820,8 +831,10 @@ def _stamp_donor_facts(run: WarmstartRun) -> None:
             crashed += 1
     run.phase_a["k_finite"] = finite
     run.phase_a["k_crashed"] = crashed
-    run.phase_a["k_preflight_rejected"] = (
-        1 if run.donor_preflight_rejection is not None else 0
+    run.phase_a["k_preflight_rejected"] = sum(
+        1
+        for row in run.warm_rows
+        if isinstance(row, dict) and row.get("status") == "preflight_rejected"
     )
     run.phase_a["global_donor_observation"] = _global_donor_observation(run)
 
@@ -953,11 +966,6 @@ def _prepare_run(
     make_model = train_module.make_model
     evaluate = resolve_score_fn(prepare_module, args.candidate_path)
     preflight_enabled = resolve_preflight_fn(prepare_module, args.candidate_path) is not None
-    preflight_mode = (
-        "resource"
-        if resolve_resource_probe_fn(prepare_module, args.candidate_path) is not None
-        else "preflight"
-    )
 
     # Resume cache: configs already scored in a prior run, keyed by params. A
     # config the caller edited (config-invalid fix) gets new params → cache miss
@@ -1130,7 +1138,6 @@ def _prepare_run(
         make_model=make_model,
         evaluate=evaluate,
         preflight_enabled=preflight_enabled,
-        preflight_mode=preflight_mode,
         report=report,
         preflight_report=preflight_report,
         cache_rows=cache_rows,
@@ -1154,14 +1161,13 @@ def _preflight_config(
     *,
     params: dict,
     proposed_index: int,
-    evaluation_position: int,
-    fatal: bool = True,
+    trial_receipt: dict,
 ) -> str:
-    """Run and persist one no-score feasibility check.
+    """Run and persist one no-score smoke check before the objective.
 
-    Returns "evaluate" to proceed to the objective, "stop" after a fatal
-    rejection (the historical fail-closed path), or "skip" when a donor-only
-    row was rejected: the rejection is persisted as the donor observation and
+    A rejection is a per-point observation, never a candidate crash: the row
+    is persisted as ``preflight_rejected`` (score None, same shape as a
+    Phase-C rejection trial), consumes no objective slot, is not cached, and
     the evaluation loop continues with the remaining selected rows.
     """
     if not run.preflight_enabled:
@@ -1171,7 +1177,6 @@ def _preflight_config(
             params,
             run.candidate_path,
             expected_execution_revision=run.candidate_code_revision,
-            probe_mode=run.preflight_mode,
         )
     except Exception as exc:
         tb = traceback.format_exc()
@@ -1198,28 +1203,19 @@ def _preflight_config(
         )
         if run.donor_warm_config_index == proposed_index:
             run.donor_preflight_rejection = failure
-        run.phase_a["warm_start_configs"] = run.warm_rows
-        _stamp_donor_facts(run)
-        if not fatal:
-            # A donor-only rejection consumes no objective slot and does not
-            # stop the screening; it is the persisted transfer observation.
-            write_tune_report(run.report_path, run.report)
-            return "skip"
-        run.preflight_report["status"] = "failed"
-        run.phase_a["status"] = "preflight_failed"
-        write_tune_report(run.report_path, run.report)
-        write_json(
+        run.warm_rows.append(
             {
-                "phase": "preflight",
-                "status": "crashed",
-                "crash_index": proposed_index,
-                "evaluation_position": evaluation_position,
-                "crash_params": params,
-                "objective_slot_consumed": False,
+                "params": params,
+                "score": None,
+                "status": "preflight_rejected",
+                **trial_receipt,
                 **failure,
             }
         )
-        return "stop"
+        run.phase_a["warm_start_configs"] = run.warm_rows
+        _stamp_donor_facts(run)
+        write_tune_report(run.report_path, run.report)
+        return "skip"
 
     run.preflight_report.setdefault("attempts", []).append(
         {
@@ -1398,8 +1394,9 @@ def _finish_phase_a(run: WarmstartRun) -> int:
     """Apply the best finite row and persist the successful Phase A."""
     selectable = finite_warm_incumbent_rows(run.warm_rows)
     if not selectable:
-        # Every selected row failed non-fatally (config-infeasible rows, or the
-        # donor-only treatment path); the candidate follows the crash path.
+        # Every selected row failed non-fatally (smoke rejections,
+        # config-infeasible rows, or the donor-only treatment path); the
+        # candidate follows the crash path.
         run.phase_a["warm_start_configs"] = run.warm_rows
         run.phase_a["status"] = "crashed"
         _stamp_donor_facts(run)
@@ -1409,11 +1406,12 @@ def _finish_phase_a(run: WarmstartRun) -> int:
                 "phase": "a",
                 "status": "crashed",
                 "reason": "no finite warm row",
-                "k_evaluated": len(run.configs),
+                "k_evaluated": len(run.warm_rows),
                 "trials_attempted": run.trials_attempted,
                 "failed_rows": [
                     {
                         "proposed_index": row.get("proposed_index"),
+                        "status": row.get("status"),
                         "config_infeasible": bool(row.get("config_infeasible")),
                         "error": row.get("error"),
                     }
@@ -1433,7 +1431,7 @@ def _finish_phase_a(run: WarmstartRun) -> int:
         {
             "best_warm_score": best_warm_score,
             "best_warm_params": best_params,
-            "k_evaluated": len(run.configs),
+            "k_evaluated": len(run.warm_rows),
             "k_survived": len(selectable),
             "k_deferred": len(run.deferred),
             "elapsed_seconds": round(elapsed, 1),
@@ -1448,7 +1446,7 @@ def _finish_phase_a(run: WarmstartRun) -> int:
     completion = {
         "phase": "a",
         "status": "ok",
-        "k_evaluated": len(run.configs),
+        "k_evaluated": len(run.warm_rows),
         "k_survived": len(selectable),
         "trials_attempted": run.trials_attempted,
         "warm_config_selection": run.selection,
@@ -1471,7 +1469,17 @@ def _finish_phase_a(run: WarmstartRun) -> int:
 
 
 def _evaluate_selected_configs(run: WarmstartRun) -> int:
-    """Evaluate selected configs sequentially, stopping at the first failure."""
+    """Evaluate selected configs sequentially, stopping at the first crash.
+
+    Smoke rejections and config-infeasible failures are per-point
+    observations; only a genuine score_fn crash stops the loop for
+    diagnosis.  The circuit breaker ends the invocation early after
+    CONSECUTIVE_INFEASIBLE_LIMIT consecutive config-infeasible rows: further
+    points of a candidate whose envelope twice exceeded the per-point limit
+    are not worth another limit each, so they move to the deferred set
+    (params-only, no objective cost).
+    """
+    consecutive_infeasible = 0
 
     for position, raw in enumerate(run.configs):
         proposed_index = run.selected_indices[position]
@@ -1492,18 +1500,32 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
             write_tune_report(run.report_path, run.report)
             continue
         if donor_only and run.donor_preflight_rejection is not None:
+            # Resume replays a persisted donor rejection as its warm row;
+            # neither the probe nor the objective runs again for it.
+            run.warm_rows.append(
+                {
+                    "params": params,
+                    "score": None,
+                    "status": "preflight_rejected",
+                    **trial_receipt,
+                    "failure_ref": run.donor_preflight_rejection.get(
+                        "failure_ref"
+                    ),
+                }
+            )
+            run.phase_a["warm_start_configs"] = run.warm_rows
+            _stamp_donor_facts(run)
+            write_tune_report(run.report_path, run.report)
             continue
 
         preflight = _preflight_config(
             run,
             params=params,
             proposed_index=proposed_index,
-            evaluation_position=position,
-            fatal=not donor_only,
+            trial_receipt=trial_receipt,
         )
-        if preflight == "stop":
-            return CRASHED
         if preflight == "skip":
+            consecutive_infeasible = 0
             continue
 
         key = _params_key(params)
@@ -1512,6 +1534,7 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
             # Replays a finite score or a config-infeasible failure recorded
             # under this same code revision; neither costs an objective slot.
             run.warm_rows.append({**cached, **trial_receipt})
+            row = run.warm_rows[-1]
         else:
             try:
                 score = timed_eval(
@@ -1540,19 +1563,47 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
                 )
                 if outcome is not None:
                     return outcome
-                continue
-            run.trials_attempted += 1
-            run.phase_a["trials_attempted"] = run.trials_attempted
-            run.warm_rows.append(
-                {"params": params, "score": score, **trial_receipt}
-            )
-            run.cache[key] = score
-            run.cache_rows[key] = {"params": params, "score": score}
-            run.phase_a["warm_score_cache"] = _cache_receipt(run)
+                row = run.warm_rows[-1]
+            else:
+                run.trials_attempted += 1
+                run.phase_a["trials_attempted"] = run.trials_attempted
+                run.warm_rows.append(
+                    {"params": params, "score": score, **trial_receipt}
+                )
+                run.cache[key] = score
+                run.cache_rows[key] = {"params": params, "score": score}
+                run.phase_a["warm_score_cache"] = _cache_receipt(run)
+                row = run.warm_rows[-1]
+
+        if row.get("status") == "failed" and row.get("config_infeasible"):
+            consecutive_infeasible += 1
+        else:
+            consecutive_infeasible = 0
 
         run.phase_a["warm_start_configs"] = run.warm_rows
         _stamp_donor_facts(run)
         write_tune_report(run.report_path, run.report)
+
+        if (
+            consecutive_infeasible >= CONSECUTIVE_INFEASIBLE_LIMIT
+            and position + 1 < len(run.configs)
+        ):
+            run.deferred = run.deferred + run.configs[position + 1:]
+            run.phase_a["deferred_configs"].extend(
+                {
+                    "params": cast_params_to_search_space(
+                        dict(config), run.search_space
+                    )
+                }
+                for config in run.configs[position + 1:]
+            )
+            run.phase_a["circuit_breaker"] = {
+                "reason": "consecutive_config_infeasible",
+                "consecutive": consecutive_infeasible,
+                "deferred_from_position": position + 1,
+            }
+            write_tune_report(run.report_path, run.report)
+            break
 
     return _finish_phase_a(run)
 

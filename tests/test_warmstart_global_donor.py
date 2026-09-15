@@ -790,7 +790,11 @@ class WarmstartGlobalDonorTests(unittest.TestCase):
             self.assertEqual(phase_a["k_finite"], 2)
             self.assertEqual(phase_a["k_crashed"], 0)
             self.assertEqual(phase_a["k_preflight_rejected"], 1)
-            self.assertEqual(len(phase_a["warm_start_configs"]), 2)
+            # The rejection is itself a warm row (score None, per-point).
+            self.assertEqual(len(phase_a["warm_start_configs"]), 3)
+            rejected_row = phase_a["warm_start_configs"][0]
+            self.assertEqual(rejected_row["status"], "preflight_rejected")
+            self.assertIsNone(rejected_row["score"])
             observation = phase_a["global_donor_observation"]
             self.assertEqual(observation["warm_config_index"], 5)
             self.assertEqual(observation["status"], "preflight_rejected")
@@ -804,7 +808,11 @@ class WarmstartGlobalDonorTests(unittest.TestCase):
             )
             self.assertEqual(
                 phase_a["best_warm_score"],
-                min(row["score"] for row in phase_a["warm_start_configs"]),
+                min(
+                    row["score"]
+                    for row in phase_a["warm_start_configs"]
+                    if row["score"] is not None
+                ),
             )
 
             # Resume keeps the rejection; no preflight or objective re-run

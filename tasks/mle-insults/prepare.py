@@ -11,7 +11,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from tools.mle_resource_probe import run_resource_probe
+from tools.mle_resource_probe import run_resource_probe, run_smoke_probe
 
 TARGET = "Insult"
 FEATURES = ("Date", "Comment")
@@ -94,8 +94,8 @@ def preflight_environment() -> dict:
 
 
 def preflight_config(make_model, params: dict) -> dict:
-    """No-score full training-shape feasibility probe."""
-    return run_resource_probe(make_model, params, _split()[0])
+    """No-score seconds-scale smoke: construct and fit a subsample."""
+    return run_smoke_probe(make_model, params, _split()[0])
 
 
 def resource_probe_config(make_model, params: dict) -> dict:

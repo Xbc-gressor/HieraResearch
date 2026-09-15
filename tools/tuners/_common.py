@@ -59,6 +59,9 @@ except ImportError:  # pragma: no cover - non-POSIX hosts have no getrusage.
     resource = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 from evaluation_budget import (  # noqa: E402
     find_run_dir,
     record_evaluation_completion,
@@ -276,6 +279,8 @@ def load_candidate_modules(
 
     candidate_dir = candidate_path.parent
     sys.path.insert(0, str(candidate_dir))
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
 
     prepare_path = candidate_dir / "prepare.py"
     if not prepare_path.is_file():
@@ -795,27 +800,38 @@ def _configured_runtime_limit(cfg: Path) -> float | None:
 
 
 def read_preflight_limit(ref_path: Any) -> float:
-    """Return the bounded no-score preflight timeout for one config."""
+    """Return the bounded no-score preflight timeout for one config.
+
+    Clamped to the time the run has left, mirroring :func:`read_runtime_limit`
+    (with the same 1s floor): a probe may not outlive the run deadline.
+    """
     cfg = find_framework_cfg(ref_path)
     if cfg is None:
         return DEFAULT_PREFLIGHT_LIMIT
     data = read_framework_cfg(cfg)
+    limit = None
     value = data.get("preflight_runtime_limit")
     if value is not None:
         try:
             value = float(value)
             if value > 0:
-                return value
+                limit = value
         except (TypeError, ValueError):
             pass
-    runtime = data.get("per_runtime_limit")
-    try:
-        runtime = float(runtime)
-        if runtime > 0:
-            return min(DEFAULT_PREFLIGHT_LIMIT, runtime)
-    except (TypeError, ValueError):
-        pass
-    return DEFAULT_PREFLIGHT_LIMIT
+    if limit is None:
+        runtime = data.get("per_runtime_limit")
+        try:
+            runtime = float(runtime)
+            if runtime > 0:
+                limit = min(DEFAULT_PREFLIGHT_LIMIT, runtime)
+        except (TypeError, ValueError):
+            pass
+    if limit is None:
+        limit = DEFAULT_PREFLIGHT_LIMIT
+    left = time_remaining(cfg.parent)
+    if left is not None:
+        limit = min(limit, max(1.0, left))
+    return limit
 
 
 def _communicate_with_limit(
@@ -1361,12 +1377,17 @@ def read_prior_infeasible_trials(report_path: Path) -> list[dict]:
     every tuner restart).
 
     Included: preflight_rejected trials (infeasible by definition) and failed
-    trials explicitly classified config_infeasible at record time. Legacy
-    failed trials without the flag are NOT treated as infeasible: an
-    unclassified crash is not evidence about the parameter region.
+    trials explicitly classified config_infeasible at record time, from BOTH
+    the warm screening rows and the Phase-C stages — a warm-time rejection is
+    the same sampler-visible fact as a Phase-C one. Legacy failed trials
+    without the flag are NOT treated as infeasible: an unclassified crash is
+    not evidence about the parameter region.
     """
     report = read_tune_report(report_path)
     trials: list[dict] = []
+    warm = report.get("phase_a", {}).get("warm_start_configs", [])
+    if isinstance(warm, list):
+        trials.extend(warm)
     for stage in report.get("phase_c", {}).get("stages", []):
         trials.extend(stage.get("trials", []))
     return [

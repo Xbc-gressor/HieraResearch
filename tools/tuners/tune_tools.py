@@ -3187,15 +3187,21 @@ def summarize(report: dict) -> dict:
     # crashes cannot disappear from accounting. Injected warm priors are reused
     # and never appended to a Phase-C stage, so neither count double-counts them.
     warm_trials = phase_a.get("warm_start_configs", [])
+    warm_attempted = sum(
+        trial.get("status") != "preflight_rejected"
+        for trial in warm_trials
+        if isinstance(trial, dict)
+    )
     phase_a_attempted = phase_a.get("trials_attempted")
     if (
         not isinstance(phase_a_attempted, int)
         or isinstance(phase_a_attempted, bool)
-        or phase_a_attempted < len(warm_trials)
+        or phase_a_attempted < warm_attempted
     ):
         raise ValueError(
             "phase_a.trials_attempted must be a nonnegative integer covering "
-            "every persisted warm trial"
+            "every persisted warm trial (preflight rejections never reserve "
+            "an objective slot)"
         )
     phase_c_trials = [
         trial

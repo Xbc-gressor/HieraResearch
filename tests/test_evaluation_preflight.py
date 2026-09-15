@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -712,6 +713,238 @@ def make_model(env, params):
             self.assertEqual(payload["params_source"], "DEFAULT_PARAMS")
             self.assertEqual(payload["result"]["seen"], 7)
             self.assertFalse((run_dir / evaluation_budget.ATTEMPT_LOG).exists())
+
+
+class WarmstartProbeSemanticsTests(unittest.TestCase):
+    """Phase-A probe failures are per-point observations, never candidate crashes."""
+
+    def _candidate(
+        self, root: Path, configs: list[dict], *, seed: int | None = None
+    ) -> tuple[Path, Path, Path]:
+        candidate_dir = root / "runs" / "unit" / "tag" / "candidates" / "001"
+        candidate_dir.mkdir(parents=True)
+        train = candidate_dir / "train.py"
+        train.write_text(
+            "PARAM_SCHEMA = {'x': 'int'}\n"
+            "SEARCH_SPACE = {'x': ('int', 1, 9)}\n"
+            "def make_model(params):\n"
+            "    return params\n"
+        )
+        (candidate_dir / "prepare.py").write_text(
+            "def evaluate_config(make_model, params):\n"
+            "    raise AssertionError('objective surface mocked')\n"
+        )
+        (candidate_dir / "_candidate_brief.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 4,
+                    "run_id": "001",
+                    "op": "fresh",
+                    "source_run_ids": [],
+                    "primary_parent": None,
+                    "implementation_source": {"kind": "generated"},
+                }
+            )
+        )
+        configs_path = candidate_dir / "_warm_configs.json"
+        configs_path.write_text(json.dumps(configs))
+        report_path = candidate_dir / "tune_report.json"
+        if seed is not None:
+            selection = select_warm_config_indices(
+                len(configs), len(configs), {}, seed=seed, mandatory_indices=(0,)
+            )
+            report_path.write_text(
+                json.dumps({"phase_a": {"warm_config_selection": selection}})
+            )
+        return train, configs_path, report_path
+
+    def _run(
+        self,
+        train: Path,
+        configs_path: Path,
+        report_path: Path,
+        *,
+        score_fn,
+        preflight_fn=None,
+    ) -> tuple[int, mock.Mock, str]:
+        timed_eval = mock.Mock(side_effect=score_fn)
+        argv = [
+            "warmstart_eval.py",
+            "--candidate-path", str(train),
+            "--configs-json", str(configs_path),
+            "--tune-report-json", str(report_path),
+        ]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", argv))
+            stack.enter_context(
+                mock.patch.object(warmstart_eval, "timed_eval", timed_eval)
+            )
+            stack.enter_context(mock.patch("sys.stdout", stdout))
+            stack.enter_context(mock.patch("sys.stderr", stderr))
+            if preflight_fn is not None:
+                stack.enter_context(
+                    mock.patch.object(
+                        warmstart_eval,
+                        "resolve_preflight_fn",
+                        return_value=lambda *_a, **_k: None,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        warmstart_eval,
+                        "timed_preflight",
+                        mock.Mock(side_effect=preflight_fn),
+                    )
+                )
+            code = warmstart_eval.main()
+        return code, timed_eval, stdout.getvalue()
+
+    def test_probe_timeout_is_a_per_point_rejection_not_a_candidate_crash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            train, configs_path, report_path = self._candidate(
+                Path(tmp), [{"x": 1}, {"x": 2}, {"x": 3}]
+            )
+
+            def preflight(params, *_args, **_kwargs):
+                if params["x"] == 1:
+                    raise TimeoutError(
+                        "preflight exceeded preflight_runtime_limit=180s"
+                    )
+                return {"status": "ok"}
+
+            code, timed_eval, _stdout = self._run(
+                train,
+                configs_path,
+                report_path,
+                score_fn=lambda _e, _m, params, *_a, **_k: float(params["x"]),
+                preflight_fn=preflight,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(timed_eval.call_count, 2)
+            report = json.loads(report_path.read_text())
+            phase_a = report["phase_a"]
+            self.assertEqual(phase_a["status"], "ok")
+            self.assertEqual(phase_a["trials_attempted"], 2)
+            rows = phase_a["warm_start_configs"]
+            self.assertEqual(len(rows), 3)
+            rejected = rows[0]
+            self.assertEqual(rejected["status"], "preflight_rejected")
+            self.assertIsNone(rejected["score"])
+            self.assertEqual(rejected["params"], {"x": 1})
+            self.assertIn("failure_ref", rejected)
+            self.assertTrue(
+                list((report_path.parent / "_failures").iterdir())
+            )
+            # Warm rejection rows are sampler-visible as infeasible priors.
+            self.assertEqual(
+                [row["params"] for row in _common.read_prior_infeasible_trials(report_path)],
+                [{"x": 1}],
+            )
+
+    def test_consecutive_infeasible_rows_defer_the_remaining_warm_configs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            train, configs_path, report_path = self._candidate(
+                Path(tmp), [{"x": 1}, {"x": 2}, {"x": 3}]
+            )
+
+            def always_timeout(*_args, **_kwargs) -> float:
+                raise TimeoutError(
+                    "evaluation exceeded per_runtime_limit=900s"
+                )
+
+            code, timed_eval, stdout = self._run(
+                train, configs_path, report_path, score_fn=always_timeout
+            )
+
+            self.assertEqual(code, warmstart_eval.CRASHED)
+            self.assertEqual(timed_eval.call_count, 2)
+            report = json.loads(report_path.read_text())
+            phase_a = report["phase_a"]
+            self.assertEqual(phase_a["status"], "crashed")
+            rows = phase_a["warm_start_configs"]
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(row["config_infeasible"] for row in rows))
+            deferred_params = [
+                row["params"] for row in phase_a["deferred_configs"]
+            ]
+            self.assertEqual(len(deferred_params), 1)
+            self.assertNotIn(deferred_params[0], [row["params"] for row in rows])
+            self.assertEqual(
+                phase_a["circuit_breaker"]["reason"],
+                "consecutive_config_infeasible",
+            )
+            payload = json.loads(stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["status"], "crashed")
+            self.assertTrue(
+                all(row["status"] == "failed" for row in payload["failed_rows"])
+            )
+            # Warm config_infeasible rows are sampler-visible.
+            self.assertEqual(
+                len(_common.read_prior_infeasible_trials(report_path)), 2
+            )
+
+            # Resume replays the cached timeout rows without re-paying them
+            # and re-derives the same deferral.
+            code, second_eval, _stdout = self._run(
+                train, configs_path, report_path, score_fn=always_timeout
+            )
+            self.assertEqual(code, warmstart_eval.CRASHED)
+            self.assertEqual(second_eval.call_count, 0)
+            resumed = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(
+                [row["params"] for row in resumed["deferred_configs"]],
+                deferred_params,
+            )
+
+    def test_breaker_counter_resets_on_finite_and_rejected_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            train, configs_path, report_path = self._candidate(
+                Path(tmp),
+                [{"x": 1}, {"x": 2}, {"x": 3}, {"x": 4}],
+                seed=5,
+            )
+            selection = select_warm_config_indices(
+                4, 4, {}, seed=5, mandatory_indices=(0,)
+            )
+            order = [
+                [{"x": 1}, {"x": 2}, {"x": 3}, {"x": 4}][index]
+                for index in selection["selected_indices"]
+            ]
+            infeasible, rejected = order[0], order[1]
+
+            def preflight(params, *_args, **_kwargs):
+                if params == rejected:
+                    raise RuntimeError("smoke rejected")
+                return {"status": "ok"}
+
+            def score(_e, _m, params, *_a, **_k) -> float:
+                if params == infeasible or params == order[2]:
+                    raise TimeoutError("evaluation exceeded per_runtime_limit=900s")
+                return 0.25
+
+            code, timed_eval, _stdout = self._run(
+                train,
+                configs_path,
+                report_path,
+                score_fn=score,
+                preflight_fn=preflight,
+            )
+
+            self.assertEqual(code, 0)
+            # Two infeasible rows exist, but a rejection sits between them;
+            # every non-rejected point still ran.
+            self.assertEqual(timed_eval.call_count, 3)
+            phase_a = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(phase_a["status"], "ok")
+            self.assertNotIn("circuit_breaker", phase_a)
+            self.assertEqual(phase_a["best_warm_score"], 0.25)
+            self.assertEqual(phase_a["deferred_configs"], [])
 
 
 if __name__ == "__main__":
