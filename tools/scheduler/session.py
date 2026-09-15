@@ -175,8 +175,28 @@ def decide_for_run(
     existing = store.open_decision(snapshot_id, cursor)
     # A rewrite decision (round_v1) is closed by the driver, never by a bout;
     # an open one left by a crash must not stand in for this tune decision.
-    if existing is not None and existing.get("selected_action") != round_policy.REWRITE:
+    # A round_v1 TUNE decision is never reused through this generic path
+    # either: the cycle lives in round_state, not the ledger, so snapshot
+    # identity cannot see the phase boundary and would resurrect an earlier
+    # cycle's decision whenever the ledger did not move across it.
+    if (
+        existing is not None
+        and existing.get("selected_action") != round_policy.REWRITE
+        and not (
+            scheduler_policy == round_policy.POLICY_ID
+            and existing.get("selected_action") == "TUNE"
+        )
+    ):
         return _view(existing, state, reconciled, reused=True)
+
+    if scheduler_policy == round_policy.POLICY_ID:
+        # Snapshot identity cannot survive a partially executed bout (the
+        # state has advanced), so within one optimization phase reuse is
+        # keyed on the cycle instead: an interrupted bout's decision must be
+        # re-issued, not re-decided against drifted state.
+        resumed = round_policy.open_tune_decision(store, run_dir)
+        if resumed is not None:
+            return _view(resumed, state, reconciled, reused=True)
 
     tuning = arrival = None
     if scheduler_policy == tournament.POLICY_ID:
@@ -218,6 +238,9 @@ def decide_for_run(
             evidence_cursor=cursor,
             snapshot_id=snapshot_id,
             decision_id=decision_id,
+        )
+        receipt["round_cycle"] = int(
+            round_policy.load_round_state(run_dir).get("cycle", 0)
         )
     else:
         receipt = decision.receipt(
@@ -300,6 +323,8 @@ def _view(
         "reason": receipt.get("reason"),
         "state_snapshot_id": receipt.get("state_snapshot_id"),
         "policy_version": receipt.get("policy_version", POLICY_VERSION),
+        "evidence_cursor": receipt.get("evidence_cursor"),
+        "round_cycle": receipt.get("round_cycle"),
         "prior_id": receipt.get("prior_id"),
         "evidence_mode": receipt.get("evidence_mode", {}),
         "coverage_spent": receipt.get("coverage_spent", 0),

@@ -159,6 +159,40 @@ def time_remaining(run_dir: Path) -> float | None:
     return min(values) if values else None
 
 
+def phase_c_attempts(run_dir: Path, run_id: str) -> int:
+    """Admitted Phase-C score attempts on record for one candidate.
+
+    Lenient by design: this counts consumption for failure accounting on
+    recovery paths, where a missing or partly unreadable log must read as
+    what it does show rather than raise — enforcement stays with the
+    reservation log itself.
+    """
+    path = Path(run_dir) / ATTEMPT_LOG
+    if not path.is_file():
+        return 0
+    run_id = str(run_id)
+    total = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(row, dict)
+            and row.get("kind") == ATTEMPT_KIND
+            and row.get("phase") == "phase_c"
+            and row.get("run_id") == run_id
+        ):
+            total += 1
+    return total
+
+
 def _deep_tune_limits(run_dir: Path, budget: int | None) -> dict:
     """Phase-C allocation limits.
 

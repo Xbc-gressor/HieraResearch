@@ -4728,6 +4728,7 @@ def cmd_select_candidate(args) -> int:
         "v3_2",
         "anchor_challenger_v1",
         "anchor_transfer_challenger_v1",
+        "round_v1",
     ):
         print(json.dumps(_scheduler_selection(led, rc.get("scheduler_scenarios")), indent=2))
         return 0

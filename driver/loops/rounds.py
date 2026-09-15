@@ -40,11 +40,11 @@ def _round(run_dir: Path, repo_root: Path, cmd, *args) -> dict:
     return json.loads(proc.stdout)
 
 
-def _record(run_dir, repo_root, cmd, decision_id, run_id, *, consumed,
+def _record(run_dir, repo_root, cmd, decision_id, run_id, *, action, consumed,
             status, gain=None) -> None:
     args = ["python", "tools/scheduler/cli.py", "record",
             "--ledger", run_dir / "ledger.json",
-            "--decision-id", decision_id, "--action", "REWRITE",
+            "--decision-id", decision_id, "--action", action,
             "--run-id", run_id, "--consumed", str(consumed),
             "--status", status]
     if gain is not None:
@@ -257,6 +257,7 @@ def _rewrite_climb(runner, store, task, tag, run_dir, selection, task_toml,
             reference = result["reference"]
         bouts = rewrite._load_bouts(candidate)
     _record(run_dir, repo_root, cmd, selection["decision_id"], run_id,
+            action="REWRITE",
             consumed=attempts,
             status="valid" if steps > 0 else "infra_failure",
             gain=(None if kept == 0 or initial_reference is None
@@ -296,6 +297,50 @@ def _commit_kept(run_dir, run_id, candidate, bout, result, repo_root, cmd,
                 score=result["score"], reference=reference)
 
 
+def tune_handoff(selection: dict) -> dict:
+    """The compact exact-target contract the tuner session must obey.
+
+    Budget is the contract bout cost (evaluation count); round_v1's mid-bout
+    truncation semantics (reservation refusal + `close_exhausted_stage`)
+    are unchanged by the handoff.
+    """
+    keys = ("decision_id", "run_id", "policy_version", "state_snapshot_id",
+            "evidence_cursor", "bout_trials")
+    return {key: selection.get(key) for key in keys}
+
+
+def close_tune_outcome(run_dir, repo_root, cmd, events, selection, receipt,
+                       *, evals_before, reference_before) -> None:
+    """Bind the tune bout's result to the decision that selected it.
+
+    Every terminal path of a TUNE selection ends here: a kept improvement, a
+    valid no-op, or a receipt whose `tuned_run_id` names another candidate.
+    The orchestrator's objective jobs are pinned to the selected candidate,
+    so a mismatching id can only be a stale or fabricated handoff — the
+    result is never re-attributed to the candidate the receipt names.
+    """
+    run_id = str(selection["run_id"])
+    executed = str(receipt.get("tuned_run_id", "none"))
+    if executed not in (run_id, "none"):
+        events.emit("tune_target_mismatch",
+                    decision_id=selection.get("decision_id"),
+                    selected_run_id=run_id, executed_run_id=executed)
+        _record(run_dir, repo_root, cmd, selection["decision_id"], run_id,
+                action="TUNE", consumed=0, status="infra_failure")
+        return
+    evals_after, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
+    consumed = max(0, evals_after - evals_before)
+    reference_after = _ledger_score(run_dir, run_id)
+    gain = (None if reference_before is None or reference_after is None
+            else reference_before - reference_after)
+    _record(run_dir, repo_root, cmd, selection["decision_id"], run_id,
+            action="TUNE", consumed=consumed, status="valid", gain=gain)
+    events.emit("tune_bout", decision_id=selection.get("decision_id"),
+                selected_run_id=run_id, executed_run_id=executed,
+                tuned=bool(receipt.get("tuned")),
+                consumed_evaluations=consumed, realized_gain=gain)
+
+
 def optimization_phase(runner, store, task, tag, run_dir, round_no, task_toml,
                        repo_root, cmd, events, *, tune, config) -> bool:
     """Run one optimization round; True when any bout ran."""
@@ -328,20 +373,26 @@ def optimization_phase(runner, store, task, tag, run_dir, round_no, task_toml,
         for _ in range(int(config["tune_bouts"])):
             if budget_status(run_dir, repo_root, cmd).get("reached"):
                 break
-            selection = _round(run_dir, repo_root, cmd, "select", "--kind", "tune")
+            selection = _round(run_dir, repo_root, cmd, "select",
+                               "--kind", "tune")
             events.emit("round_select", bout_kind="tune",
                         action=selection["action"],
                         run_id=selection.get("run_id"),
+                        decision_id=selection.get("decision_id"),
                         reason=selection.get("reason"))
             if selection["action"] != "TUNE":
                 break
             run_id = str(selection["run_id"])
+            reference_before = _ledger_score(run_dir, run_id)
             started = time.monotonic()
             evals_before, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
-            receipt = tune(round_no)
+            receipt = tune(round_no, selection)
             progressed = progressed or bool(receipt.get("tuned"))
             _overhead(run_dir, repo_root, cmd, "tune", run_id, started,
                       evals_before)
+            close_tune_outcome(run_dir, repo_root, cmd, events, selection,
+                               receipt, evals_before=evals_before,
+                               reference_before=reference_before)
     finally:
         args = ["end"]
         stage = os.environ.get("EVALUATION_STAGE")

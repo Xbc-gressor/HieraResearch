@@ -27,8 +27,13 @@ from tools.scheduler import cli as scheduler_cli  # noqa: E402
 from tools.scheduler import round_policy  # noqa: E402
 from tools.scheduler.session import contract_for  # noqa: E402
 from tools.scheduler.state import load_state  # noqa: E402
-from tune_tools import _candidate_execution_revision  # noqa: E402
+from tools.scheduler.store import SchedulerStore  # noqa: E402
+from tune_tools import (  # noqa: E402
+    _candidate_execution_revision,
+    cmd_select_candidate,
+)
 from driver.loops.experiment import run_experiment  # noqa: E402
+from driver.roles import InvocationContext, tuner_target_matches_handoff  # noqa: E402
 from driver.session import FakeSessionRunner  # noqa: E402
 from tests.fixtures import (  # noqa: E402
     background_text,
@@ -218,6 +223,67 @@ class RoundPolicyTests(unittest.TestCase):
             # Outside a phase the orchestrator's tune query defers.
             self.assertEqual(round_policy.decide(state, run_dir).action, "DEFER")
 
+    def test_tune_decision_reuse_is_scoped_to_the_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _run_dir(Path(tmp), deadline=time.time() + 86400,
+                               round_cfg={"round_seconds": 3600})
+            ledger = run_dir / "ledger.json"
+            ledger.write_text(json.dumps({"records": [_record("000", 0.9)]}))
+            _candidate(run_dir, "000", 0.9)
+            self._cli(ledger, "begin")
+
+            first = self._cli(ledger, "select", "--kind", "tune")
+            self.assertEqual(first["action"], "TUNE")
+            # State drift (a partially executed bout does the same): the
+            # snapshot identity no longer matches, but this cycle's open
+            # decision must be re-issued, not re-decided.
+            ledger.write_text(json.dumps({"records": [
+                _record("000", 0.9), _record("003", 0.95)]}))
+            again = self._cli(ledger, "select", "--kind", "tune")
+            self.assertEqual(again["decision_id"], first["decision_id"])
+            self.assertTrue(again["reused_open_decision"])
+
+            # Closing the decision frees the next selection.
+            SchedulerStore(run_dir).record_outcome(
+                first["decision_id"], executed_action="TUNE",
+                executed_run_id=first["run_id"], realized_gain=None,
+                consumed=0, status="valid")
+            fresh = self._cli(ledger, "select", "--kind", "tune")
+            self.assertNotEqual(fresh["decision_id"], first["decision_id"])
+            self.assertFalse(fresh["reused_open_decision"])
+
+            # A stale open decision from an earlier cycle is never reused.
+            self._cli(ledger, "end")
+            self._cli(ledger, "begin")
+            ledger.write_text(json.dumps({"records": [
+                _record("000", 0.9), _record("004", 0.96)]}))
+            crossed = self._cli(ledger, "select", "--kind", "tune")
+            self.assertNotEqual(crossed["decision_id"], fresh["decision_id"])
+            self.assertFalse(crossed["reused_open_decision"])
+            self.assertEqual(crossed["round_cycle"], 1)
+
+    def test_tune_decision_not_reused_across_cycle_with_unchanged_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _run_dir(Path(tmp), deadline=time.time() + 86400,
+                               round_cfg={"round_seconds": 3600})
+            ledger = run_dir / "ledger.json"
+            ledger.write_text(json.dumps({"records": [_record("000", 0.9)]}))
+            _candidate(run_dir, "000", 0.9)
+            self._cli(ledger, "begin")
+
+            first = self._cli(ledger, "select", "--kind", "tune")
+            self.assertEqual(first["action"], "TUNE")
+
+            # Cross the phase boundary with the ledger and the evidence log
+            # untouched: snapshot identity still matches the open decision,
+            # but the earlier cycle's TUNE decision must not be resurrected.
+            self._cli(ledger, "end")
+            self._cli(ledger, "begin")
+            second = self._cli(ledger, "select", "--kind", "tune")
+            self.assertNotEqual(second["decision_id"], first["decision_id"])
+            self.assertFalse(second["reused_open_decision"])
+            self.assertEqual(second["round_cycle"], 1)
+
 
 class LedgerViewTests(unittest.TestCase):
     def test_run_best_materializes_one_view_for_all_candidates(self) -> None:
@@ -369,6 +435,12 @@ class ClimbCmd:
         self.reserved = 0
         self.calls: list[list[str]] = []
         self.selects = 0
+        self.rewrite_selection: dict = {
+            "action": "REWRITE", "run_id": "000",
+            "reason": "scripted", "decision_id": "dec-r1",
+            "reference": 1.0,
+            "evidence_mode": {"overhead_seconds": 10.0}}
+        self.tune_selection: dict | None = None
 
     def _real_bout_cli(self, args: list[str]) -> "subprocess.CompletedProcess":
         import subprocess
@@ -409,12 +481,10 @@ class ClimbCmd:
                                       "phase_deadline": None}))
             if "select" in joined and "rewrite" in joined:
                 self.selects += 1
-                return ok(json.dumps({
-                    "action": "REWRITE", "run_id": "000",
-                    "reason": "scripted", "decision_id": "dec-r1",
-                    "reference": 1.0,
-                    "evidence_mode": {"overhead_seconds": 10.0}}))
+                return ok(json.dumps(self.rewrite_selection))
             if "select" in joined:
+                if self.tune_selection is not None:
+                    return ok(json.dumps(self.tune_selection))
                 return ok(json.dumps({"action": "STOP", "run_id": None,
                                       "reason": "no eligible",
                                       "decision_id": "dec-t1"}))
@@ -487,7 +557,7 @@ class RewriteClimbTests(unittest.TestCase):
             progressed = rounds.optimization_phase(
                 runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir, 1,
                 {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
-                EventsLog(run_dir), tune=lambda no: {"tuned": False},
+                EventsLog(run_dir), tune=lambda no, selection: {"tuned": False},
                 config=config)
 
             self.assertTrue(progressed)
@@ -540,7 +610,7 @@ class RewriteClimbTests(unittest.TestCase):
             progressed = rounds.optimization_phase(
                 runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir, 1,
                 {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
-                EventsLog(run_dir), tune=lambda no: {"tuned": False},
+                EventsLog(run_dir), tune=lambda no, selection: {"tuned": False},
                 config=config)
 
             # the selection was already committed, but no step fits the
@@ -557,6 +627,223 @@ class RewriteClimbTests(unittest.TestCase):
                          if e.get("kind") == "rewrite_climb")
             self.assertEqual((climb["steps"], climb["stop"]),
                              (0, "round_quota"))
+
+
+class SelectCandidateDispatchTests(unittest.TestCase):
+    """Under round_v1, select-candidate answers from the scheduler, not the
+    legacy percentile gate."""
+
+    def test_round_v1_returns_scheduler_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _run_dir(Path(tmp), deadline=time.time() + 86400,
+                               round_cfg={"round_seconds": 3600})
+            ledger = run_dir / "ledger.json"
+            ledger.write_text(json.dumps({"records": [
+                _record("000", 0.9), _record("002", 0.7)]}))
+            _candidate(run_dir, "000", 0.9)
+            _candidate(run_dir, "002", 0.7)
+            round_policy.begin_optimization(run_dir)
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_select_candidate(types.SimpleNamespace(
+                    ledger=str(ledger), top_percentile=None, n_min=None)), 0)
+            result = json.loads(out.getvalue())
+            self.assertEqual(result["run_id"], "002")
+            self.assertEqual(result["scheduler"]["action"], "TUNE")
+            self.assertTrue(result["scheduler"]["decision_id"])
+            # the legacy selector's receipt shape is absent
+            self.assertNotIn("percentile", result)
+            self.assertNotIn("is_continuation", result)
+
+
+class TunerHandoffPostconditionTests(unittest.TestCase):
+    def _ctx(self, run_dir: Path, handoff: dict | None):
+        extra = ({"scheduler_selection": json.dumps(handoff)}
+                 if handoff is not None else {})
+        return InvocationContext(
+            task="fake-task", tag="t1", run_dir=run_dir, invocation_id=1,
+            extra=extra)
+
+    def test_receipt_must_echo_the_handoff_target(self) -> None:
+        from driver.receipts import ReceiptStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            handoff = {"decision_id": "dec-0001", "run_id": "005"}
+            ReceiptStore(run_dir).persist_receipt(
+                "tuner-orchestrator", 1,
+                {"tuned_run_id": "002", "tuned": True, "ledger_updated": True})
+            problem = tuner_target_matches_handoff(self._ctx(run_dir, handoff))
+            self.assertIsNotNone(problem)
+            self.assertIn("005", problem)
+
+            ReceiptStore(run_dir).persist_receipt(
+                "tuner-orchestrator", 1,
+                {"tuned_run_id": "005", "tuned": True, "ledger_updated": True},
+                allow_replace=True)
+            self.assertIsNone(
+                tuner_target_matches_handoff(self._ctx(run_dir, handoff)))
+
+    def test_unpinned_invocations_are_unchecked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                tuner_target_matches_handoff(self._ctx(Path(tmp), None)))
+
+
+class TuneBindingTests(unittest.TestCase):
+    """The tune selection the driver commits is the bout the tuner runs:
+    handoff contents, outcome binding, and mismatch rejection."""
+
+    def _setup_run(self, tmp: Path):
+        run_dir = tmp / "runs" / "fake-task" / "t1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "ledger.json").write_text(json.dumps(
+            {"records": [_record("000", 1.0)]}))
+        candidate = run_dir / "candidates" / "000"
+        candidate.mkdir(parents=True)
+        (candidate / "train.py").write_text(ClimbCmd.V[0])
+        (candidate / "tune_report.json").write_text(json.dumps({
+            "phase_a": {"best_warm_score": 1.0}, "phase_c": {"stages": []}}))
+        return run_dir
+
+    def _events(self, run_dir: Path) -> list[dict]:
+        path = run_dir / "driver_events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()
+                if line.strip()]
+
+    def _phase(self, tmp: Path, run_dir: Path, cmd, tune) -> bool:
+        from driver.events import EventsLog
+        from driver.loops import rounds
+        from driver.receipts import ReceiptStore
+        config = {**round_policy.DEFAULTS, "rewrite_bouts": 1,
+                  "tune_bouts": 1, "noise_margin": 0.0}
+        return rounds.optimization_phase(
+            FakeSessionRunner([]), ReceiptStore(run_dir), "fake-task", "t1",
+            run_dir, 1, {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
+            EventsLog(run_dir), tune=tune, config=config)
+
+    def _tune_cmd(self, tmp: Path, run_dir: Path) -> ClimbCmd:
+        cmd = ClimbCmd(Path(tmp), run_dir, eval_script=[])
+        cmd.rewrite_selection = {"action": "STOP", "run_id": None,
+                                 "reason": "no eligible",
+                                 "decision_id": "dec-r0"}
+        cmd.tune_selection = {"action": "TUNE", "run_id": "000",
+                              "reason": "scripted", "decision_id": "dec-t9",
+                              "policy_version": "scheduler-round-v2",
+                              "state_snapshot_id": "snap-1",
+                              "evidence_cursor": 7, "bout_trials": 24}
+        return cmd
+
+    def test_handoff_and_outcome_bind_to_the_same_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._setup_run(Path(tmp))
+            cmd = self._tune_cmd(Path(tmp), run_dir)
+            seen = {}
+
+            def tune(no, selection):
+                seen.update(round_no=no, selection=selection)
+                return {"tuned": True, "tuned_run_id": "000",
+                        "ledger_updated": True}
+
+            self.assertTrue(self._phase(Path(tmp), run_dir, cmd, tune))
+            selection = seen["selection"]
+            self.assertEqual(seen["round_no"], 1)
+            self.assertEqual(
+                (selection["decision_id"], selection["run_id"],
+                 selection["policy_version"], selection["state_snapshot_id"],
+                 selection["evidence_cursor"], selection["bout_trials"]),
+                ("dec-t9", "000", "scheduler-round-v2", "snap-1", 7, 24))
+            record = next(call for call in cmd.calls
+                          if "record" in call and "dec-t9" in call)
+            self.assertEqual(record[record.index("--action") + 1], "TUNE")
+            self.assertEqual(record[record.index("--status") + 1], "valid")
+            self.assertEqual(record[record.index("--consumed") + 1], "0")
+            event = next(e for e in self._events(run_dir)
+                         if e.get("kind") == "tune_bout")
+            self.assertEqual(
+                (event["selected_run_id"], event["executed_run_id"],
+                 event["decision_id"], event["tuned"]),
+                ("000", "000", "dec-t9", True))
+
+    def test_blocked_session_still_closes_the_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._setup_run(Path(tmp))
+            cmd = self._tune_cmd(Path(tmp), run_dir)
+            from driver.events import EventsLog
+            from driver.loops.common import RunBlocked
+            from driver.loops.experiment import _tune
+            from driver.receipts import ReceiptStore
+
+            with self.assertRaises(RunBlocked):
+                _tune(FakeSessionRunner([]), ReceiptStore(run_dir), "fake-task",
+                      "t1", run_dir, 1, Path(tmp), cmd, EventsLog(run_dir),
+                      selection=dict(cmd.tune_selection))
+            record = next(call for call in cmd.calls
+                          if "record" in call and "dec-t9" in call)
+            self.assertEqual(record[record.index("--action") + 1], "TUNE")
+            self.assertEqual(record[record.index("--status") + 1],
+                             "infra_failure")
+
+    def test_failed_tune_charges_the_attempts_the_bout_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._setup_run(Path(tmp))
+            cmd = self._tune_cmd(Path(tmp), run_dir)
+            from driver.events import EventsLog
+            from driver.loops.common import RunBlocked
+            from driver.loops.experiment import _tune
+            from driver.receipts import ReceiptStore
+
+            def admit_two_evals(ctx) -> None:
+                # The pinned Phase-C job evaluated twice before the tuner
+                # session collapsed; the outcome must charge both, not zero.
+                with (run_dir / "evaluation_attempts.jsonl").open(
+                        "w", encoding="utf-8") as handle:
+                    for _ in range(2):
+                        handle.write(json.dumps({
+                            "schema_version": 1, "kind": "score_attempt",
+                            "phase": "phase_c", "run_id": "000"}) + "\n")
+
+            runner = FakeSessionRunner([
+                {"receipt": None,
+                 "side_effects": admit_two_evals,
+                 "fail": ["fake runner: bout collapsed mid-evaluation"]},
+            ])
+
+            with self.assertRaises(RunBlocked):
+                _tune(runner, ReceiptStore(run_dir), "fake-task", "t1",
+                      run_dir, 1, Path(tmp), cmd, EventsLog(run_dir),
+                      selection=dict(cmd.tune_selection))
+            record = next(call for call in cmd.calls
+                          if "record" in call and "dec-t9" in call)
+            self.assertEqual(record[record.index("--status") + 1],
+                             "infra_failure")
+            self.assertEqual(record[record.index("--consumed") + 1], "2")
+
+    def test_mismatched_receipt_is_never_reattributed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._setup_run(Path(tmp))
+            cmd = self._tune_cmd(Path(tmp), run_dir)
+
+            def tune(no, selection):
+                return {"tuned": True, "tuned_run_id": "002",
+                        "ledger_updated": True}
+
+            self.assertTrue(self._phase(Path(tmp), run_dir, cmd, tune))
+            record = next(call for call in cmd.calls
+                          if "record" in call and "dec-t9" in call)
+            self.assertEqual(record[record.index("--action") + 1], "TUNE")
+            self.assertEqual(record[record.index("--status") + 1],
+                             "infra_failure")
+            self.assertEqual(record[record.index("--consumed") + 1], "0")
+            event = next(e for e in self._events(run_dir)
+                         if e.get("kind") == "tune_target_mismatch")
+            self.assertEqual(
+                (event["selected_run_id"], event["executed_run_id"]),
+                ("000", "002"))
+            # no tune_bout event: the result was not accepted as a bout
+            self.assertFalse(any(e.get("kind") == "tune_bout"
+                                 for e in self._events(run_dir)))
 
 
 class RoundCmd(ExperimentCmd):
@@ -655,6 +942,19 @@ class RoundLoopTests(unittest.TestCase):
             init_call = next(call for call in cmd.calls if "init_run.py" in call)
             self.assertIn("--time-budget 3600", init_call)
             self.assertIn("--scheduler-policy round_v1", init_call)
+            # the tuner invocation was pinned to the selected candidate and
+            # carried the committed decision as a structured handoff
+            tuner_ctx = next(ctx for name, ctx in runner.calls
+                             if name == "tuner-orchestrator")
+            self.assertEqual(tuner_ctx.run_id, "000")
+            handoff = json.loads(tuner_ctx.extra["scheduler_selection"])
+            self.assertEqual(handoff["decision_id"], "dec-0002")
+            self.assertEqual(handoff["run_id"], "000")
+            # the tune decision was closed against the same id
+            tune_record = next(call for call in cmd.calls
+                               if "cli.py record" in call and "dec-0002" in call)
+            self.assertIn("--action TUNE", tune_record)
+            self.assertIn("--status valid", tune_record)
 
 
 if __name__ == "__main__":

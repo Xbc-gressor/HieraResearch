@@ -166,8 +166,17 @@ exact-target rule applies: obey the returned `scheduler.action` and `run_id`
 without re-ranking. The driver invokes you only inside an optimization round;
 the policy ranks eligible candidates by expected improvement per unit of
 wall-clock time (score rank against the candidate's mean evaluation time).
-The run is bounded by a wall-clock budget and each round by a time quota, so
-a bout may be cut short: when a reservation is refused mid-bout
+When your invocation context carries a `scheduler_selection` line (the normal
+round path), that JSON **is** the committed decision — its `run_id` names the
+bout you run, its `decision_id`/`state_snapshot_id`/`evidence_cursor` identify
+the decision, and its `bout_trials` is the bout's trial cap. Do **not** call
+`select-candidate` in that invocation; `select-candidate` is only for
+invocations without a handoff, and it returns the same decision the scheduler
+already committed. Your receipt's `tuned_run_id` must echo the handoff's
+`run_id` or be `"none"` — the driver rejects any Phase-C job whose target
+differs, and a mismatching id is recorded as an infrastructure failure, never
+as a result. The run is bounded by a wall-clock budget and each round by a
+time quota, so a bout may be cut short: when a reservation is refused mid-bout
 (`budget_exhausted_scope` `time` or `round_quota`), `phase-c-action` answers
 `close_exhausted_stage` — finalize the candidate with the observations it
 has; that truncated bout is a complete, valid bout. A candidate whose code
@@ -200,7 +209,7 @@ INITIAL bout warm-started from that row.
 
 | value | how |
 |---|---|
-| `run_id` | from select-candidate |
+| `run_id` | from select-candidate or the `scheduler_selection` handoff |
 | `candidate_dir` | `<run_dir>/candidates/<run_id>` |
 | `candidate_path` | `<candidate_dir>/train.py` |
 | `<candidate_dir>/tune_report.json` | has `phase_a` plus any earlier bouts' `phase_c.stages` |

@@ -51,6 +51,7 @@ from . import common
 from . import rounds
 from .common import RunBlocked
 from tools.evaluation_budget import budget_status as objective_budget_status
+from tools.evaluation_budget import phase_c_attempts
 from tools.objective_brief import (
     build_brief,
     compact_line,
@@ -1120,11 +1121,14 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
 
 
 def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str,
-                     repo_root=REPO_ROOT, job_runner=execute_driver_job):
+                     repo_root=REPO_ROOT, job_runner=execute_driver_job,
+                     selection=None):
     receipt, _ = _invoke_with_driver_jobs(
         runner, store, "tuner-orchestrator", task, tag, run_dir,
         round_no=round_no,
-        extra={"reconcile_note": reason + _RECONCILE_GUIDANCE},
+        run_id=(str(selection["run_id"]) if selection else None),
+        extra=_tune_invocation_extra(selection,
+                                     {"reconcile_note": reason + _RECONCILE_GUIDANCE}),
         repo_root=repo_root, job_runner=job_runner)
     return receipt
 
@@ -1185,14 +1189,65 @@ def _phase_c_recover_close(run_dir: Path, run_id: str, repo_root: Path, cmd,
     return json.loads(result.stdout)
 
 
+def _close_failed_tune(run_dir, repo_root, cmd, events, selection, *,
+                       phase_c_before: int = 0) -> None:
+    """A pinned tune bout is ending in a blocked run: close its decision as
+    an infrastructure failure so it cannot be silently re-executed later.
+
+    ``phase_c_before`` is the selected candidate's admitted Phase-C attempt
+    count when the bout started: the outcome must charge the decision with
+    what the failed attempts actually consumed, not an unconditional zero.
+    """
+    if selection is None:
+        return
+    run_id = str(selection["run_id"])
+    consumed = max(
+        0, phase_c_attempts(run_dir, run_id) - int(phase_c_before))
+    try:
+        rounds._record(run_dir, repo_root, cmd, selection["decision_id"],
+                       run_id, action="TUNE", consumed=consumed,
+                       status="infra_failure")
+    except subprocess.CalledProcessError as exc:
+        events.emit("tune_outcome_record_failed",
+                    decision_id=selection.get("decision_id"),
+                    detail=(exc.stderr or str(exc))[-1500:])
+
+
+def _tune_invocation_extra(selection, base=None):
+    """Session context for a pinned tune invocation (round_v1 handoff).
+
+    The handoff is the committed scheduler decision; `run_id` travels as a
+    separate invocation pin so every driver-owned Phase-C job is fail-closed
+    to the selected candidate before any objective evaluation launches.
+    """
+    extra = dict(base or {})
+    if selection is not None:
+        extra["scheduler_selection"] = json.dumps(
+            rounds.tune_handoff(selection), sort_keys=True)
+    return extra or None
+
+
 def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
-          events, job_runner=execute_driver_job) -> dict:
-    """Run the decoupled tuning step; return the effective tuner receipt."""
+          events, job_runner=execute_driver_job, selection=None) -> dict:
+    """Run the decoupled tuning step; return the effective tuner receipt.
+
+    ``selection`` is the round scheduler's committed TUNE decision
+    (round_v1): it pins the session and its Phase-C jobs to the selected
+    candidate. ``None`` keeps the orchestrator-side selection used by the
+    complete-bout and legacy policies.
+    """
+    phase_c_before = (
+        phase_c_attempts(run_dir, str(selection["run_id"]))
+        if selection is not None else 0
+    )
     tuner_inv = None  # set only on a successful first invocation
     try:
         receipt, tuner_inv = _invoke_with_driver_jobs(
             runner, store, "tuner-orchestrator", task, tag, run_dir,
-            round_no=round_no, repo_root=repo_root, job_runner=job_runner)
+            round_no=round_no,
+            run_id=(str(selection["run_id"]) if selection else None),
+            extra=_tune_invocation_extra(selection),
+            repo_root=repo_root, job_runner=job_runner)
     except (InvocationFailed, DriverJobError) as exc:
         # The reconcile session is the recovery path: hand it the first
         # session's problems, and keep them for the block reason too.
@@ -1202,10 +1257,12 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             receipt = _tuner_reconcile(
                 runner, store, task, tag, run_dir, round_no,
                 "tuner session failed: " + "; ".join(first_problems),
-                repo_root, job_runner)
+                repo_root, job_runner, selection=selection)
         except (InvocationFailed, DriverJobError) as exc:
             problems = [str(p) for p in
                         getattr(exc, "problems", [str(exc)])]
+            _close_failed_tune(run_dir, repo_root, cmd, events, selection,
+                               phase_c_before=phase_c_before)
             _or_block(run_dir, repo_root, cmd, events,
                       f"tuner session failed: {first_problems}; "
                       f"reconciliation failed: {problems}")
@@ -1230,7 +1287,9 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             corrected, _ = _invoke_with_driver_jobs(
                 runner, store, "tuner-orchestrator", task, tag, run_dir,
                 round_no=round_no, resume_from=tuner_inv,
-                extra={"reconcile_note": note + _RECONCILE_GUIDANCE},
+                run_id=(str(selection["run_id"]) if selection else None),
+                extra=_tune_invocation_extra(
+                    selection, {"reconcile_note": note + _RECONCILE_GUIDANCE}),
                 repo_root=repo_root, job_runner=job_runner)
         except InvocationFailed as exc:
             corrected = None
@@ -1242,14 +1301,19 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             try:
                 corrected = _tuner_reconcile(
                     runner, store, task, tag, run_dir, round_no,
-                    reconcile_note, repo_root, job_runner)
+                    reconcile_note, repo_root, job_runner,
+                    selection=selection)
             except (InvocationFailed, DriverJobError) as exc:
                 problems = getattr(exc, "problems", [str(exc)])
+                _close_failed_tune(run_dir, repo_root, cmd, events, selection,
+                                   phase_c_before=phase_c_before)
                 _or_block(run_dir, repo_root, cmd, events,
                       f"tuner receipt/ledger contradiction unresolved: "
                           f"{problems}")
         if corrected.get("tuned") and \
                 not _tune_flag(run_dir, corrected.get("tuned_run_id", "none")):
+            _close_failed_tune(run_dir, repo_root, cmd, events, selection,
+                               phase_c_before=phase_c_before)
             _or_block(run_dir, repo_root, cmd, events,
                       "authoritative artifacts still contradict after "
                       "tuner reconciliation")
@@ -1775,9 +1839,9 @@ def _round_step(runner, store, task, tag, run_dir, round_no, task_toml,
                 produced=view.get("produced"), threshold=view.get("threshold"),
                 final_round=view.get("final_round"))
 
-    def tune(no):
+    def tune(no, selection):
         return _tune(runner, store, task, tag, run_dir, no, repo_root, cmd,
-                     events, job_runner)
+                     events, job_runner, selection=selection)
 
     progressed = rounds.optimization_phase(
         runner, store, task, tag, run_dir, round_no, task_toml, repo_root,

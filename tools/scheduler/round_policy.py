@@ -436,6 +436,27 @@ def decide(state: SchedulerState, run_dir: Path) -> Decision:
     return select_tune(state, run_dir)
 
 
+def open_tune_decision(store, run_dir: Path) -> dict | None:
+    """This cycle's still-open TUNE decision, if one exists (round_v1).
+
+    The generic reuse identity `(state_snapshot_id, evidence_cursor)` cannot
+    survive a partially executed bout — the artifacts the snapshot is built
+    from have advanced — so a resumed round would otherwise mint a second
+    decision for the same conceptual bout. Reuse within an optimization phase
+    is keyed on the cycle instead: `end_optimization` increments it, so a
+    stale decision from an earlier phase never stands in for this one.
+    """
+    cycle = int(load_round_state(run_dir).get("cycle", 0))
+    for row in reversed(store.unbound_decisions()):
+        if (
+            row.get("selected_action") == "TUNE"
+            and row.get("policy_version") == POLICY_VERSION
+            and row.get("round_cycle") == cycle
+        ):
+            return row
+    return None
+
+
 def receipt(
     decision: Decision,
     *,

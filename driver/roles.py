@@ -150,6 +150,28 @@ def record_status(run_dir: Path, run_id: str) -> str | None:
 # --- postconditions ---------------------------------------------------------
 
 
+def tuner_target_matches_handoff(ctx: InvocationContext) -> str | None:
+    """A pinned tune invocation's receipt names the selected candidate."""
+    handoff = ctx.extra.get("scheduler_selection")
+    if not handoff:
+        return None
+    from .receipts import ReceiptStore  # local import: receipts reads roles
+    path = ReceiptStore(ctx.run_dir).receipt_path(
+        "tuner-orchestrator", ctx.invocation_id)
+    if not path.exists():
+        return None
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    selected = (json.loads(handoff) or {}).get("run_id")
+    executed = receipt.get("tuned_run_id", "none")
+    if executed not in (selected, "none"):
+        return (
+            f"tuned_run_id {executed!r} must echo the scheduler selection "
+            f"{selected!r} or be 'none'; a pinned invocation cannot name "
+            "another candidate"
+        )
+    return None
+
+
 def background_artifacts_exist(ctx: InvocationContext) -> str | None:
     """background.md and background_retrieval.json exist in run_dir."""
     missing = [
@@ -263,6 +285,7 @@ ROLES: dict[str, RoleDefinition] = {
             "ledger_updated": "bool",
             "driver_job": "?dict",
         },
+        postconditions=(tuner_target_matches_handoff,),
         forbidden_bash_substrings=(
             "tools/tuners/grid_search.py",
             "tools/tuners/bo_search.py",
