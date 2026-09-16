@@ -692,6 +692,65 @@ def _slate_plan_payload(slot: dict, pool_doc: dict, context_doc: dict,
     return "\n\n".join(parts) + "\n"
 
 
+def _slate_plan_retry_note(problems: list[str]) -> str:
+    """Decorrelated retry appendix: the prior attempt's actual failure plus,
+    for the repetition failure mode, an explicitly worded admonition."""
+    items = "\n".join(f"- {p}" for p in problems)
+    if any("repetition breaker" in p for p in problems):
+        admonition = (
+            "A previous planning attempt for this seat was terminated for "
+            "repeating an identical file Read. Use the supplied context, "
+            "read any required referenced file once, then complete the plan "
+            "and call submit_receipt.")
+    else:
+        admonition = (
+            "A previous planning attempt for this seat failed as listed "
+            "below. Address its failure, then complete the plan and call "
+            "submit_receipt.")
+    return ("--- Prior attempt note ---\n"
+            f"{admonition}\nFailure problems from that attempt:\n{items}\n")
+
+
+# slate-plan-writer attempt budget: 1 initial + 2 decorrelated inline
+# retries per (generation, slot). Persisted before each invocation so a
+# crash mid-attempt still consumes budget, and never reset by restarts or
+# external resumes (2026-09-16 incident: 75 blocked resumes re-drew the
+# same failing payload for ~$4 before the budget ran out elsewhere).
+_SLATE_WRITER_ATTEMPTS = 3
+
+
+def _slot_attempts_path(plans_dir, slot_no) -> Path:
+    return plans_dir / f"slot-{slot_no}.attempts.json"
+
+
+def _slate_writer_attempts_used(plans_dir, slot_no) -> int:
+    path = _slot_attempts_path(plans_dir, slot_no)
+    if not path.exists():
+        return 0
+    try:
+        return int(json.loads(
+            path.read_text(encoding="utf-8")).get("attempts", 0))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return 0
+
+
+def _register_slate_writer_attempt(plans_dir, slot_no) -> int:
+    """Increment-and-persist the per-slot attempt counter; returns the
+    1-based attempt number just registered."""
+    path = _slot_attempts_path(plans_dir, slot_no)
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    attempts = int(data.get("attempts", 0)) + 1
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"attempts": attempts}) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return attempts
+
+
 def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
                         round_no, repo_root, cmd, events) -> None:
     """One plan per seat; only missing or invalid plans are (re)written."""
@@ -712,6 +771,12 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
             if existing is not None and not _slate_plan_problems(
                     existing, slot, route_arm):
                 continue
+        if _slate_writer_attempts_used(plans_dir, slot["slot"]) \
+                >= _SLATE_WRITER_ATTEMPTS:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"slate-plan-writer attempt budget exhausted for slot "
+                      f"{slot['slot']} ({_SLATE_WRITER_ATTEMPTS} attempts, no "
+                      f"valid plan)")
         route_memory_path = None
         if route_arm:
             point_path = plans_dir / f"slot-{slot['slot']}.point.json"
@@ -729,17 +794,24 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
         if route_arm:
             extra["n_route_sketches"] = route_arm
             extra["route_memory"] = str(route_memory_path)
-        try:
-            receipt, _ = _invoke(
-                runner, store, "slate-plan-writer", task, tag, run_dir,
-                run_id=slot["run_id"], round_no=round_no, extra=extra,
-                inline_payload=_slate_plan_payload(
-                    slot, pool_doc, context_doc, route_memory_path,
-                    objective_text=objective_text))
-        except InvocationFailed as exc:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"slate-plan-writer failed for slot {slot['slot']}: "
-                      f"{exc.problems}")
+        payload = _slate_plan_payload(
+            slot, pool_doc, context_doc, route_memory_path,
+            objective_text=objective_text)
+        receipt = None
+        while receipt is None:
+            attempt = _register_slate_writer_attempt(plans_dir, slot["slot"])
+            try:
+                receipt, _ = _invoke(
+                    runner, store, "slate-plan-writer", task, tag, run_dir,
+                    run_id=slot["run_id"], round_no=round_no, extra=extra,
+                    inline_payload=payload)
+            except InvocationFailed as exc:
+                if attempt >= _SLATE_WRITER_ATTEMPTS:
+                    _or_block(run_dir, repo_root, cmd, events,
+                              f"slate-plan-writer failed for slot "
+                              f"{slot['slot']} (attempt {attempt}/"
+                              f"{_SLATE_WRITER_ATTEMPTS}): {exc.problems}")
+                payload = payload + _slate_plan_retry_note(exc.problems)
         problems = _slate_plan_problems(receipt, slot, route_arm)
         if problems:
             _or_block(run_dir, repo_root, cmd, events,

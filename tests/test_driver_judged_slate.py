@@ -364,6 +364,14 @@ def writer_entry():
     }
 
 
+def kill_entry():
+    """A hard driver kill mid-invocation: no InvocationFailed, no blocked
+    phase — the process just dies (attempt budget already registered)."""
+    def boom(ctx):
+        raise RuntimeError("simulated driver kill")
+    return {"side_effects": boom}
+
+
 def extractor_entry(cmd: JudgedCmd):
     entry: dict = {}
 
@@ -527,12 +535,12 @@ class JudgedSlateTests(unittest.TestCase):
         self._seed_run()
         cmd = JudgedCmd(self.repo)
         cmd.reached = [False]
-        runner1 = self._run(cmd, [
-            judge_entry(),
-            judge_entry(),
-            {"fail": ["killed before any plan"]},
-        ])
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        with self.assertRaises(RuntimeError):
+            self._run(cmd, [
+                judge_entry(),
+                judge_entry(),
+                kill_entry(),                   # driver dies mid-plan
+            ])
         manifest_bytes = (self._gen_dir() / "generation.json").read_bytes()
         self.assertEqual(len(cmd._ledger()["records"]), 5)
 
@@ -566,12 +574,13 @@ class JudgedSlateTests(unittest.TestCase):
         self._seed_run()
         cmd = JudgedCmd(self.repo)
         cmd.reached = [False]
-        self._run(cmd, [
-            judge_entry(),
-            judge_entry(),
-            plan_entry(),                     # slot 0 lands
-            {"fail": ["killed mid-plan"]},    # slot 1 does not
-        ])
+        with self.assertRaises(RuntimeError):
+            self._run(cmd, [
+                judge_entry(),
+                judge_entry(),
+                plan_entry(),                     # slot 0 lands
+                kill_entry(),                     # slot 1 dies mid-plan
+            ])
         plan0_bytes = (self._gen_dir() / "plans" / "slot-0.json").read_bytes()
 
         cmd2 = JudgedCmd(self.repo)
@@ -594,6 +603,78 @@ class JudgedSlateTests(unittest.TestCase):
         )
         self.assertEqual(
             [r["run_id"] for r in self._new_records(cmd2)], ["005", "006"])
+
+    def test_writer_failure_retries_inline_with_decorrelated_payload(self) -> None:
+        self._seed_run()
+        cmd = JudgedCmd(self.repo)
+        cmd.reached = [False, False, False, False, True]
+        runner = self._run(cmd, [
+            judge_entry(),
+            judge_entry(),
+            {"fail": ["no accepted receipt",
+                      "repetition breaker tripped: Read invoked 5x with "
+                      "identical input"]},   # slot 0, attempt 1
+            plan_entry(),                    # slot 0, inline retry lands
+            plan_entry(),                    # slot 1, first attempt
+            writer_entry(),
+            extractor_entry(cmd),
+            writer_entry(),
+            extractor_entry(cmd),
+            tuner_entry(),
+        ])
+        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        plans = self._gen_dir() / "plans"
+        self.assertTrue((plans / "slot-0.json").exists())
+        self.assertTrue((plans / "slot-1.json").exists())
+        self.assertEqual(
+            json.loads((plans / "slot-0.attempts.json").read_text()),
+            {"attempts": 2})
+        self.assertEqual(
+            json.loads((plans / "slot-1.attempts.json").read_text()),
+            {"attempts": 1})
+        plan_calls = [(ctx.invocation_id, ctx) for name, ctx in runner.calls
+                      if name == "slate-plan-writer"]
+        self.assertEqual(len(plan_calls), 3)
+        first_id, first = plan_calls[0]
+        retry_id, retry = plan_calls[1]
+        # decorrelated retry: a NEW invocation and session, never a resume
+        # of the breaker-tripped failure
+        self.assertNotEqual(first_id, retry_id)
+        self.assertIsNone(retry.resume_session_id)
+        self.assertIn("repetition breaker tripped", retry.inline_payload)
+        self.assertIn("identical file Read", retry.inline_payload)
+        self.assertIn("Prior attempt note", retry.inline_payload)
+        self.assertNotIn("Prior attempt note", first.inline_payload)
+
+    def test_writer_budget_exhausted_blocks_and_resume_never_reinvokes(self) -> None:
+        self._seed_run()
+        cmd = JudgedCmd(self.repo)
+        cmd.reached = [False]
+        self._run(cmd, [
+            judge_entry(),
+            judge_entry(),
+            {"fail": ["a"]},
+            {"fail": ["b"]},
+            {"fail": ["c"]},
+        ])
+        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        plans = self._gen_dir() / "plans"
+        self.assertFalse((plans / "slot-0.json").exists())
+        self.assertEqual(
+            json.loads((plans / "slot-0.attempts.json").read_text()),
+            {"attempts": 3})
+
+        cmd2 = JudgedCmd(self.repo)
+        cmd2.reached = [False, False]
+        runner2 = self._run(cmd2, [])  # empty script: any session is a bug
+        self.assertEqual([name for name, _ in runner2.calls], [])
+        self.assertEqual(cmd2._ledger().get("phase"), "blocked")
+        events_path = (self.repo / "runs" / TASK / TAG
+                       / "driver_events.jsonl")
+        rows = [json.loads(line) for line in
+                events_path.read_text().splitlines() if line.strip()]
+        reasons = [r.get("reason") for r in rows if r.get("kind") == "blocked"]
+        self.assertIn("attempt budget exhausted", reasons[-1])
 
     def test_resume_with_both_seats_pending_uses_step0_pipeline(self) -> None:
         self._seed_run()

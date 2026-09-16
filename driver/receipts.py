@@ -84,6 +84,22 @@ class ReceiptStore:
     def session_path(self, role: str, invocation_id: int) -> Path:
         return self._dir() / f"{role}-{invocation_id:04d}.session.json"
 
+    def session_messages_path(self, role: str, invocation_id: int) -> Path:
+        return self._dir() / f"{role}-{invocation_id:04d}.session-messages.jsonl"
+
+    def persist_session_messages(self, role: str, invocation_id: int,
+                                 rows: list[dict]) -> None:
+        """Bounded diagnostic transcript for FAILED sessions only (error
+        result or repetition trip; see session._drain). Success sessions
+        persist nothing here. The caller pre-truncates rows; this only
+        writes them atomically."""
+        path = self.session_messages_path(role, invocation_id)
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+
     def next_invocation_id(self) -> int:
         highest = 0
         for path in self._dir().iterdir():

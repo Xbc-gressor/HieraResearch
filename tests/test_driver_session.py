@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -12,6 +13,8 @@ from driver.events import EventsLog  # noqa: E402
 from driver.receipts import ReceiptStore, build_receipt_server  # noqa: E402
 from driver.roles import ROLES, InvocationContext, RoleDefinition  # noqa: E402
 from driver.session import (  # noqa: E402
+    _DUMP_MAX_ENTRIES,
+    _DUMP_MSG_CHARS,
     REPETITION_LIMIT,
     FakeSessionRunner,
     InvocationFailed,
@@ -76,6 +79,58 @@ class CapabilityHookTests(unittest.TestCase):
         for i in range(REPETITION_LIMIT * 2):
             call = {"tool_name": "Read",
                     "tool_input": {"file_path": f"f{i % 2}.py"}}
+            self.assertEqual(asyncio.run(hook(call, None, {})), {})
+        self.assertIsNone(breaker["tripped"])
+
+
+class EarlyRepeatCorrectionTests(unittest.TestCase):
+    """slate-plan-writer: #2..#4 consecutive identical calls are denied with
+    an explicit corrective count (invocation stays alive); the hard trip at
+    REPETITION_LIMIT is unchanged. Other roles keep the silent prefix."""
+
+    def _writer_hook(self, breaker):
+        runner = SDKSessionRunner(
+            model="m", events=EventsLog(Path(tempfile.mkdtemp())))
+        return runner._capability_hook(ROLES["slate-plan-writer"], breaker)
+
+    def test_writer_denied_with_count_before_hard_trip(self) -> None:
+        breaker = new_breaker()
+        hook = self._writer_hook(breaker)
+        call = {"tool_name": "Read", "tool_input": {"file_path": "TASK.md"}}
+        self.assertEqual(asyncio.run(hook(call, None, {})), {})
+        for expected in (2, 3, 4):
+            decision = asyncio.run(
+                hook(call, None, {}))["hookSpecificOutput"]
+            self.assertEqual(decision["permissionDecision"], "deny")
+            self.assertIn(f"#{expected}", decision["permissionDecisionReason"])
+            self.assertIsNone(breaker["tripped"])
+        decision = asyncio.run(hook(call, None, {}))["hookSpecificOutput"]
+        self.assertIn("repetition breaker",
+                      decision["permissionDecisionReason"])
+        self.assertIsNotNone(breaker["tripped"])
+
+    def test_other_tool_call_resets_the_correction_count(self) -> None:
+        breaker = new_breaker()
+        hook = self._writer_hook(breaker)
+        a = {"tool_name": "Read", "tool_input": {"file_path": "a.md"}}
+        b = {"tool_name": "Read", "tool_input": {"file_path": "b.md"}}
+        self.assertEqual(asyncio.run(hook(a, None, {})), {})
+        self.assertEqual(
+            asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
+            ["permissionDecision"], "deny")
+        self.assertEqual(asyncio.run(hook(b, None, {})), {})   # reset
+        self.assertEqual(asyncio.run(hook(a, None, {})), {})   # fresh count
+        self.assertEqual(
+            asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
+            ["permissionDecision"], "deny")
+
+    def test_roles_without_the_flag_keep_the_silent_prefix(self) -> None:
+        breaker = new_breaker()
+        runner = SDKSessionRunner(
+            model="m", events=EventsLog(Path(tempfile.mkdtemp())))
+        hook = runner._capability_hook(SIMPLE_ROLE, breaker)
+        call = {"tool_name": "Read", "tool_input": {"file_path": "f.py"}}
+        for _ in range(REPETITION_LIMIT - 1):
             self.assertEqual(asyncio.run(hook(call, None, {})), {})
         self.assertIsNone(breaker["tripped"])
 
@@ -425,6 +480,127 @@ class FakeSessionRunnerTests(unittest.TestCase):
             self.assertTrue(receipt["edited"])
             with self.assertRaises(InvocationFailed):
                 runner.run(ROLES["hillclimb-editor"], make_ctx(run_dir))
+
+
+class FakeAssistantMessage:
+    def __init__(self, text: str):
+        self.content = [{"type": "text", "text": text}]
+
+
+class FailureTranscriptDumpTests(unittest.TestCase):
+    """Error-ended (or breaker-tripped) sessions persist a bounded message
+    transcript; success sessions persist nothing; a dump failure never
+    masks the invocation's own outcome."""
+
+    class TranscriptFakeClient:
+        def __init__(self, run_dir: Path, store: ReceiptStore,
+                     invocation_id: int, *, error: bool,
+                     huge: bool = False, flood: int = 0):
+            self.store = store
+            self.invocation_id = invocation_id
+            self.error = error
+            self.huge = huge
+            self.flood = flood
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def query(self, prompt: str) -> None:
+            pass
+
+        async def receive_response(self):
+            yield FakeSystemMessage("sess-fake")
+            if self.flood:
+                for _ in range(self.flood):
+                    yield FakeAssistantMessage("loop")
+            elif self.huge:
+                yield FakeAssistantMessage("x" * 6000)
+            else:
+                yield FakeAssistantMessage("planning to Read TASK.md")
+            if self.error:
+                msg = FakeResultMessage(is_error=True,
+                                        subtype="error_max_turns")
+                msg.result = "turned too long"
+            else:
+                self.store.persist_receipt(
+                    "hillclimb-editor", self.invocation_id,
+                    {"edited": True, "summary": "ok"})
+                msg = FakeResultMessage()
+                msg.result = "done"
+            yield msg
+
+    def _run_client(self, run_dir: Path, **kw):
+        client = self.TranscriptFakeClient(
+            run_dir, ReceiptStore(run_dir), 1, **kw)
+        runner = SDKSessionRunner(model="m", events=EventsLog(run_dir),
+                                  client_factory=lambda options: client)
+        return runner.run(SIMPLE_ROLE, make_ctx(run_dir))
+
+    def _dump_rows(self, run_dir: Path) -> list[dict]:
+        path = ReceiptStore(run_dir).session_messages_path(
+            SIMPLE_ROLE.name, 1)
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def test_error_session_writes_bounded_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with self.assertRaises(InvocationFailed):
+                self._run_client(run_dir, error=True)
+            rows = self._dump_rows(run_dir)
+            msgs = [row.get("msg") for row in rows]
+            self.assertNotIn("FakeSystemMessage", msgs)  # init skipped
+            self.assertIn("FakeAssistantMessage", msgs)
+            self.assertTrue(any(row.get("result") == "turned too long"
+                                for row in rows))
+
+    def test_success_session_writes_no_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            receipt = self._run_client(run_dir, error=False)
+            self.assertTrue(receipt["edited"])
+            self.assertFalse(
+                ReceiptStore(run_dir).session_messages_path(
+                    SIMPLE_ROLE.name, 1).exists())
+
+    def test_huge_message_is_clipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with self.assertRaises(InvocationFailed):
+                self._run_client(run_dir, error=True, huge=True)
+            content = next(row["content"] for row in self._dump_rows(run_dir)
+                           if row.get("msg") == "FakeAssistantMessage")
+            self.assertLessEqual(len(content),
+                                 _DUMP_MSG_CHARS + len("…[truncated]"))
+            self.assertTrue(content.endswith("…[truncated]"))
+
+    def test_entry_cap_marks_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with self.assertRaises(InvocationFailed):
+                self._run_client(run_dir, error=True, flood=_DUMP_MAX_ENTRIES)
+            rows = self._dump_rows(run_dir)
+            self.assertEqual(len(rows), _DUMP_MAX_ENTRIES + 1)
+            # the trailing ResultMessage itself fell past the cap
+            self.assertEqual(rows[-1],
+                             {"truncated": True, "dropped_messages": 1})
+
+    def test_dump_failure_does_not_mask_invocation_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with mock.patch.object(
+                    ReceiptStore, "persist_session_messages",
+                    side_effect=OSError("disk full")):
+                with self.assertRaises(InvocationFailed) as cm:
+                    self._run_client(run_dir, error=True)
+            self.assertTrue(any("error_max_turns" in p
+                                for p in cm.exception.problems))
+            rows = [json.loads(line) for line in
+                    (run_dir / "driver_events.jsonl").read_text().splitlines()]
+            self.assertTrue(any(r.get("kind") == "session_dump_failed"
+                                for r in rows))
 
 
 class OptionsTests(unittest.TestCase):

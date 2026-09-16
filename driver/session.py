@@ -37,9 +37,83 @@ RECEIPT_TOOL = "mcp__receipts__submit_receipt"
 # or change the input, so the fingerprint necessarily changes.
 REPETITION_LIMIT = 5
 
+# Bounded failure-transcript dump (diagnostics only; success sessions write
+# nothing). Per-message and whole-buffer caps keep the JSONL small even for
+# max_turns-size sessions.
+_DUMP_MSG_CHARS = 4000
+_DUMP_MAX_ENTRIES = 200
+_DUMP_MAX_BYTES = 256 * 1024
+
 
 def new_breaker() -> dict:
     return {"fp": None, "count": 0, "tripped": None}
+
+
+def _jsonish(value) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _clip(text: str) -> str:
+    if len(text) <= _DUMP_MSG_CHARS:
+        return text
+    return text[:_DUMP_MSG_CHARS] + "…[truncated]"
+
+
+def _summarize_message(msg) -> dict | None:
+    """One compact JSON-able row per streamed message; None when the message
+    carries no diagnostic content (the init handshake). Assistant text, tool
+    inputs, and tool results all serialize through .content; the final
+    ResultMessage's text lands via .result."""
+    if getattr(msg, "subtype", None) == "init":
+        return None
+    row: dict = {"msg": type(msg).__name__}
+    content = getattr(msg, "content", None)
+    if content is not None:
+        row["content"] = _clip(_jsonish(content))
+    result = getattr(msg, "result", None)
+    if result:
+        row["result"] = _clip(_jsonish(result))
+    return row if len(row) > 1 else None
+
+
+class _BoundedTranscript:
+    """Invocation-scoped, size-capped buffer of streamed session messages.
+
+    Persisted only when a session ends on an error result or the repetition
+    breaker trips — the forensic blind spot of the 2026-09-16
+    slate-plan-writer incident (107B session stubs, no transcript, diagnosis
+    only via byte-level payload reconstruction).
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+        self.dropped = 0
+        self._bytes = 0
+
+    def add(self, msg) -> None:
+        if len(self.entries) >= _DUMP_MAX_ENTRIES:
+            self.dropped += 1
+            return
+        entry = _summarize_message(msg)
+        if entry is None:
+            return
+        size = len(json.dumps(entry, ensure_ascii=False))
+        if self._bytes + size > _DUMP_MAX_BYTES:
+            self.dropped += 1
+            return
+        self.entries.append(entry)
+        self._bytes += size
+
+    def rows(self) -> list[dict]:
+        rows = list(self.entries)
+        if self.dropped:
+            rows.append({"truncated": True, "dropped_messages": self.dropped})
+        return rows
 
 
 class InvocationFailed(Exception):
@@ -111,6 +185,15 @@ class SDKSessionRunner:
                                       "with identical input")
             if breaker["tripped"] is not None:
                 return deny(f"repetition breaker tripped: {breaker['tripped']}")
+            if role.early_repeat_correct and breaker["count"] >= 2:
+                # Corrective deny, not a trip: refuse the wasted repeat with
+                # an explicit count so the model can break the loop itself;
+                # the hard breaker at REPETITION_LIMIT is unchanged.
+                return deny(
+                    f"repeated identical call #{breaker['count']} to {fp[0]} "
+                    "with the same input; the earlier result is already in "
+                    "your context — do not re-read; proceed to produce your "
+                    "receipt/output.")
             name = input_data.get("tool_name", "")
             if name not in allowed:
                 return deny(f"role {role.name} may not use tool {name}")
@@ -199,7 +282,8 @@ class SDKSessionRunner:
 
     async def _drain(self, client, role: RoleDefinition, ctx: InvocationContext,
                      store: ReceiptStore, accepted: list[dict],
-                     breaker: dict | None = None) -> dict | None:
+                     breaker: dict | None = None,
+                     transcript: _BoundedTranscript | None = None) -> dict | None:
         if breaker is None:
             breaker = new_breaker()
         from claude_agent_sdk import ResultMessage, SystemMessage
@@ -214,6 +298,8 @@ class SDKSessionRunner:
         # drain — only a NEW acceptance ends this turn's useful work.
         accepted_baseline = len(accepted)
         async for msg in client.receive_response():
+            if transcript is not None:
+                transcript.add(msg)
             if isinstance(msg, SystemMessage) and msg.subtype == "init":
                 session_id = msg.data.get("session_id")
                 if session_id:
@@ -294,6 +380,16 @@ class SDKSessionRunner:
                         # The receipt is already persisted; a failed
                         # interrupt must not fail the invocation.
                         pass
+        if transcript is not None and transcript.entries and (
+                (result_info and result_info["is_error"])
+                or breaker["tripped"] is not None):
+            try:
+                store.persist_session_messages(role.name, ctx.invocation_id,
+                                               transcript.rows())
+            except Exception:
+                # Diagnostics must never change the invocation's outcome.
+                self.events.emit("session_dump_failed", role=role.name,
+                                 invocation_id=ctx.invocation_id)
         return result_info
 
     @staticmethod
@@ -364,10 +460,11 @@ class SDKSessionRunner:
         self.events.emit("session_start", role=role.name,
                          invocation_id=ctx.invocation_id,
                          resume=bool(ctx.resume_session_id))
+        transcript = _BoundedTranscript()
         async with factory(options) as client:
             await client.query(ctx.user_message())
             result = await self._drain(client, role, ctx, store, accepted,
-                                       breaker)
+                                       breaker, transcript)
             receipt = self._latest_receipt(store, role, ctx, accepted)
             problems = self._problems(role, ctx, receipt)
             if breaker["tripped"] is not None:
@@ -393,7 +490,7 @@ class SDKSessionRunner:
                                  attempt=attempts, problems=problems)
                 await client.query(self._corrective_message(problems))
                 result = await self._drain(client, role, ctx, store, accepted,
-                                           breaker)
+                                           breaker, transcript)
                 receipt = self._latest_receipt(store, role, ctx, accepted)
                 problems = self._problems(role, ctx, receipt)
         if problems:

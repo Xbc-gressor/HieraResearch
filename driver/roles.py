@@ -80,6 +80,12 @@ class RoleDefinition:
     # When non-empty, Bash calls must start with one of these prefixes
     # (enforced by the PreToolUse hook in session.py).
     bash_patterns: tuple[str, ...] = ()
+    # Early corrective denies for consecutive identical (tool, input) calls
+    # BEFORE the hard repetition trip: #2..#LIMIT-1 are denied with an
+    # explicit count while the invocation stays alive. Reserved for roles
+    # with an observed read-loop attractor (slate-plan-writer, 2026-09-16:
+    # 75/79 sessions lost to byte-identical Reads the CLI could not dissuade).
+    early_repeat_correct: bool = False
     # Long objective commands are driver-owned. These substrings keep an agent
     # from bypassing the typed job handoff and orphaning a GPU process.
     forbidden_bash_substrings: tuple[str, ...] = ()
@@ -377,6 +383,7 @@ ROLES: dict[str, RoleDefinition] = {
         prompt_file="slate-plan-writer.md",
         tools=("Read",),
         disallowed=_BASE_DISALLOWED + ("Write", "Edit", "Bash"),
+        early_repeat_correct=True,
         receipt_schema={
             "slot": "int",
             "idea": "str",
