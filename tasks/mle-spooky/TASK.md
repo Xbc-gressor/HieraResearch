@@ -21,8 +21,13 @@ The task-native protocol evaluator, `prepare.evaluate_protocol`, consumes
 `torch_outputs.npz` containing `holdout_ids`, `holdout_predictions`, `test_ids`
 and `test_submission`. Predictions must follow the task-provided sample IDs
 and class order EAP, HPL, MWS. Both prediction arrays have three probability
-columns. The evaluator scores the holdout predictions and separately validates
-the test output. Protocol predictions use the model trained on the training
+columns, and every value must lie in `[0, 1]` as well as sum to one per row;
+official grading rejects a negative or above-one entry even when its row sums
+correctly. The archive is read with `allow_pickle=False`, so save the two id
+arrays as strings rather than as an object array: `np.array(list(ids))` works,
+while a bare `frame.id.to_numpy()` on this task's string ids does not reload.
+The evaluator scores the holdout predictions and separately validates the test
+output. Protocol predictions use the model trained on the training
 partition; full public-data refitting happens only after search is frozen.
 Protocol scores use the same public holdout and are not official grades.
 Compare candidates only within the same stage and fidelity.

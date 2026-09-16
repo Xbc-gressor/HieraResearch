@@ -20,28 +20,28 @@ IMAGE_SUFFIX = ".png"
 @dataclass(frozen=True)
 class DatasetSplit:
     name: str
-    x_train: np.ndarray
-    y_train: np.ndarray
+    x_train: list[np.ndarray]
+    y_train: list[np.ndarray]
 
 
 def public_dir() -> Path:
     return Path(os.environ["MLEBENCH_PUBLIC_DATA"]).resolve()
 
 
-def _read_images(directory: Path, names: tuple[str, ...]) -> np.ndarray:
+def _read_images(directory: Path, names: tuple[str, ...]) -> list[np.ndarray]:
+    """One float32 array per image.
+
+    The official public split mixes page sizes, so the images cannot be
+    stacked into a single array and each one keeps its own shape.
+    """
     values = []
-    shape = None
     for name in names:
         with Image.open(directory / name) as image:
             array = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
-        if shape is None:
-            shape = array.shape
-        if array.shape != shape:
-            raise ValueError("all public document images must have one shape")
         values.append(array)
     if not values:
         raise ValueError(f"no PNG images found in {directory}")
-    return np.stack(values)
+    return values
 
 
 @lru_cache(maxsize=1)
@@ -54,7 +54,7 @@ def _training_names() -> tuple[str, ...]:
 
 
 @lru_cache(maxsize=1)
-def _split() -> tuple[DatasetSplit, np.ndarray, np.ndarray]:
+def _split() -> tuple[DatasetSplit, list[np.ndarray], list[np.ndarray]]:
     names = _training_names()
     train_names, valid_names = train_test_split(names, test_size=0.2, random_state=0)
     root = public_dir()
@@ -69,14 +69,18 @@ def load_datasets():
     return [_split()[0]]
 
 
-def _predictions(model, images: np.ndarray, targets: np.ndarray | None = None) -> np.ndarray:
-    values = np.asarray(model.predict(images), dtype=np.float32)
-    if values.shape != images.shape:
-        raise ValueError(f"predict returned {values.shape}, expected {images.shape}")
-    if not np.isfinite(values).all():
-        raise ValueError("predict must return finite pixel values")
-    # Pixel values outside the image domain are never useful for this metric.
-    return np.clip(values, 0.0, 1.0)
+def _predictions(model, images: list[np.ndarray]) -> list[np.ndarray]:
+    values = model.predict(images)
+    if len(values) != len(images):
+        raise ValueError("predict returned the wrong number of images")
+    output = []
+    for value, image in zip(values, images):
+        array = np.asarray(value, dtype=np.float32)
+        if array.shape != image.shape or not np.isfinite(array).all():
+            raise ValueError("predict returned an invalid image")
+        # Pixel values outside the image domain never help this metric.
+        output.append(np.clip(array, 0.0, 1.0))
+    return output
 
 
 def evaluate_config(make_model, params: dict) -> float:
@@ -84,7 +88,9 @@ def evaluate_config(make_model, params: dict) -> float:
     model = make_model(dataset, params)
     model.fit(dataset.x_train, dataset.y_train)
     prediction = _predictions(model, valid_dirty)
-    return float(np.sqrt(np.mean((prediction - valid_clean) ** 2)))
+    squared = [np.square(pred - target).ravel()
+               for pred, target in zip(prediction, valid_clean)]
+    return float(np.sqrt(np.mean(np.concatenate(squared))))
 
 
 def preflight_environment() -> dict:

@@ -115,6 +115,22 @@ def export_submission(make_model, params: dict, output: Path) -> None:
     temporary.replace(output)
 
 
+def _protocol_array(values, name: str) -> np.ndarray:
+    """One member of the protocol archive, with a legible dtype remedy.
+
+    ``np.load`` opens an ``.npz`` lazily, so an object-dtype array that
+    ``allow_pickle=False`` refuses fails at member access rather than at open
+    time.  Saving string ids straight from pandas is the usual cause.
+    """
+    try:
+        return np.asarray(values[name])
+    except ValueError as exc:
+        raise ValueError(
+            f"protocol {name} could not be read ({exc}); save ids as a string "
+            "array, e.g. np.array(list(ids)), not an object array"
+        ) from exc
+
+
 def evaluate_protocol(artifact: Path, params: dict, *, stage: str = "protocol",
                       fidelity: str = "full") -> dict:
     """Score a candidate-produced protocol artifact in the evaluator process.
@@ -135,18 +151,18 @@ def evaluate_protocol(artifact: Path, params: dict, *, stage: str = "protocol",
         frame, test_size=0.2, stratify=frame.author, random_state=42,
     )
     test = pd.read_csv(public_dir() / "test.csv")
-    expected_holdout = np.asarray(values["holdout_ids"])
+    expected_holdout = _protocol_array(values, "holdout_ids")
     canonical_holdout = valid_frame.id.to_numpy()
     if expected_holdout.tolist() != canonical_holdout.tolist():
         raise ValueError("protocol holdout IDs do not match task split")
     if len(expected_holdout) != len(holdout_labels) or len(set(expected_holdout)) != len(expected_holdout):
         raise ValueError("protocol holdout IDs have the wrong cardinality")
     holdout_ids = list(expected_holdout.tolist())
-    test_ids = list(np.asarray(values["test_ids"]).tolist())
+    test_ids = list(_protocol_array(values, "test_ids").tolist())
     if test_ids != list(test.id.to_numpy()):
         raise ValueError("protocol test IDs do not match public test.csv")
-    holdout_predictions = np.asarray(values["holdout_predictions"], dtype=float)
-    test_predictions = np.asarray(values["test_submission"], dtype=float)
+    holdout_predictions = _protocol_array(values, "holdout_predictions").astype(float)
+    test_predictions = _protocol_array(values, "test_submission").astype(float)
     if holdout_predictions.shape != (len(holdout_ids), len(CLASSES)):
         raise ValueError("invalid protocol holdout prediction shape")
     if test_predictions.shape != (len(test_ids), len(CLASSES)):
@@ -155,6 +171,14 @@ def evaluate_protocol(artifact: Path, params: dict, *, stage: str = "protocol",
         raise ValueError("protocol predictions contain non-finite values")
     if not np.allclose(holdout_predictions.sum(axis=1), 1, atol=1e-6) or not np.allclose(test_predictions.sum(axis=1), 1, atol=1e-6):
         raise ValueError("protocol probabilities must sum to one")
+    # Summing to one does not make every value a probability: a row like
+    # (-0.2, 0.6, 0.6) sums to one and is rejected by official grading.
+    for stream, probabilities in (("holdout", holdout_predictions),
+                                  ("test", test_predictions)):
+        if (probabilities < 0).any() or (probabilities > 1).any():
+            raise ValueError(
+                f"protocol {stream} probabilities must lie in [0, 1]"
+            )
     # Canonicalize harmless float32 summation drift before scoring and
     # persisting the evaluator output manifest.
     holdout_predictions = holdout_predictions / holdout_predictions.sum(axis=1, keepdims=True)

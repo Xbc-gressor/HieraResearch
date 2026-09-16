@@ -6,15 +6,19 @@ pixel RMSE within the available runtime. One CUDA GPU is available; choose the m
 ## Evaluation Contract
 
 `make_model(dataset, params)` returns an unfitted image regressor implementing
-`fit` and `predict`. Inputs and targets are float32 grayscale arrays with shape
-`(n, height, width)` and values in `[0, 1]`. The model must return one image per
-input with the same shape. Keep the tuner contract in `train.py`.
+`fit` and `predict`. Inputs and targets are lists of float32 grayscale arrays
+with shape `(height, width)` and values in `[0, 1]`, one array per document
+page. The public split mixes page sizes, so the images are not a single stacked
+array and a model must not assume one shape across the batch. `predict` takes
+such a list and returns one image per input with that input's own shape. Keep
+the tuner contract in `train.py`.
 
-`prepare.evaluate_config` owns the fixed MLE-bench public split (the official
-`train.zip` split uses `test_size=0.2`, `random_state=0`) and scores pixel RMSE
-on the held-out clean images. Lower is better, and this is the only feedback
-used for screening, tuning, and candidate selection. Candidate code receives no
-held-out images or targets.
+`prepare.evaluate_config` re-splits the prepared public training pages 80/20
+(seed 0) and scores pixel RMSE on its held-out clean pages. That holdout is
+this project's proxy, not the official MLE-bench test split, whose answers stay
+private. Lower is better, and it is the only feedback used for screening,
+tuning, and candidate selection. Candidate code receives no held-out images or
+targets.
 
 The final selected implementation is refit on all public dirty/clean training
 pairs by `prepare.export_submission`. It emits `id,value` rows for the public

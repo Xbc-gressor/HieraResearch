@@ -91,11 +91,17 @@ def _subsample(values: Any, index: np.ndarray) -> Any:
 
     Some tasks hand pd.DataFrame (or Series) splits to candidates on the
     score surface; silently downgrading them to ndarrays here would break
-    the smoke's contract with the surface it is predicting.
+    the smoke's contract with the surface it is predicting.  Image tasks
+    hand one array per sample and those arrays need not share a shape, so a
+    sequence split is selected element-wise instead of through ``np.asarray``,
+    which cannot represent an inhomogeneous stack.
     """
     iloc = getattr(values, "iloc", None)
     if iloc is not None:
         return iloc[index]
+    if isinstance(values, (list, tuple)):
+        selected = [values[int(position)] for position in index]
+        return tuple(selected) if isinstance(values, tuple) else selected
     return np.asarray(values)[index]
 
 
