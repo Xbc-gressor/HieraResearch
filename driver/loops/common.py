@@ -112,7 +112,7 @@ def crash_diagnose(runner, store, task, tag, run_dir, evidence: str) -> dict:
     """
     ctx = InvocationContext(
         task=task, tag=tag, run_dir=run_dir,
-        invocation_id=store.next_invocation_id(),
+        invocation_id=store.issue_invocation_id(),
         extra={"failure_evidence": evidence},
     )
     return runner.run(ROLES["crash-diagnosis"], ctx)

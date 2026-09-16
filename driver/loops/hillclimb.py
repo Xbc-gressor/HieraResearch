@@ -6,6 +6,7 @@ monolithic session did by diligence; the editor session only edits.
 from __future__ import annotations
 
 import math
+import os
 import re
 import shutil
 from pathlib import Path
@@ -126,11 +127,11 @@ def _revert(run_dir: Path) -> None:
 
 def _preflight(task, run_dir, repo_root, cmd, task_toml=None):
     owner = {"task": task, "run_dir": str(run_dir), "kind": "candidate_preflight"}
-    with task_resource_lease(task_toml or {}, owner=owner):
+    with task_resource_lease(task_toml or {}, owner=owner) as lease:
         return cmd(["uv", "--project", common.task_project(task, task_toml), "run", "python",
                     repo_root / "tools" / "preflight_candidate.py",
                     "--candidate-path", run_dir / "train.py"],
-                   repo_root, check=False)
+                   repo_root, check=False, env=_leased_env(lease))
 
 
 def _reserve(run_dir, repo_root, cmd) -> bool:
@@ -141,8 +142,13 @@ def _reserve(run_dir, repo_root, cmd) -> bool:
     return result.returncode == 0
 
 
+def _leased_env(lease) -> dict:
+    """The child environment for one leased step (device pin included)."""
+    return {**os.environ, **((lease or {}).get("env") or {})}
+
+
 def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd,
-                    task_toml=None) -> tuple[Path, int]:
+                    task_toml=None, env=None) -> tuple[Path, int]:
     """One entrypoint run; the caller holds the task's resource lease."""
     log_path = run_dir / "run.log"
     entrypoint = run_dir / "train.py"
@@ -153,7 +159,8 @@ def _run_entrypoint(task, run_dir, per_runtime_limit, repo_root, cmd,
     else:
         argv = ["uv", "--project", common.task_project(task, task_toml), "run", "python", entrypoint]
     with log_path.open("w", encoding="utf-8") as fh:
-        result = cmd(argv, repo_root, check=False, capture=False, stdout=fh)
+        result = cmd(argv, repo_root, check=False, capture=False, stdout=fh,
+                     env=env if env is not None else dict(os.environ))
     return log_path, result.returncode
 
 
@@ -167,11 +174,11 @@ def _reserve_and_run(task, run_dir, per_runtime_limit, repo_root, cmd,
     means the reservation was refused (normal budget completion).
     """
     owner = {"task": task, "run_dir": str(run_dir), "kind": "hillclimb"}
-    with task_resource_lease(task_toml or {}, owner=owner):
+    with task_resource_lease(task_toml or {}, owner=owner) as lease:
         if not _reserve(run_dir, repo_root, cmd):
             return None
         return _run_entrypoint(task, run_dir, per_runtime_limit, repo_root,
-                               cmd, task_toml)
+                               cmd, task_toml, env=_leased_env(lease))
 
 
 def _evaluate_outcome(log_path: Path, returncode: int, metric: str,
@@ -299,7 +306,7 @@ def _restore_best(run_dir, events) -> None:
 def _editor_session(runner, store, task, tag, run_dir, extra=None,
                     resume_from: int | None = None,
                     objective: str | None = None) -> int:
-    inv_id = store.next_invocation_id()
+    inv_id = store.issue_invocation_id()
     resume = None
     if resume_from is not None:
         resume = store.load_session_id("hillclimb-editor", resume_from)

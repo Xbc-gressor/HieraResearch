@@ -37,10 +37,38 @@ RECEIPT_TOOL = "mcp__receipts__submit_receipt"
 # or change the input, so the fingerprint necessarily changes.
 REPETITION_LIMIT = 5
 
-# Bounded failure-transcript dump (diagnostics only; success sessions write
-# nothing). Per-message and whole-buffer caps keep the JSONL small even for
+# Bounded transcript dump (diagnostics only), written for every session.
+# Per-message and whole-buffer caps keep the JSONL small even for
 # max_turns-size sessions.
 _DUMP_MSG_CHARS = 4000
+
+# The ledger has exactly one mutator (tools/ledger.py). Sessions read it
+# freely; any direct write path is denied at the tool layer, so "agents never
+# hand-edit the ledger" stops being a prompt convention.
+_LEDGER_FILENAME = "ledger.json"
+_FILE_EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+_BASH_WRITE_MARKERS = (">", "sed -i", "tee ", "python -c", "python3 -c",
+                       "truncate ", "mv ", "cp ", "rm ")
+
+
+def _ledger_write_problem(name: str, tool_input: dict | None) -> str | None:
+    tool_input = tool_input or {}
+    if name in _FILE_EDIT_TOOLS:
+        target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+        if Path(target).name == _LEDGER_FILENAME:
+            return (f"{name} on {_LEDGER_FILENAME} is not allowed: the ledger "
+                    "is written only through `python tools/ledger.py` "
+                    "subcommands")
+        return None
+    if name == "Bash":
+        command = str(tool_input.get("command") or "")
+        if _LEDGER_FILENAME in command \
+                and not command.lstrip().startswith(("python tools/ledger.py",
+                                                     "python3 tools/ledger.py")) \
+                and any(marker in command for marker in _BASH_WRITE_MARKERS):
+            return (f"Bash may not write {_LEDGER_FILENAME}: the ledger is "
+                    "written only through `python tools/ledger.py` subcommands")
+    return None
 _DUMP_MAX_ENTRIES = 200
 _DUMP_MAX_BYTES = 256 * 1024
 
@@ -84,10 +112,10 @@ def _summarize_message(msg) -> dict | None:
 class _BoundedTranscript:
     """Invocation-scoped, size-capped buffer of streamed session messages.
 
-    Persisted only when a session ends on an error result or the repetition
-    breaker trips — the forensic blind spot of the 2026-09-16
-    slate-plan-writer incident (107B session stubs, no transcript, diagnosis
-    only via byte-level payload reconstruction).
+    Persisted for every session (2026-09-16: the failed slate-plan-writer
+    sessions left 107B stubs and no transcript; the notune3 extractor
+    sessions that hand-edited the ledger ended "successfully" and left no
+    transcript either — both blind spots need the same dump).
     """
 
     def __init__(self) -> None:
@@ -197,6 +225,10 @@ class SDKSessionRunner:
             name = input_data.get("tool_name", "")
             if name not in allowed:
                 return deny(f"role {role.name} may not use tool {name}")
+            ledger_problem = _ledger_write_problem(
+                name, input_data.get("tool_input"))
+            if ledger_problem:
+                return deny(ledger_problem)
             if name == "Bash" and role.bash_patterns:
                 # Coarse prefix matching — compound commands (&&, ;, |) can
                 # evade it. This is minimal containment, not a sandbox.
@@ -305,7 +337,10 @@ class SDKSessionRunner:
                 if session_id:
                     # Persist IMMEDIATELY on init — a later kill can then
                     # resume this exact conversation via resume=<session_id>.
-                    store.persist_session_id(role.name, ctx.invocation_id, session_id)
+                    store.persist_session_id(
+                        role.name, ctx.invocation_id, session_id,
+                        run_id=ctx.run_id,
+                        parent_session_id=ctx.resume_session_id)
             elif isinstance(msg, ResultMessage):
                 is_error = self._result_is_error(msg.is_error, interrupted,
                                                  breaker)
@@ -332,7 +367,10 @@ class SDKSessionRunner:
             elif getattr(msg, "subtype", None) == "init":
                 session_id = msg.data.get("session_id")
                 if session_id:
-                    store.persist_session_id(role.name, ctx.invocation_id, session_id)
+                    store.persist_session_id(
+                        role.name, ctx.invocation_id, session_id,
+                        run_id=ctx.run_id,
+                        parent_session_id=ctx.resume_session_id)
             elif hasattr(msg, "num_turns"):
                 is_error = self._result_is_error(msg.is_error, interrupted,
                                                  breaker)
@@ -380,9 +418,7 @@ class SDKSessionRunner:
                         # The receipt is already persisted; a failed
                         # interrupt must not fail the invocation.
                         pass
-        if transcript is not None and transcript.entries and (
-                (result_info and result_info["is_error"])
-                or breaker["tripped"] is not None):
+        if transcript is not None and transcript.entries:
             try:
                 store.persist_session_messages(role.name, ctx.invocation_id,
                                                transcript.rows())

@@ -28,6 +28,7 @@ replayed bout restores train.py from its existing snapshot (tool-side).
 from __future__ import annotations
 
 import json
+import os
 import math
 from pathlib import Path
 
@@ -202,11 +203,11 @@ def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
     """The task's no-score gate; returns an error tail on failure."""
     owner = {"task": task, "run_dir": str(candidate),
              "kind": "candidate_preflight"}
-    with task_resource_lease(task_toml or {}, owner=owner):
+    with task_resource_lease(task_toml or {}, owner=owner) as lease:
         proc = cmd(["uv", "--project", common.task_project(task, task_toml), "run", "python",
                     repo_root / "tools" / "preflight_candidate.py",
                     "--candidate-path", candidate / "train.py"],
-                   repo_root, check=False)
+                   repo_root, check=False, env=_leased_env(lease))
     if proc.returncode == 0:
         return None
     return ("candidate preflight failed. stderr tail:\n"
@@ -219,9 +220,9 @@ def _evaluate(task: str, candidate: Path, repo_root: Path, cmd,
     """One rewrite_eval call: (returncode, payload). Exit 4 = budget out;
     stage "params" = BASE_PARAMS unreadable (no budget spent)."""
     owner = {"task": task, "run_dir": str(candidate), "kind": "rewrite_eval"}
-    with task_resource_lease(task_toml or {}, owner=owner):
+    with task_resource_lease(task_toml or {}, owner=owner) as lease:
         proc = cmd(["python", "tools/rewrite_eval.py", "--candidate",
-                    candidate], repo_root, check=False)
+                    candidate], repo_root, check=False, env=_leased_env(lease))
     try:
         payload = json.loads(proc.stdout or "")
     except ValueError:
@@ -229,6 +230,11 @@ def _evaluate(task: str, candidate: Path, repo_root: Path, cmd,
                    "error": "unparseable rewrite_eval output: "
                             + (proc.stdout or "")[-200:]}
     return proc.returncode, payload
+
+
+def _leased_env(lease) -> dict:
+    """The child environment for one leased step (device pin included)."""
+    return {**os.environ, **((lease or {}).get("env") or {})}
 
 
 def _leased(step, candidate: Path, snapshot, repo_root: Path, cmd):
@@ -255,7 +261,7 @@ def _params_error(payload: dict) -> str | None:
 
 def _editor_session(runner, store, task, tag, run_dir, extra,
                     resume_from: int | None) -> tuple[dict, int]:
-    inv_id = store.next_invocation_id()
+    inv_id = store.issue_invocation_id()
     resume = None
     if resume_from is not None:
         resume = store.load_session_id("rewrite-editor", resume_from)

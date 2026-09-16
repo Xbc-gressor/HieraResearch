@@ -33,6 +33,12 @@ from . import rewrite
 
 POLICY_ID = "round_v1"
 
+# The selection domain production evaluations land in: every objective path
+# publishes its scalar through the legacy adapter as a (proxy, fast) record
+# indexed on the ledger. The driver CLI sets EVALUATION_STAGE/FIDELITY to
+# this pair unless the operator already did.
+DEFAULT_EVALUATION_DOMAIN = ("proxy", "fast")
+
 
 def _round(run_dir: Path, repo_root: Path, cmd, *args) -> dict:
     proc = cmd(["python", "tools/scheduler/cli.py", "round",
@@ -130,10 +136,16 @@ def status(run_dir, repo_root, cmd) -> dict:
 
 
 def _eval_seconds(run_dir, repo_root, cmd, run_id) -> tuple[int, float | None]:
+    """(admitted attempts of ``run_id``, its mean evaluation seconds).
+
+    Per-candidate on purpose: a bout's consumption is the delta of ITS
+    candidate's attempts, so evaluations another channel runs concurrently
+    are never charged to this decision.
+    """
     view = budget_status(run_dir, repo_root, cmd)
     row = next((r for r in view.get("per_candidate", [])
                 if r.get("run_id") == run_id), {})
-    return int(view.get("evaluations_done") or 0), row.get("mean_seconds")
+    return int(row.get("evals") or 0), row.get("mean_seconds")
 
 
 def _overhead(run_dir, repo_root, cmd, kind, run_id, started, evals_before):

@@ -31,15 +31,17 @@ def pool_env(monkeypatch, tmp_path):
 
 
 def _lease_in_thread(devices_seen: list[str], done: threading.Event) -> None:
-    with resources.task_resource_lease(CUDA_TOML):
-        devices_seen.append(os.environ["CUDA_VISIBLE_DEVICES"])
+    with resources.task_resource_lease(CUDA_TOML) as lease:
+        devices_seen.append(lease["env"]["CUDA_VISIBLE_DEVICES"])
         done.set()
 
 
 def test_distinct_devices_lease_concurrently(pool_env, monkeypatch):
     monkeypatch.setattr(resources, "_visible_devices", lambda: ["0", "1"])
-    with resources.task_resource_lease(CUDA_TOML):
-        assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+    with resources.task_resource_lease(CUDA_TOML) as lease:
+        assert lease["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+        # the driver's own environment is never rewritten by a lease
+        assert "CUDA_VISIBLE_DEVICES" not in os.environ
         devices_seen, done = [], threading.Event()
         thread = threading.Thread(
             target=_lease_in_thread, args=(devices_seen, done)
@@ -67,8 +69,9 @@ def test_same_device_serializes(pool_env, monkeypatch):
 def test_multi_device_lease_pins_all(pool_env, monkeypatch):
     monkeypatch.setattr(resources, "_visible_devices", lambda: ["0", "1"])
     toml = {"resources": {"accelerator": "cuda", "devices": 2}}
-    with resources.task_resource_lease(toml):
-        assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1"
+    with resources.task_resource_lease(toml) as lease:
+        assert lease["env"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+        assert lease["devices"] == ["0", "1"]
     assert "CUDA_VISIBLE_DEVICES" not in os.environ
 
 

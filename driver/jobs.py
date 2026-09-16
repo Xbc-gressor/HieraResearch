@@ -8,11 +8,17 @@ small job record before returning control to the same agent session.
 Process hygiene: the child runs in its own process group and its pid goes
 into the job record, so a driver that is killed mid-job leaves evidence that
 the next launch can reconcile — a stale "running" record with a dead pid is
-marked ``dead``, and a live one refuses the new launch instead of letting a
-second objective write the same tune_report concurrently. On SIGTERM /
-interrupt / interpreter exit the driver terminates the child's whole process
-group (best-effort; SIGKILL still orphans, which is what reconciliation is
-for).
+marked ``dead``, and a live one for the SAME candidate refuses the new launch
+instead of letting a second objective write the same tune_report
+concurrently. On SIGTERM / interrupt / interpreter exit the driver terminates
+the child's whole process group (best-effort; SIGKILL still orphans, which is
+what reconciliation is for).
+
+Concurrency: role sessions may run on several driver threads, so jobs for
+different candidates queue on the GPU channel (the device lease) instead of
+failing; one candidate never has two jobs in flight. Lease queueing is bounded
+by the run deadline, not the task's short ``lease_wait_timeout`` — waiting for
+the GPU is not a candidate observation and is never shown to the session.
 """
 
 from __future__ import annotations
@@ -23,10 +29,12 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import threading
 import time
 
 from .resources import ResourceUnavailable, task_resource_lease
 from .roles import InvocationContext, REPO_ROOT
+from tools.evaluation_budget import time_budget
 
 
 class DriverJobError(ValueError):
@@ -35,6 +43,15 @@ class DriverJobError(ValueError):
 
 _live_children: list[subprocess.Popen] = []
 _exit_hooks_armed = False
+_candidate_locks: dict[str, threading.Lock] = {}
+_candidate_locks_guard = threading.Lock()
+
+
+def _candidate_lock(run_dir: Path, run_id: str) -> threading.Lock:
+    """At most one objective job per candidate at a time (tune_report writer)."""
+    key = f"{run_dir}:{run_id}"
+    with _candidate_locks_guard:
+        return _candidate_locks.setdefault(key, threading.Lock())
 
 
 def _terminate_child_group(proc: subprocess.Popen) -> None:
@@ -52,8 +69,12 @@ def _kill_live_children() -> None:
 
 
 def _arm_exit_hooks() -> None:
+    """Idempotent; signal handlers can only be installed from the main thread,
+    so loops arm this once at start-up and worker threads merely re-check."""
     global _exit_hooks_armed
     if _exit_hooks_armed:
+        return
+    if threading.current_thread() is not threading.main_thread():
         return
     atexit.register(_kill_live_children)
 
@@ -65,13 +86,17 @@ def _arm_exit_hooks() -> None:
     _exit_hooks_armed = True
 
 
-def _reconcile_running_jobs(jobs_dir: Path) -> None:
+def _reconcile_running_jobs(jobs_dir: Path, run_id: str | None = None) -> None:
     """Reconcile leftover "running" records before launching a new job.
 
     A record whose pid is gone was orphaned by a killed driver: mark it
-    ``dead``. A record whose pid is still alive means an orphaned objective
-    (or another driver) may still be writing — refuse to launch a second one.
+    ``dead``. A live pid owned by this driver is another candidate's job on
+    the GPU channel and is left alone (the device lease queues behind it). A
+    live pid this driver does not own is an orphaned objective (or another
+    driver) that may still be writing: refuse when it works on ``run_id``, or
+    on any candidate when the caller gave none.
     """
+    own_pids = {proc.pid for proc in list(_live_children)}
     for path in sorted(jobs_dir.glob("*.json")):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -90,11 +115,15 @@ def _reconcile_running_jobs(jobs_dir: Path) -> None:
             except PermissionError:
                 alive = True
         if alive:
-            raise DriverJobError(
-                f"a previous driver job is still running (pid {pid}, record "
-                f"{path.name}); confirm it has exited or kill its process "
-                "group before launching another objective job"
-            )
+            if pid in own_pids:
+                continue
+            if run_id is None or str(record.get("run_id")) == str(run_id):
+                raise DriverJobError(
+                    f"a previous driver job is still running (pid {pid}, record "
+                    f"{path.name}); confirm it has exited or kill its process "
+                    "group before launching another objective job"
+                )
+            continue
         record.update(
             status="dead",
             note="pid gone at next driver launch; driver was killed mid-job",
@@ -346,7 +375,6 @@ def execute_driver_job(
     task_cfg = tomllib.loads(
         (repo_root / "tasks" / ctx.task / "task.toml").read_text(encoding="utf-8")
     )
-    _reconcile_running_jobs(ctx.run_dir / "driver_jobs")
     record_path = (
         ctx.run_dir / "driver_jobs" / f"{role_name}-{ctx.invocation_id:04d}.json"
     )
@@ -358,8 +386,8 @@ def execute_driver_job(
         "request": request,
         "argv": argv,
         "log": str(log_path),
-        "status": "running",
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "status": "queued",
+        "queued_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     owner = {
         "task": ctx.task,
@@ -368,29 +396,57 @@ def execute_driver_job(
         "run_dir": str(ctx.run_dir),
         "kind": request["kind"],
     }
+    _atomic_json(record_path, record)  # queued evidence survives a kill
+    queued = time.monotonic()
+    started = None
     try:
-        with task_resource_lease(task_cfg, owner=owner):
-            with log_path.open("w", encoding="utf-8") as log:
-                proc = subprocess.Popen(
-                    argv,
-                    cwd=repo_root,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    start_new_session=True,
-                )
-                record["pid"] = proc.pid
-                _atomic_json(record_path, record)
-                _live_children.append(proc)
-                _arm_exit_hooks()
-                try:
-                    returncode = proc.wait()
-                except BaseException:
-                    _terminate_child_group(proc)
-                    raise
-                finally:
-                    _live_children.remove(proc)
-    except (OSError, subprocess.SubprocessError, ResourceUnavailable) as exc:
+        with _candidate_lock(ctx.run_dir, run_id):
+            _reconcile_running_jobs(ctx.run_dir / "driver_jobs", run_id)
+            with task_resource_lease(
+                    task_cfg, owner=owner,
+                    wait_timeout=_lease_wait_timeout(ctx.run_dir)) as lease:
+                env = {**os.environ, **(lease.get("env") or {})}
+                started = time.monotonic()
+                with log_path.open("w", encoding="utf-8") as log:
+                    proc = subprocess.Popen(
+                        argv,
+                        cwd=repo_root,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        start_new_session=True,
+                        env=env,
+                    )
+                    record.update(
+                        pid=proc.pid,
+                        status="running",
+                        devices=lease.get("devices"),
+                        lease_wait_seconds=round(started - queued, 3),
+                        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    )
+                    _atomic_json(record_path, record)
+                    _live_children.append(proc)
+                    _arm_exit_hooks()
+                    try:
+                        returncode = proc.wait()
+                    except BaseException:
+                        _terminate_child_group(proc)
+                        raise
+                    finally:
+                        _live_children.remove(proc)
+    except ResourceUnavailable as exc:
+        # Lease queueing is free: it is neither a candidate observation nor a
+        # job result the session gets to see. The caller decides what an
+        # unevaluable candidate at the deadline becomes.
+        record.update(
+            status="lease_unavailable",
+            error=str(exc),
+            lease_wait_seconds=round(time.monotonic() - queued, 3),
+            finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+        _atomic_json(record_path, record)
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
         record.update(
             status="launch_failed",
             error=str(exc),
@@ -401,6 +457,7 @@ def execute_driver_job(
     record.update(
         status="completed",
         returncode=int(returncode),
+        eval_seconds=round(time.monotonic() - started, 3),
         finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
     _atomic_json(record_path, record)
@@ -415,3 +472,13 @@ def execute_driver_job(
         "log_tail": tail[-6000:],
         "job_record": str(record_path),
     }
+
+
+def _lease_wait_timeout(run_dir: Path) -> float | None:
+    """Queue for the GPU until the run's usable time is gone; without a
+    deadline, wait indefinitely (the process-group hygiene above keeps
+    orphans from holding the lease forever)."""
+    usable = time_budget(run_dir).get("usable_seconds")
+    if usable is None:
+        return None
+    return max(0.0, float(usable))

@@ -21,6 +21,13 @@ The high-level lifecycle is:
         -> complete on budget exhaustion (evaluations or wall clock) or
            quiescence
 
+Within one generation the admitted seats are implemented on a bounded
+session channel (``pipeline.session_concurrency`` driver threads): while one
+seat's extractor is blocked on its warm-screening job, another seat's writer
+or extractor runs. The GPU channel stays serial (the device lease), each
+candidate's own chain stays ordered, and the admission gates are unchanged,
+so evaluation facts and attribution are exactly those of the serial loop.
+
 The helpers below are grouped by responsibility. Recovery policy stays close
 to the operation it recovers, while ``run_experiment`` remains a compact map of
 the complete lifecycle.
@@ -31,10 +38,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ..events import EventsLog
-from ..jobs import DriverJobError, execute_driver_job
+from ..jobs import DriverJobError, _arm_exit_hooks, execute_driver_job
 from ..metadata import warn_on_mismatch, write_metadata
 from ..receipts import ReceiptStore
 from ..resources import ResourceUnavailable
@@ -43,6 +53,7 @@ from ..roles import (
     ROLES,
     InvocationContext,
     driver_job_handoff_problem,
+    record_status,
 )
 from ..session import InvocationFailed
 from ..status import budget_status, compact_status
@@ -147,7 +158,8 @@ def _invoke(runner, store, role_name, task, tag, run_dir, *,
             run_id=None, round_no=None, extra=None, resume_from=None,
             inline_payload=None) -> dict:
     """Invoke one role and return its persisted receipt plus invocation id."""
-    inv_id = store.next_invocation_id()
+    _refuse_if_blocked(run_dir)
+    inv_id = store.issue_invocation_id()
     resume = (store.load_session_id(role_name, resume_from)
               if resume_from is not None else None)
     ctx = InvocationContext(task=task, tag=tag, run_dir=run_dir,
@@ -215,6 +227,7 @@ def _invoke_with_driver_jobs(
             extra=extra or {},
         )
         handoff_problem = driver_job_handoff_problem(role_name, receipt)
+        _refuse_if_blocked(run_dir)
         try:
             if handoff_problem:
                 raise DriverJobError(handoff_problem)
@@ -224,8 +237,17 @@ def _invoke_with_driver_jobs(
                 receipt["driver_job"],
                 repo_root=repo_root,
             )
-        except (DriverJobError, OSError, subprocess.SubprocessError,
-                ResourceUnavailable) as exc:
+        except ResourceUnavailable as exc:
+            # The GPU never became available before the deadline. That is not
+            # a candidate observation and not a job result for the session:
+            # the invocation ends here and the caller settles the candidate
+            # from the budget state (zero attempts at a reached stop).
+            raise InvocationFailed(
+                role_name,
+                [f"objective job could not start before the deadline: {exc}"],
+                invocation_id=inv_id,
+            ) from exc
+        except (DriverJobError, OSError, subprocess.SubprocessError) as exc:
             result = {
                 "kind": receipt["driver_job"].get("kind"),
                 "accepted": False,
@@ -255,9 +277,36 @@ def _invoke_with_driver_jobs(
 # =============================================================================
 
 
+# Run-wide block state. Seats run on driver threads; the first channel to
+# block persists the blocked phase, every other channel stops accepting new
+# sessions or job handoffs at its next boundary (an in-flight GPU job always
+# drains to completion — evaluations are expensive and their facts stay
+# valid), and run_experiment unwinds once the channels have joined.
+_block_lock = threading.Lock()
+_block_reason: dict[str, str] = {}  # run_dir -> first block reason
+
+
+def _reset_block_state(run_dir) -> None:
+    with _block_lock:
+        _block_reason.pop(str(run_dir), None)
+
+
+def _refuse_if_blocked(run_dir) -> None:
+    with _block_lock:
+        reason = _block_reason.get(str(run_dir))
+    if reason is not None:
+        raise RunBlocked(reason)
+
+
 def _or_block(run_dir, repo_root, cmd, events, reason: str):
-    """Persist a blocked phase, then unwind to ``run_experiment``."""
-    common.block(run_dir, repo_root, cmd, events, reason)
+    """Persist a blocked phase (first blocker only), then unwind."""
+    with _block_lock:
+        first = str(run_dir) not in _block_reason
+        _block_reason.setdefault(str(run_dir), reason)
+    if first:
+        common.block(run_dir, repo_root, cmd, events, reason)
+    else:
+        events.emit("blocked_secondary", reason=reason)
     raise RunBlocked(reason)
 
 
@@ -862,14 +911,92 @@ def _slate_binding_errors(manifest: dict, seats: list) -> list[str]:
 
 def _evaluate_admitted_slate(runner, store, task, tag, run_dir, manifest,
                              repo_root, cmd, events, job_runner) -> None:
-    """Evaluate the seats in slot order; a slot-0 crash never refills it."""
-    for slot in manifest["slate"]:
+    """Implement the seats on the session channel; a slot-0 crash never
+    refills it."""
+    _implement_seats(runner, store, task, tag, run_dir,
+                     [slot["run_id"] for slot in manifest["slate"]],
+                     repo_root, cmd, events, job_runner)
+
+
+# =============================================================================
+# Session channel: bounded overlap of seat implementations
+# =============================================================================
+
+
+def _session_concurrency(run_dir: Path) -> int:
+    """Seats implemented at once (framework_cfg ``pipeline.session_concurrency``,
+    absent = 1 = the serial loop)."""
+    config_path = run_dir / "framework_cfg.json"
+    try:
+        section = json.loads(config_path.read_text(encoding="utf-8")).get(
+            "pipeline")
+    except (OSError, json.JSONDecodeError):
+        return 1
+    value = section.get("session_concurrency") if isinstance(section, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1
+    return value
+
+
+def _implement_seats(runner, store, task, tag, run_dir, run_ids, repo_root,
+                     cmd, events, job_runner) -> None:
+    """Materialize + implement each admitted seat, up to
+    ``session_concurrency`` at a time.
+
+    Serial (concurrency 1) runs exactly the historical loop. Otherwise each
+    seat is one task on a small thread pool: the stop-condition check moves
+    into the seat so a seat that becomes runnable after the budget landed is
+    skipped, and a RunBlocked raised on one seat lets the others finish their
+    current boundary before it unwinds. Per-seat waits are emitted for
+    throughput diagnostics only — never as a scoring input.
+    """
+    concurrency = _session_concurrency(run_dir)
+
+    def seat(run_id, ready):
+        started = time.monotonic()
         if budget_status(run_dir, repo_root, cmd).get("reached"):
-            break
-        run_id = slot["run_id"]
+            events.emit("seat_skipped", run_id=run_id, reason="budget_reached")
+            return
+        events.emit("seat_started", run_id=run_id,
+                    session_wait_seconds=round(started - ready, 3))
         _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
         _implement_candidate(runner, store, task, tag, run_dir, run_id,
                              repo_root, cmd, events, job_runner)
+        events.emit("seat_finished", run_id=run_id,
+                    seconds=round(time.monotonic() - started, 3))
+
+    if concurrency <= 1 or len(run_ids) <= 1:
+        for run_id in run_ids:
+            if budget_status(run_dir, repo_root, cmd).get("reached"):
+                break
+            _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
+            _implement_candidate(runner, store, task, tag, run_dir, run_id,
+                                 repo_root, cmd, events, job_runner)
+        return
+
+    batch_started = time.monotonic()
+    ready = time.monotonic()
+    with ThreadPoolExecutor(max_workers=concurrency,
+                            thread_name_prefix="seat") as pool:
+        futures = [pool.submit(seat, run_id, ready) for run_id in run_ids]
+        blocked = None
+        error = None
+        for future in futures:
+            try:
+                future.result()
+            except RunBlocked as exc:
+                blocked = blocked or exc
+            except BaseException as exc:  # noqa: BLE001 - surfaced after join
+                error = error or exc
+    events.emit("seats_completed", run_ids=list(run_ids),
+                session_concurrency=concurrency,
+                wall_seconds=round(time.monotonic() - batch_started, 3))
+    if blocked is not None:
+        if error is not None:  # planned stops win, but never silently
+            events.emit("seat_error_masked", error=repr(error))
+        raise blocked
+    if error is not None:
+        raise error
 
 
 def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
@@ -1104,6 +1231,49 @@ def _extractor_extra(run_dir: Path, run_id: str, candidate_dir: Path,
     }
 
 
+def _settle_unevaluated(runner, store, task, tag, run_dir, run_id,
+                        candidate_dir, donor_extra, extractor_inv, repo_root,
+                        cmd, events, job_runner) -> None:
+    """The extractor reported a zero-attempt candidate at a reached stop
+    condition; the driver owns that lifecycle resolution.
+
+    ``resolve-unevaluated`` proves the stop condition and the zero attempts
+    itself. When it refuses (the budget is not actually exhausted), the
+    session is resumed once with that fact so it re-requests its job; a
+    second unsupported claim blocks the run rather than leaving a pending
+    seat behind.
+    """
+    if record_status(run_dir, run_id) in ("keep", "discard", "crash",
+                                         "unevaluated"):
+        return
+    if _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
+        events.emit("candidate_unevaluated", run_id=run_id)
+        return
+    note = ("Your receipt claimed status=unevaluated, but the run's stop "
+            "condition has not been reached and resolve-unevaluated refused. "
+            "Continue the extractor procedure: request the warmstart "
+            "driver_job (or record the candidate's real outcome) and submit "
+            "a terminal receipt.")
+    try:
+        receipt, _ = _invoke_with_driver_jobs(
+            runner, store, "tunable-contract-extractor", task, tag, run_dir,
+            run_id=run_id,
+            extra=_extractor_extra(run_dir, run_id, candidate_dir,
+                                   reconcile_note=note, **donor_extra),
+            resume_from=extractor_inv, repo_root=repo_root,
+            job_runner=job_runner)
+    except InvocationFailed as exc:
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"extractor could not settle unevaluated claim for "
+                  f"{run_id}: {exc.problems}")
+    if receipt.get("status") == "unevaluated" and record_status(
+            run_dir, run_id) == "pending" and not _resolve_unevaluated(
+            run_dir, run_id, repo_root, cmd):
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"extractor repeated an unsupported unevaluated claim for "
+                  f"{run_id}")
+
+
 def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                           cmd, events, job_runner=execute_driver_job,
                           task_toml=None) -> None:
@@ -1129,17 +1299,22 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                       f"retry: {retry_exc.problems}; "
                       f"first attempt: {exc.problems}")
     try:
-        _, extractor_inv = _invoke_with_driver_jobs(
+        receipt, extractor_inv = _invoke_with_driver_jobs(
             runner, store, "tunable-contract-extractor", task, tag, run_dir,
             run_id=run_id,
             extra=_extractor_extra(
                 run_dir, run_id, candidate_dir, **donor_extra
             ),
             repo_root=repo_root, job_runner=job_runner)
-        return
     except InvocationFailed as exc:
         problems = exc.problems
         extractor_inv = exc.invocation_id
+    else:
+        if receipt.get("status") == "unevaluated":
+            _settle_unevaluated(runner, store, task, tag, run_dir, run_id,
+                                candidate_dir, donor_extra, extractor_inv,
+                                repo_root, cmd, events, job_runner)
+        return
 
     # Branch on durable evidence (spec Error handling):
     # 1. stop condition reached + zero attempts → resolve-unevaluated (call+catch)
@@ -1409,8 +1584,10 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
                     semantic_policy, scheduler_policy, inner_policy,
                     k_warm, k_eval, proposer_arm=None, time_budget=None,
                     deadline=None, final_reserve=None,
-                    round_options=None) -> list[str]:
+                    round_options=None, session_concurrency=None) -> list[str]:
     extra = []
+    if session_concurrency is not None:
+        extra += ["--session-concurrency", str(session_concurrency)]
     if time_budget is not None:
         extra += ["--time-budget", str(time_budget)]
     if deadline is not None:
@@ -1447,7 +1624,8 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
            llm_intelligence_score, semantic_policy, scheduler_policy,
            inner_policy, k_warm, k_eval, model, cli_path,
            proposer_arm=None, time_budget=None, deadline=None,
-           final_reserve=None, round_options=None) -> None:
+           final_reserve=None, round_options=None,
+           session_concurrency=None) -> None:
     extra = _init_run_extra(
         dimension_strategy,
         llm_intelligence_score,
@@ -1461,6 +1639,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         deadline=deadline,
         final_reserve=final_reserve,
         round_options=round_options,
+        session_concurrency=session_concurrency,
     )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
@@ -1878,13 +2057,9 @@ def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
                                            model, job_runner)
     actions = _ideate(runner, store, task, tag, run_dir, round_no,
                       repo_root, cmd, events, task_toml or {})
-    for action in actions:
-        if budget_status(run_dir, repo_root, cmd).get("reached"):
-            break
-        run_id = str(action["run_id"])
-        _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
-        _implement_candidate(runner, store, task, tag, run_dir, run_id,
-                             repo_root, cmd, events, job_runner)
+    _implement_seats(runner, store, task, tag, run_dir,
+                     [str(action["run_id"]) for action in actions],
+                     repo_root, cmd, events, job_runner)
     return actions
 
 
@@ -1932,13 +2107,15 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    scheduler_policy=None, inner_policy=None, k_warm=None,
                    k_eval=None, proposer_arm=None, time_budget=None,
                    deadline=None, final_reserve=None, round_options=None,
-                   cli_path=None, cmd=common.run_cmd,
-                   job_runner=execute_driver_job) -> dict:
+                   session_concurrency=None, cli_path=None,
+                   cmd=common.run_cmd, job_runner=execute_driver_job) -> dict:
     """Set up or resume a run, then advance it until blocked or complete."""
     run_dir = repo_root / "runs" / task / tag
     events = EventsLog(run_dir)
     task_toml = common.load_task_toml(task, repo_root)
     store = ReceiptStore(run_dir)
+    _reset_block_state(run_dir)
+    _arm_exit_hooks()  # main thread: SIGTERM must reach leased child groups
 
     try:
         if not (run_dir / "framework_cfg.json").exists():
@@ -1948,7 +2125,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    inner_policy, k_warm, k_eval, model, cli_path,
                    proposer_arm=proposer_arm, time_budget=time_budget,
                    deadline=deadline, final_reserve=final_reserve,
-                   round_options=round_options)
+                   round_options=round_options,
+                   session_concurrency=session_concurrency)
         else:
             # Explicit CLI overrides must never disappear merely because the
             # run directory already exists. init_run applies mutable limits,
@@ -1979,6 +2157,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 deadline=None if existing_deadline is not None else deadline,
                 final_reserve=final_reserve,
                 round_options=round_options,
+                session_concurrency=session_concurrency,
             )
             if max_evaluations is not None or timeout is not None or extra:
                 common.init_run(

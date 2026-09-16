@@ -352,10 +352,10 @@ Use the driver-owned `screening_k_eval`; use 1 for a provided entrypoint as
 specified above. The driver validates it against the invocation allocation,
 passes the configured target separately, launches the evaluator in the task uv
 environment, waits synchronously with no outer timeout, and resumes this same
-session with `driver_job_result`. No candidate generation, tuning bout, or
-other driver work runs while the evaluator owns the process. CUDA tasks also
-hold a per-device objective lease (whole GPUs, `CUDA_VISIBLE_DEVICES` pinned
-to them) for the entire job.
+session with `driver_job_result`. CUDA tasks hold a per-device objective lease
+(whole GPUs, `CUDA_VISIBLE_DEVICES` pinned to them) for the entire job; if
+another candidate's job holds the device, yours queues behind it and starts
+when the device frees — that wait is the driver's, never a result you see.
 
 On resume, read `driver_job_result`: its `returncode`, durable `log`, and
 `log_tail` are the evaluator result. The evaluator is resumable, so after a

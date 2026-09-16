@@ -152,6 +152,7 @@ def initialize_run(
     deadline: float | None = None,
     final_reserve_seconds: float | None = None,
     round_options: dict | None = None,
+    session_concurrency: int | None = None,
 ) -> Path:
     repo_root = Path(repo_root).resolve()
     round_options = {
@@ -675,6 +676,17 @@ def initialize_run(
         updates.extend(f"round.{key}={value}" for key, value in
                        sorted(round_options.items()))
 
+    if session_concurrency is not None:
+        if isinstance(session_concurrency, bool) or session_concurrency < 1:
+            raise ValueError("--session-concurrency must be a positive integer")
+        section = config.get("pipeline", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: pipeline must be an object")
+        # Mutable on resume: it changes only how much LLM work overlaps a GPU
+        # evaluation, never what is evaluated or how it is scored.
+        config["pipeline"] = {**section, "session_concurrency": session_concurrency}
+        updates.append(f"pipeline.session_concurrency={session_concurrency}")
+
     if per_runtime_limit is not None:
         normalized_limit: int | float = per_runtime_limit
         if isinstance(normalized_limit, float) and normalized_limit.is_integer():
@@ -814,6 +826,9 @@ def main() -> int:
                         help="round_v1: rewrite keep/revert noise margin (>= 0)")
     parser.add_argument("--round-rewrite-top-k", type=int, metavar="K",
                         help="round_v1: rewrite eligibility is the top-K by score")
+    parser.add_argument("--session-concurrency", type=int, metavar="S",
+                        help="seats of one generation implemented at once on "
+                             "the driver's session channel (1 = serial)")
     args = parser.parse_args()
     try:
         initialize_run(
@@ -841,6 +856,7 @@ def main() -> int:
                 "noise_margin": args.round_noise_margin,
                 "rewrite_top_k": args.round_rewrite_top_k,
             },
+            session_concurrency=args.session_concurrency,
         )
     except ValueError as exc:
         parser.error(str(exc))

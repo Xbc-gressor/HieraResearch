@@ -531,6 +531,21 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
             raise RunConfigError(f"{path}: judged_slate must be an object")
         _validate_judged_slate_config(judged_slate, path)
 
+    pipeline = config.get("pipeline")
+    if pipeline is not None:
+        if not isinstance(pipeline, dict):
+            raise RunConfigError(f"{path}: pipeline must be an object")
+        unknown = sorted(set(pipeline) - {"session_concurrency"})
+        if unknown:
+            raise RunConfigError(f"{path}: unknown pipeline keys {unknown}")
+        value = pipeline.get("session_concurrency")
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise RunConfigError(
+                f"{path}: pipeline.session_concurrency must be a positive integer"
+            )
+
     tuner = config.get("tuner")
     if tuner is None:
         return

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import json
 import math
 import sys
@@ -116,9 +117,57 @@ def load_task_config(task_name: str) -> dict:
 
 
 # ---------- ledger I/O ----------
+#
+# Every mutation is one load -> change -> save in a short-lived process, and
+# several role sessions plus the driver may mutate concurrently. A load
+# ``for_update`` takes an exclusive lock on ``<ledger>.lock`` that the save
+# releases (or process exit does), so a writer never saves over a baseline
+# another writer has moved. Read-only loads never lock. Reentrant within the
+# process: a second locked load while held is a no-op.
+
+_LEDGER_LOCKS: dict[str, Any] = {}
 
 
-def _load_ledger(path: Path) -> dict:
+def _lock_ledger(path: Path) -> None:
+    key = str(Path(path).resolve())
+    if key in _LEDGER_LOCKS:
+        return
+    lock_path = Path(path).with_name(Path(path).name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    _LEDGER_LOCKS[key] = handle
+
+
+def _unlock_ledger(path: Path) -> None:
+    handle = _LEDGER_LOCKS.pop(str(Path(path).resolve()), None)
+    if handle is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _mutation(fn):
+    """Locks acquired inside a mutation are released on every exit, not only
+    the save: an early return (resolve_unevaluated's idempotent path) must not
+    keep the flock either (in-process callers such as finalize_tuning.py and
+    the tests continue after the call; a CLI process would have exited
+    anyway)."""
+    def wrapped(*args, **kwargs):
+        baseline = set(_LEDGER_LOCKS)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for key in list(_LEDGER_LOCKS):
+                if key not in baseline:
+                    _unlock_ledger(Path(key))
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    return wrapped
+
+
+def _load_ledger(path: Path, *, for_update: bool = False) -> dict:
+    if for_update:
+        _lock_ledger(path)
     if path.exists() and path.stat().st_size > 0:
         with open(path) as f:
             data = json.load(f)
@@ -155,6 +204,7 @@ def _save_ledger(path: Path, data: dict) -> None:
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     tmp.replace(path)
+    _unlock_ledger(path)
 
 
 def _ensure_meta(data: dict, ledger_path: Path, task_name: str, config: dict) -> None:
@@ -191,6 +241,7 @@ def _coerce(value: Optional[str], kind: str):
     return value
 
 
+@_mutation
 def cmd_add_record(args) -> int:
     from ledger_admission import AdmissionError, AdmissionRequest, admit_record
 
@@ -199,7 +250,7 @@ def cmd_add_record(args) -> int:
     if not task_name:
         raise SystemExit("could not infer task; pass --task")
     config = load_task_config(task_name)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     _ensure_meta(data, ledger_path, task_name, config)
     try:
         record = admit_record(
@@ -232,6 +283,7 @@ def cmd_add_record(args) -> int:
     return 0
 
 
+@_mutation
 def cmd_admit_slate(args) -> int:
     from ledger_admission import (
         AdmissionError,
@@ -244,7 +296,7 @@ def cmd_admit_slate(args) -> int:
     if not task_name:
         raise SystemExit("could not infer task; pass --task")
     config = load_task_config(task_name)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     _ensure_meta(data, ledger_path, task_name, config)
     try:
         records = admit_slate_atomic(
@@ -270,10 +322,12 @@ def _tuning_target(
     ledger_path: Path,
     task_name: str,
     run_id: str,
+    *,
+    for_update: bool = False,
 ) -> tuple[dict, dict, dict]:
     """Load and validate the immutable preconditions for a tuning close."""
     config = load_task_config(task_name)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=for_update)
     record = _get_record(data, run_id)
     if record is None:
         raise ValueError(f"no record for run_id {run_id}; add-record first")
@@ -345,6 +399,7 @@ def validate_tuning_target(
     budget_status(ledger_path.parent)
 
 
+@_mutation
 def finalize_tuning(
     ledger_path: Path,
     task_name: str,
@@ -361,7 +416,8 @@ def finalize_tuning(
     ledger_path = Path(ledger_path).resolve()
     report_path = Path(report_path).resolve()
     _validate_tuning_report_ownership(ledger_path, run_id, report_path)
-    config, data, record = _tuning_target(ledger_path, task_name, run_id)
+    config, data, record = _tuning_target(ledger_path, task_name, run_id,
+                                         for_update=True)
     _preserve_descendant_bindings(data, run_id)
 
     # The append-only admission log is authoritative even when an external kill
@@ -395,6 +451,7 @@ def finalize_tuning(
     return record
 
 
+@_mutation
 def cmd_set_tuning(args) -> int:
     ledger_path = Path(args.ledger)
     task_name = args.task or infer_task_name([ledger_path])
@@ -405,7 +462,7 @@ def cmd_set_tuning(args) -> int:
         )
 
     config = load_task_config(task_name)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     record = _get_record(data, args.run_id)
     if record is None:
         raise SystemExit(f"no record for run_id {args.run_id}; add-record first")
@@ -481,6 +538,7 @@ def cmd_set_tuning(args) -> int:
     return 0
 
 
+@_mutation
 def record_run(
     ledger_path: Path,
     task_name: str,
@@ -498,7 +556,7 @@ def record_run(
     synthesized by the result path. Returns the updated record.
     """
     config = load_task_config(task_name)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     record = _get_record(data, run_id)
     if record is None:
         raise ValueError(
@@ -548,6 +606,7 @@ def record_run(
     return record
 
 
+@_mutation
 def record_rewrite(
     ledger_path: Path,
     task_name: str,
@@ -565,7 +624,8 @@ def record_rewrite(
     incumbent so later children and tuning bouts bind to the new code.
     Without a report the stale snapshot is dropped rather than kept.
     """
-    config, data, record = _tuning_target(ledger_path, task_name, run_id)
+    config, data, record = _tuning_target(ledger_path, task_name, run_id,
+                                         for_update=True)
     if not math.isfinite(float(score)):
         raise ValueError("rewrite reference score must be finite")
     _preserve_descendant_bindings(data, run_id)
@@ -663,6 +723,7 @@ def _capture_task_baseline_item(data: dict, record: dict) -> None:
         )
 
 
+@_mutation
 def resolve_unevaluated(
     ledger_path: Path,
     task_name: str,
@@ -680,7 +741,7 @@ def resolve_unevaluated(
     """
     config = load_task_config(task_name)
     ledger_path = Path(ledger_path)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     record = _get_record(data, run_id)
     if record is None:
         raise ValueError(f"no record for run_id {run_id}; add-record first")
@@ -764,10 +825,11 @@ def cmd_record_run(args) -> int:
     return 0
 
 
+@_mutation
 def cmd_append_evaluation(args) -> int:
     """Index an evaluator-owned record digest without copying its facts."""
     ledger_path = Path(args.ledger)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     record_path = Path(args.record)
     try:
         from evaluation_records import read_records
@@ -846,10 +908,11 @@ def cmd_brief(args) -> int:
     return 0
 
 
+@_mutation
 def cmd_set_phase(args) -> int:
     """Persist a blocked/running state; completion is budget-derived only."""
     ledger_path = Path(args.ledger)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     time_budget_configured = False
     if args.phase == "completed":
         try:
@@ -926,6 +989,7 @@ def cmd_loop_state(args) -> int:
     return 0
 
 
+@_mutation
 def _set_experience(
     ledger_path: Path,
     validated_ledger: dict,
@@ -939,7 +1003,7 @@ def _set_experience(
     after the caller has validated the complete replacement snapshot, so a
     failed extraction cannot acknowledge graph changes it did not process.
     """
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     if data != validated_ledger or _current_dag_revision(data) != validated_dag_revision:
         raise ValueError(
             "ledger changed after experience validation; rerun extraction against "
@@ -1032,6 +1096,7 @@ def cmd_set_experience(args) -> int:
     return 0
 
 
+@_mutation
 def cmd_apply_space_state(args) -> int:
     """Atomically apply the current experience's deterministic pruning transitions.
 
@@ -1055,7 +1120,7 @@ def cmd_apply_space_state(args) -> int:
 
     ledger_path = Path(args.ledger)
     background_path = Path(args.background)
-    data = _load_ledger(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
     registry = load_registry(background_path)
     try:
         dimension_strategy = resolve_dimension_strategy(background_path)

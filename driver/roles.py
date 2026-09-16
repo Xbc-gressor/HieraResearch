@@ -194,10 +194,26 @@ def candidate_train_py_exists(ctx: InvocationContext) -> str | None:
     return None if path.exists() else f"missing candidate file: {path}"
 
 
+def _own_receipt(ctx: InvocationContext, role_name: str) -> dict | None:
+    from .receipts import ReceiptStore  # local import: receipts reads roles
+    path = ReceiptStore(ctx.run_dir).receipt_path(role_name, ctx.invocation_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def record_is_terminal(ctx: InvocationContext) -> str | None:
-    """the ledger record for run_id is keep/discard/crash, never pending."""
+    """the ledger record for run_id is keep/discard/crash (written via
+    record-run); the one exception is the zero-attempt budget-exhausted path,
+    where the receipt says status=unevaluated, ledger_updated=false and the
+    record stays pending for the driver to resolve."""
     status = record_status(ctx.run_dir, str(ctx.run_id))
     if status in ("keep", "discard", "crash"):
+        return None
+    receipt = _own_receipt(ctx, "tunable-contract-extractor") or {}
+    if receipt.get("status") == "unevaluated" \
+            and receipt.get("ledger_updated") is False \
+            and status in ("pending", "unevaluated"):
         return None
     return f"record {ctx.run_id} status is {status!r}, expected keep/discard/crash"
 

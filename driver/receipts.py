@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +70,12 @@ class ReceiptStore:
 
     invocation_id is driver-assigned, monotonic across BOTH receipt and
     session files, and links receipt ↔ session ↔ driver_events rows.
+    Sessions may be started from several driver threads, so ids are issued
+    under a process-wide lock and never re-issued before their files land.
     """
+
+    _issue_lock = threading.Lock()
+    _issued: dict[str, int] = {}
 
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
@@ -89,10 +96,10 @@ class ReceiptStore:
 
     def persist_session_messages(self, role: str, invocation_id: int,
                                  rows: list[dict]) -> None:
-        """Bounded diagnostic transcript for FAILED sessions only (error
-        result or repetition trip; see session._drain). Success sessions
-        persist nothing here. The caller pre-truncates rows; this only
-        writes them atomically."""
+        """Bounded diagnostic transcript of one session (see session._drain);
+        written for every session so a session that never submitted the
+        expected artifact can still be read afterwards. The caller
+        pre-truncates rows; this only writes them atomically."""
         path = self.session_messages_path(role, invocation_id)
         tmp = path.with_name(path.name + ".tmp")
         with tmp.open("w", encoding="utf-8") as stream:
@@ -100,13 +107,30 @@ class ReceiptStore:
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
         os.replace(tmp, path)
 
-    def next_invocation_id(self) -> int:
+    def _highest_persisted(self) -> int:
         highest = 0
         for path in self._dir().iterdir():
             match = _ID_SUFFIX.search(path.name)
             if match:
                 highest = max(highest, int(match.group(1)))
-        return highest + 1
+        return highest
+
+    def next_invocation_id(self) -> int:
+        """Peek: the id the next invocation gets (persisted files plus ids
+        already issued in this process). Pure; safe to call repeatedly."""
+        key = str(self.run_dir.resolve())
+        with self._issue_lock:
+            return max(self._highest_persisted(), self._issued.get(key, 0)) + 1
+
+    def issue_invocation_id(self) -> int:
+        """Reserve the next id. Invocations start on several driver threads
+        and persist their first file only at SDK init, so the reservation is
+        what keeps two concurrent invocations from sharing an id."""
+        key = str(self.run_dir.resolve())
+        with self._issue_lock:
+            issued = max(self._highest_persisted(), self._issued.get(key, 0)) + 1
+            self._issued[key] = issued
+            return issued
 
     def persist_receipt(self, role: str, invocation_id: int, payload: dict,
                         allow_replace: bool = False) -> Path:
@@ -119,9 +143,20 @@ class ReceiptStore:
         os.replace(tmp, path)
         return path
 
-    def persist_session_id(self, role: str, invocation_id: int, session_id: str) -> None:
+    def persist_session_id(self, role: str, invocation_id: int, session_id: str,
+                           *, run_id: str | None = None,
+                           parent_session_id: str | None = None) -> None:
+        """The session anchor: id first (resume needs nothing else), plus the
+        candidate and the session it was resumed from so a run's session
+        chains can be read back per candidate."""
+        record = {"session_id": session_id, "role": role,
+                  "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        if run_id is not None:
+            record["candidate_id"] = str(run_id)
+        if parent_session_id is not None:
+            record["parent_session_id"] = parent_session_id
         self.session_path(role, invocation_id).write_text(
-            json.dumps({"session_id": session_id}) + "\n", encoding="utf-8"
+            json.dumps(record) + "\n", encoding="utf-8"
         )
 
     def mark_session_ended(self, role: str, invocation_id: int, ok: bool,
@@ -136,6 +171,7 @@ class ReceiptStore:
         data = (json.loads(path.read_text(encoding="utf-8"))
                 if path.exists() else {})
         data["ended"] = "ok" if ok else "error"
+        data["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         if subtype:
             data["subtype"] = subtype
         tmp = path.with_name(path.name + ".tmp")

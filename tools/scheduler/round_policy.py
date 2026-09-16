@@ -31,6 +31,7 @@ bout's expected seconds, so a slower candidate needs a better rank to win.
 
 from __future__ import annotations
 
+import fcntl
 import json
 from pathlib import Path
 import time
@@ -76,8 +77,34 @@ def _state_path(run_dir: Path) -> Path:
     return Path(run_dir) / STORE_DIRNAME / ROUND_STATE_FILENAME
 
 
-def load_round_state(run_dir: Path) -> dict:
+# load -> save pairs run in short-lived CLI processes that may overlap with
+# each other and with the driver; a load ``for_update`` takes an exclusive
+# lock that the save releases, so a writer never saves over a baseline
+# another writer has moved. Read-only loads never lock.
+_STATE_LOCKS: dict[str, object] = {}
+
+
+def _lock_state(path: Path) -> None:
+    key = str(path.resolve())
+    if key in _STATE_LOCKS:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.with_name(path.name + ".lock").open("a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    _STATE_LOCKS[key] = handle
+
+
+def _unlock_state(path: Path) -> None:
+    handle = _STATE_LOCKS.pop(str(path.resolve()), None)
+    if handle is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def load_round_state(run_dir: Path, *, for_update: bool = False) -> dict:
     path = _state_path(run_dir)
+    if for_update:
+        _lock_state(path)
     if path.is_file():
         return json.loads(path.read_text(encoding="utf-8"))
     return {
@@ -99,6 +126,7 @@ def save_round_state(run_dir: Path, state: dict) -> None:
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n",
                    encoding="utf-8")
     tmp.replace(path)
+    _unlock_state(path)
 
 
 def finite_candidate_count(
@@ -165,11 +193,11 @@ def begin_optimization(run_dir: Path, *, now: float | None = None) -> dict:
     run_dir = Path(run_dir)
     now = time.time() if now is None else now
     config = load_config(run_dir)
-    state = load_round_state(run_dir)
     quota = config["round_seconds"]
     usable = time_budget(run_dir, now=now)["usable_seconds"]
     if usable is not None:
         quota = usable if quota is None else min(quota, usable)
+    state = load_round_state(run_dir, for_update=True)
     state["phase"] = "optimize"
     state["phase_started_at"] = now
     state["phase_deadline"] = None if quota is None else now + float(quota)
@@ -185,7 +213,7 @@ def end_optimization(
     fidelity: str | None = None,
 ) -> dict:
     run_dir = Path(run_dir)
-    state = load_round_state(run_dir)
+    state = load_round_state(run_dir, for_update=True)
     state["cycle"] = int(state.get("cycle", 0)) + 1
     state["cycle_start_count"] = finite_candidate_count(
         ledger, stage=stage, fidelity=fidelity
@@ -200,7 +228,7 @@ def end_optimization(
 def record_overhead(run_dir: Path, kind: str, seconds: float) -> dict:
     """Observed non-evaluation seconds of one bout (session + tooling)."""
     run_dir = Path(run_dir)
-    state = load_round_state(run_dir)
+    state = load_round_state(run_dir, for_update=True)
     window = state.setdefault("overhead_seconds", {}).setdefault(kind, [])
     window.append(round(max(0.0, float(seconds)), 1))
     del window[:-OVERHEAD_WINDOW]

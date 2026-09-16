@@ -30,6 +30,21 @@ service dependency.
   version, or prompt hashes differ from `run_metadata.json`); record and
   warn, never refuse (`warning`).
 - `blocked` — the loop hit a hard stop condition (`reason`).
+- `blocked_secondary` — another seat hit a stop condition while the run was
+  already blocked (`reason`); only the first block persists the phase.
+- `seat_started` / `seat_finished` / `seat_skipped` — one admitted seat's
+  implementation on the session channel (`run_id`; `session_wait_seconds`
+  is the time it waited for a session slot, `seconds` its wall clock).
+- `seats_completed` — a generation's seats all returned (`run_ids`,
+  `session_concurrency`, `wall_seconds`); compare with the per-seat seconds
+  to read the realized overlap. Throughput diagnostics only.
+- `candidate_unevaluated` — the driver resolved a zero-attempt candidate at
+  a reached stop condition after the extractor reported it (`run_id`).
+- `seat_error_masked` — a seat's non-block error was superseded by another
+  seat's block (`error`); diagnostic only, the block still unwinds the run.
+
+Per-job timing (`lease_wait_seconds`, `eval_seconds`, `devices`) lives in the
+job record under `<run_dir>/driver_jobs/`.
 
 ## Correlation
 

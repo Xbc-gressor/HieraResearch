@@ -556,14 +556,14 @@ class FailureTranscriptDumpTests(unittest.TestCase):
             self.assertTrue(any(row.get("result") == "turned too long"
                                 for row in rows))
 
-    def test_success_session_writes_no_transcript(self) -> None:
+    def test_success_session_writes_transcript_too(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             receipt = self._run_client(run_dir, error=False)
             self.assertTrue(receipt["edited"])
-            self.assertFalse(
-                ReceiptStore(run_dir).session_messages_path(
-                    SIMPLE_ROLE.name, 1).exists())
+            rows = self._dump_rows(run_dir)
+            self.assertIn("FakeAssistantMessage",
+                          [row.get("msg") for row in rows])
 
     def test_huge_message_is_clipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

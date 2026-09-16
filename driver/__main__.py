@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -72,6 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="round_v1: wall-clock quota of one optimization round")
     run.add_argument("--round-rewrite-top-k", type=int, metavar="K",
                      help="round_v1: rewrite eligibility is the top-K by score")
+    run.add_argument("--session-concurrency", type=int, metavar="S",
+                     help="experiment loop: seats of one generation implemented "
+                          "at once on the session channel (template default 2; "
+                          "1 = serial)")
     run.add_argument(
         "--inner-tuner-policy",
         choices=[
@@ -201,6 +206,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(status, indent=2, sort_keys=True))
             return exit_code_for(status, args.loop)
         from driver.loops.experiment import run_experiment
+        from driver.loops.rounds import DEFAULT_EVALUATION_DOMAIN
+        # Selection consumes one evaluation domain: the task-native records
+        # every production objective path indexes (legacy adapter -> stage
+        # "proxy", fidelity "fast"). An operator override stays in force.
+        os.environ.setdefault("EVALUATION_STAGE", DEFAULT_EVALUATION_DOMAIN[0])
+        os.environ.setdefault("EVALUATION_FIDELITY", DEFAULT_EVALUATION_DOMAIN[1])
         runner = SDKSessionRunner(model=model, events=EventsLog(run_dir),
                                   cli_path=args.cli_path)
         status = run_experiment(
@@ -225,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
                 "noise_margin": args.noise_margin,
                 "rewrite_top_k": args.round_rewrite_top_k,
             },
+            session_concurrency=args.session_concurrency,
             cli_path=args.cli_path,
         )
         print(json.dumps(status, indent=2, sort_keys=True))
