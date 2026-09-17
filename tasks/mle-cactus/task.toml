@@ -25,6 +25,11 @@ min_memory_gib = 8
 [result]
 metric = "one_minus_auc"
 required_patterns = ["^score:"]
+# Ambitious target on the metric scale: the official mle-bench leaderboard
+# is saturated (1221 teams; gold, silver, and bronze all sit at AUC 1.0),
+# so every medal tier maps to a perfect 1 - AUC of 0.0. Validation scores
+# track but do not equal the private-leaderboard score.
+target_score = 0.0
 
 [constraints]
 editable_files = ["train.py", "pyproject.toml"]

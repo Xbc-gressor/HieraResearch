@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -42,6 +44,15 @@ SPOOKY_TOML = {
 }
 
 NO_TARGET_TOML = {"result": {"metric": "neg_acc", "required_patterns": []}}
+
+TIERED_TOML = {
+    "result": {
+        "metric": "validation_log_loss",
+        "required_patterns": ["^score:"],
+        "target_tier": "gold",
+        "target_tiers": {"gold": 0.16506, "silver": 0.26996},
+    }
+}
 
 
 class BriefBuildTests(unittest.TestCase):
@@ -100,6 +111,43 @@ class BriefBuildTests(unittest.TestCase):
             # a later, different task_toml must not overwrite the stored brief
             again = ob.ensure_brief(run_dir, NO_TARGET_TOML)
             self.assertEqual(again["aspirational_target_score"], 0.26996)
+
+
+class TierResolutionTests(unittest.TestCase):
+    def test_selector_resolves_tier(self) -> None:
+        brief = ob.build_brief(TIERED_TOML)
+        self.assertEqual(brief["aspirational_target_score"], 0.16506)
+        self.assertEqual(brief["target_source"],
+                         "task.toml[result].target_tiers.gold")
+
+    def test_env_override_wins_and_is_recorded(self) -> None:
+        with mock.patch.dict(os.environ, {"TARGET_TIER": "silver"}):
+            brief = ob.build_brief(TIERED_TOML)
+            self.assertEqual(brief["aspirational_target_score"], 0.26996)
+            self.assertEqual(
+                brief["target_source"],
+                "task.toml[result].target_tiers.silver (env TARGET_TIER)")
+            self.assertEqual(ob.validated_target(TIERED_TOML["result"]),
+                             0.26996)
+        # empty env value is unset, and plain tasks keep their target_score
+        with mock.patch.dict(os.environ, {"TARGET_TIER": ""}):
+            self.assertEqual(ob.validated_target(SPOOKY_TOML["result"]),
+                             0.26996)
+
+    def test_tier_contract_errors(self) -> None:
+        with mock.patch.dict(os.environ, {"TARGET_TIER": "silver"}):
+            with self.assertRaises(ValueError):  # no tiers declared
+                ob.validated_target(SPOOKY_TOML["result"])
+        with self.assertRaises(ValueError):  # selector not in tiers
+            ob.build_brief({**TIERED_TOML, "result": {
+                **TIERED_TOML["result"], "target_tier": "bronze"}})
+        with self.assertRaises(ValueError):  # tiers without a selector
+            ob.build_brief({"result": {
+                "metric": "m", "target_tiers": {"gold": 1.0}}})
+        with self.assertRaises(ValueError):  # non-finite tier value
+            ob.build_brief({"result": {
+                "metric": "m", "target_tier": "gold",
+                "target_tiers": {"gold": float("nan")}}})
 
 
 class InnerTunerRenderingTests(unittest.TestCase):
@@ -170,7 +218,7 @@ class CrossLayerSourceTests(unittest.TestCase):
         import freeze
         block = freeze._task_block(
             ROOT / "runs" / "mle-spooky" / "tag", {"per_runtime_limit": None})
-        self.assertEqual(block["aspirational_target_score"], 0.26996)
+        self.assertEqual(block["aspirational_target_score"], 0.16506)
         self.assertEqual(block["relative_improvement_over_baseline"], None)
 
     def test_hebo_production_checkpoint_reads_spooky_target(self) -> None:
@@ -178,7 +226,7 @@ class CrossLayerSourceTests(unittest.TestCase):
         target = hebo_search._configured_target_score(
             ROOT / "runs" / "mle-spooky" / "tag" / "candidates" / "001"
             / "train.py")
-        self.assertEqual(target, 0.26996)
+        self.assertEqual(target, 0.16506)
         # a task without runs-path context (no task.toml resolution) degrades
         # to None rather than guessing
         self.assertIsNone(
@@ -189,7 +237,7 @@ class CrossLayerSourceTests(unittest.TestCase):
         target = local_tr_search._configured_target_score(
             ROOT / "runs" / "mle-spooky" / "tag" / "candidates" / "001"
             / "train.py")
-        self.assertEqual(target, 0.26996)
+        self.assertEqual(target, 0.16506)
         self.assertIsNone(
             local_tr_search._configured_target_score(Path("/tmp/x/train.py")))
 

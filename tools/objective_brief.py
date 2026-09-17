@@ -3,10 +3,15 @@
 
 Every role that proposes, implements, or tunes (outer loops, judged slate,
 inner tuner arms) consumes the same bounded view of the task's metric and
-its declared aspirational target (``[result].target_score``), so no loop
-parses task.toml on its own. The target is an anti-slop aspiration bar: it
-raises ambition and never enters keep/revert thresholds, attribution,
-budget reservation, crash adjudication, or scheduler decisions.
+its declared aspirational target, so no loop parses task.toml on its own.
+The target is an anti-slop aspiration bar: it raises ambition and never
+enters keep/revert thresholds, attribution, budget reservation, crash
+adjudication, or scheduler decisions.
+
+The target resolves from ``[result]`` in one place: the ``TARGET_TIER``
+environment variable (per-run E2E override), then the ``target_tier``
+selector over the ``target_tiers`` table, then the plain ``target_score``.
+The brief always carries a single number plus the source it came from.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BRIEF_FILENAME = "objective_brief.json"
 TARGET_SOURCE = "task.toml[result].target_score"
+TIER_ENV_VAR = "TARGET_TIER"
 TARGET_SEMANTICS = "anti_slop_aspiration"
 
 SEMANTICS_TEXT = (
@@ -45,23 +51,75 @@ def _finite_or_none(value) -> float | None:
     return float(value) if _is_finite_number(value) else None
 
 
+def _tiers_table(result_section: dict) -> dict | None:
+    """``[result].target_tiers`` validated as a finite-number table."""
+    tiers = result_section.get("target_tiers")
+    if tiers is None:
+        return None
+    if not isinstance(tiers, dict) or not tiers:
+        raise ValueError(
+            "task.toml [result].target_tiers must be a non-empty table"
+        )
+    for name, value in tiers.items():
+        if not _is_finite_number(value):
+            raise ValueError(
+                f"task.toml [result].target_tiers.{name} must be a finite number"
+            )
+    return tiers
+
+
+def resolve_target(result_section: dict | None) -> tuple[float | None, str | None]:
+    """The active aspiration target as ``(value, source)``; ``(None, None)`` unset.
+
+    Resolution order: the ``TARGET_TIER`` environment variable (per-run
+    override), then ``[result].target_tier`` over ``[result].target_tiers``,
+    then the plain ``[result].target_score``. A declared tiers table without
+    a resolvable selector is a contract error, never a silent fallback.
+    """
+    if result_section is None:
+        return None, None
+    if not isinstance(result_section, dict):
+        raise ValueError("task.toml [result] must be a table")
+    tiers = _tiers_table(result_section)
+    env_tier = os.environ.get(TIER_ENV_VAR) or None
+    if tiers is None:
+        if env_tier:
+            raise ValueError(
+                f"{TIER_ENV_VAR}={env_tier} but task.toml declares no "
+                "[result].target_tiers"
+            )
+        value = result_section.get("target_score")
+        if value is None:
+            return None, None
+        if not _is_finite_number(value):
+            raise ValueError(
+                "task.toml [result].target_score must be a finite number"
+            )
+        return float(value), TARGET_SOURCE
+    tier = env_tier or result_section.get("target_tier")
+    if not isinstance(tier, str) or not tier:
+        raise ValueError(
+            "task.toml declares [result].target_tiers but sets no "
+            "[result].target_tier selector"
+        )
+    if tier not in tiers:
+        raise ValueError(
+            f"target tier {tier!r} not in task.toml [result].target_tiers "
+            f"(available: {sorted(tiers)})"
+        )
+    source = f"task.toml[result].target_tiers.{tier}"
+    if env_tier:
+        source += f" (env {TIER_ENV_VAR})"
+    return float(tiers[tier]), source
+
+
 def validated_target(result_section: dict | None) -> float | None:
-    """``[result].target_score`` as a finite float; None when unset.
+    """The active aspiration target as a finite float; None when unset.
 
     Same finite-number rule as validate_tasks (bools and non-finite values
     are contract errors, not silently dropped).
     """
-    if result_section is None:
-        value = None
-    elif isinstance(result_section, dict):
-        value = result_section.get("target_score")
-    else:
-        raise ValueError("task.toml [result] must be a table")
-    if value is None:
-        return None
-    if not _is_finite_number(value):
-        raise ValueError("task.toml [result].target_score must be a finite number")
-    return float(value)
+    return resolve_target(result_section)[0]
 
 
 def build_brief(task_toml: dict, *, baseline_score=None, run_best=None,
@@ -74,13 +132,13 @@ def build_brief(task_toml: dict, *, baseline_score=None, run_best=None,
     result = task_toml.get("result") if isinstance(task_toml, dict) else None
     result = result if isinstance(result, dict) else {}
     metric = result.get("metric")
-    target = validated_target(result)
+    target, target_source = resolve_target(result)
     return {
         "schema_version": 1,
         "metric": metric if isinstance(metric, str) and metric else None,
         "direction": "minimize",
         "aspirational_target_score": target,
-        "target_source": TARGET_SOURCE if target is not None else None,
+        "target_source": target_source if target is not None else None,
         "target_semantics": TARGET_SEMANTICS if target is not None else None,
         "baseline_score": _finite_or_none(baseline_score),
         "run_best": _finite_or_none(run_best),

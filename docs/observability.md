@@ -14,7 +14,10 @@ service dependency.
   hillclimb loop on fresh runs.
 - `objective_brief` — the run's `objective_brief.json` was written
   (`metric`, `aspirational_target_score`, `target_source`); the declared
-  aspiration bar is diagnostic only and never a decision input.
+  aspiration bar is diagnostic only and never a decision input. Tasks may
+  declare `target_tiers` with a `target_tier` selector; the `TARGET_TIER`
+  environment variable overrides the selector per run (E2E A/B), and the
+  frozen brief's `target_source` records the tier actually used.
 - `session_start` — a role SDK session opened (`role`, `invocation_id`,
   `resume`).
 - `session_end` — the session returned (`role`, `invocation_id`,

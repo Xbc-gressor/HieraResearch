@@ -1,13 +1,17 @@
-name = "mle-spooky"
-description = "Spooky Author Identification: public-training validation log loss and a separate final MLE-bench submission."
+name = "mle-google-quest"
+description = "Google QUEST Q&A Labeling: public-training validation mean column-wise Spearman over 30 question/answer quality targets (scored as 1 - mean Spearman) and a separate final MLE-bench submission."
 
 [env]
 type = "uv"
 project = "envs/mle"
 
 [run]
-working_dir = "tasks/mle-spooky"
-timeout_seconds = 300
+working_dir = "tasks/mle-google-quest"
+# Basis (2026-09-18, RTX 3080 Ti 12 GB, AMP): fine-tuning bert-base-uncased
+# on the 4373-row training partition at 512 tokens takes 51 s/epoch (3.8 GB
+# peak at batch 8), bert-large-uncased 187 s/epoch (8.2 GB peak at batch 4);
+# the limit leaves room for cross-validated ensembles of large encoders.
+timeout_seconds = 3600
 
 
 [evaluation]
@@ -29,15 +33,16 @@ lease_wait_timeout = 600
 min_memory_gib = 8
 
 [result]
-metric = "validation_log_loss"
+metric = "one_minus_mean_spearman"
 required_patterns = ["^score:"]
 # Aspiration-bar tiers from the official mle-bench leaderboard rule
-# (1242 teams; cross-checked against grade-sample output 2026-09-13).
+# (1572 teams, pinned checkout leaderboard.csv, 2026-09-18), expressed on
+# this surface as 1 - Spearman (official gold 0.42278, silver 0.39597).
 # target_tier picks the active bar; TARGET_TIER=<tier> overrides it per run
 # (E2E A/B) and the run's frozen objective_brief.json records the selection.
 # Validation scores track but do not equal the private-leaderboard score.
 target_tier = "gold"
-target_tiers = { gold = 0.16506, silver = 0.26996 }
+target_tiers = { gold = 0.57722, silver = 0.60403 }
 
 [constraints]
 editable_files = ["train.py", "pyproject.toml"]
@@ -45,6 +50,6 @@ readonly_files = ["prepare.py"]
 allow_dependencies = true
 
 [mlebench]
-competition_id = "spooky-author-identification"
+competition_id = "google-quest-challenge"
 public_data_env = "MLEBENCH_PUBLIC_DATA"
 submission = "submission.csv"

@@ -25,6 +25,15 @@ min_memory_gib = 8
 [result]
 metric = "mean_rmsle"
 required_patterns = ["^score:"]
+# Aspiration-bar tiers from the official mle-bench leaderboard rule
+# (879 teams, 2026-09-17). The official score sums the two per-target
+# RMSLEs while this metric averages them, so leaderboard thresholds are
+# halved onto this scale. target_tier picks the active bar;
+# TARGET_TIER=<tier> overrides it per run (E2E A/B) and the run's frozen
+# objective_brief.json records the selection. Validation scores track but
+# do not equal the private-leaderboard score.
+target_tier = "gold"
+target_tiers = { gold = 0.027945, silver = 0.031145 }
 
 [constraints]
 editable_files = ["train.py", "pyproject.toml"]

@@ -25,6 +25,13 @@ min_memory_gib = 8
 [result]
 metric = "one_minus_auc"
 required_patterns = ["^score:"]
+# Aspiration-bar tiers from the official mle-bench leaderboard rule
+# (50 teams, 2026-09-17), mapped to this metric as 1 - AUC. target_tier
+# picks the active bar; TARGET_TIER=<tier> overrides it per run (E2E A/B)
+# and the run's frozen objective_brief.json records the selection.
+# Validation scores track but do not equal the private-leaderboard score.
+target_tier = "gold"
+target_tiers = { gold = 0.16679, silver = 0.17693 }
 
 [constraints]
 editable_files = ["train.py", "pyproject.toml"]

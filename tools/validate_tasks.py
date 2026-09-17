@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import ast
+import os
 import re
 import sys
 from pathlib import Path
+
+import objective_brief
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,12 +41,50 @@ def strip_comment(line: str) -> str:
     return line
 
 
+def _split_inline_items(body: str) -> list[str]:
+    items: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote = ""
+    for char in body:
+        if quote:
+            if char == quote:
+                quote = ""
+            buf.append(char)
+        elif char in {"'", '"'}:
+            quote = char
+            buf.append(char)
+        elif char in "{[":
+            depth += 1
+            buf.append(char)
+        elif char in "}]":
+            depth -= 1
+            buf.append(char)
+        elif char == "," and depth == 0:
+            items.append("".join(buf))
+            buf = []
+        else:
+            buf.append(char)
+    tail = "".join(buf).strip()
+    if tail or items:
+        items.append(tail)
+    return items
+
+
 def parse_value(value: str):
     value = value.strip()
     if value == "true":
         return True
     if value == "false":
         return False
+    if value.startswith("{") and value.endswith("}"):
+        table = {}
+        for item in _split_inline_items(value[1:-1]):
+            if "=" not in item:
+                raise ValueError(f"invalid inline table entry {item!r}")
+            key, sub = item.split("=", 1)
+            table[key.strip().strip("\"'")] = parse_value(sub)
+        return table
     try:
         return ast.literal_eval(value)
     except (SyntaxError, ValueError):
@@ -179,6 +220,10 @@ def validate_task(task_dir: Path) -> list[str]:
             or target in (float("inf"), float("-inf"))
         ):
             errors.append(f"{task_toml}: result.target_score must be a finite number")
+        try:
+            objective_brief.resolve_target(result)
+        except ValueError as exc:
+            errors.append(f"{task_toml}: {exc}")
     seed = data.get("seed")
     seed_entrypoint = "train.py"
     seed_can_generate_entrypoint = True
@@ -288,9 +333,16 @@ def main() -> int:
         print("no tasks found", file=sys.stderr)
         return 1
 
-    errors: list[str] = []
-    for task_dir in task_dirs:
-        errors.extend(validate_task(task_dir))
+    # Static contract check: the TARGET_TIER run-time override belongs to
+    # run startup (which fails loudly there), not to this validator.
+    saved_tier = os.environ.pop(objective_brief.TIER_ENV_VAR, None)
+    try:
+        errors: list[str] = []
+        for task_dir in task_dirs:
+            errors.extend(validate_task(task_dir))
+    finally:
+        if saved_tier is not None:
+            os.environ[objective_brief.TIER_ENV_VAR] = saved_tier
 
     if errors:
         for error in errors:
