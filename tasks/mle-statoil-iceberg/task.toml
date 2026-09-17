@@ -1,0 +1,51 @@
+name = "mle-statoil-iceberg"
+description = "Statoil/C-CORE Iceberg Classifier Challenge: public-training validation log loss for ship-vs-iceberg probabilities and a separate final MLE-bench submission."
+
+[env]
+type = "uv"
+project = "envs/mle"
+
+[run]
+working_dir = "tasks/mle-statoil-iceberg"
+# Basis (2026-09-17, CPU, 8 threads): a 390k-parameter 4-block CNN takes
+# 1.5 s/epoch on the 1026-image training partition, so a 5-fold x 50-epoch
+# run is ~370 s on CPU; the limit leaves room for larger pretrained
+# backbones, cross-validated ensembles and test-time augmentation on GPU.
+timeout_seconds = 1200
+
+
+[evaluation]
+# Versioned task-native surface. ``score_fn`` remains the compatibility
+# adapter; the staged evaluator owns protocol and official output checks.
+version = "1"
+score_fn = "evaluate_config"
+proxy = "evaluate_config"
+protocol = "evaluate_protocol"
+data_version = "public-v1"
+environment_preflight_fn = "preflight_environment"
+preflight_fn = "preflight_config"
+resource_probe_fn = "resource_probe_config"
+
+[resources]
+accelerator = "cuda"
+devices = 1
+lease_wait_timeout = 600
+min_memory_gib = 8
+
+[result]
+metric = "log_loss"
+required_patterns = ["^score:"]
+# Ambitious target on the metric scale: the competition's silver-medal log
+# loss threshold (mlebench leaderboard rule over 3330 teams, 2026-09-17).
+# Validation scores track but do not equal the private-leaderboard score.
+target_score = 0.13753
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true
+
+[mlebench]
+competition_id = "statoil-iceberg-classifier-challenge"
+public_data_env = "MLEBENCH_PUBLIC_DATA"
+submission = "submission.csv"

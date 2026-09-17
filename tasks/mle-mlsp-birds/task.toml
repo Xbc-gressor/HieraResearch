@@ -1,0 +1,47 @@
+name = "mle-mlsp-birds"
+description = "MLSP 2013 Bird Classification Challenge: public-training validation ROC AUC over recording-species pairs (scored as 1 - AUC) and a separate final MLE-bench submission."
+
+[env]
+type = "uv"
+project = "envs/mle"
+
+[run]
+working_dir = "tasks/mle-mlsp-birds"
+timeout_seconds = 900
+
+
+[evaluation]
+# Versioned task-native surface. ``score_fn`` remains the compatibility
+# adapter; the staged evaluator owns protocol and official output checks.
+version = "1"
+score_fn = "evaluate_config"
+proxy = "evaluate_config"
+protocol = "evaluate_protocol"
+data_version = "public-v1"
+environment_preflight_fn = "preflight_environment"
+preflight_fn = "preflight_config"
+resource_probe_fn = "resource_probe_config"
+
+[resources]
+accelerator = "cuda"
+devices = 1
+lease_wait_timeout = 600
+min_memory_gib = 8
+
+[result]
+metric = "one_minus_auc"
+required_patterns = ["^score:"]
+# Ambitious target on the metric scale: 1 - the competition's silver-medal AUC
+# threshold (mlebench leaderboard rule over 81 teams, 2026-09-17). Validation
+# scores track but do not equal the private-leaderboard score.
+target_score = 0.09962
+
+[constraints]
+editable_files = ["train.py", "pyproject.toml"]
+readonly_files = ["prepare.py"]
+allow_dependencies = true
+
+[mlebench]
+competition_id = "mlsp-2013-birds"
+public_data_env = "MLEBENCH_PUBLIC_DATA"
+submission = "submission.csv"
