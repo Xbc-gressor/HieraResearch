@@ -11,8 +11,11 @@ the next launch can reconcile — a stale "running" record with a dead pid is
 marked ``dead``, and a live one for the SAME candidate refuses the new launch
 instead of letting a second objective write the same tune_report
 concurrently. On SIGTERM / interrupt / interpreter exit the driver terminates
-the child's whole process group (best-effort; SIGKILL still orphans, which is
-what reconciliation is for).
+the child's whole process group and waits for it to exit (SIGTERM, grace,
+SIGKILL); a SIGKILL of the driver itself still orphans, which is what
+reconciliation is for. A job's ``proc.wait`` is bounded by the run's cutoff
+(``deadline − final_reserve``): past it the job is terminated the same way
+and the handoff returns ``accepted: False`` (``deadline_killed``).
 
 Concurrency: role sessions may run on several driver threads, so jobs for
 different candidates queue on the GPU channel (the device lease) instead of
@@ -35,6 +38,10 @@ import time
 from .resources import ResourceUnavailable, task_resource_lease
 from .roles import InvocationContext, REPO_ROOT
 from tools.evaluation_budget import time_budget
+from tools.process_group import terminate_group
+
+# SIGTERM grace for a driver job's group before SIGKILL escalation.
+JOB_TERMINATE_GRACE_SECONDS = 30.0
 
 
 class DriverJobError(ValueError):
@@ -54,13 +61,15 @@ def _candidate_lock(run_dir: Path, run_id: str) -> threading.Lock:
         return _candidate_locks.setdefault(key, threading.Lock())
 
 
-def _terminate_child_group(proc: subprocess.Popen) -> None:
-    # start_new_session=True makes the child's pid its process-group id, so
-    # this reaches the whole uv → script → torchrun tree.
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except OSError:
-        pass
+def _terminate_child_group(proc: subprocess.Popen) -> int | None:
+    """Terminate the job's whole process group and wait for it to exit.
+
+    start_new_session=True makes the child's pid its process-group id, so
+    this reaches the whole uv → script → torchrun tree. Returns only after
+    the group is gone (SIGTERM, grace, SIGKILL): the lease and the job
+    record are handed over afterwards, never while the job may still run.
+    """
+    return terminate_group(proc, grace=JOB_TERMINATE_GRACE_SECONDS)
 
 
 def _kill_live_children() -> None:
@@ -406,6 +415,23 @@ def execute_driver_job(
                     task_cfg, owner=owner,
                     wait_timeout=_lease_wait_timeout(ctx.run_dir)) as lease:
                 env = {**os.environ, **(lease.get("env") or {})}
+                # Queueing for the device may itself cross the cutoff; a job
+                # that starts now would run into the export reserve.
+                if time_budget(ctx.run_dir)["time_reached"]:
+                    record.update(
+                        status="refused_time_reached",
+                        lease_wait_seconds=round(time.monotonic() - queued, 3),
+                        finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    )
+                    _atomic_json(record_path, record)
+                    return {
+                        "kind": request["kind"],
+                        "run_id": run_id,
+                        "accepted": False,
+                        "error": "time budget reached before the job could "
+                                 "start; no further objective work is possible",
+                        "job_record": str(record_path),
+                    }
                 started = time.monotonic()
                 with log_path.open("w", encoding="utf-8") as log:
                     proc = subprocess.Popen(
@@ -427,12 +453,25 @@ def execute_driver_job(
                     _atomic_json(record_path, record)
                     _live_children.append(proc)
                     _arm_exit_hooks()
+                    killed = False
                     try:
-                        returncode = proc.wait()
+                        # Bounded by the run's cutoff, not by the job's own
+                        # loop: past deadline − final_reserve the GPU must
+                        # be free for export whatever the job is doing.
+                        usable = time_budget(ctx.run_dir).get("usable_seconds")
+                        try:
+                            returncode = proc.wait(
+                                timeout=None if usable is None
+                                else max(0.0, float(usable)))
+                        except subprocess.TimeoutExpired:
+                            killed = True
+                            returncode = _terminate_child_group(proc)
                     except BaseException:
                         _terminate_child_group(proc)
                         raise
                     finally:
+                        # Only after the group has exited: the lease is
+                        # released by the enclosing `with` once we leave.
                         _live_children.remove(proc)
     except ResourceUnavailable as exc:
         # Lease queueing is free: it is neither a candidate observation nor a
@@ -454,6 +493,27 @@ def execute_driver_job(
         )
         _atomic_json(record_path, record)
         raise DriverJobError(f"driver job could not run: {exc}") from exc
+    tail = "".join(
+        log_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[-40:]
+    )
+    if killed:
+        record.update(
+            status="deadline_killed",
+            returncode=None if returncode is None else int(returncode),
+            eval_seconds=round(time.monotonic() - started, 3),
+            finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+        _atomic_json(record_path, record)
+        return {
+            "kind": request["kind"],
+            "run_id": run_id,
+            "accepted": False,
+            "error": "time budget reached; the job was terminated and no "
+                     "further objective work is possible",
+            "log": str(log_path),
+            "log_tail": tail[-6000:],
+            "job_record": str(record_path),
+        }
     record.update(
         status="completed",
         returncode=int(returncode),
@@ -461,9 +521,6 @@ def execute_driver_job(
         finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
     _atomic_json(record_path, record)
-    tail = "".join(
-        log_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[-40:]
-    )
     return {
         "kind": request["kind"],
         "run_id": run_id,

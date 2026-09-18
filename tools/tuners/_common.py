@@ -39,7 +39,6 @@ import importlib.util
 import json
 import math
 import os
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -70,6 +69,12 @@ from evaluation_budget import (  # noqa: E402
     reserve_evaluation,
 )
 from run_cfg import find_framework_cfg, read_framework_cfg  # noqa: E402
+from process_group import (  # noqa: E402
+    arm_sigterm_forwarding,
+    register_child,
+    terminate_group,
+    unregister_child,
+)
 from validate_tasks import ROOT, parse_task_toml  # noqa: E402
 
 
@@ -847,25 +852,27 @@ def _communicate_with_limit(
     elif os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(command, **kwargs)
+    # This wrapper owns the evaluation's process group: if the wrapper is
+    # terminated (watchdog killpg of the driver tree), it kills the group
+    # and waits before exiting, so no evaluation body is orphaned.
+    register_child(proc)
+    arm_sigterm_forwarding()
     try:
-        out, err = proc.communicate(timeout=limit)
-    except subprocess.TimeoutExpired:
         try:
-            if posix:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            else:
-                proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        partial_out = partial_err = ""
-        try:
-            partial_out, partial_err = proc.communicate(timeout=5)
+            out, err = proc.communicate(timeout=limit)
         except subprocess.TimeoutExpired:
-            pass
-        exc = TimeoutError(f"{label}={limit:g}s")
-        exc.partial_stdout = partial_out
-        exc.partial_stderr = partial_err
-        raise exc from None
+            terminate_group(proc, grace=0)  # hard kill at the per-eval limit
+            partial_out = partial_err = ""
+            try:
+                partial_out, partial_err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            exc = TimeoutError(f"{label}={limit:g}s")
+            exc.partial_stdout = partial_out
+            exc.partial_stderr = partial_err
+            raise exc from None
+    finally:
+        unregister_child(proc)
     return out, err, int(proc.returncode)
 
 
@@ -972,6 +979,7 @@ def timed_eval(
     )
     attempt_id = receipt.get("attempt_id") if receipt else None
     started = time.monotonic()
+    time_cutoff = False
     try:
         return _timed_eval_body(
             evaluate,
@@ -984,6 +992,9 @@ def timed_eval(
             python_cmd=python_cmd,
             attempt_id=attempt_id,
         )
+    except EvaluationBudgetExhausted as exc:
+        time_cutoff = exc.scope == "time_cutoff"
+        raise
     finally:
         # Every admitted attempt — success, crash, or timeout — reports how
         # long it held the evaluator; the round scheduler prices bouts by it.
@@ -991,6 +1002,7 @@ def timed_eval(
             candidate_path,
             attempt_id=attempt_id,
             duration_seconds=time.monotonic() - started,
+            time_cutoff=time_cutoff,
         )
 
 

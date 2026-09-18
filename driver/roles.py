@@ -35,6 +35,11 @@ class InvocationContext:
     # A verbatim bounded payload for tool-free roles (e.g. the slate judge's
     # prepared prompt text). None keeps the historical message byte-identical.
     inline_payload: str | None = None
+    # The run whose time budget bounds this session. None = derive from
+    # run_dir (itself, or the enclosing runs/<task>/<tag> when the session's
+    # storage directory is a per-candidate sub-directory such as
+    # candidates/<id>/_hebo_llm). Never rendered into the message.
+    budget_run_dir: Path | None = None
 
     def user_message(self) -> str:
         """Paths and compact ids first; an inline payload follows a fixed delimiter."""
@@ -89,6 +94,19 @@ class RoleDefinition:
     # Long objective commands are driver-owned. These substrings keep an agent
     # from bypassing the typed job handoff and orphaning a GPU process.
     forbidden_bash_substrings: tuple[str, ...] = ()
+    # Backstop wall-clock bound for one invocation (seconds; None = only the
+    # run deadline bounds it). Set far above the observed maximum: a trip is
+    # a hang signal to inspect, not a trimming threshold. Checked per
+    # streamed message, so it fires at the next message after the bound.
+    wall_limit_seconds: float | None = None
+    # At the wall limit, roles whose partial result is itself valid (an edit,
+    # a draft, notes) get one "submit now" turn with a short grace; terminal
+    # roles (ledger writers, judges, diagnosis) fail outright, because a
+    # coerced receipt would be a fabricated verdict.
+    soft_rescue: bool = False
+    # Longest legal silence between two streamed messages (tool execution
+    # produces none). Guards against a hung CLI only; None disables.
+    idle_timeout_seconds: float | None = 900.0
 
 
 def driver_job_handoff_problem(role_name: str, receipt: dict) -> str | None:
@@ -260,6 +278,8 @@ ROLES: dict[str, RoleDefinition] = {
             "retrieval_manifest": "str",
         },
         postconditions=(background_artifacts_exist,),
+        wall_limit_seconds=1800.0,
+        soft_rescue=True,
     ),
     "idea-generator": RoleDefinition(
         name="idea-generator",
@@ -280,6 +300,8 @@ ROLES: dict[str, RoleDefinition] = {
             "candidate_dir": "str",
         },
         postconditions=(candidate_train_py_exists,),
+        wall_limit_seconds=960.0,
+        soft_rescue=True,
     ),
     "tunable-contract-extractor": RoleDefinition(
         name="tunable-contract-extractor",
@@ -295,6 +317,7 @@ ROLES: dict[str, RoleDefinition] = {
         },
         postconditions=(record_is_terminal,),
         forbidden_bash_substrings=("warmstart_eval.py", "nohup "),
+        wall_limit_seconds=900.0,
     ),
     "tuner-orchestrator": RoleDefinition(
         name="tuner-orchestrator",
@@ -314,6 +337,7 @@ ROLES: dict[str, RoleDefinition] = {
             "tools/tuners/cmaes_search.py",
             "nohup ",
         ),
+        wall_limit_seconds=900.0,
     ),
     "experience-extractor": RoleDefinition(
         name="experience-extractor",
@@ -325,6 +349,8 @@ ROLES: dict[str, RoleDefinition] = {
             "decision_ids": "list",
         },
         postconditions=(refresh_flag_cleared,),
+        wall_limit_seconds=900.0,
+        soft_rescue=True,
     ),
     "crash-diagnosis": RoleDefinition(
         name="crash-diagnosis",
@@ -341,6 +367,7 @@ ROLES: dict[str, RoleDefinition] = {
         # observed unbounded "confirm the bug" loops at 55-301 turns; a
         # bounded read-only diagnosis needs far fewer
         max_turns=40,
+        wall_limit_seconds=600.0,
     ),
     "hillclimb-editor": RoleDefinition(
         name="hillclimb-editor",
@@ -353,6 +380,8 @@ ROLES: dict[str, RoleDefinition] = {
         # (varied junk turns). Healthy invocations stay far below: a few
         # reads, one edit, one receipt. The incident run burned 894 turns.
         max_turns=120,
+        wall_limit_seconds=900.0,
+        soft_rescue=True,
     ),
     # rewrite loop: one long-lived session per imported candidate, one
     # in-place improvement edit per bout; basis names the intelligence the
@@ -364,6 +393,8 @@ ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"edited": "bool", "summary": "str", "basis": "str"},
         postconditions=(rewrite_train_py_exists,),
+        wall_limit_seconds=900.0,
+        soft_rescue=True,
     ),
     # judged_slate arm: a tool-free listwise judge. The bounded payload
     # arrives as the invocation context's inline_payload; the receipt's
@@ -378,6 +409,7 @@ ROLES: dict[str, RoleDefinition] = {
         receipt_schema={"ranking": "list", "rationale": "str"},
         corrective_attempts=0,
         max_turns=8,
+        wall_limit_seconds=600.0,
     ),
     # background faithfulness audit: a tool-free judge over a prepared
     # payload of claim↔receipt mappings. corrective_attempts=0: the driver's
@@ -390,6 +422,7 @@ ROLES: dict[str, RoleDefinition] = {
         receipt_schema={"verdicts": "list", "rationale": "str"},
         corrective_attempts=0,
         max_turns=8,
+        wall_limit_seconds=600.0,
     ),
     # judged_slate arm: writes the PLAN for exactly one frozen slate seat.
     # Read-only: the driver persists the receipt as plans/slot-N.json; the
@@ -407,5 +440,7 @@ ROLES: dict[str, RoleDefinition] = {
             "candidate_name": "str",
             "route_provenance": "?dict",
         },
+        wall_limit_seconds=600.0,
+        soft_rescue=True,
     ),
 }

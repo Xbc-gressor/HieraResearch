@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="experiment loop: seats of one generation implemented "
                           "at once on the session channel (template default 2; "
                           "1 = serial)")
+    run.add_argument("--rewrite-concurrency", type=int, metavar="R",
+                     help="round_v1: rewrite climbs of one optimization round "
+                          "run at once over different candidates (template "
+                          "default 2; 1 = serial; needs --round-rewrite-bouts "
+                          ">= R to matter)")
     run.add_argument(
         "--inner-tuner-policy",
         choices=[
@@ -237,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 "rewrite_top_k": args.round_rewrite_top_k,
             },
             session_concurrency=args.session_concurrency,
+            rewrite_concurrency=args.rewrite_concurrency,
             cli_path=args.cli_path,
         )
         print(json.dumps(status, indent=2, sort_keys=True))

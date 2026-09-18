@@ -329,8 +329,12 @@ def select_rewrite(
     run_dir: Path,
     *,
     now: float | None = None,
+    exclude: tuple[str, ...] | list[str] = (),
 ) -> Decision:
+    """``exclude``: candidates another rewrite channel is climbing right now
+    (concurrent climbs); they are ineligible for this selection."""
     run_dir = Path(run_dir)
+    exclude = {str(r) for r in exclude}
     config = load_config(run_dir)
     round_state = load_round_state(run_dir)
     quota = quota_remaining(round_state, now=now)
@@ -343,6 +347,8 @@ def select_rewrite(
         if candidate.crashed:
             continue
         reasons = []
+        if candidate.run_id in exclude:
+            reasons.append("in_flight")
         if candidate.has_unresolved_descendant:
             reasons.append("unresolved primary descendant")
         facts = rewrite_facts(run_dir, candidate.run_id)
@@ -492,11 +498,13 @@ def receipt(
     evidence_cursor: int,
     snapshot_id: str,
     decision_id: str,
+    exclude_run_ids: tuple[str, ...] | list[str] = (),
 ) -> dict:
     return {
         "schema_version": 1,
         "kind": "scheduler_decision",
         "decision_id": decision_id,
+        "exclude_run_ids": sorted(str(r) for r in exclude_run_ids),
         "state_snapshot_id": snapshot_id,
         "policy_version": POLICY_VERSION,
         "prior_id": None,

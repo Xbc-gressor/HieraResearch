@@ -255,6 +255,7 @@ class BoutSession:
         task: str,
         tag: str,
         first_extras: dict | None = None,
+        budget_run_dir=None,
     ):
         self.role = role
         self.runner = runner
@@ -262,6 +263,10 @@ class BoutSession:
         self.task = task
         self.tag = tag
         self.first_extras = dict(first_extras or {})
+        # The production run whose deadline bounds these sessions (the
+        # session directory itself is a per-candidate sub-directory with no
+        # framework_cfg.json). None = the runner derives it from run_dir.
+        self.budget_run_dir = None if budget_run_dir is None else Path(budget_run_dir)
         self._store = ReceiptStore(self.run_dir)
         self._last_invocation_id: int | None = None
         self.usage_log: list[dict] = []
@@ -311,6 +316,7 @@ class BoutSession:
             invocation_id=invocation_id,
             extra=message_extras,
             resume_session_id=resume,
+            budget_run_dir=self.budget_run_dir,
         )
         receipt = None
         try:
@@ -396,6 +402,7 @@ def make_bout_session_factory(
     run_dir,
     task: str,
     tag: str,
+    budget_run_dir=None,
 ) -> Callable[..., BoutSession]:
     """The factory cell wiring places into ``ctx.extras`` for LLM arms.
 
@@ -419,6 +426,7 @@ def make_bout_session_factory(
             task=task,
             tag=tag,
             first_extras=first_extras,
+            budget_run_dir=budget_run_dir,
         )
 
     return factory

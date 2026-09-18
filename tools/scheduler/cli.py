@@ -233,7 +233,8 @@ def cmd_round(args) -> int:
         if args.peek and args.kind == "tune":
             view = peek_tune_for_run(ledger)
         elif args.kind == "rewrite":
-            view = select_rewrite_for_run(ledger)
+            exclude = [r for r in (args.exclude or "").split(",") if r]
+            view = select_rewrite_for_run(ledger, exclude)
         else:
             view = decide_for_run(ledger)
         view.pop("state", None)
@@ -294,6 +295,9 @@ def build_parser() -> argparse.ArgumentParser:
     sel = rnd_sub.add_parser("select", help="choose the next rewrite/tune target")
     sel.add_argument("--kind", required=True, choices=("rewrite", "tune"))
     sel.add_argument("--peek", action="store_true")
+    sel.add_argument("--exclude", default="",
+                     help="comma-separated run_ids another rewrite channel is "
+                          "climbing; ineligible and part of the decision identity")
     ovh = rnd_sub.add_parser("overhead", help="record one bout's non-eval seconds")
     ovh.add_argument("--kind", required=True, choices=("rewrite", "tune"))
     ovh.add_argument("--seconds", required=True, type=float)

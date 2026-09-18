@@ -277,32 +277,38 @@ def peek_tune_for_run(ledger_path: Path) -> dict:
             "reference": (decision.evidence_mode or {}).get("reference")}
 
 
-def select_rewrite_for_run(ledger_path: Path) -> dict:
+def select_rewrite_for_run(ledger_path: Path,
+                           exclude: tuple[str, ...] | list[str] = ()) -> dict:
     """round_v1: choose (or reuse) this phase's rewrite target and commit it.
 
     Same commit discipline as `decide_for_run`: reconcile, build the exact
     state, reuse an open REWRITE decision for the identical state, otherwise
     decide and append. The driver closes the decision with `record` once the
-    bout has run.
+    bout has run. ``exclude`` names the candidates other concurrent channels
+    are climbing; it is part of the decision's identity (STOP rows too), so
+    channels with different exclude sets never share a decision.
     """
     ledger_path = Path(ledger_path)
     run_dir = ledger_path.parent
+    exclude = sorted(str(r) for r in exclude)
     store = SchedulerStore(run_dir)
     contract = contract_for(ledger_path)
     reconciled = reconcile_path(ledger_path, k_eval=contract.k_eval)
     state = load_state(ledger_path, contract=contract)
     snapshot_id = store.put_snapshot(state.snapshot())
     cursor = store.evidence.cursor()
-    existing = store.open_decision(snapshot_id, cursor)
-    if existing is not None and existing.get("selected_action") == round_policy.REWRITE:
+    existing = store.open_decision(snapshot_id, cursor, exclude)
+    if existing is not None and existing.get("selected_action") in (
+            round_policy.REWRITE, "STOP"):
         return _view(existing, state, reconciled, reused=True)
-    decision = round_policy.select_rewrite(state, run_dir)
+    decision = round_policy.select_rewrite(state, run_dir, exclude=exclude)
     receipt = round_policy.receipt(
         decision,
         state=state,
         evidence_cursor=cursor,
         snapshot_id=snapshot_id,
         decision_id=store.next_decision_id(),
+        exclude_run_ids=exclude,
     )
     store.append_decision(receipt)
     return _view(receipt, state, reconciled, reused=False)
@@ -327,6 +333,7 @@ def _view(
         "round_cycle": receipt.get("round_cycle"),
         "prior_id": receipt.get("prior_id"),
         "evidence_mode": receipt.get("evidence_mode", {}),
+        "exclude_run_ids": receipt.get("exclude_run_ids") or [],
         "coverage_spent": receipt.get("coverage_spent", 0),
         "reused_open_decision": reused,
         "bout_trials": state.contract.bout_trials,

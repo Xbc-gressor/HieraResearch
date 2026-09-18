@@ -768,15 +768,21 @@ def resolve_unevaluated(
             "unevaluated resolution requires an exhausted evaluation budget "
             "or a reached time budget"
         )
-    candidate_attempts = next(
-        (
-            row.get("evals")
-            for row in strict.get("per_candidate", [])
-            if row.get("run_id") == run_id
-        ),
-        0,
+    candidate_row = next(
+        (row for row in strict.get("per_candidate", [])
+         if row.get("run_id") == run_id),
+        {},
     )
-    if candidate_attempts != 0:
+    candidate_attempts = int(candidate_row.get("evals") or 0)
+    time_cutoffs = int(candidate_row.get("time_cutoff_evals") or 0)
+    # The one admitted exception to "zero attempts": every attempt the
+    # candidate got was killed by the time budget's remainder before it
+    # produced a result. That is the budget ending, not a candidate fact.
+    all_time_cutoff = (
+        time_exhausted and candidate_attempts > 0
+        and time_cutoffs == candidate_attempts
+    )
+    if candidate_attempts != 0 and not all_time_cutoff:
         raise ValueError(
             f"record {run_id} has {candidate_attempts} objective attempt(s); "
             "it cannot be marked unevaluated"
@@ -785,19 +791,33 @@ def resolve_unevaluated(
         raise ValueError(
             f"record {run_id} already carries a score and cannot be marked unevaluated"
         )
+    if all_time_cutoff:
+        report_path = ledger_path.parent / "candidates" / run_id / "tune_report.json"
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            report = {}
+        warm = ((report or {}).get("phase_a") or {}).get("best_warm_score")
+        if isinstance(warm, (int, float)) and not isinstance(warm, bool) \
+                and math.isfinite(float(warm)):
+            raise ValueError(
+                f"record {run_id} has a finite best_warm_score in its tune "
+                "report; settle it with set-tuning/record-run instead"
+            )
 
     attempt_log = Path(strict["attempt_log"])
-    kind = (
-        "budget_exhausted_before_candidate_attempt"
-        if evals_exhausted
-        else "time_budget_reached_before_candidate_attempt"
-    )
+    if evals_exhausted and not all_time_cutoff:
+        kind = "budget_exhausted_before_candidate_attempt"
+    elif all_time_cutoff:
+        kind = "time_budget_reached_before_finite_result"
+    else:
+        kind = "time_budget_reached_before_candidate_attempt"
     receipt = {
         "schema_version": 1,
         "kind": kind,
         "budget": budget if evals_exhausted else None,
         "evaluations_done": strict["evaluations_done"],
-        "candidate_objective_attempts": 0,
+        "candidate_objective_attempts": candidate_attempts,
         "attempt_log": attempt_log.name,
     }
     record["metric"] = data.get("metric")
@@ -919,7 +939,14 @@ def cmd_set_phase(args) -> int:
             refresh = _experience_refresh_status(data)
         except ValueError as exc:
             raise SystemExit(f"invalid experience refresh state: {exc}") from None
-        if refresh["semantic_admission_blocked"]:
+        # Past deadline − final_reserve no session may start, so the final
+        # experience refresh cannot run: complete anyway. The delta stays
+        # visible through experience_refresh_status; pending records still
+        # have to be settled first.
+        time_view = budget_status(ledger_path.parent).get("time") or {}
+        at_deadline = time_view.get("time_reached") is True
+        if refresh["semantic_admission_blocked"] and not (
+                at_deadline and refresh["all_records_terminal"]):
             detail = (
                 "pending records must be resolved before that refresh can run"
                 if not refresh["all_records_terminal"]
@@ -948,7 +975,6 @@ def cmd_set_phase(args) -> int:
                 "cannot mark completed before a configured evaluation budget is reached "
                 f"(attempted={attempted}, budget={budget})"
             )
-        time_view = budget_status(ledger_path.parent).get("time", {})
         time_budget_configured = (
             budget is None
             and isinstance(time_view, dict)

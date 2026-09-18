@@ -460,22 +460,39 @@ def record_evaluation_completion(
     *,
     attempt_id: str | None,
     duration_seconds: float,
+    time_cutoff: bool = False,
 ) -> None:
-    """Append the wall-clock duration of one admitted attempt (any outcome)."""
+    """Append the wall-clock duration of one admitted attempt (any outcome).
+
+    ``time_cutoff`` marks an attempt the run's time budget killed before it
+    produced a result (the limit was the budget's remainder, not the task's
+    per_runtime_limit); deadline settlement tells such candidates apart from
+    genuinely crashed ones.
+    """
     run_dir = find_run_dir(ref_path)
     if run_dir is None or not isinstance(attempt_id, str):
         return
+    row = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": COMPLETION_KIND,
+        "attempt_id": attempt_id,
+        "run_id": Path(ref_path).resolve().parent.name,
+        "duration_seconds": round(float(duration_seconds), 3),
+    }
+    if time_cutoff:
+        row["time_cutoff"] = True
     with _locked_log(run_dir) as handle:
-        _append_row(
-            handle,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "kind": COMPLETION_KIND,
-                "attempt_id": attempt_id,
-                "run_id": Path(ref_path).resolve().parent.name,
-                "duration_seconds": round(float(duration_seconds), 3),
-            },
-        )
+        _append_row(handle, row)
+
+
+def _time_cutoffs(rows: list[dict]) -> dict[str, int]:
+    """Per candidate, admitted attempts the time budget cut off."""
+    counts: Counter[str] = Counter()
+    for row in rows:
+        if row.get("kind") == COMPLETION_KIND and row.get("time_cutoff") is True \
+                and isinstance(row.get("run_id"), str):
+            counts[row["run_id"]] += 1
+    return dict(counts)
 
 
 def budget_status(run_dir: Path, *, create: bool = False) -> dict:
@@ -494,6 +511,7 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
     clock = time_budget(run_dir)
     quota = phase_quota_remaining(run_dir)
     overall_seconds, seconds_by_candidate = _durations(rows)
+    cutoffs = _time_cutoffs(rows)
     evals_reached = None if budget is None else total >= budget
     if clock["time_reached"] is None:
         reached = evals_reached
@@ -515,6 +533,7 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
                 "run_id": run_id,
                 "evals": value,
                 "mean_seconds": _mean(seconds_by_candidate.get(run_id, [])),
+                "time_cutoff_evals": cutoffs.get(run_id, 0),
             }
             for run_id, value in sorted(per_candidate.items())
         ],

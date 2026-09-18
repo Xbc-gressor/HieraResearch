@@ -12,6 +12,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -627,6 +628,188 @@ class RewriteClimbTests(unittest.TestCase):
                          if e.get("kind") == "rewrite_climb")
             self.assertEqual((climb["steps"], climb["stop"]),
                              (0, "round_quota"))
+
+
+class ConcurrentClimbTests(unittest.TestCase):
+    """Two rewrite channels: the exclude set is part of the decision identity
+    and the channels never climb the same candidate."""
+
+    def _cli(self, ledger: Path, *args) -> dict:
+        out = io.StringIO()
+        argv = sys.argv
+        sys.argv = ["cli.py", "round", "--ledger", str(ledger), *args]
+        try:
+            with contextlib.redirect_stdout(out):
+                code = scheduler_cli.main()
+        finally:
+            sys.argv = argv
+        self.assertEqual(code, 0)
+        return json.loads(out.getvalue())
+
+    def test_exclude_set_is_part_of_the_decision_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _run_dir(
+                Path(tmp), deadline=time.time() + 86400,
+                round_cfg={"rewrite_top_k": 3, "round_seconds": 3600,
+                           "session_overhead_seconds": 10})
+            ledger = run_dir / "ledger.json"
+            ledger.write_text(json.dumps({"records": [
+                _record("000", 0.9), _record("001", 0.8)]}))
+            _candidate(run_dir, "000", 0.9)
+            _candidate(run_dir, "001", 0.8)
+            self._cli(ledger, "begin")
+
+            first = self._cli(ledger, "select", "--kind", "rewrite")
+            self.assertEqual((first["action"], first["run_id"]), ("REWRITE", "001"))
+            # channel B, with A's candidate in flight: a different decision
+            second = self._cli(ledger, "select", "--kind", "rewrite",
+                               "--exclude", "001")
+            self.assertEqual((second["action"], second["run_id"]), ("REWRITE", "000"))
+            self.assertNotEqual(second["decision_id"], first["decision_id"])
+            self.assertEqual(second["exclude_run_ids"], ["001"])
+            self.assertFalse(second["reused_open_decision"])
+            row = next(r for r in second["evidence_mode"]["ranked"]
+                       if r["run_id"] == "001")
+            self.assertIn("in_flight", row["ineligible"])
+            # both in flight: STOP, reused only for the identical exclude set
+            stop = self._cli(ledger, "select", "--kind", "rewrite",
+                             "--exclude", "000,001")
+            self.assertEqual(stop["action"], "STOP")
+            again = self._cli(ledger, "select", "--kind", "rewrite",
+                              "--exclude", "001,000")
+            self.assertEqual(again["decision_id"], stop["decision_id"])
+            self.assertTrue(again["reused_open_decision"])
+            # A's own re-query (nothing excluded) gets A's open decision back,
+            # never B's STOP
+            reissued = self._cli(ledger, "select", "--kind", "rewrite")
+            self.assertEqual(reissued["decision_id"], first["decision_id"])
+            self.assertTrue(reissued["reused_open_decision"])
+
+    def test_two_channels_climb_different_candidates(self) -> None:
+        import threading
+        from driver.events import EventsLog
+        from driver.loops import rounds
+        from driver.receipts import ReceiptStore
+
+        class TwoChannelCmd(ClimbCmd):
+            lock = threading.Lock()
+
+            def __call__(self, args, repo_root, check=True, capture=True, **kw):
+                import subprocess
+                args = [str(a) for a in args]
+                joined = " ".join(args)
+                if "scheduler/cli.py" in joined and "select" in joined \
+                        and "rewrite" in joined:
+                    self.selects += 1
+                    self.calls.append(args)
+                    exclude = (args[args.index("--exclude") + 1].split(",")
+                               if "--exclude" in args else [])
+                    free = [r for r in ("000", "001") if r not in exclude]
+                    if not free:
+                        view = {"action": "STOP", "run_id": None,
+                                "reason": "all in flight", "decision_id": "dec-s"}
+                    else:
+                        view = {"action": "REWRITE", "run_id": free[0],
+                                "reason": "scripted",
+                                "decision_id": f"dec-{free[0]}",
+                                "reference": 1.0,
+                                "evidence_mode": {"overhead_seconds": 10.0}}
+                    return subprocess.CompletedProcess(args, 0, json.dumps(view), "")
+                with self.lock:  # the in-process bout CLI swaps sys.argv/stdout
+                    return super().__call__(args, repo_root, check, capture, **kw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "fake-task" / "t1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "framework_cfg.json").write_text(json.dumps({
+                "pipeline": {"rewrite_concurrency": 2}}))
+            (run_dir / "ledger.json").write_text(json.dumps({
+                "records": [_record("000", 1.0), _record("001", 1.0)]}))
+            for run_id in ("000", "001"):
+                candidate = run_dir / "candidates" / run_id
+                candidate.mkdir(parents=True)
+                (candidate / "train.py").write_text(ClimbCmd.V[0])
+                (candidate / "tune_report.json").write_text(json.dumps({
+                    "phase_a": {"best_warm_score": 1.0}, "phase_c": {"stages": []}}))
+            cmd = TwoChannelCmd(Path(tmp), run_dir, eval_script=[0.9] * 4)
+
+            def edit(ctx):
+                (Path(ctx.extra["candidate_dir"]) / "train.py").write_text(
+                    ClimbCmd.V[1])
+
+            runner = FakeSessionRunner([
+                {"receipt": {"edited": True, "summary": "a", "basis": "h"},
+                 "side_effects": edit},
+                {"receipt": {"edited": True, "summary": "b", "basis": "h"},
+                 "side_effects": edit},
+            ])
+            config = {**round_policy.DEFAULTS, "rewrite_bouts": 2,
+                      "rewrite_max_bouts": 1, "tune_bouts": 0,
+                      "noise_margin": 0.0}
+            # EventsLog's stdout line would land in the OTHER channel's
+            # in-process bout-CLI capture (redirect_stdout is process-wide);
+            # production runs the CLI as a subprocess with its own pipe.
+            with mock.patch("driver.events.print", create=True):
+                progressed = rounds.optimization_phase(
+                    runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir,
+                    1, {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
+                    EventsLog(run_dir),
+                    tune=lambda no, selection: {"tuned": False},
+                    config=config)
+            self.assertTrue(progressed)
+            events = [json.loads(line) for line in
+                      (run_dir / "driver_events.jsonl").read_text().splitlines()
+                      if line.strip()]
+            climbs = [e for e in events if e.get("kind") == "rewrite_climb"]
+            self.assertEqual(sorted(c["run_id"] for c in climbs), ["000", "001"])
+            self.assertEqual([c["stop"] for c in climbs], ["bout_cap", "bout_cap"])
+            selects = [e for e in events if e.get("kind") == "round_select"]
+            self.assertEqual(sorted(len(e["exclude_run_ids"]) for e in selects),
+                             [0, 1])
+            for run_id in ("000", "001"):
+                bouts = rewrite_bout.load_bouts(run_dir / "candidates" / run_id)
+                self.assertEqual([b["outcome"] for b in bouts], ["kept"])
+            self.assertEqual(
+                next(e for e in events if e.get("kind") == "rewrite_channels")
+                ["concurrency"], 2)
+
+    def test_admission_counts_the_other_channels_decaying_commitment(self) -> None:
+        import threading
+        from driver.loops import rounds
+
+        class QuotaCmd:
+            def __call__(self, args, repo_root, check=True, **kw):
+                import subprocess
+                return subprocess.CompletedProcess(
+                    [str(a) for a in args], 0, json.dumps({
+                        "reached": False, "phase_quota_remaining_seconds": 90.0,
+                        "per_candidate": [{"run_id": "000", "evals": 2,
+                                           "mean_seconds": 20.0}]}), "")
+
+        # expected = 2 × 20 + 10 = 50 against a 90 s quota
+        coord = rounds._ClimbCoordinator(2)
+        coord.commitments[1] = (50.0, time.monotonic() - 20.0)  # 30 s left
+        self.assertEqual(rounds._admit_step(
+            Path("."), "000", Path("."), QuotaCmd(), 10.0, 0.0, coord, 0), "ok")
+        self.assertEqual(coord.commitments[0][0], 50.0)
+        coord.commitments.pop(0)
+
+        coord.commitments[1] = (50.0, time.monotonic())  # squeezes 0 out
+        admitted = []
+
+        def channel0():
+            admitted.append(rounds._admit_step(
+                Path("."), "000", Path("."), QuotaCmd(), 10.0, 0.0, coord, 0))
+
+        thread = threading.Thread(target=channel0)
+        thread.start()
+        time.sleep(0.2)
+        self.assertEqual(admitted, [])  # waiting, not ending the climb
+        with coord.cond:
+            coord.commitments.pop(1)  # the other bout closes
+            coord.cond.notify_all()
+        thread.join(timeout=5)
+        self.assertEqual(admitted, ["ok"])
 
 
 class SelectCandidateDispatchTests(unittest.TestCase):

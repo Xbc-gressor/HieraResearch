@@ -661,6 +661,7 @@ def main() -> int:
             run_dir=run_dir,
             task=_task_name(args.candidate_path) or "unknown",
             tag=f"{args.candidate_path.parent.name}--{METHOD}--bout{bout_index}",
+            budget_run_dir=find_run_dir(args.candidate_path),
         )
 
     if _TEST_RANK_FN is not None:

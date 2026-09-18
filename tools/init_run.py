@@ -153,6 +153,7 @@ def initialize_run(
     final_reserve_seconds: float | None = None,
     round_options: dict | None = None,
     session_concurrency: int | None = None,
+    rewrite_concurrency: int | None = None,
 ) -> Path:
     repo_root = Path(repo_root).resolve()
     round_options = {
@@ -687,6 +688,17 @@ def initialize_run(
         config["pipeline"] = {**section, "session_concurrency": session_concurrency}
         updates.append(f"pipeline.session_concurrency={session_concurrency}")
 
+    if rewrite_concurrency is not None:
+        if isinstance(rewrite_concurrency, bool) or rewrite_concurrency < 1:
+            raise ValueError("--rewrite-concurrency must be a positive integer")
+        section = config.get("pipeline", {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{target}: pipeline must be an object")
+        # Mutable on resume for the same reason: it only changes how many
+        # rewrite climbs overlap, never what is evaluated or scored.
+        config["pipeline"] = {**section, "rewrite_concurrency": rewrite_concurrency}
+        updates.append(f"pipeline.rewrite_concurrency={rewrite_concurrency}")
+
     if per_runtime_limit is not None:
         normalized_limit: int | float = per_runtime_limit
         if isinstance(normalized_limit, float) and normalized_limit.is_integer():
@@ -829,6 +841,10 @@ def main() -> int:
     parser.add_argument("--session-concurrency", type=int, metavar="S",
                         help="seats of one generation implemented at once on "
                              "the driver's session channel (1 = serial)")
+    parser.add_argument("--rewrite-concurrency", type=int, metavar="R",
+                        help="round_v1: rewrite climbs of one optimization "
+                             "round run at once over different candidates "
+                             "(1 = serial)")
     args = parser.parse_args()
     try:
         initialize_run(
@@ -857,6 +873,7 @@ def main() -> int:
                 "rewrite_top_k": args.round_rewrite_top_k,
             },
             session_concurrency=args.session_concurrency,
+            rewrite_concurrency=args.rewrite_concurrency,
         )
     except ValueError as exc:
         parser.error(str(exc))

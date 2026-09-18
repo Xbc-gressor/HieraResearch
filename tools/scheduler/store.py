@@ -121,7 +121,8 @@ class SchedulerStore:
             and row.get("selected_action") != "STOP"
         ]
 
-    def open_decision(self, snapshot_id: str, evidence_cursor: int) -> dict | None:
+    def open_decision(self, snapshot_id: str, evidence_cursor: int,
+                      exclude_run_ids: list[str] | tuple[str, ...] = ()) -> dict | None:
         """An already-issued decision for this exact state, if unexecuted.
 
         A decision is a commitment to spend budget, not a query result. The
@@ -132,11 +133,17 @@ class SchedulerStore:
         the two inputs the policy is a pure function of. Once an outcome is
         bound, the decision is closed and an identical state (a bout that
         consumed nothing and changed nothing) is genuinely a new decision.
+        ``exclude_run_ids`` (concurrent rewrite channels: the candidates
+        another channel is climbing) is a third identity input: the policy
+        is a function of it too, so a STOP issued under exclude={X} must
+        not stand in for a later query with nothing excluded.
         """
+        exclude = sorted(str(r) for r in exclude_run_ids)
         for row in reversed(self.unbound_decisions()):
             if (
                 row.get("state_snapshot_id") == snapshot_id
                 and row.get("evidence_cursor") == evidence_cursor
+                and sorted(row.get("exclude_run_ids") or []) == exclude
             ):
                 return row
         # STOP spends nothing, so it never gets an outcome row and never
@@ -150,6 +157,7 @@ class SchedulerStore:
                 and row.get("selected_action") == "STOP"
                 and row.get("state_snapshot_id") == snapshot_id
                 and row.get("evidence_cursor") == evidence_cursor
+                and sorted(row.get("exclude_run_ids") or []) == exclude
             ):
                 return row
         return None

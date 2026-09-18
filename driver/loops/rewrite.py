@@ -198,12 +198,25 @@ def _confirm(candidate: Path, bout: int, payload: dict, repo_root: Path,
     return json.loads(proc.stdout)
 
 
+def _lease_kwargs(wait_timeout) -> dict:
+    return {} if wait_timeout is None else {"wait_timeout": wait_timeout}
+
+
+def _note_wait(waits, lease) -> None:
+    if waits is not None:
+        waits.append(float((lease or {}).get("lease_wait_seconds") or 0.0))
+
+
 def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
-               task_toml) -> str | None:
-    """The task's no-score gate; returns an error tail on failure."""
+               task_toml, *, waits: list | None = None,
+               wait_timeout: float | None = None) -> str | None:
+    """The task's no-score gate; returns an error tail on failure.
+    ``waits`` collects the lease queueing seconds (not the candidate's cost)."""
     owner = {"task": task, "run_dir": str(candidate),
              "kind": "candidate_preflight"}
-    with task_resource_lease(task_toml or {}, owner=owner) as lease:
+    with task_resource_lease(task_toml or {}, owner=owner,
+                             **_lease_kwargs(wait_timeout)) as lease:
+        _note_wait(waits, lease)
         proc = cmd(["uv", "--project", common.task_project(task, task_toml), "run", "python",
                     repo_root / "tools" / "preflight_candidate.py",
                     "--candidate-path", candidate / "train.py"],
@@ -216,11 +229,14 @@ def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
 
 
 def _evaluate(task: str, candidate: Path, repo_root: Path, cmd,
-              task_toml) -> tuple[int, dict]:
+              task_toml, *, waits: list | None = None,
+              wait_timeout: float | None = None) -> tuple[int, dict]:
     """One rewrite_eval call: (returncode, payload). Exit 4 = budget out;
     stage "params" = BASE_PARAMS unreadable (no budget spent)."""
     owner = {"task": task, "run_dir": str(candidate), "kind": "rewrite_eval"}
-    with task_resource_lease(task_toml or {}, owner=owner) as lease:
+    with task_resource_lease(task_toml or {}, owner=owner,
+                             **_lease_kwargs(wait_timeout)) as lease:
+        _note_wait(waits, lease)
         proc = cmd(["python", "tools/rewrite_eval.py", "--candidate",
                     candidate], repo_root, check=False, env=_leased_env(lease))
     try:
@@ -319,21 +335,34 @@ def _editor_extra(candidate: Path, current_best: float, metric: str,
 
 def _result(status: str, **fields) -> dict:
     return {"status": status, "outcome": None, "score": None,
-            "reference": None, "attempts": 0, **fields}
+            "reference": None, "attempts": 0, "lease_wait_seconds": 0.0,
+            **fields}
 
 
 def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
               noise_margin, context, task_toml, repo_root, cmd,
               events, *, reference: float | None = None,
-              confirm: bool = False, run_best: float | None = None) -> dict:
+              confirm: bool = False, run_best: float | None = None,
+              lease_wait_timeout: float | None = None) -> dict:
     """Run one bout.
 
     Returns {"status": "done" | "budget" | "no_reference", "outcome",
-    "score", "reference", "attempts"}. ``reference`` overrides the
-    journal-derived incumbent (the experiment loop passes the ledger score);
-    ``confirm`` re-evaluates a kept edit once and folds that score into the
-    reference so one lucky sample cannot anchor later adjudications.
+    "score", "reference", "attempts", "lease_wait_seconds"}. ``reference``
+    overrides the journal-derived incumbent (the experiment loop passes the
+    ledger score); ``confirm`` re-evaluates a kept edit once and folds that
+    score into the reference so one lucky sample cannot anchor later
+    adjudications. ``lease_wait_seconds`` is the time this bout queued for
+    the device (another channel's GPU time, never this candidate's cost);
+    ``lease_wait_timeout`` bounds that queueing.
     """
+    waits: list[float] = []
+    lease = {"waits": waits, "wait_timeout": lease_wait_timeout}
+
+    def _result(status: str, **fields) -> dict:  # noqa: F811 - bout-scoped
+        return {"status": status, "outcome": None, "score": None,
+                "reference": None, "attempts": 0,
+                "lease_wait_seconds": sum(waits), **fields}
+
     bout = len(bouts) + 1
     _render_context(candidate, context, repo_root, cmd)
     snapshot = _snapshot(candidate, bout, repo_root, cmd)
@@ -395,12 +424,12 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
     # (both free). One repair resume with the error tail; a second failure
     # reverts and journals reverted_crash without spending budget.
     error_tail = _leased(
-        lambda: _preflight(task, candidate, repo_root, cmd, task_toml),
+        lambda: _preflight(task, candidate, repo_root, cmd, task_toml, **lease),
         candidate, snapshot, repo_root, cmd)
     payload = None
     if error_tail is None:
         returncode, payload = _leased(
-            lambda: _evaluate(task, candidate, repo_root, cmd, task_toml),
+            lambda: _evaluate(task, candidate, repo_root, cmd, task_toml, **lease),
             candidate, snapshot, repo_root, cmd)
         if returncode == 4:
             # Budget exhausted: the unverified edit must not survive.
@@ -435,11 +464,13 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
                 return _result("done", outcome="reverted_params",
                                reference=best)
             error_tail = _leased(
-                lambda: _preflight(task, candidate, repo_root, cmd, task_toml),
+                lambda: _preflight(task, candidate, repo_root, cmd, task_toml,
+                                   **lease),
                 candidate, snapshot, repo_root, cmd)
             if error_tail is None:
                 returncode, payload = _leased(
-                    lambda: _evaluate(task, candidate, repo_root, cmd, task_toml),
+                    lambda: _evaluate(task, candidate, repo_root, cmd,
+                                      task_toml, **lease),
                     candidate, snapshot, repo_root, cmd)
                 if returncode == 4:
                     _revert(candidate, snapshot, repo_root, cmd)
@@ -467,7 +498,7 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
         # Confirmation re-eval: the keep stands; only the reference moves.
         try:
             returncode, confirmation = _evaluate(task, candidate, repo_root,
-                                                 cmd, task_toml)
+                                                 cmd, task_toml, **lease)
         except ResourceUnavailable as exc:
             # The keep is already journaled: skip only the reference move.
             events.emit("resource_unavailable", candidate=candidate.name,

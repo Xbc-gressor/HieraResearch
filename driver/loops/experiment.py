@@ -36,6 +36,7 @@ the complete lifecycle.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import threading
@@ -63,6 +64,7 @@ from . import rounds
 from .common import RunBlocked
 from tools.evaluation_budget import budget_status as objective_budget_status
 from tools.evaluation_budget import phase_c_attempts
+from tools.evaluation_budget import time_budget as run_time_budget
 from tools.objective_brief import (
     build_brief,
     compact_line,
@@ -321,8 +323,21 @@ def _complete_run(run_dir, repo_root, cmd, events, terminal_leftover=False) -> N
                   f"set-phase completed refused: {detail}")
 
 
+def _time_reached(run_dir) -> bool:
+    """Past deadline − final_reserve: no session may start (D1)."""
+    return bool(run_time_budget(run_dir).get("time_reached"))
+
+
 def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
-    """Refresh bounded experience, with one artifact-aware retry."""
+    """Refresh bounded experience, with one artifact-aware retry.
+
+    Skipped once the run's cutoff has passed: the final refresh is the one
+    session that used to run past the deadline (two deadline_expired
+    submissions), and completion no longer depends on it (set-phase
+    tolerates the unprocessed terminal delta at the cutoff)."""
+    if _time_reached(run_dir):
+        events.emit("refresh_skipped", reason="time_reached")
+        return
     try:
         _invoke(runner, store, "experience-extractor", task, tag, run_dir)
         return
@@ -1084,6 +1099,67 @@ def _record_crash(run_dir, run_id, repo_root, cmd) -> None:
          "--status", "crash"], repo_root)
 
 
+def _finite_warm_score(candidate_dir: Path) -> float | None:
+    try:
+        report = json.loads((candidate_dir / "tune_report.json")
+                            .read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = ((report or {}).get("phase_a") or {}).get("best_warm_score")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(float(value)) else None
+
+
+def _settle_at_deadline(run_dir, run_id, repo_root, cmd, events) -> None:
+    """Deterministic settlement of a pending candidate once the run's cutoff
+    has passed — ledger subcommands only, no session.
+
+    Three-way, by on-disk evidence: no objective attempt → unevaluated;
+    a finite warm score in the tune report → set-tuning + record-run (the
+    extractor's own step 3c replayed; auto status keep/discard); attempts
+    but no finite score → unevaluated when every attempt was cut off by the
+    time budget, else crash.
+    """
+    if record_status(run_dir, run_id) in ("keep", "discard", "crash",
+                                         "unevaluated"):
+        return
+    candidate_dir = run_dir / "candidates" / run_id
+    view = budget_status(run_dir, repo_root, cmd)
+    row = next((r for r in view.get("per_candidate", [])
+                if r.get("run_id") == run_id), {})
+    attempts = int(row.get("evals") or 0)
+    warm = _finite_warm_score(candidate_dir)
+    ledger = run_dir / "ledger.json"
+    if attempts == 0 or (warm is None and int(
+            row.get("time_cutoff_evals") or 0) == attempts):
+        if _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
+            events.emit("candidate_settled_at_deadline", run_id=run_id,
+                        outcome="unevaluated", attempts=attempts)
+            return
+        # Refused (e.g. the record already carries a score): a record left
+        # pending would block set-phase completed at the cutoff, so fall
+        # through to the crash settlement like a refused set-tuning.
+    if warm is not None:
+        try:
+            cmd(["python", "tools/ledger.py", "set-tuning", "--ledger", ledger,
+                 "--run-id", run_id,
+                 "--from-report", candidate_dir / "tune_report.json"], repo_root)
+            cmd(["python", "tools/ledger.py", "record-run", "--ledger", ledger,
+                 "--run-id", run_id, "--final-best-score", str(warm)], repo_root)
+        except subprocess.CalledProcessError as exc:
+            events.emit("candidate_settlement_failed", run_id=run_id,
+                        detail=(exc.stderr or str(exc))[-2000:])
+        else:
+            events.emit("candidate_settled_at_deadline", run_id=run_id,
+                        outcome=record_status(run_dir, run_id),
+                        best_warm_score=warm, attempts=attempts)
+            return
+    _record_crash(run_dir, run_id, repo_root, cmd)
+    events.emit("candidate_settled_at_deadline", run_id=run_id,
+                outcome="crash", attempts=attempts)
+
+
 def _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd) -> None:
     """new_candidate.py refuses a non-empty candidate dir; on resume the dir
     may already be materialized, so only run the helper when it is not."""
@@ -1317,6 +1393,11 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
         return
 
     # Branch on durable evidence (spec Error handling):
+    # 0. past the run's cutoff no session (diagnosis, repair) may start:
+    #    settle from the on-disk report instead of diagnosing.
+    if _time_reached(run_dir):
+        _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
+        return
     # 1. stop condition reached + zero attempts → resolve-unevaluated (call+catch)
     if budget_status(run_dir, repo_root, cmd).get("reached") and \
             _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
@@ -1584,10 +1665,13 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
                     semantic_policy, scheduler_policy, inner_policy,
                     k_warm, k_eval, proposer_arm=None, time_budget=None,
                     deadline=None, final_reserve=None,
-                    round_options=None, session_concurrency=None) -> list[str]:
+                    round_options=None, session_concurrency=None,
+                    rewrite_concurrency=None) -> list[str]:
     extra = []
     if session_concurrency is not None:
         extra += ["--session-concurrency", str(session_concurrency)]
+    if rewrite_concurrency is not None:
+        extra += ["--rewrite-concurrency", str(rewrite_concurrency)]
     if time_budget is not None:
         extra += ["--time-budget", str(time_budget)]
     if deadline is not None:
@@ -1625,7 +1709,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
            inner_policy, k_warm, k_eval, model, cli_path,
            proposer_arm=None, time_budget=None, deadline=None,
            final_reserve=None, round_options=None,
-           session_concurrency=None) -> None:
+           session_concurrency=None, rewrite_concurrency=None) -> None:
     extra = _init_run_extra(
         dimension_strategy,
         llm_intelligence_score,
@@ -1640,6 +1724,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         final_reserve=final_reserve,
         round_options=round_options,
         session_concurrency=session_concurrency,
+        rewrite_concurrency=rewrite_concurrency,
     )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
@@ -2107,7 +2192,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    scheduler_policy=None, inner_policy=None, k_warm=None,
                    k_eval=None, proposer_arm=None, time_budget=None,
                    deadline=None, final_reserve=None, round_options=None,
-                   session_concurrency=None, cli_path=None,
+                   session_concurrency=None, rewrite_concurrency=None,
+                   cli_path=None,
                    cmd=common.run_cmd, job_runner=execute_driver_job) -> dict:
     """Set up or resume a run, then advance it until blocked or complete."""
     run_dir = repo_root / "runs" / task / tag
@@ -2126,7 +2212,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    proposer_arm=proposer_arm, time_budget=time_budget,
                    deadline=deadline, final_reserve=final_reserve,
                    round_options=round_options,
-                   session_concurrency=session_concurrency)
+                   session_concurrency=session_concurrency,
+                   rewrite_concurrency=rewrite_concurrency)
         else:
             # Explicit CLI overrides must never disappear merely because the
             # run directory already exists. init_run applies mutable limits,
@@ -2158,6 +2245,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 final_reserve=final_reserve,
                 round_options=round_options,
                 session_concurrency=session_concurrency,
+                rewrite_concurrency=rewrite_concurrency,
             )
             if max_evaluations is not None or timeout is not None or extra:
                 common.init_run(
@@ -2198,8 +2286,13 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 # may have become terminal on the final available call.
                 unresolved = (_brief(run_dir, repo_root, cmd) or {}).get(
                     "pending_run_ids", [])
+                at_deadline = _time_reached(run_dir)
                 for pending_id in unresolved:
-                    _resolve_unevaluated(run_dir, pending_id, repo_root, cmd)
+                    if at_deadline:
+                        _settle_at_deadline(run_dir, pending_id, repo_root,
+                                            cmd, events)
+                    else:
+                        _resolve_unevaluated(run_dir, pending_id, repo_root, cmd)
                 brief = _brief(run_dir, repo_root, cmd)
                 if brief.get("experience_refresh_required"):
                     _refresh(runner, store, task, tag, run_dir, repo_root,

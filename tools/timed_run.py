@@ -18,11 +18,11 @@ session/process group; on timeout the whole group is killed and this exits 124
 (the GNU `timeout` convention). Otherwise it forwards the command's exit code.
 """
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
 
+from process_group import arm_sigterm_forwarding, register_child, terminate_group
 from run_cfg import RunConfigError, find_framework_cfg, read_framework_cfg
 
 
@@ -70,22 +70,16 @@ def main() -> int:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
     proc = subprocess.Popen(cmd, **kwargs)
+    # On SIGTERM this wrapper kills the command's group and waits for it
+    # before exiting (see process_group): the command is never orphaned.
+    register_child(proc)
+    arm_sigterm_forwarding()
     if limit is None:
         return proc.wait()                       # no limit configured
     try:
         return proc.wait(timeout=limit)
     except subprocess.TimeoutExpired:
-        try:
-            if posix:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            else:
-                proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        terminate_group(proc, grace=0)           # hard kill at the limit
         return 124                               # timed out
 
 
