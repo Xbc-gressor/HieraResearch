@@ -470,7 +470,8 @@ Backends are selected explicitly per round:
 - `frozen`: a pinned local JSON corpus (`--frozen-corpus`) for reproducible,
   network-disabled work; the adapter permits no live backend alongside it;
 - `deepxiv`: open-world scholarly retrieval;
-- `jina-search`: live web search (requires `JINA_API_KEY`). Web visits read
+- `jina-search`: live web search (requires `JINA_API_KEY`; comma-separated
+  `JINA_API_KEY_BACKUPS` rotate in on auth/quota rejections). Web visits read
   through the jina reader with a direct fallback (`--visit-backend
   auto|jina-read|direct`).
 

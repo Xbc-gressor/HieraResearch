@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import time
 
 import anyio
@@ -48,6 +49,44 @@ SOFT_RESCUE_MESSAGE = ("Wall-clock limit reached. Submit your current best "
 # the same context (resume id intact) instead of spending a corrective.
 TRANSPORT_BACKOFF_SECONDS = (5.0, 15.0, 30.0)
 TRANSPORT_RETRIES = 3
+
+# Relay key rotation: ANTHROPIC_AUTH_TOKEN is the active key and
+# ANTHROPIC_AUTH_TOKEN_BACKUPS a comma-separated standby list. These
+# api_error_status values are key/quota-class failures where swapping the key
+# can succeed while backoff alone cannot (e.g. a relay's 402/503 pool
+# exhaustion); rotation skips the dead key for the rest of the process.
+AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN"
+AUTH_TOKEN_BACKUPS_ENV = "ANTHROPIC_AUTH_TOKEN_BACKUPS"
+KEY_ROTATION_STATUSES = frozenset({401, 402, 403, 503})
+
+
+class AuthTokenPool:
+    """Process-wide relay key state: the active key plus backups. Rotation
+    never logs token material; ``index`` identifies the key in events."""
+
+    def __init__(self) -> None:
+        self.index = 0
+
+    def tokens(self) -> list[str]:
+        primary = os.environ.get(AUTH_TOKEN_ENV, "").strip()
+        backups = (t.strip()
+                   for t in os.environ.get(AUTH_TOKEN_BACKUPS_ENV, "").split(","))
+        return list(dict.fromkeys(t for t in (primary, *backups) if t))
+
+    def active(self) -> str | None:
+        tokens = self.tokens()
+        if not tokens:
+            return None
+        return tokens[min(self.index, len(tokens) - 1)]
+
+    def rotate(self) -> bool:
+        if self.index + 1 < len(self.tokens()):
+            self.index += 1
+            return True
+        return False
+
+
+AUTH_TOKEN_POOL = AuthTokenPool()
 
 # Consecutive identical (tool, input) calls before the repetition breaker
 # trips. Observed incident: a model retried one hallucinated Edit verbatim
@@ -235,11 +274,13 @@ class SDKSessionRunner:
         events: EventsLog,
         cli_path: str | None = None,
         client_factory: Callable | None = None,
+        token_pool: AuthTokenPool | None = None,
     ):
         self.model = model
         self.events = events
         self.cli_path = cli_path
         self._client_factory = client_factory
+        self._token_pool = token_pool or AUTH_TOKEN_POOL
 
     # -- public -------------------------------------------------------------
 
@@ -250,6 +291,16 @@ class SDKSessionRunner:
             try:
                 return anyio.run(self._run_async, role, ctx)
             except _TransportFailure as exc:
+                if (exc.api_error_status in KEY_ROTATION_STATUSES
+                        and self._token_pool.rotate()):
+                    # Key/quota-class failure: swap to a backup key and retry
+                    # at once — no backoff, and the transport retries stay
+                    # unspent for genuine transients on the new key.
+                    self.events.emit("api_key_fallback", role=role.name,
+                                     invocation_id=ctx.invocation_id,
+                                     api_error_status=exc.api_error_status,
+                                     key_index=self._token_pool.index)
+                    continue
                 if attempt >= TRANSPORT_RETRIES:
                     raise InvocationFailed(role.name, exc.problems,
                                            invocation_id=ctx.invocation_id)
@@ -379,6 +430,11 @@ class SDKSessionRunner:
         if role.max_turns is not None:
             kwargs["max_turns"] = role.max_turns
         env = {"IS_SANDBOX": "1"}
+        token = self._token_pool.active()
+        if token:
+            # Overrides the inherited ANTHROPIC_AUTH_TOKEN once rotation has
+            # advanced the pool; identical to it otherwise.
+            env[AUTH_TOKEN_ENV] = token
         task_toml = REPO_ROOT / "tasks" / ctx.task / "task.toml"
         if task_toml.is_file():
             import tomllib

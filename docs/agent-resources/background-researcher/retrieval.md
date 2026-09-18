@@ -37,7 +37,9 @@ Select search backends explicitly:
   task-local path is storage, not evidence of compliant provenance.
 - `deepxiv` — open-world scholarly retrieval.
 - `jina-search` — live web search; requires `JINA_API_KEY` in the environment,
-  without it every call fails.
+  without it every call fails. `JINA_API_KEY_BACKUPS` (comma-separated) lists
+  standby keys; an auth/quota rejection (401/402/403) rotates to the next key
+  for the rest of the process.
 
 Repeat `--backend` to fan a round across several. A backend that is
 unavailable or errors records per-query failed calls and does not block the

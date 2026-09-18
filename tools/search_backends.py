@@ -72,6 +72,58 @@ RESULT_METADATA_FIELDS = (
     "score",
 )
 HTTP_TIMEOUT = 45
+JINA_KEY_ENV = "JINA_API_KEY"
+JINA_KEY_BACKUPS_ENV = "JINA_API_KEY_BACKUPS"
+# Auth/quota rejections: rotate to the next configured key instead of failing.
+JINA_ROTATION_STATUSES = frozenset({401, 402, 403})
+
+
+class JinaKeyPool:
+    """Process-wide Jina key state: JINA_API_KEY plus comma-separated
+    JINA_API_KEY_BACKUPS. A rotation-status response advances ``index`` so
+    later calls skip the dead key; token material is never logged."""
+
+    def __init__(self) -> None:
+        self.index = 0
+
+    def keys(self) -> list[str]:
+        primary = os.environ.get(JINA_KEY_ENV, "").strip()
+        backups = (k.strip()
+                   for k in os.environ.get(JINA_KEY_BACKUPS_ENV, "").split(","))
+        return list(dict.fromkeys(k for k in (primary, *backups) if k))
+
+    def active(self) -> str | None:
+        keys = self.keys()
+        if not keys:
+            return None
+        return keys[min(self.index, len(keys) - 1)]
+
+    def rotate(self) -> bool:
+        if self.index + 1 < len(self.keys()):
+            self.index += 1
+            return True
+        return False
+
+
+JINA_KEYS = JinaKeyPool()
+
+
+def jina_urlopen(url: str, headers: dict[str, str]) -> bytes:
+    """urlopen with the pool's active key; on an auth/quota rejection rotates
+    to the next key and retries, re-raising when every key has failed."""
+    while True:
+        key = JINA_KEYS.active()
+        request_headers = dict(headers)
+        if key:
+            request_headers["Authorization"] = f"Bearer {key}"
+        request = urllib.request.Request(url, headers=request_headers)
+        try:
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in JINA_ROTATION_STATUSES and JINA_KEYS.rotate():
+                continue
+            raise
 DEEPXIV_MAX_SECTIONS = 3
 SUBSTANTIVE_VIEWS = {"section", "preview", "full_text", "page"}
 
@@ -571,9 +623,10 @@ class JinaSearchBackend(SearchBackend):
     version = "hosted-api-unknown"
 
     def __init__(self) -> None:
-        if not os.environ.get("JINA_API_KEY"):
+        if not JINA_KEYS.keys():
             raise RuntimeError(
-                "JINA_API_KEY is not set; keyless s.jina.ai always returns 401"
+                f"neither {JINA_KEY_ENV} nor {JINA_KEY_BACKUPS_ENV} is set; "
+                "keyless s.jina.ai always returns 401"
             )
 
     async def search(self, query: str, max_results: int) -> dict[str, Any]:
@@ -582,11 +635,8 @@ class JinaSearchBackend(SearchBackend):
     def _search_sync(self, query: str, max_results: int) -> dict[str, Any]:
         url = "https://s.jina.ai/?q=" + urllib.parse.quote(query)
         headers = {"Accept": "application/json", "User-Agent": "HieraResearch/1"}
-        if os.environ.get("JINA_API_KEY"):
-            headers["Authorization"] = f"Bearer {os.environ['JINA_API_KEY']}"
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        payload = json.loads(
+            jina_urlopen(url, headers).decode("utf-8", errors="replace"))
         rows = payload.get("data", payload) if isinstance(payload, dict) else payload
         output: list[dict[str, Any]] = []
         for row in (rows or [])[:max_results]:
@@ -983,13 +1033,10 @@ def _web_read(url: str) -> tuple[str, str, str | None]:
     """jina-reader first, direct fallback; the note records any reader failure."""
     headers = {"Accept": "text/plain", "X-Return-Format": "markdown",
                "User-Agent": "HieraResearch/1"}
-    if os.environ.get("JINA_API_KEY"):
-        headers["Authorization"] = f"Bearer {os.environ['JINA_API_KEY']}"
     reader_error: str | None = None
     try:
-        request = urllib.request.Request("https://r.jina.ai/" + url, headers=headers)
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
-            text = response.read().decode("utf-8", errors="replace")
+        text = jina_urlopen("https://r.jina.ai/" + url, headers).decode(
+            "utf-8", errors="replace")
         if text.strip():
             return text, "jina-read", None
         reader_error = "jina-reader returned empty content"

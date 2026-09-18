@@ -33,6 +33,7 @@ from driver.receipts import ReceiptStore  # noqa: E402
 from driver.roles import InvocationContext, RoleDefinition  # noqa: E402
 from driver.session import (  # noqa: E402
     SOFT_RESCUE_MESSAGE,
+    AuthTokenPool,
     FakeSessionRunner,
     InvocationFailed,
     SDKSessionRunner,
@@ -297,6 +298,56 @@ class SessionBudgetTests(unittest.TestCase):
                 runner.run(_role(), InvocationContext(
                     task="toy", tag="r1", run_dir=run_dir, invocation_id=1))
             self.assertEqual(len(_events(run_dir, "transport_retry")), 3)
+
+    def test_key_class_failure_rotates_to_the_backup_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            store = ReceiptStore(run_dir)
+
+            class _ApiResult(_Result):
+                def __init__(self, *, api_error_status=None, **kw):
+                    super().__init__(**kw)
+                    self.api_error_status = api_error_status
+
+            async def quota_fail():
+                yield _Init()
+                yield _ApiResult(is_error=True,
+                                 subtype="error_during_execution",
+                                 num_turns=1, api_error_status=402)
+
+            async def success():
+                yield _Init()
+                (run_dir / "train.py").write_text("# edited\n")
+                store.persist_receipt("hillclimb-editor", 1,
+                                      {"edited": True, "summary": "ok"})
+                yield _Result(num_turns=2)
+
+            options_seen = []
+
+            def factory(options):
+                options_seen.append(options)
+                turns = [quota_fail] if len(options_seen) == 1 else [success]
+                return _Client(turns)
+
+            pool = AuthTokenPool()
+            runner = SDKSessionRunner(model="m", events=EventsLog(run_dir),
+                                      client_factory=factory, token_pool=pool)
+            runner._sleep = lambda seconds: None
+            env = {"ANTHROPIC_AUTH_TOKEN": "tok-a",
+                   "ANTHROPIC_AUTH_TOKEN_BACKUPS": "tok-b,tok-c"}
+            with mock.patch.dict(os.environ, env):
+                receipt = runner.run(_role(), InvocationContext(
+                    task="toy", tag="r1", run_dir=run_dir, invocation_id=1))
+            self.assertTrue(receipt["edited"])
+            # the retry carried the rotated key via options env
+            self.assertEqual([o.env["ANTHROPIC_AUTH_TOKEN"]
+                              for o in options_seen], ["tok-a", "tok-b"])
+            self.assertEqual(pool.index, 1)
+            fallback = _events(run_dir, "api_key_fallback")
+            self.assertEqual([(f["api_error_status"], f["key_index"])
+                              for f in fallback], [(402, 1)])
+            # rotation spent no transport retry
+            self.assertEqual(_events(run_dir, "transport_retry"), [])
 
 
 # --- driver jobs and process groups -----------------------------------------
