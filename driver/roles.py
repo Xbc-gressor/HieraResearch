@@ -278,7 +278,9 @@ ROLES: dict[str, RoleDefinition] = {
             "retrieval_manifest": "str",
         },
         postconditions=(background_artifacts_exist,),
-        wall_limit_seconds=1800.0,
+        # Runs once per run; healthy cells observed 1066-1259s, degraded
+        # retrieval pushed one session past 2164s (2026-09-19 calibration).
+        wall_limit_seconds=3600.0,
         soft_rescue=True,
     ),
     "idea-generator": RoleDefinition(
@@ -300,7 +302,9 @@ ROLES: dict[str, RoleDefinition] = {
             "candidate_dir": "str",
         },
         postconditions=(candidate_train_py_exists,),
-        wall_limit_seconds=960.0,
+        # Observed max 874s across three MLE cells (2026-09-19 calibration);
+        # 960s left only 9% headroom, violating the far-above-maximum rule.
+        wall_limit_seconds=1800.0,
         soft_rescue=True,
     ),
     "tunable-contract-extractor": RoleDefinition(
