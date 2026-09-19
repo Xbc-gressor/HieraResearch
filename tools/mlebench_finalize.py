@@ -16,13 +16,31 @@ from pathlib import Path
 
 try:
     from .mlebench_official import OfficialPreflightError, validate_submission
+    from .process_group import (arm_sigterm_forwarding, register_child,
+                                terminate_group, unregister_child)
 except ImportError:  # direct script execution from the repository checkout
     from mlebench_official import OfficialPreflightError, validate_submission
+    from process_group import (arm_sigterm_forwarding, register_child,
+                               terminate_group, unregister_child)
 
 
 def _command(value: str, *, task: str, run_dir: Path, data_dir: Path) -> list[str]:
     rendered = value.format(task=task, run_dir=str(run_dir), data_dir=str(data_dir))
     return shlex.split(rendered)
+
+
+def _run(command: list[str], cwd: Path, timeout: float) -> int:
+    # Export commands commonly wrap uv/python and training subprocesses.
+    # Stop the whole command tree at timeout, including its GPU workers.
+    arm_sigterm_forwarding()
+    proc = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+    register_child(proc)
+    try:
+        return proc.wait(timeout=timeout)
+    finally:
+        if proc.poll() is None:
+            terminate_group(proc, grace=0)
+        unregister_child(proc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -51,8 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         rc = 124
     else:
         try:
-            proc = subprocess.run(sub, cwd=run_dir, timeout=remaining, check=False)
-            rc = proc.returncode
+            rc = _run(sub, run_dir, remaining)
             status = "failed"
             if rc == 0:
                 try:
@@ -80,13 +97,12 @@ def main(argv: list[str] | None = None) -> int:
         grader = _command(a.grader_command, task=a.task, run_dir=run_dir, data_dir=data_dir)
         gs = time.time()
         try:
-            gp = subprocess.run(grader, cwd=run_dir, timeout=a.grader_timeout, check=False)
-            manifest["grader"] = {"status": "success" if gp.returncode == 0 else "failed",
-                                   "returncode": gp.returncode, "started_at_unix": gs,
+            rc = _run(grader, run_dir, a.grader_timeout)
+            manifest["grader"] = {"status": "success" if rc == 0 else "failed",
+                                   "returncode": rc, "started_at_unix": gs,
                                    "ended_at_unix": time.time(),
                                    "elapsed_seconds": time.time() - gs, "command": grader,
                                    "counts_toward_submission_budget": False}
-            rc = gp.returncode
         except subprocess.TimeoutExpired:
             rc = 124
             manifest["grader"] = {"status": "timeout", "started_at_unix": gs,

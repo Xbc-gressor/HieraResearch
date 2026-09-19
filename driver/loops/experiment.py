@@ -342,7 +342,12 @@ def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
         _invoke(runner, store, "experience-extractor", task, tag, run_dir)
         return
     except InvocationFailed:
-        pass
+        # A refresh may have started before cutoff and been cancelled at it.
+        # Re-entering the session gate would turn normal exhaustion into a
+        # blocked run, consuming finalization time on an external resume.
+        if _time_reached(run_dir):
+            events.emit("refresh_skipped", reason="time_reached")
+            return
     try:  # one retry with reconciliation context, then block
         brief = _brief(run_dir, repo_root, cmd)
         _invoke(runner, store, "experience-extractor", task, tag, run_dir,
@@ -351,6 +356,10 @@ def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
                        + json.dumps(brief, sort_keys=True)})
         return
     except InvocationFailed as exc:
+        # Also covers cutoff during reconciliation or the retry itself.
+        if _time_reached(run_dir):
+            events.emit("refresh_skipped", reason="time_reached")
+            return
         _or_block(run_dir, repo_root, cmd, events,
                   f"experience refresh failed: {exc.problems}")
 

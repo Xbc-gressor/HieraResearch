@@ -66,6 +66,37 @@ def _role(**overrides) -> RoleDefinition:
     return RoleDefinition(**base)
 
 
+class RefreshCutoffTests(unittest.TestCase):
+    def test_cutoff_during_first_call_or_retry_does_not_block(self):
+        for gates, calls in (([False, True], 1), ([False, False, True], 2)):
+            with self.subTest(calls=calls), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                with mock.patch.object(experiment, "_time_reached", side_effect=gates), \
+                        mock.patch.object(experiment, "_invoke", side_effect=InvocationFailed(
+                            "experience-extractor", ["time budget reached"])) as invoke, \
+                        mock.patch.object(experiment, "_brief", return_value={}), \
+                        mock.patch.object(experiment, "_or_block") as block:
+                    experiment._refresh(None, None, "toy", "r1", run_dir,
+                                        ROOT, None, EventsLog(run_dir))
+                self.assertEqual(invoke.call_count, calls)
+                block.assert_not_called()
+                self.assertEqual(len(_events(run_dir, "refresh_skipped")), 1)
+
+    def test_real_refresh_failure_before_cutoff_still_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with mock.patch.object(experiment, "_time_reached", return_value=False), \
+                    mock.patch.object(experiment, "_invoke", side_effect=InvocationFailed(
+                        "experience-extractor", ["invalid receipt"])) as invoke, \
+                    mock.patch.object(experiment, "_brief", return_value={}), \
+                    mock.patch.object(experiment, "_or_block") as block:
+                experiment._refresh(None, None, "toy", "r1", run_dir,
+                                    ROOT, None, EventsLog(run_dir))
+            self.assertEqual(invoke.call_count, 2)
+            block.assert_called_once()
+            self.assertEqual(_events(run_dir, "refresh_skipped"), [])
+
+
 class _Result:
     def __init__(self, *, is_error=False, subtype=None, num_turns=1):
         self.session_id = "sess-fake"

@@ -60,7 +60,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--deadline", type=float, metavar="EPOCH_SECONDS",
                      help="absolute run deadline instead of --time-budget")
     run.add_argument("--final-reserve", type=float, metavar="SECONDS",
-                     help="tail of the time budget kept free for finalization")
+                     help="tail of the time budget kept free for finalization "
+                          "(automatic finalization defaults to 1200 seconds)")
+    run.add_argument("--submission-command",
+                     help="experiment: export command for automatic finalization; "
+                          "supports {task}, {run_dir}, {data_dir}")
+    run.add_argument("--grader-command",
+                     help="experiment: operator grading command after export")
+    run.add_argument("--data-dir",
+                     help="experiment: data directory passed to finalization commands")
     run.add_argument("--round-new-candidates", type=int, metavar="N",
                      help="round_v1: new finite candidates per optimization round")
     run.add_argument("--round-rewrite-bouts", type=int, metavar="R",
@@ -158,6 +166,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         if args.noise_margin is not None and args.noise_margin < 0:
             parser.error("--noise-margin must be >= 0")
+        finalization = (args.submission_command, args.grader_command, args.data_dir)
+        if any(finalization):
+            if not all(finalization) or args.loop != "experiment":
+                parser.error("automatic finalization requires --loop experiment and "
+                             "--submission-command, --grader-command, --data-dir")
+            # Match the MLSP full-refit reserve in both comparison arms.
+            if args.final_reserve is None:
+                args.final_reserve = 1200
         import json
 
         from driver.loops.hillclimb import run_hillclimb
@@ -246,6 +262,21 @@ def main(argv: list[str] | None = None) -> int:
             cli_path=args.cli_path,
         )
         print(json.dumps(status, indent=2, sort_keys=True))
+        if args.submission_command and status.get("phase") == "completed":
+            from tools.mlebench_finalize import main as finalize
+
+            # Use the persisted absolute deadline, including on resume. Never
+            # give export a fresh budget or rely on a watchdog to invoke it.
+            cfg = json.loads((run_dir / "framework_cfg.json").read_text())
+            rc = finalize([
+                "--task", args.task, "--run-dir", str(run_dir),
+                "--data-dir", args.data_dir,
+                "--deadline", str(cfg["deadline"]),
+                "--submission-command", args.submission_command,
+                "--grader-command", args.grader_command,
+            ])
+            EventsLog(run_dir).emit("finalization_finished", returncode=rc)
+            return rc
         return exit_code_for(status, args.loop)
     return 0
 
