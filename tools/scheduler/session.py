@@ -147,10 +147,16 @@ def decide_for_run(
     ledger_path: Path,
     *,
     scenarios: int | None = None,
+    exclude: tuple[str, ...] | list[str] = (),
 ) -> dict:
-    """Reconcile, decide (or reuse), commit. Returns the decision view."""
+    """Reconcile, decide (or reuse), commit. Returns the decision view.
+
+    ``exclude`` (round_v1 tune only): candidates the driver has backed off
+    from tuning; part of the decision identity, like rewrite channels'.
+    """
     ledger_path = Path(ledger_path)
     run_dir = ledger_path.parent
+    exclude = sorted(str(r) for r in exclude)
     store = SchedulerStore(run_dir)
     contract = contract_for(ledger_path)
     config = config_from_scenarios(scenarios)
@@ -194,7 +200,7 @@ def decide_for_run(
         # state has advanced), so within one optimization phase reuse is
         # keyed on the cycle instead: an interrupted bout's decision must be
         # re-issued, not re-decided against drifted state.
-        resumed = round_policy.open_tune_decision(store, run_dir)
+        resumed = round_policy.open_tune_decision(store, run_dir, exclude)
         if resumed is not None:
             return _view(resumed, state, reconciled, reused=True)
 
@@ -204,7 +210,7 @@ def decide_for_run(
     elif scheduler_policy == transfer_tournament.POLICY_ID:
         decision = transfer_tournament.decide(state)
     elif scheduler_policy == round_policy.POLICY_ID:
-        decision = round_policy.decide(state, run_dir)
+        decision = round_policy.decide(state, run_dir, exclude=exclude)
     else:
         tuning, arrival = models_for(store)
         decision = decide_policy(
@@ -238,6 +244,7 @@ def decide_for_run(
             evidence_cursor=cursor,
             snapshot_id=snapshot_id,
             decision_id=decision_id,
+            exclude_run_ids=exclude,
         )
         receipt["round_cycle"] = int(
             round_policy.load_round_state(run_dir).get("cycle", 0)

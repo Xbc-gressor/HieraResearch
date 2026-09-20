@@ -257,6 +257,10 @@ or the report yourself.
 
 ### Phase C — Single-method search
 
+Once `phase-c-action` answers `action: run`, submit the `driver_job` handoff
+immediately — never re-run or re-read the same deterministic query while
+deliberating.
+
 1. Ask the deterministic state machine what to do — do **not** infer a method
    or resume point from prose/stdout:
    ```

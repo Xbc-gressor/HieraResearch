@@ -473,15 +473,61 @@ def tune_handoff(selection: dict) -> dict:
     return {key: selection.get(key) for key in keys}
 
 
+# In-process tune backoff: consecutive zero-progress/infra failures per
+# candidate. `select_tune` sees none of them (score, rank, expected seconds
+# and report currency are all unchanged by a consumed=0 failure), so without
+# this the same candidate is re-selected every round. A driver restart
+# forgets the streaks; the first re-failure re-excludes.
+TUNE_BACKOFF_LIMIT = 2
+_tune_backoff: dict[str, dict] = {}
+
+
+def _backoff_state(run_dir) -> dict:
+    return _tune_backoff.setdefault(
+        str(run_dir), {"streak": {}, "excluded": set(), "succeeded": 0})
+
+
+def _note_tune_outcome(run_dir, events, run_id: str, status: str) -> None:
+    state = _backoff_state(run_dir)
+    if status == "valid":
+        state["succeeded"] += 1
+        state["streak"][run_id] = 0
+        return
+    streak = state["streak"].get(run_id, 0) + 1
+    state["streak"][run_id] = streak
+    if streak >= TUNE_BACKOFF_LIMIT and run_id not in state["excluded"]:
+        state["excluded"].add(run_id)
+        events.emit("tune_candidate_excluded", run_id=run_id,
+                    consecutive_infra_failures=streak)
+
+
+def tune_excluded(run_dir) -> list[str]:
+    """Candidates backed off from this run's tune selection (this process)."""
+    return sorted(_backoff_state(run_dir)["excluded"])
+
+
+def reset_tune_backoff(run_dir) -> None:
+    """Fresh entry into a run (run_experiment start) starts with no streaks."""
+    _tune_backoff.pop(str(run_dir), None)
+
+
+def tune_backoff_no_success(run_dir) -> bool:
+    """True when backoff excluded candidates and no tune bout ever succeeded:
+    a completion in that state must not look like a normal close."""
+    state = _tune_backoff.get(str(run_dir))
+    return bool(state and state["excluded"] and state["succeeded"] == 0)
+
+
 def close_tune_outcome(run_dir, repo_root, cmd, events, selection, receipt,
                        *, evals_before, reference_before) -> None:
     """Bind the tune bout's result to the decision that selected it.
 
     Every terminal path of a TUNE selection ends here: a kept improvement, a
-    valid no-op, or a receipt whose `tuned_run_id` names another candidate.
-    The orchestrator's objective jobs are pinned to the selected candidate,
-    so a mismatching id can only be a stale or fabricated handoff — the
-    result is never re-attributed to the candidate the receipt names.
+    valid no-op, a zero-progress/infra failure (`outcome_status` on the
+    receipt), or a receipt whose `tuned_run_id` names another candidate.
+    The bout's objective jobs are pinned to the selected candidate, so a
+    mismatching id can only be a stale or fabricated handoff — the result is
+    never re-attributed to the candidate the receipt names.
     """
     run_id = str(selection["run_id"])
     executed = str(receipt.get("tuned_run_id", "none"))
@@ -491,9 +537,22 @@ def close_tune_outcome(run_dir, repo_root, cmd, events, selection, receipt,
                     selected_run_id=run_id, executed_run_id=executed)
         _record(run_dir, repo_root, cmd, selection["decision_id"], run_id,
                 action="TUNE", consumed=0, status="infra_failure")
+        _note_tune_outcome(run_dir, events, run_id, "infra_failure")
         return
     evals_after, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
     consumed = max(0, evals_after - evals_before)
+    if receipt.get("outcome_status") == "infra_failure":
+        _record(run_dir, repo_root, cmd, selection["decision_id"], run_id,
+                action="TUNE", consumed=consumed, status="infra_failure")
+        events.emit("tune_infra_failure",
+                    decision_id=selection.get("decision_id"),
+                    selected_run_id=run_id, executed_run_id=executed,
+                    consumed=consumed,
+                    reason=receipt.get("outcome_reason"),
+                    detail=receipt.get("outcome_detail"),
+                    snapshot=receipt.get("snapshot_counts"))
+        _note_tune_outcome(run_dir, events, run_id, "infra_failure")
+        return
     reference_after = _ledger_score(run_dir, run_id)
     gain = (None if reference_before is None or reference_after is None
             else reference_before - reference_after)
@@ -503,6 +562,7 @@ def close_tune_outcome(run_dir, repo_root, cmd, events, selection, receipt,
                 selected_run_id=run_id, executed_run_id=executed,
                 tuned=bool(receipt.get("tuned")),
                 consumed_evaluations=consumed, realized_gain=gain)
+    _note_tune_outcome(run_dir, events, run_id, "valid")
 
 
 def _rewrite_channel(channel, coord, runner, store, task, tag, run_dir,
@@ -621,14 +681,22 @@ def optimization_phase(runner, store, task, tag, run_dir, round_no, task_toml,
         for _ in range(int(config["tune_bouts"])):
             if budget_status(run_dir, repo_root, cmd).get("reached"):
                 break
-            selection = _round(run_dir, repo_root, cmd, "select",
-                               "--kind", "tune")
+            excluded = tune_excluded(run_dir)
+            select_args = ["select", "--kind", "tune"]
+            if excluded:
+                select_args += ["--exclude", ",".join(excluded)]
+            selection = _round(run_dir, repo_root, cmd, *select_args)
             events.emit("round_select", bout_kind="tune",
                         action=selection["action"],
                         run_id=selection.get("run_id"),
                         decision_id=selection.get("decision_id"),
-                        reason=selection.get("reason"))
+                        reason=selection.get("reason"),
+                        exclude_run_ids=excluded)
             if selection["action"] != "TUNE":
+                if excluded:
+                    events.emit("tune_backoff_stop",
+                                exclude_run_ids=excluded,
+                                reason=selection.get("reason"))
                 break
             run_id = str(selection["run_id"])
             reference_before = _ledger_score(run_dir, run_id)

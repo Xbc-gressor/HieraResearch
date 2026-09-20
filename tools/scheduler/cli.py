@@ -230,13 +230,13 @@ def cmd_round(args) -> int:
     elif args.round_command == "overhead":
         view = round_policy.record_overhead(run_dir, args.kind, args.seconds)
     elif args.round_command == "select":
+        exclude = [r for r in (args.exclude or "").split(",") if r]
         if args.peek and args.kind == "tune":
             view = peek_tune_for_run(ledger)
         elif args.kind == "rewrite":
-            exclude = [r for r in (args.exclude or "").split(",") if r]
             view = select_rewrite_for_run(ledger, exclude)
         else:
-            view = decide_for_run(ledger)
+            view = decide_for_run(ledger, exclude=exclude)
         view.pop("state", None)
         view["reference"] = (view.get("evidence_mode") or {}).get("reference")
     else:  # pragma: no cover - argparse restricts the choices
@@ -296,8 +296,10 @@ def build_parser() -> argparse.ArgumentParser:
     sel.add_argument("--kind", required=True, choices=("rewrite", "tune"))
     sel.add_argument("--peek", action="store_true")
     sel.add_argument("--exclude", default="",
-                     help="comma-separated run_ids another rewrite channel is "
-                          "climbing; ineligible and part of the decision identity")
+                     help="comma-separated run_ids ineligible for this "
+                          "selection (another rewrite channel's climb, or a "
+                          "tune candidate the driver backed off from); part "
+                          "of the decision identity")
     ovh = rnd_sub.add_parser("overhead", help="record one bout's non-eval seconds")
     ovh.add_argument("--kind", required=True, choices=("rewrite", "tune"))
     ovh.add_argument("--seconds", required=True, type=float)

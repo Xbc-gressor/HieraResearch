@@ -341,6 +341,9 @@ ROLES: dict[str, RoleDefinition] = {
             "driver_job": "?dict",
         },
         postconditions=(tuner_target_matches_handoff,),
+        # Observed read-loop attractor: 0918/0920 quest sessions re-read the
+        # deterministic phase-c-action answer until the breaker tripped.
+        early_repeat_correct=True,
         forbidden_bash_substrings=(
             "tools/tuners/grid_search.py",
             "tools/tuners/bo_search.py",

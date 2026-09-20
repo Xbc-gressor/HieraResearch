@@ -405,8 +405,12 @@ def select_tune(
     run_dir: Path,
     *,
     now: float | None = None,
+    exclude: tuple[str, ...] | list[str] = (),
 ) -> Decision:
+    """``exclude``: candidates the driver has backed off from tuning
+    (consecutive zero-progress bouts); ineligible for this selection."""
     run_dir = Path(run_dir)
+    exclude = {str(r) for r in exclude}
     config = load_config(run_dir)
     round_state = load_round_state(run_dir)
     quota = quota_remaining(round_state, now=now)
@@ -431,6 +435,7 @@ def select_tune(
             "expected_seconds": expected,
             "priority": value / max(1.0, expected if expected is not None else 1.0),
             "report_current": tune_report_current(run_dir, candidate.run_id),
+            "excluded": candidate.run_id in exclude,
         })
     mode = {
         "kind": "tune",
@@ -440,7 +445,8 @@ def select_tune(
     }
     choices = [
         row for row in rows
-        if row["report_current"] and _fits(row["expected_seconds"], quota)
+        if not row["excluded"] and row["report_current"]
+        and _fits(row["expected_seconds"], quota)
     ]
     if not choices:
         return Decision(
@@ -458,7 +464,8 @@ def select_tune(
     )
 
 
-def decide(state: SchedulerState, run_dir: Path) -> Decision:
+def decide(state: SchedulerState, run_dir: Path,
+           exclude: tuple[str, ...] | list[str] = ()) -> Decision:
     """The tune decision `select-candidate` executes; tuning only runs inside
     an open optimization phase."""
     round_state = load_round_state(run_dir)
@@ -467,10 +474,11 @@ def decide(state: SchedulerState, run_dir: Path) -> Decision:
             "DEFER", None, "generation phase: no tuning outside a round",
             evidence_mode={"kind": "tune", "phase": round_state.get("phase")},
         )
-    return select_tune(state, run_dir)
+    return select_tune(state, run_dir, exclude=exclude)
 
 
-def open_tune_decision(store, run_dir: Path) -> dict | None:
+def open_tune_decision(store, run_dir: Path,
+                       exclude: tuple[str, ...] | list[str] = ()) -> dict | None:
     """This cycle's still-open TUNE decision, if one exists (round_v1).
 
     The generic reuse identity `(state_snapshot_id, evidence_cursor)` cannot
@@ -479,13 +487,18 @@ def open_tune_decision(store, run_dir: Path) -> dict | None:
     decision for the same conceptual bout. Reuse within an optimization phase
     is keyed on the cycle instead: `end_optimization` increments it, so a
     stale decision from an earlier phase never stands in for this one.
+    ``exclude`` is part of the identity, like the rewrite channels': a
+    decision selected before a candidate was backed off must not be reused
+    once it is.
     """
+    exclude = sorted(str(r) for r in exclude)
     cycle = int(load_round_state(run_dir).get("cycle", 0))
     for row in reversed(store.unbound_decisions()):
         if (
             row.get("selected_action") == "TUNE"
             and row.get("policy_version") == POLICY_VERSION
             and row.get("round_cycle") == cycle
+            and sorted(row.get("exclude_run_ids") or []) == exclude
         ):
             return row
     return None

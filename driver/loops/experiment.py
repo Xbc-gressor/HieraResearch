@@ -60,6 +60,7 @@ from ..session import InvocationFailed
 from ..status import budget_status, compact_status
 from . import background_audit
 from . import common
+from . import phase_c
 from . import rounds
 from .common import RunBlocked
 from tools import competition_policy
@@ -1571,27 +1572,187 @@ def _tune_invocation_extra(selection, base=None):
     return extra or None
 
 
+def _tuner_inner_policy(run_dir: Path) -> str | None:
+    """Read the inner tuner policy frozen into this run's framework config."""
+    try:
+        section = json.loads((run_dir / "framework_cfg.json").read_text(
+            encoding="utf-8")).get("tuner")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return section.get("inner_policy") if isinstance(section, dict) else None
+
+
+def _tuning_snapshot(run_dir: Path, run_id: str) -> dict:
+    """Persistent-state fingerprint of one candidate's tuning progress.
+
+    Zero progress is judged from this, never from receipt shape, exception
+    type, or mtimes: attempts, Phase-C stage states, and the report's
+    closing fields all unchanged means the bout produced nothing.
+    """
+    candidate_dir = run_dir / "candidates" / str(run_id)
+    try:
+        report = json.loads((candidate_dir / "tune_report.json").read_text(
+            encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        report = {}
+    stages = (report.get("phase_c") or {}).get("stages") or []
+    return {
+        "phase_c_attempts": phase_c_attempts(run_dir, str(run_id)),
+        "stages": [
+            {"method": stage.get("method"), "status": stage.get("status"),
+             "trials_attempted": stage.get("trials_attempted"),
+             "trials_completed": stage.get("trials_completed"),
+             "trials": len(stage.get("trials") or [])}
+            for stage in stages if isinstance(stage, dict)
+        ],
+        "applied_to_base_params": report.get("applied_to_base_params"),
+        "last_finalized_stage_index": report.get("last_finalized_stage_index"),
+    }
+
+
+def _snapshot_counts(snapshot: dict) -> dict:
+    """The compact counts that travel on outcome events (never the report)."""
+    stages = snapshot.get("stages") or []
+    return {
+        "phase_c_attempts": snapshot.get("phase_c_attempts"),
+        "stages": len(stages),
+        "trials": sum(int(stage.get("trials") or 0) for stage in stages),
+    }
+
+
 def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
           events, job_runner=execute_driver_job, selection=None) -> dict:
     """Run the decoupled tuning step; return the effective tuner receipt.
 
     ``selection`` is the round scheduler's committed TUNE decision
-    (round_v1): it pins the session and its Phase-C jobs to the selected
-    candidate. ``None`` keeps the orchestrator-side selection used by the
-    complete-bout and legacy policies.
+    (round_v1): the bout is driver-owned and deterministic — no
+    tuner-orchestrator session sits between ``phase-c-action`` and the job
+    (the legacy inner policy keeps the session, because Phase-R re-warm
+    proposals exist only there). ``None`` keeps the orchestrator-side
+    selection and recovery used by the complete-bout and legacy policies.
     """
-    phase_c_before = (
-        phase_c_attempts(run_dir, str(selection["run_id"]))
-        if selection is not None else 0
-    )
+    if selection is None:
+        return _tune_session(runner, store, task, tag, run_dir, round_no,
+                             repo_root, cmd, events, job_runner)
+    return _tune_pinned(runner, store, task, tag, run_dir, round_no,
+                        repo_root, cmd, events, job_runner, selection)
+
+
+def _tune_pinned(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
+                 events, job_runner, selection) -> dict:
+    """One pinned round_v1 TUNE bout; every ending funnels through one settle:
+    deterministic close, then persistent-state zero-progress classification,
+    then at most one reconciliation for a progressed ambiguity."""
+    _refuse_if_blocked(run_dir)
+    run_id = str(selection["run_id"])
+    before = _tuning_snapshot(run_dir, run_id)
+    receipt = None
+    failure = None
+    if _tuner_inner_policy(run_dir) == "legacy":
+        origin = "session"
+        try:
+            receipt, _ = _invoke_with_driver_jobs(
+                runner, store, "tuner-orchestrator", task, tag, run_dir,
+                round_no=round_no, run_id=run_id,
+                extra=_tune_invocation_extra(selection),
+                repo_root=repo_root, job_runner=job_runner)
+        except (InvocationFailed, DriverJobError) as exc:
+            failure = "; ".join(
+                str(p) for p in getattr(exc, "problems", [str(exc)]))
+    else:
+        origin = "bout"
+        try:
+            phase_c.run_single_bout(
+                task, tag, run_dir, run_id, repo_root, cmd, job_runner,
+                next_invocation_id=store.issue_invocation_id,
+                trial_cap_fn=lambda action: int(action.get("bout_trials") or 0),
+                round_no=round_no, finalize_task=task, resume_once=True)
+            return {"tuned_run_id": run_id, "tuned": True,
+                    "ledger_updated": True, "outcome_status": "valid"}
+        except phase_c.PhaseCBoutFailure as exc:
+            failure = str(exc)
+    return _settle_pinned_tune(runner, store, task, tag, run_dir, round_no,
+                               repo_root, cmd, events, job_runner, selection,
+                               receipt, failure, before, origin)
+
+
+def _settle_pinned_tune(runner, store, task, tag, run_dir, round_no, repo_root,
+                        cmd, events, job_runner, selection, receipt, failure,
+                        before, origin) -> dict:
+    run_id = str(selection["run_id"])
+    tuned_id = (receipt or {}).get("tuned_run_id", "none")
+    # Deterministic close first: the report/action pair, not the receipt,
+    # decides whether a bout landed — an exhausted bout must be closed and
+    # applied even under a missing or tuned=false ending.
+    if not _tune_flag(run_dir, run_id):
+        finalized = _phase_c_recover_close(run_dir, run_id, repo_root, cmd,
+                                           events, task)
+        if finalized is not None:
+            return {**(receipt or {}), **finalized, "tuned": True,
+                    "tuned_run_id": run_id, "ledger_updated": True,
+                    "outcome_status": "valid"}
+    after = _tuning_snapshot(run_dir, run_id)
+    if after == before:
+        # Zero progress by persistent state: infra failure, no
+        # reconciliation, whatever shape the ending took (breaker trip,
+        # DriverJobError, clean empty receipt, truthful no-op).
+        return {
+            "tuned_run_id": run_id, "tuned": False, "ledger_updated": False,
+            "outcome_status": "infra_failure",
+            "outcome_reason": f"zero_progress_{origin}_failure",
+            "outcome_detail": failure,
+            "snapshot_counts": _snapshot_counts(after),
+        }
+    if (failure is None and receipt is not None and tuned_id == run_id
+            and receipt.get("tuned") and _tune_flag(run_dir, run_id)):
+        return {**receipt, "outcome_status": "valid"}
+    if (failure is None and receipt is not None and tuned_id == run_id
+            and not receipt.get("tuned")):
+        # A truthful in-progress receipt: the stage stays open and resumable,
+        # its paid trials preserved for a later decision.
+        return receipt
+    if failure is not None:
+        note = f"tuner bout failed with progressed tuning state: {failure}"
+    elif receipt is not None and receipt.get("tuned"):
+        note = f"receipt claims tuned {tuned_id} but ledger has tune: false."
+    else:
+        note = ("session disowned the bout while the tuning state "
+                "progressed")
+    try:
+        reconciled = _tuner_reconcile(runner, store, task, tag, run_dir,
+                                      round_no, note, repo_root, job_runner,
+                                      selection=selection)
+    except (InvocationFailed, DriverJobError) as exc:
+        problems = [str(p) for p in getattr(exc, "problems", [str(exc)])]
+        events.emit("tune_reconcile_failed",
+                    decision_id=selection.get("decision_id"), run_id=run_id,
+                    first_failure=note, problems=problems,
+                    snapshot_before=_snapshot_counts(before),
+                    snapshot_after=_snapshot_counts(after))
+        _close_failed_tune(run_dir, repo_root, cmd, events, selection,
+                           phase_c_before=before["phase_c_attempts"])
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"tuner bout failed: {note}; reconciliation failed: "
+                  f"{problems}")
+    if reconciled.get("tuned") and not _tune_flag(
+            run_dir, reconciled.get("tuned_run_id", "none")):
+        _close_failed_tune(run_dir, repo_root, cmd, events, selection,
+                           phase_c_before=before["phase_c_attempts"])
+        _or_block(run_dir, repo_root, cmd, events,
+                  "authoritative artifacts still contradict after tuner "
+                  "reconciliation")
+    return reconciled
+
+
+def _tune_session(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
+                  events, job_runner=execute_driver_job) -> dict:
+    """The orchestrator-side tuning step (complete-bout and legacy policies):
+    the session selects its own candidate and owns the bout handoffs."""
     tuner_inv = None  # set only on a successful first invocation
     try:
         receipt, tuner_inv = _invoke_with_driver_jobs(
             runner, store, "tuner-orchestrator", task, tag, run_dir,
-            round_no=round_no,
-            run_id=(str(selection["run_id"]) if selection else None),
-            extra=_tune_invocation_extra(selection),
-            repo_root=repo_root, job_runner=job_runner)
+            round_no=round_no, repo_root=repo_root, job_runner=job_runner)
     except (InvocationFailed, DriverJobError) as exc:
         # The reconcile session is the recovery path: hand it the first
         # session's problems, and keep them for the block reason too.
@@ -1601,12 +1762,10 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             receipt = _tuner_reconcile(
                 runner, store, task, tag, run_dir, round_no,
                 "tuner session failed: " + "; ".join(first_problems),
-                repo_root, job_runner, selection=selection)
+                repo_root, job_runner)
         except (InvocationFailed, DriverJobError) as exc:
             problems = [str(p) for p in
                         getattr(exc, "problems", [str(exc)])]
-            _close_failed_tune(run_dir, repo_root, cmd, events, selection,
-                               phase_c_before=phase_c_before)
             _or_block(run_dir, repo_root, cmd, events,
                       f"tuner session failed: {first_problems}; "
                       f"reconciliation failed: {problems}")
@@ -1631,9 +1790,7 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             corrected, _ = _invoke_with_driver_jobs(
                 runner, store, "tuner-orchestrator", task, tag, run_dir,
                 round_no=round_no, resume_from=tuner_inv,
-                run_id=(str(selection["run_id"]) if selection else None),
-                extra=_tune_invocation_extra(
-                    selection, {"reconcile_note": note + _RECONCILE_GUIDANCE}),
+                extra={"reconcile_note": note + _RECONCILE_GUIDANCE},
                 repo_root=repo_root, job_runner=job_runner)
         except InvocationFailed as exc:
             corrected = None
@@ -1645,19 +1802,14 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             try:
                 corrected = _tuner_reconcile(
                     runner, store, task, tag, run_dir, round_no,
-                    reconcile_note, repo_root, job_runner,
-                    selection=selection)
+                    reconcile_note, repo_root, job_runner)
             except (InvocationFailed, DriverJobError) as exc:
                 problems = getattr(exc, "problems", [str(exc)])
-                _close_failed_tune(run_dir, repo_root, cmd, events, selection,
-                                   phase_c_before=phase_c_before)
                 _or_block(run_dir, repo_root, cmd, events,
                       f"tuner receipt/ledger contradiction unresolved: "
                           f"{problems}")
         if corrected.get("tuned") and \
                 not _tune_flag(run_dir, corrected.get("tuned_run_id", "none")):
-            _close_failed_tune(run_dir, repo_root, cmd, events, selection,
-                               phase_c_before=phase_c_before)
             _or_block(run_dir, repo_root, cmd, events,
                       "authoritative artifacts still contradict after "
                       "tuner reconciliation")
@@ -2242,6 +2394,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
     task_toml = common.load_task_toml(task, repo_root)
     store = ReceiptStore(run_dir)
     _reset_block_state(run_dir)
+    rounds.reset_tune_backoff(run_dir)
     _arm_exit_hooks()  # main thread: SIGTERM must reach leased child groups
 
     try:
@@ -2338,7 +2491,11 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 if brief.get("experience_refresh_required"):
                     _refresh(runner, store, task, tag, run_dir, repo_root,
                              cmd, events)
-                _complete_run(run_dir, repo_root, cmd, events)
+                _complete_run(run_dir, repo_root, cmd, events,
+                              stop_condition=(
+                                  "budget_reached_tune_backoff_no_success"
+                                  if rounds.tune_backoff_no_success(run_dir)
+                                  else None))
                 break
 
             # -----------------------------------------------------------------
@@ -2367,7 +2524,10 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     events.emit("quiescent", round_no=round_no,
                                 reason="two consecutive zero-progress rounds")
                     _complete_run(run_dir, repo_root, cmd, events,
-                                  stop_condition="quiescent")
+                                  stop_condition=(
+                                      "quiescent_tune_backoff_no_success"
+                                      if rounds.tune_backoff_no_success(run_dir)
+                                      else "quiescent"))
                     break
                 round_no += 1
                 continue

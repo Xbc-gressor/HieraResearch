@@ -14,8 +14,6 @@ class BaselineTuneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = root / "runs" / "toy" / "baseline"
-            candidate = run_dir / "candidates" / "000" / "train.py"
-            report = candidate.parent / "tune_report.json"
             failed = subprocess.CalledProcessError(
                 1,
                 ["phase-c-action"],
@@ -28,10 +26,10 @@ class BaselineTuneTest(unittest.TestCase):
                 side_effect=baseline_tune.RunBlocked("blocked"),
             ) as block:
                 with self.assertRaises(baseline_tune.RunBlocked):
-                    baseline_tune._phase_c_action(
+                    baseline_tune._tune_full_budget(
+                        "toy",
+                        "baseline",
                         run_dir,
-                        candidate,
-                        report,
                         root,
                         mock.Mock(side_effect=failed),
                         mock.sentinel.events,
@@ -42,7 +40,7 @@ class BaselineTuneTest(unittest.TestCase):
                 root,
                 mock.ANY,
                 mock.sentinel.events,
-                "phase-c-action failed: broken action",
+                "baseline bout: phase-c-action failed: broken action",
             )
 
 

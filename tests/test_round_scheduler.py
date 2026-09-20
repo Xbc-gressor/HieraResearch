@@ -215,6 +215,16 @@ class RoundPolicyTests(unittest.TestCase):
             decision = round_policy.select_tune(state, run_dir)
             self.assertEqual((decision.action, decision.run_id), ("TUNE", "002"))
 
+            # A backed-off candidate leaves the tune selection surface; an
+            # exclude set covering every eligible candidate is a STOP.
+            decision = round_policy.select_tune(state, run_dir,
+                                                exclude=("002",))
+            self.assertEqual((decision.action, decision.run_id),
+                             ("TUNE", "001"))
+            decision = round_policy.select_tune(
+                state, run_dir, exclude=("000", "001", "002"))
+            self.assertEqual(decision.action, "STOP")
+
             ended = self._cli(ledger, "end")
             self.assertEqual((ended["cycle"], ended["cycle_start_count"]), (1, 3))
             status = self._cli(ledger, "status")
@@ -262,6 +272,31 @@ class RoundPolicyTests(unittest.TestCase):
             self.assertNotEqual(crossed["decision_id"], fresh["decision_id"])
             self.assertFalse(crossed["reused_open_decision"])
             self.assertEqual(crossed["round_cycle"], 1)
+
+    def test_tune_exclude_is_part_of_the_decision_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _run_dir(Path(tmp), deadline=time.time() + 86400,
+                               round_cfg={"round_seconds": 3600})
+            ledger = run_dir / "ledger.json"
+            ledger.write_text(json.dumps({"records": [_record("000", 0.9)]}))
+            _candidate(run_dir, "000", 0.9)
+            self._cli(ledger, "begin")
+
+            first = self._cli(ledger, "select", "--kind", "tune")
+            self.assertEqual((first["action"], first["run_id"]),
+                             ("TUNE", "000"))
+            # The same cycle queried under a backoff exclusion must not reuse
+            # the open decision selecting the now-excluded candidate.
+            stopped = self._cli(ledger, "select", "--kind", "tune",
+                                "--exclude", "000")
+            self.assertNotEqual(stopped["decision_id"], first["decision_id"])
+            self.assertFalse(stopped["reused_open_decision"])
+            self.assertEqual(stopped["action"], "STOP")
+            self.assertEqual(stopped["exclude_run_ids"], ["000"])
+            # Without the exclusion the open decision is still this cycle's.
+            again = self._cli(ledger, "select", "--kind", "tune")
+            self.assertEqual(again["decision_id"], first["decision_id"])
+            self.assertTrue(again["reused_open_decision"])
 
     def test_tune_decision_not_reused_across_cycle_with_unchanged_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,6 +477,7 @@ class ClimbCmd:
             "reference": 1.0,
             "evidence_mode": {"overhead_seconds": 10.0}}
         self.tune_selection: dict | None = None
+        self.phase_c_action: dict = {}
 
     def _real_bout_cli(self, args: list[str]) -> "subprocess.CompletedProcess":
         import subprocess
@@ -474,6 +510,8 @@ class ClimbCmd:
                 "phase_quota_reached": (self.quota is not None
                                         and self.quota <= 0),
                 "per_candidate": []}))
+        if "phase-c-action" in joined:
+            return ok(json.dumps(self.phase_c_action))
         if "rewrite_bout.py" in joined:
             return self._real_bout_cli(args)
         if "scheduler/cli.py" in joined:
@@ -949,59 +987,95 @@ class TuneBindingTests(unittest.TestCase):
                  event["decision_id"], event["tuned"]),
                 ("000", "000", "dec-t9", True))
 
-    def test_blocked_session_still_closes_the_decision(self) -> None:
+    def test_zero_progress_bout_settles_infra_failure_without_block(self) -> None:
+        """A bout that cannot start and moves nothing is an infra failure —
+        no tuner session, no reconciliation, no blocked run."""
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._setup_run(Path(tmp))
             cmd = self._tune_cmd(Path(tmp), run_dir)
             from driver.events import EventsLog
-            from driver.loops.common import RunBlocked
             from driver.loops.experiment import _tune
             from driver.receipts import ReceiptStore
 
-            with self.assertRaises(RunBlocked):
-                _tune(FakeSessionRunner([]), ReceiptStore(run_dir), "fake-task",
-                      "t1", run_dir, 1, Path(tmp), cmd, EventsLog(run_dir),
-                      selection=dict(cmd.tune_selection))
-            record = next(call for call in cmd.calls
-                          if "record" in call and "dec-t9" in call)
-            self.assertEqual(record[record.index("--action") + 1], "TUNE")
-            self.assertEqual(record[record.index("--status") + 1],
-                             "infra_failure")
+            runner = FakeSessionRunner([])
+            receipt = _tune(runner, ReceiptStore(run_dir), "fake-task", "t1",
+                            run_dir, 1, Path(tmp), cmd, EventsLog(run_dir),
+                            selection=dict(cmd.tune_selection))
+            self.assertEqual(receipt["outcome_status"], "infra_failure")
+            self.assertEqual(receipt["outcome_reason"],
+                             "zero_progress_bout_failure")
+            self.assertEqual((receipt["tuned_run_id"], receipt["tuned"]),
+                             ("000", False))
+            self.assertEqual(runner.calls, [])
+
+    def test_clean_empty_receipt_is_infra_failure_not_valid(self) -> None:
+        """The legacy-inner session path: a clean `tuned_run_id: "none"`
+        receipt with an unmoved tuning state settles exactly like a session
+        death — infra failure, no reconciliation session."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._setup_run(Path(tmp))
+            (run_dir / "framework_cfg.json").write_text(json.dumps({
+                "tuner": {"scheduler_policy": "round_v1",
+                          "inner_policy": "legacy"}}))
+            cmd = self._tune_cmd(Path(tmp), run_dir)
+            from driver.events import EventsLog
+            from driver.loops.experiment import _tune
+            from driver.receipts import ReceiptStore
+
+            runner = FakeSessionRunner([
+                {"receipt": {"tuned_run_id": "none", "tuned": False,
+                             "ledger_updated": False}},
+            ])
+            receipt = _tune(runner, ReceiptStore(run_dir), "fake-task", "t1",
+                            run_dir, 1, Path(tmp), cmd, EventsLog(run_dir),
+                            selection=dict(cmd.tune_selection))
+            self.assertEqual(receipt["outcome_status"], "infra_failure")
+            self.assertEqual(receipt["outcome_reason"],
+                             "zero_progress_session_failure")
+            self.assertEqual([name for name, _ in runner.calls],
+                             ["tuner-orchestrator"])
 
     def test_failed_tune_charges_the_attempts_the_bout_consumed(self) -> None:
+        """A progressed-then-failed bout gets exactly one reconciliation;
+        when that fails too, the blocked decision charges the paid attempts."""
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._setup_run(Path(tmp))
             cmd = self._tune_cmd(Path(tmp), run_dir)
+            cmd.phase_c_action = {"action": "run", "method": "hebo",
+                                  "bout_trials": 24}
             from driver.events import EventsLog
             from driver.loops.common import RunBlocked
             from driver.loops.experiment import _tune
             from driver.receipts import ReceiptStore
 
-            def admit_two_evals(ctx) -> None:
-                # The pinned Phase-C job evaluated twice before the tuner
-                # session collapsed; the outcome must charge both, not zero.
+            def failing_job(role_name, ctx, request, *, repo_root):
+                # The pinned Phase-C job evaluated twice before crashing;
+                # the outcome must charge both, not zero.
                 with (run_dir / "evaluation_attempts.jsonl").open(
                         "w", encoding="utf-8") as handle:
                     for _ in range(2):
                         handle.write(json.dumps({
                             "schema_version": 1, "kind": "score_attempt",
                             "phase": "phase_c", "run_id": "000"}) + "\n")
+                return {"kind": "phase_c", "run_id": "000", "returncode": 1}
 
-            runner = FakeSessionRunner([
-                {"receipt": None,
-                 "side_effects": admit_two_evals,
-                 "fail": ["fake runner: bout collapsed mid-evaluation"]},
-            ])
-
+            runner = FakeSessionRunner([])  # the reconciliation also dies
             with self.assertRaises(RunBlocked):
                 _tune(runner, ReceiptStore(run_dir), "fake-task", "t1",
                       run_dir, 1, Path(tmp), cmd, EventsLog(run_dir),
+                      job_runner=failing_job,
                       selection=dict(cmd.tune_selection))
+            # exactly one reconciliation session was attempted
+            self.assertEqual([name for name, _ in runner.calls],
+                             ["tuner-orchestrator"])
             record = next(call for call in cmd.calls
                           if "record" in call and "dec-t9" in call)
             self.assertEqual(record[record.index("--status") + 1],
                              "infra_failure")
             self.assertEqual(record[record.index("--consumed") + 1], "2")
+            event = next(e for e in self._events(run_dir)
+                         if e.get("kind") == "tune_reconcile_failed")
+            self.assertEqual(event["run_id"], "000")
 
     def test_mismatched_receipt_is_never_reattributed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1027,6 +1101,94 @@ class TuneBindingTests(unittest.TestCase):
             # no tune_bout event: the result was not accepted as a bout
             self.assertFalse(any(e.get("kind") == "tune_bout"
                                  for e in self._events(run_dir)))
+
+
+class TuneBackoffTests(unittest.TestCase):
+    """A zero-progress outcome adds no tuned progress, and two consecutive
+    infra failures push the candidate out of the tune selection surface."""
+
+    def _setup_run(self, tmp: Path):
+        run_dir = tmp / "runs" / "fake-task" / "t1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "ledger.json").write_text(json.dumps(
+            {"records": [_record("000", 1.0)]}))
+        return run_dir
+
+    def _events(self, run_dir: Path) -> list[dict]:
+        path = run_dir / "driver_events.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines()
+                if line.strip()]
+
+    def _phase(self, tmp: Path, run_dir: Path, cmd, tune) -> bool:
+        from driver.events import EventsLog
+        from driver.loops import rounds
+        from driver.receipts import ReceiptStore
+        config = {**round_policy.DEFAULTS, "rewrite_bouts": 0,
+                  "tune_bouts": 1, "noise_margin": 0.0}
+        return rounds.optimization_phase(
+            FakeSessionRunner([]), ReceiptStore(run_dir), "fake-task", "t1",
+            run_dir, 1, {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
+            EventsLog(run_dir), tune=tune, config=config)
+
+    def test_two_zero_progress_bouts_exclude_the_candidate(self) -> None:
+        from driver.loops import rounds
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._setup_run(Path(tmp))
+            rounds.reset_tune_backoff(run_dir)
+            cmd = ClimbCmd(Path(tmp), run_dir, eval_script=[])
+            cmd.tune_selection = {"action": "TUNE", "run_id": "000",
+                                  "reason": "scripted",
+                                  "decision_id": "dec-t9"}
+
+            def tune(no, selection):
+                return {"tuned_run_id": "000", "tuned": False,
+                        "ledger_updated": False,
+                        "outcome_status": "infra_failure",
+                        "outcome_reason": "zero_progress_bout_failure"}
+
+            self.assertFalse(self._phase(Path(tmp), run_dir, cmd, tune))
+            self.assertEqual(rounds.tune_excluded(run_dir), [])
+            record = next(call for call in cmd.calls
+                          if "record" in call and "dec-t9" in call)
+            self.assertEqual(record[record.index("--status") + 1],
+                             "infra_failure")
+            self.assertEqual(record[record.index("--consumed") + 1], "0")
+            self.assertTrue(any(e.get("kind") == "tune_infra_failure"
+                                for e in self._events(run_dir)))
+
+            self.assertFalse(self._phase(Path(tmp), run_dir, cmd, tune))
+            self.assertEqual(rounds.tune_excluded(run_dir), ["000"])
+            self.assertTrue(any(e.get("kind") == "tune_candidate_excluded"
+                                for e in self._events(run_dir)))
+            self.assertTrue(rounds.tune_backoff_no_success(run_dir))
+
+            # The next selection carries the exclusion; a STOP under a
+            # non-empty exclude set is announced explicitly.
+            cmd.tune_selection = {"action": "STOP", "run_id": None,
+                                  "reason": "no eligible",
+                                  "decision_id": "dec-t10"}
+            self._phase(Path(tmp), run_dir, cmd, tune)
+            select = next(call for call in cmd.calls
+                          if "select" in call and "tune" in call
+                          and "--exclude" in call)
+            self.assertEqual(select[select.index("--exclude") + 1], "000")
+            self.assertTrue(any(e.get("kind") == "tune_backoff_stop"
+                                for e in self._events(run_dir)))
+
+    def test_success_resets_the_streak(self) -> None:
+        from driver.events import EventsLog
+        from driver.loops import rounds
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._setup_run(Path(tmp))
+            rounds.reset_tune_backoff(run_dir)
+            events = EventsLog(run_dir)
+            rounds._note_tune_outcome(run_dir, events, "000", "infra_failure")
+            rounds._note_tune_outcome(run_dir, events, "000", "valid")
+            rounds._note_tune_outcome(run_dir, events, "000", "infra_failure")
+            self.assertEqual(rounds.tune_excluded(run_dir), [])
+            self.assertFalse(rounds.tune_backoff_no_success(run_dir))
 
 
 class RoundCmd(ExperimentCmd):
@@ -1106,18 +1268,17 @@ class RoundLoopTests(unittest.TestCase):
                  "side_effects": writer_effect},
                 {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
                  "side_effects": extractor_keep},
-                {"receipt": {"tuned_run_id": "none", "tuned": False,
-                             "ledger_updated": False}},
             ])
             run_experiment("fake-task", "t1", runner=runner, model="m",
                            repo_root=repo, cmd=cmd,
                            semantic_policy="coverage_attempt",
                            scheduler_policy="round_v1", time_budget=3600)
             self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
+            # the TUNE bout is driver-owned: no tuner-orchestrator session
             roles = [name for name, _ in runner.calls]
             self.assertEqual(roles, ["background-researcher", "idea-generator",
-                                     "candidate-writer", "tunable-contract-extractor",
-                                     "tuner-orchestrator"])
+                                     "candidate-writer",
+                                     "tunable-contract-extractor"])
             self.assertEqual(
                 [call for call in cmd.round_calls if not call.startswith("overhead")],
                 ["status", "begin", "select --kind rewrite", "select --kind tune",
@@ -1125,19 +1286,21 @@ class RoundLoopTests(unittest.TestCase):
             init_call = next(call for call in cmd.calls if "init_run.py" in call)
             self.assertIn("--time-budget 3600", init_call)
             self.assertIn("--scheduler-policy round_v1", init_call)
-            # the tuner invocation was pinned to the selected candidate and
-            # carried the committed decision as a structured handoff
-            tuner_ctx = next(ctx for name, ctx in runner.calls
-                             if name == "tuner-orchestrator")
-            self.assertEqual(tuner_ctx.run_id, "000")
-            handoff = json.loads(tuner_ctx.extra["scheduler_selection"])
-            self.assertEqual(handoff["decision_id"], "dec-0002")
-            self.assertEqual(handoff["run_id"], "000")
-            # the tune decision was closed against the same id
+            # the driver consulted the deterministic state machine directly
+            self.assertTrue(any("phase-c-action" in call for call in cmd.calls))
+            # this scripted surface cannot run a bout, so the decision closes
+            # as a zero-progress infra failure — never a valid no-op
             tune_record = next(call for call in cmd.calls
                                if "cli.py record" in call and "dec-0002" in call)
             self.assertIn("--action TUNE", tune_record)
-            self.assertIn("--status valid", tune_record)
+            self.assertIn("--status infra_failure", tune_record)
+            events_path = cmd.run_dir / "driver_events.jsonl"
+            events = [json.loads(line) for line
+                      in events_path.read_text().splitlines() if line.strip()]
+            failure = next(e for e in events
+                           if e.get("kind") == "tune_infra_failure")
+            self.assertEqual(failure["selected_run_id"], "000")
+            self.assertEqual(failure["decision_id"], "dec-0002")
 
 
 if __name__ == "__main__":

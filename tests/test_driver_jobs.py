@@ -128,6 +128,36 @@ def test_phase_c_job_must_match_deterministic_action(tmp_path: Path) -> None:
             build_driver_job("tuner-orchestrator", ctx, request, repo_root=repo)
 
 
+def test_round_v1_driver_bout_uses_the_same_validation(tmp_path: Path) -> None:
+    """The driver-owned round_v1 bout and a tuner session handoff build the
+    identical job, and the candidate pin fails closed before any launch."""
+    repo, ctx = _fixture(tmp_path)
+    request = {
+        "kind": "phase_c", "run_id": "007", "method": "bo", "trial_cap": 10
+    }
+    action = {"action": "run", "method": "bo", "bout_trials": 10}
+    with mock.patch("driver.jobs._phase_c_action", return_value=action):
+        driver_argv, driver_log, _ = build_driver_job(
+            "driver", ctx, request, repo_root=repo)
+        session_argv, session_log, _ = build_driver_job(
+            "tuner-orchestrator", ctx, request, repo_root=repo)
+    assert driver_argv == session_argv and driver_log == session_log
+
+    with mock.patch("driver.jobs._phase_c_action", return_value=action):
+        with pytest.raises(DriverJobError, match="does not match invocation"):
+            build_driver_job(
+                "driver", ctx,
+                {"kind": "phase_c", "run_id": "008", "method": "bo",
+                 "trial_cap": 10},
+                repo_root=repo)
+        with pytest.raises(DriverJobError, match="does not match"):
+            build_driver_job(
+                "driver", ctx,
+                {"kind": "phase_c", "run_id": "007", "method": "grid",
+                 "trial_cap": 10},
+                repo_root=repo)
+
+
 def test_v3_phase_c_job_requires_the_complete_bout_cap(tmp_path: Path) -> None:
     repo, ctx = _fixture(tmp_path)
     (ctx.run_dir / "framework_cfg.json").write_text(json.dumps({

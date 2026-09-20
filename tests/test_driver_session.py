@@ -83,46 +83,57 @@ class CapabilityHookTests(unittest.TestCase):
         self.assertIsNone(breaker["tripped"])
 
 
+CORRECTED_ROLES = ("slate-plan-writer", "tuner-orchestrator")
+
+
 class EarlyRepeatCorrectionTests(unittest.TestCase):
-    """slate-plan-writer: #2..#4 consecutive identical calls are denied with
+    """Roles with the observed read-loop attractor (slate-plan-writer,
+    tuner-orchestrator): #2..#4 consecutive identical calls are denied with
     an explicit corrective count (invocation stays alive); the hard trip at
     REPETITION_LIMIT is unchanged. Other roles keep the silent prefix."""
 
-    def _writer_hook(self, breaker):
+    def _role_hook(self, role_name, breaker):
         runner = SDKSessionRunner(
             model="m", events=EventsLog(Path(tempfile.mkdtemp())))
-        return runner._capability_hook(ROLES["slate-plan-writer"], breaker)
+        return runner._capability_hook(ROLES[role_name], breaker)
 
-    def test_writer_denied_with_count_before_hard_trip(self) -> None:
-        breaker = new_breaker()
-        hook = self._writer_hook(breaker)
-        call = {"tool_name": "Read", "tool_input": {"file_path": "TASK.md"}}
-        self.assertEqual(asyncio.run(hook(call, None, {})), {})
-        for expected in (2, 3, 4):
-            decision = asyncio.run(
-                hook(call, None, {}))["hookSpecificOutput"]
-            self.assertEqual(decision["permissionDecision"], "deny")
-            self.assertIn(f"#{expected}", decision["permissionDecisionReason"])
-            self.assertIsNone(breaker["tripped"])
-        decision = asyncio.run(hook(call, None, {}))["hookSpecificOutput"]
-        self.assertIn("repetition breaker",
-                      decision["permissionDecisionReason"])
-        self.assertIsNotNone(breaker["tripped"])
+    def test_denied_with_count_before_hard_trip(self) -> None:
+        for role_name in CORRECTED_ROLES:
+            with self.subTest(role=role_name):
+                breaker = new_breaker()
+                hook = self._role_hook(role_name, breaker)
+                call = {"tool_name": "Read",
+                        "tool_input": {"file_path": "TASK.md"}}
+                self.assertEqual(asyncio.run(hook(call, None, {})), {})
+                for expected in (2, 3, 4):
+                    decision = asyncio.run(
+                        hook(call, None, {}))["hookSpecificOutput"]
+                    self.assertEqual(decision["permissionDecision"], "deny")
+                    self.assertIn(f"#{expected}",
+                                  decision["permissionDecisionReason"])
+                    self.assertIsNone(breaker["tripped"])
+                decision = asyncio.run(
+                    hook(call, None, {}))["hookSpecificOutput"]
+                self.assertIn("repetition breaker",
+                              decision["permissionDecisionReason"])
+                self.assertIsNotNone(breaker["tripped"])
 
     def test_other_tool_call_resets_the_correction_count(self) -> None:
-        breaker = new_breaker()
-        hook = self._writer_hook(breaker)
-        a = {"tool_name": "Read", "tool_input": {"file_path": "a.md"}}
-        b = {"tool_name": "Read", "tool_input": {"file_path": "b.md"}}
-        self.assertEqual(asyncio.run(hook(a, None, {})), {})
-        self.assertEqual(
-            asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
-            ["permissionDecision"], "deny")
-        self.assertEqual(asyncio.run(hook(b, None, {})), {})   # reset
-        self.assertEqual(asyncio.run(hook(a, None, {})), {})   # fresh count
-        self.assertEqual(
-            asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
-            ["permissionDecision"], "deny")
+        for role_name in CORRECTED_ROLES:
+            with self.subTest(role=role_name):
+                breaker = new_breaker()
+                hook = self._role_hook(role_name, breaker)
+                a = {"tool_name": "Read", "tool_input": {"file_path": "a.md"}}
+                b = {"tool_name": "Read", "tool_input": {"file_path": "b.md"}}
+                self.assertEqual(asyncio.run(hook(a, None, {})), {})
+                self.assertEqual(
+                    asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
+                    ["permissionDecision"], "deny")
+                self.assertEqual(asyncio.run(hook(b, None, {})), {})  # reset
+                self.assertEqual(asyncio.run(hook(a, None, {})), {})  # fresh
+                self.assertEqual(
+                    asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
+                    ["permissionDecision"], "deny")
 
     def test_roles_without_the_flag_keep_the_silent_prefix(self) -> None:
         breaker = new_breaker()
