@@ -319,6 +319,22 @@ entrypoint = "train.py"
             payload = json.loads(completed.stdout)
             self.assertEqual(payload["phase"], "completed")
             self.assertNotIn("evaluation_budget", payload)
+            # loop_state.md and brief are regenerated from the stored
+            # completion: an early-stop write (cutoff not passed, no budget)
+            # must not be downgraded back to running by re-derivation.
+            self.assertIn("phase: completed",
+                          (run_dir / "loop_state.md").read_text())
+            self.assertIn("active_stop_condition: time_budget_reached",
+                          (run_dir / "loop_state.md").read_text())
+            brief = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "ledger.py"), "brief",
+                 "--ledger", str(ledger_path)],
+                check=True, capture_output=True, text=True,
+            )
+            brief_payload = json.loads(brief.stdout)
+            self.assertEqual(brief_payload["phase"], "completed")
+            self.assertEqual(brief_payload["active_stop_condition"],
+                             "time_budget_reached")
 
             (run_dir / "framework_cfg.json").write_text(json.dumps({
                 "max_evaluations": 4,

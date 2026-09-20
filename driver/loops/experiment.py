@@ -312,10 +312,16 @@ def _or_block(run_dir, repo_root, cmd, events, reason: str):
     raise RunBlocked(reason)
 
 
-def _complete_run(run_dir, repo_root, cmd, events, terminal_leftover=False) -> None:
-    """Persist normal completion, translating a refusal into a blocked run."""
+def _complete_run(run_dir, repo_root, cmd, events, terminal_leftover=False,
+                  stop_condition=None) -> None:
+    """Persist normal completion, translating a refusal into a blocked run.
+
+    ``stop_condition`` names the actual early-stop cause (quiescent,
+    scheduler stop, unspendable budget tail); the None default keeps the
+    budget/clock-derived reason for normal exhaustion completions."""
     try:
         common.set_phase(run_dir, repo_root, cmd, "completed",
+                         stop_condition=stop_condition,
                          terminal_leftover=terminal_leftover)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or str(exc)).strip()
@@ -1937,14 +1943,15 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
 
     common.preflight_env(task, run_dir, repo_root, cmd)
 
-    # Status consumers must not keep seeing a stale "blocked" phase after an
+    # Status consumers must not keep seeing a stale terminal phase after an
     # explicit resume has started making progress again.
     ledger_path = run_dir / "ledger.json"
     if ledger_path.exists():
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-        if ledger.get("run_state", {}).get("phase") == "blocked":
+        stale_phase = ledger.get("run_state", {}).get("phase")
+        if stale_phase in ("blocked", "completed"):
             common.set_phase(run_dir, repo_root, cmd, "running")
-            events.emit("resumed_from_blocked")
+            events.emit("resumed_from_terminal", phase=stale_phase)
 
     background_missing = (
         not (run_dir / "background.md").exists()
@@ -2334,7 +2341,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 if zero_progress_rounds >= 2:
                     events.emit("quiescent", round_no=round_no,
                                 reason="two consecutive zero-progress rounds")
-                    _complete_run(run_dir, repo_root, cmd, events)
+                    _complete_run(run_dir, repo_root, cmd, events,
+                                  stop_condition="quiescent")
                     break
                 round_no += 1
                 continue
@@ -2366,6 +2374,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     remaining = objective_budget_status(run_dir).get("remaining")
                     _complete_run(
                         run_dir, repo_root, cmd, events,
+                        stop_condition="scheduler_stop",
                         terminal_leftover=(isinstance(remaining, int)
                                            and 0 < remaining < MIN_GENERATION_K_EVAL),
                     )
@@ -2394,13 +2403,15 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     unused_budget=remaining,
                 )
                 _complete_run(run_dir, repo_root, cmd, events,
+                              stop_condition="insufficient_remaining_budget",
                               terminal_leftover=True)
                 break
             zero_progress_rounds = 0 if progressed else zero_progress_rounds + 1
             if zero_progress_rounds >= 2:
                 events.emit("quiescent", round_no=round_no,
                             reason="two consecutive zero-progress rounds")
-                _complete_run(run_dir, repo_root, cmd, events)
+                _complete_run(run_dir, repo_root, cmd, events,
+                              stop_condition="quiescent")
                 break
             round_no += 1
     except RunBlocked:

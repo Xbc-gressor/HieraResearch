@@ -130,7 +130,17 @@ class ExperimentCmd:
             return self._ok("")
         if "set-phase" in joined:
             ledger = self._ledger()
-            ledger["phase"] = args[args.index("--phase") + 1]
+            phase = args[args.index("--phase") + 1]
+            run_state = {"phase": phase}
+            if "--stop-condition" in args:
+                run_state["active_stop_condition"] = \
+                    args[args.index("--stop-condition") + 1]
+            elif phase == "completed":
+                # Mirrors the real default for the fake's capped framework_cfg.
+                run_state["active_stop_condition"] = "evaluation_budget_reached"
+            else:
+                run_state["active_stop_condition"] = "none"
+            ledger["run_state"] = run_state
             self._save_ledger(ledger)
             return self._ok("")
         if "new_candidate.py" in joined:
@@ -274,7 +284,7 @@ class ExperimentTests(unittest.TestCase):
                        repo_root=self.repo, cmd=cmd,
                        semantic_policy="coverage_attempt",
                        scheduler_policy="v3_2")
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["background-researcher", "idea-generator",
                                  "candidate-writer", "tunable-contract-extractor",
@@ -327,7 +337,7 @@ class ExperimentTests(unittest.TestCase):
 
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd, job_runner=job_runner)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         self.assertEqual(len(jobs), 1)
         tuner_calls = [ctx for name, ctx in runner.calls
                        if name == "tuner-orchestrator"]
@@ -366,7 +376,7 @@ class ExperimentTests(unittest.TestCase):
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         tuner_calls = [ctx for name, ctx in runner.calls
                        if name == "tuner-orchestrator"]
         self.assertEqual(len(tuner_calls), 2)
@@ -439,7 +449,7 @@ class ExperimentTests(unittest.TestCase):
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
         self.assertTrue(any("resolve-unevaluated" in c for c in cmd.calls))
-        self.assertNotEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertNotEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
 
     def test_extractor_failure_with_evidence_resumes_failed_session(self) -> None:
         write_task(self.repo)
@@ -482,7 +492,7 @@ class ExperimentTests(unittest.TestCase):
             extractor_calls[1].resume_session_id,
             f"fake-sess-{extractor_calls[0].invocation_id:04d}",
         )
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
 
     def _seed_resumed_run(self, records: list[dict]) -> None:
         """A run killed after setup: cfg/background exist, no metadata."""
@@ -518,7 +528,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(writer_ctx.run_id, "000")
         self.assertTrue(any("new_candidate.py" in c and " 000 " in c
                             for c in cmd.calls))
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
 
     def test_quiescent_rounds_complete_instead_of_spinning(self) -> None:
         self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
@@ -531,12 +541,18 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
-        run_experiment("fake-task", "t1", runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
+        status = run_experiment("fake-task", "t1", runner=runner, model="m",
+                                repo_root=self.repo, cmd=cmd)
         roles = [name for name, _ in runner.calls]
         # exactly two zero-progress rounds, then normal completion
         self.assertEqual(roles, ["idea-generator", "tuner-orchestrator"] * 2)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(
+            cmd._ledger().get("run_state", {}).get("phase"), "completed")
+        # The persisted early-stop completion is what the loop returns:
+        # phase completed with the actual stop cause, not a re-derived
+        # "running" (the delivery-gap regression).
+        self.assertEqual(status["phase"], "completed")
+        self.assertEqual(status["stop_condition"], "quiescent")
         self.assertEqual(
             sum("background_contract.py validate" in call for call in cmd.calls),
             1,
@@ -559,15 +575,38 @@ class ExperimentTests(unittest.TestCase):
         self.assertTrue(any("--phase running" in c for c in set_phases),
                         set_phases)
 
+    def test_resume_resets_stale_completed_phase(self) -> None:
+        self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [True]  # budget exhausted: completes immediately
+        import json as _json
+        ledger_path = self.repo / "runs" / "fake-task" / "t1" / "ledger.json"
+        ledger = _json.loads(ledger_path.read_text())
+        ledger["run_state"] = {"phase": "completed",
+                               "active_stop_condition": "quiescent"}
+        ledger_path.write_text(_json.dumps(ledger))
+        runner = FakeSessionRunner([])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        set_phases = [c for c in cmd.calls if "set-phase" in c]
+        # A resumed run does not carry its stale completion through the new
+        # session; it ends completed again through its own guard.
+        self.assertTrue(any("--phase running" in c for c in set_phases),
+                        set_phases)
+        self.assertEqual(
+            cmd._ledger().get("run_state", {}).get("phase"), "completed")
+
     def test_set_phase_completed_refusal_blocks_cleanly(self) -> None:
         self._seed_resumed_run([{"run_id": "000", "status": "keep"}])
         cmd = ExperimentCmd(self.repo)
         cmd.reached = [True]
         cmd.raise_once = {"phase completed"}  # set-phase completed refused once
         runner = FakeSessionRunner([])
-        run_experiment("fake-task", "t1", runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        status = run_experiment("fake-task", "t1", runner=runner, model="m",
+                                repo_root=self.repo, cmd=cmd)
+        self.assertEqual(
+            cmd._ledger().get("run_state", {}).get("phase"), "blocked")
+        self.assertEqual(status["phase"], "blocked")
         events = (cmd.run_dir / "driver_events.jsonl").read_text()
         self.assertIn("set-phase completed refused", events)
 
@@ -599,7 +638,7 @@ class ExperimentTests(unittest.TestCase):
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         tuner_calls = [ctx for name, ctx in runner.calls
                        if name == "tuner-orchestrator"]
         self.assertEqual(len(tuner_calls), 3)
@@ -624,7 +663,7 @@ class ExperimentTests(unittest.TestCase):
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
         events = (cmd.run_dir / "driver_events.jsonl").read_text()
         self.assertIn("provided baseline could not be evaluated", events)
         self.assertIn("no accepted receipt", events)
@@ -696,7 +735,7 @@ class ExperimentTests(unittest.TestCase):
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["idea-generator", "candidate-writer",
                                  "tunable-contract-extractor",
@@ -735,7 +774,7 @@ class ExperimentTests(unittest.TestCase):
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
         self.assertEqual(
             [name for name, _ in runner.calls],
             ["background-researcher", "background-researcher"],
@@ -758,7 +797,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
         self.assertEqual(runner.calls, [])
         self.assertEqual((cmd.run_dir / "background.md").read_text(),
                          "# frozen\n")
@@ -790,7 +829,7 @@ class ExperimentTests(unittest.TestCase):
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["background-faithfulness-judge",
                                  "idea-generator", "candidate-writer",
@@ -838,7 +877,7 @@ class ExperimentTests(unittest.TestCase):
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["background-faithfulness-judge",
                                  "background-researcher",
@@ -881,7 +920,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
         events = (cmd.run_dir / "driver_events.jsonl").read_text()
         self.assertIn("prepare_command failed", events)
 
@@ -927,7 +966,7 @@ class ExperimentTests(unittest.TestCase):
         runner = FakeSessionRunner([])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
         events = (run_dir / "driver_events.jsonl").read_text()
         self.assertIn("retrofitting the control", events)
         roles = [name for name, _ in runner.calls]

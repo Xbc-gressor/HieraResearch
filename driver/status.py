@@ -3,6 +3,9 @@
 Phase semantics ported from the retired harness_watch._run_snapshot:
 - blocked iff ledger.run_state.phase == "blocked" (loop_state.md may carry the
   same signal; compact_status folds it in);
+- completed iff ledger.run_state.phase == "completed": the completion guard in
+  `tools/ledger.py set-phase` already vetted that write, so the persisted
+  verdict is trusted as-is (with its stored stop condition);
 - otherwise a configured, exhausted budget means completed ONLY when every
   ledger record is lifecycle-terminal and the experience cursor is current;
 - anything else is running.
@@ -52,6 +55,8 @@ def _derive_state(ledger: dict | None, framework_cfg: dict,
     stored = ledger.get("run_state") if isinstance(ledger.get("run_state"), dict) else {}
     if stored.get("phase") == "blocked":
         return "blocked", stored.get("active_stop_condition") or "none"
+    if stored.get("phase") == "completed":
+        return "completed", stored.get("active_stop_condition") or "none"
     raw_records = ledger.get("records", [])
     records = (
         [r for r in raw_records if isinstance(r, dict)]

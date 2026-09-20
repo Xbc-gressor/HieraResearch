@@ -115,6 +115,10 @@ def run_phase(
     attempted = evaluations_done(data, ledger_path)["evaluations_done"]
     if state.get("phase") == "blocked":
         return "blocked", str(state.get("active_stop_condition") or "unspecified_blocker")
+    # A persisted completion was vetted by `ledger.py set-phase`; trust it
+    # (early-stop completions reach the ledger before budget/clock exhaustion).
+    if state.get("phase") == "completed":
+        return "completed", str(state.get("active_stop_condition") or "none")
     evaluations_reached = budget is not None and attempted >= budget
     time_reached = False
     if not evaluations_reached and budget is None and budget_override is None:

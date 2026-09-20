@@ -39,6 +39,7 @@ from driver.session import (  # noqa: E402
     SDKSessionRunner,
 )
 from ledger import cmd_set_phase, resolve_unevaluated  # noqa: E402
+from driver.status import _derive_state  # noqa: E402
 from process_group import terminate_group  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
 from semantic_space import complete_point, space_receipt  # noqa: E402
@@ -646,6 +647,13 @@ class LedgerDeadlineTests(unittest.TestCase):
             self.assertEqual(stored["run_state"]["phase"], "completed")
             self.assertEqual(stored["run_state"]["active_stop_condition"],
                              "time_budget_reached")
+            # The guard-vetted cutoff completion (with its unrefreshed
+            # terminal delta) reads back as completed — no downgrade to
+            # final_experience_refresh_required.
+            cfg = {"max_evaluations": None, "deadline": time.time() - 10}
+            self.assertEqual(
+                _derive_state(stored, cfg, 0),
+                ("completed", "time_budget_reached"))
 
 
 if __name__ == "__main__":

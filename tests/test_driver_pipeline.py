@@ -152,7 +152,7 @@ class SessionChannelTests(unittest.TestCase):
 
     def test_two_seats_overlap_llm_and_gpu_time(self) -> None:
         cmd, runner, gpu, wall = self._run(concurrency=2)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         statuses = {r["run_id"]: r["status"] for r in cmd._ledger()["records"]}
         self.assertEqual(statuses, {"000": "keep", "001": "keep"})
         self.assertEqual(sorted(gpu.jobs), ["000", "001"])
@@ -174,7 +174,7 @@ class SessionChannelTests(unittest.TestCase):
 
     def test_concurrency_one_is_the_serial_loop(self) -> None:
         cmd, runner, gpu, wall = self._run(concurrency=1)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(
             roles[2:8],
@@ -220,7 +220,7 @@ class UnevaluatedReceiptTests(unittest.TestCase):
                        scheduler_policy="v3_2")
         record = cmd._ledger()["records"][0]
         self.assertEqual(record["status"], "unevaluated")
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         self.assertTrue(any("resolve-unevaluated" in call for call in cmd.calls))
 
     def test_postcondition_accepts_the_unevaluated_receipt(self) -> None:

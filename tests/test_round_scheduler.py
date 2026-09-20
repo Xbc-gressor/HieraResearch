@@ -1113,7 +1113,7 @@ class RoundLoopTests(unittest.TestCase):
                            repo_root=repo, cmd=cmd,
                            semantic_policy="coverage_attempt",
                            scheduler_policy="round_v1", time_budget=3600)
-            self.assertEqual(cmd._ledger().get("phase"), "completed")
+            self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
             roles = [name for name, _ in runner.calls]
             self.assertEqual(roles, ["background-researcher", "idea-generator",
                                      "candidate-writer", "tunable-contract-extractor",

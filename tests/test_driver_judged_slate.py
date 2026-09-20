@@ -501,7 +501,7 @@ class JudgedSlateTests(unittest.TestCase):
             ["slate_pool_built", "slate_judge_completed",
              "slate_manifested", "slate_admitted"],
         )
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
 
     def test_judge_correction_resumes_the_same_session(self) -> None:
         self._seed_run()
@@ -568,7 +568,7 @@ class JudgedSlateTests(unittest.TestCase):
             (self._gen_dir() / "generation.json").read_bytes(), manifest_bytes)
         self.assertEqual(
             [r["run_id"] for r in self._new_records(cmd2)], ["005", "006"])
-        self.assertEqual(cmd2._ledger().get("phase"), "completed")
+        self.assertEqual(cmd2._ledger().get("run_state", {}).get("phase"), "completed")
 
     def test_resume_fills_only_the_missing_plan(self) -> None:
         self._seed_run()
@@ -622,7 +622,7 @@ class JudgedSlateTests(unittest.TestCase):
             extractor_entry(cmd),
             tuner_entry(),
         ])
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         plans = self._gen_dir() / "plans"
         self.assertTrue((plans / "slot-0.json").exists())
         self.assertTrue((plans / "slot-1.json").exists())
@@ -657,7 +657,7 @@ class JudgedSlateTests(unittest.TestCase):
             {"fail": ["b"]},
             {"fail": ["c"]},
         ])
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
         plans = self._gen_dir() / "plans"
         self.assertFalse((plans / "slot-0.json").exists())
         self.assertEqual(
@@ -668,7 +668,7 @@ class JudgedSlateTests(unittest.TestCase):
         cmd2.reached = [False, False]
         runner2 = self._run(cmd2, [])  # empty script: any session is a bug
         self.assertEqual([name for name, _ in runner2.calls], [])
-        self.assertEqual(cmd2._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd2._ledger().get("run_state", {}).get("phase"), "blocked")
         events_path = (self.repo / "runs" / TASK / TAG
                        / "driver_events.jsonl")
         rows = [json.loads(line) for line in
@@ -688,7 +688,7 @@ class JudgedSlateTests(unittest.TestCase):
             {"fail": ["writer down"]},
             {"fail": ["writer still down"]},
         ])
-        self.assertEqual(cmd._ledger().get("phase"), "blocked")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
         self.assertEqual(
             [r["status"] for r in self._new_records(cmd)],
             ["pending", "pending"],
@@ -711,7 +711,7 @@ class JudgedSlateTests(unittest.TestCase):
         )
         self.assertEqual(
             [r["status"] for r in self._new_records(cmd2)], ["keep", "keep"])
-        self.assertEqual(cmd2._ledger().get("phase"), "completed")
+        self.assertEqual(cmd2._ledger().get("run_state", {}).get("phase"), "completed")
 
     # ---------- degraded cardinality (design 10.8) ----------
 
@@ -726,7 +726,7 @@ class JudgedSlateTests(unittest.TestCase):
                 for call in cmd.calls))
         self.assertFalse((self._gen_dir() / "generation.json").exists())
         self.assertEqual(len(cmd._ledger()["records"]), 5)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
 
     def test_admission_cap_one_seats_coverage_leader_without_judges(self) -> None:
         self._seed_run(max_evaluations=2)  # terminal 2-row screen -> cap 1
@@ -895,7 +895,7 @@ class JudgedSlateDonorBindingTests(unittest.TestCase):
             extractor_entry(cmd),
             tuner_entry(),
         ])
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
 
         manifest = json.loads((self._gen_dir() / "generation.json").read_text())
         binding = manifest["donor_snapshot"]
@@ -945,7 +945,7 @@ class JudgedSlateDonorBindingTests(unittest.TestCase):
             extractor_entry(cmd),
             tuner_entry(),
         ])
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         manifest = json.loads((self._gen_dir() / "generation.json").read_text())
         self.assertEqual(
             manifest["donor_snapshot"],
@@ -1069,7 +1069,7 @@ class CoverageArmRegressionTests(unittest.TestCase):
             roles, ["idea-generator", "tuner-orchestrator"] * 2)
         self.assertFalse((run_dir / ".semantic").exists())
         self.assertNotIn("slate-judge", roles)
-        self.assertEqual(cmd._ledger().get("phase"), "completed")
+        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
 
 
 if __name__ == "__main__":

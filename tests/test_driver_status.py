@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from driver.status import (  # noqa: E402
+    _derive_state,
     budget_status,
     compact_status,
     derive_phase,
@@ -114,6 +116,36 @@ class DerivePhaseTests(unittest.TestCase):
         self.assertEqual(
             derive_phase(ledger, {"deadline": 1.0}, 0), "running")
 
+    def test_stored_completed_wins_before_budget_exhaustion(self) -> None:
+        # An early-stop completion was vetted by `ledger.py set-phase`; the
+        # read side trusts it even while budget/clock still derive running.
+        ledger = {
+            "records": [{"run_id": "001", "status": "keep"}],
+            "run_state": {"phase": "completed",
+                          "active_stop_condition": "quiescent"},
+        }
+        cfg = {"max_evaluations": 100, "deadline": time.time() + 3600}
+        self.assertEqual(_derive_state(ledger, cfg, 1),
+                         ("completed", "quiescent"))
+
+    def test_stored_completed_defaults_stop_condition_to_none(self) -> None:
+        ledger = {"records": [], "run_state": {"phase": "completed"}}
+        self.assertEqual(_derive_state(ledger, {}, 0), ("completed", "none"))
+
+    def test_stored_completed_with_stale_experience_reads_completed(self) -> None:
+        # Past the cutoff, set-phase tolerates completing with an unrefreshed
+        # terminal experience delta; the read side must not downgrade it.
+        ledger = {
+            "records": [{"run_id": "001", "status": "keep"}],
+            "dag_revision": 2,
+            "experience": {"dag_revision": 1},
+            "run_state": {"phase": "completed",
+                          "active_stop_condition": "time_budget_reached"},
+        }
+        cfg = {"deadline": 1.0, "final_reserve_seconds": 0}
+        self.assertEqual(_derive_state(ledger, cfg, 0),
+                         ("completed", "time_budget_reached"))
+
 
 def _fake_cmd(budget: dict, brief: dict):
     def cmd(argv, repo_root):
@@ -166,6 +198,23 @@ class CompactStatusTests(unittest.TestCase):
             status = compact_status("unit", "t5", run_dir, ROOT, cmd)
             self.assertEqual(status["phase"], "blocked")
             self.assertEqual(status["stop_condition"], "contract mismatch")
+
+    def test_blocked_loop_state_beats_stored_completed(self) -> None:
+        # The blocked override keeps priority over a persisted completion;
+        # the fold-in's setdefault keeps any stored stop condition.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "ledger.json").write_text(json.dumps({
+                "records": [],
+                "run_state": {"phase": "completed",
+                              "active_stop_condition": "quiescent"},
+            }))
+            (run_dir / "loop_state.md").write_text(
+                "phase: blocked\nactive_stop_condition: contract mismatch\n")
+            cmd = _fake_cmd({"evaluations_done": 0}, {})
+            status = compact_status("unit", "t5", run_dir, ROOT, cmd)
+            self.assertEqual(status["phase"], "blocked")
+            self.assertEqual(status["stop_condition"], "quiescent")
 
     def test_no_ledger_skips_brief(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -930,7 +930,12 @@ def cmd_brief(args) -> int:
 
 @_mutation
 def cmd_set_phase(args) -> int:
-    """Persist a blocked/running state; completion is budget-derived only."""
+    """Persist a lifecycle phase; completion writes are guard-vetted here.
+
+    Stored terminal phases (blocked/completed) are then trusted by the read
+    side (driver/status.py and ledger_views.run_phase) — including early-stop
+    completions written before budget/clock exhaustion, and completions past
+    the cutoff that leave an unrefreshed experience delta."""
     ledger_path = Path(args.ledger)
     data = _load_ledger(ledger_path, for_update=True)
     time_budget_configured = False

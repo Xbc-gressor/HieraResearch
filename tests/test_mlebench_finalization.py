@@ -1,7 +1,9 @@
 """Final delivery integration without a model, GPU, or paid backend."""
 import json
+import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -9,8 +11,31 @@ from unittest import mock
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
+
 from driver import __main__ as cli
+from driver.session import FakeSessionRunner
+from tests.test_driver_experiment import (
+    judge_entry,
+    write_audited_background,
+    write_task,
+)
 from tools import mlebench_export, mlebench_finalize, mlebench_grade
+from tools.search_space_state import empty_search_space_state
+
+
+@pytest.fixture(autouse=True)
+def _isolated_evaluation_domain():
+    """cli.main exports EVALUATION_STAGE/FIDELITY for the whole process;
+    keep that out of later tests (rounds.status appends them to its calls)."""
+    keys = ("EVALUATION_STAGE", "EVALUATION_FIDELITY")
+    saved = {k: os.environ.pop(k) for k in keys if k in os.environ}
+    yield
+    for key in keys:
+        if key in saved:
+            os.environ[key] = saved[key]
+        else:
+            os.environ.pop(key, None)
 
 
 @pytest.mark.parametrize("phase,export_rc,grade_rc", [
@@ -55,6 +80,112 @@ def test_driver_delivers_after_completion_without_watchdog(tmp_path, phase, expo
         assert data["submission"]["ended_at_unix"] <= deadline
         assert data["grader"]["started_at_unix"] >= data["submission"]["ended_at_unix"]
         assert data["grader"]["counts_toward_submission_budget"] is False
+
+
+def test_early_stop_run_finalizes_in_the_same_process(tmp_path, capsys):
+    """REPORT-finalize-early-stop-gap: a zero-progress early stop must reach
+    automatic finalize in the same driver process. Everything between the
+    loop entry and the delivery artifacts is real — the real completion
+    guard (ledger set-phase), the real status derivation, the real CLI gate;
+    only the paid role sessions and the export/grading commands are
+    replaced."""
+    repo = tmp_path
+    shutil.copytree(ROOT / "tools", repo / "tools",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(ROOT / "contracts", repo / "contracts")
+    write_task(repo)
+    run_dir = repo / "runs" / "fake-task" / "t1"
+    subprocess.run(
+        [sys.executable, "tools/init_run.py", "fake-task", "t1",
+         "--time-budget", "3600", "--dimension-strategy", "catalog_subset",
+         "--semantic-policy", "coverage_attempt"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    (run_dir / "ledger.json").write_text(json.dumps({
+        "records": [{"run_id": "000", "status": "keep", "op": "fresh",
+                     "final_best_score": 0.2}],
+        "search_space_state": empty_search_space_state(),
+    }))
+    # A real background that passes the real validator (catalog-matching
+    # registry); its claim mappings route through one faithfulness judge
+    # session, scripted as all-faithful.
+    write_audited_background(run_dir)
+    (run_dir / "evaluation_attempts.jsonl").write_text("")
+    cfg = json.loads((run_dir / "framework_cfg.json").read_text())
+    deadline = cfg["deadline"]
+    # The cutoff (deadline − reserve) is comfortably in the future.
+    assert deadline - time.time() > 2 * cfg.get("final_reserve_seconds", 0)
+
+    export = repo / "export.py"
+    export.write_text("from pathlib import Path\n"
+                      "Path('submission.csv').write_text('Id,Probability\\n1,0.5\\n')\n")
+    grade = repo / "grade.py"
+    grade.write_text("from pathlib import Path\n"
+                     "assert Path('submission.csv').exists()\n"
+                     "Path('graded').touch()\n")
+
+    # Two zero-progress rounds (idea-generator proposes nothing, tuner has
+    # no bout) quiesce the loop while the budget/clock still read "running".
+    runner = FakeSessionRunner([
+        judge_entry(set()),
+        {"receipt": {"actions": []}},
+        {"receipt": {"tuned_run_id": "none", "tuned": False,
+                     "ledger_updated": False}},
+        {"receipt": {"actions": []}},
+        {"receipt": {"tuned_run_id": "none", "tuned": False,
+                     "ledger_updated": False}},
+    ])
+
+    import driver.loops.experiment as experiment_mod
+    saved_default = experiment_mod.run_experiment.__kwdefaults__["repo_root"]
+    experiment_mod.run_experiment.__kwdefaults__["repo_root"] = repo
+    try:
+        with mock.patch("driver.roles.REPO_ROOT", repo), \
+                mock.patch("driver.session.SDKSessionRunner",
+                           lambda model, events, cli_path=None: runner), \
+                mock.patch("driver.loops.common.preflight_env",
+                           lambda *args, **kwargs: None):
+            rc = cli.main([
+                "run", "fake-task", "t1", "--loop", "experiment",
+                "--model", "m", "--data-dir", str(repo),
+                "--submission-command", shlex.join([sys.executable, str(export)]),
+                "--grader-command", shlex.join([sys.executable, str(grade)]),
+            ])
+    finally:
+        experiment_mod.run_experiment.__kwdefaults__["repo_root"] = saved_default
+
+    assert rc == 0
+    # The CLI prints the loop's returned status as a multi-line JSON block
+    # between single-line "[driver]" progress events.
+    block: list[str] = []
+    for line in capsys.readouterr().out.splitlines():
+        if line == "{":
+            block = ["{"]
+        elif block:
+            block.append(line)
+            if line == "}":
+                break
+    status = json.loads("\n".join(block))
+    assert status["phase"] == "completed"
+    assert status["stop_condition"] == "quiescent"
+    assert status["active_stop_condition"] == "quiescent"
+    stored = json.loads((run_dir / "ledger.json").read_text())["run_state"]
+    assert stored["phase"] == "completed"
+    assert stored["active_stop_condition"] == "quiescent"
+    loop_state = (run_dir / "loop_state.md").read_text()
+    assert "phase: completed" in loop_state
+    assert "active_stop_condition: quiescent" in loop_state
+    assert (run_dir / "submission.csv").exists()
+    assert (run_dir / "graded").exists()
+    manifest = json.loads(
+        (run_dir / "finalization-manifest.json").read_text())
+    assert manifest["deadline_unix"] == deadline
+    assert manifest["submission"]["ended_at_unix"] <= deadline
+    assert manifest["grader"]["started_at_unix"] >= \
+        manifest["submission"]["ended_at_unix"]
+    events = (run_dir / "driver_events.jsonl").read_text()
+    assert "quiescent" in events
+    assert "finalization_finished" in events
 
 
 @pytest.mark.parametrize("remaining", [-1, 0.15])
