@@ -85,6 +85,11 @@ class RoleDefinition:
     # When non-empty, Bash calls must start with one of these prefixes
     # (enforced by the PreToolUse hook in session.py).
     bash_patterns: tuple[str, ...] = ()
+    # When true, Bash runs only the retrieval-adapter commands
+    # (adapter_command_verdict in session.py): one allowlisted adapter
+    # invocation per call, no shell operators, and --manifest confined to the
+    # run's own directory.
+    bash_adapter_only: bool = False
     # Early corrective denies for consecutive identical (tool, input) calls
     # BEFORE the hard repetition trip: #2..#LIMIT-1 are denied with an
     # explicit count while the invocation stays alive. Reserved for roles
@@ -278,6 +283,7 @@ ROLES: dict[str, RoleDefinition] = {
             "retrieval_manifest": "str",
         },
         postconditions=(background_artifacts_exist,),
+        bash_adapter_only=True,
         # Runs once per run; healthy cells observed 1066-1259s, degraded
         # retrieval pushed one session past 2164s (2026-09-19 calibration).
         wall_limit_seconds=3600.0,

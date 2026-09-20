@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from background_contract import (  # noqa: E402
+    _validated_inputs,
     audit_text,
     derive_hypothesis_selection,
     extract_result_numbers,
@@ -21,6 +23,10 @@ from background_contract import (  # noqa: E402
     validate_experience,
     validate_experience_replacement,
     validate_registry,
+)
+from competition_policy import (  # noqa: E402
+    COMPETITION_POLICY_VERSION,
+    derive_profile,
 )
 from search_backends import (  # noqa: E402
     add_visit,
@@ -46,6 +52,7 @@ from semantic_space import (  # noqa: E402
 from tests.fixtures import (  # noqa: E402
     TOY_SOURCE,
     attach_matched_transfer,
+    background_text,
     belief_ledger,
     fixture_registry,
     retrieval_hit_manifest,
@@ -507,6 +514,195 @@ class RetrievalReceiptTests(unittest.TestCase):
                 content="inspected primary source" * 30,
             )
             self.assertEqual(verification_statuses(manifest)[key], "section")
+
+
+MLSP_TASK = ("mle-mlsp-birds", "mlsp-2013-birds")
+
+
+class CompetitionPolicyTests(unittest.TestCase):
+    """Artifact-side competition-policy gates in the validate flow."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.run_dir = Path(self._tmp.name) / "runs" / MLSP_TASK[0] / "t1"
+        self.run_dir.mkdir(parents=True)
+        profile = derive_profile(*MLSP_TASK)
+        self.assertIsNotNone(profile)
+        (self.run_dir / "task_identity_profile.json").write_text(json.dumps(profile))
+        self.manifest_path = self.run_dir / "background_retrieval.json"
+        self.registry = fixture_registry()
+        self.url = TOY_SOURCE["url"]
+
+    def _write_manifest(self, manifest: dict) -> dict:
+        self.manifest_path.write_text(json.dumps(manifest))
+        return manifest
+
+    def _stamp(self, manifest: dict) -> dict:
+        manifest["competition_id"] = MLSP_TASK[1]
+        manifest["competition_policy_version"] = COMPETITION_POLICY_VERSION
+        return manifest
+
+    def _preseeded_manifest(self, *, stamp: bool = True) -> dict:
+        manifest = retrieval_hit_manifest()
+        add_visit(
+            manifest,
+            self.run_dir,
+            url=self.url,
+            backend="web",
+            view="full_text",
+            status="success",
+            content="retained primary text " * 10,
+        )
+        manifest["visits"][-1]["policy_status"] = "allowed"
+        if stamp:
+            self._stamp(manifest)
+        return self._write_manifest(manifest)
+
+    def _errors(self, manifest: dict) -> list[str]:
+        return validate_registry(
+            self.registry,
+            retrieval_manifest=manifest,
+            manifest_dir=self.run_dir,
+            manifest_path=self.manifest_path,
+        )
+
+    def _validate_run(self, run_dir: Path, *, with_manifest: bool = False) -> list[str]:
+        args = argparse.Namespace(
+            background=run_dir / "background.md",
+            catalog=None,
+            ledger=None,
+            retrieval_manifest=(
+                run_dir / "background_retrieval.json" if with_manifest else None
+            ),
+            baseline_mechanisms=None,
+            number_gate=False,
+        )
+        _, _, errors = _validated_inputs(args)
+        return errors
+
+    def test_preseeded_manifest_without_policy_metadata_fails_closed(self) -> None:
+        errors = self._errors(self._preseeded_manifest(stamp=False))
+        self.assertTrue(
+            any(
+                "competition policy: retrieval manifest competition_id is missing"
+                in error
+                for error in errors
+            ),
+            errors,
+        )
+        self.assertTrue(
+            any("competition_policy_version" in error for error in errors),
+            errors,
+        )
+
+        manifest = self._preseeded_manifest(stamp=False)
+        manifest["competition_id"] = "spooky-author-identification"
+        manifest["competition_policy_version"] = COMPETITION_POLICY_VERSION
+        errors = self._errors(self._write_manifest(manifest))
+        self.assertTrue(
+            any("does not match the resolved competition" in error for error in errors),
+            errors,
+        )
+
+        self.assertEqual(self._errors(self._preseeded_manifest()), [])
+
+    def test_older_policy_version_fails(self) -> None:
+        manifest = self._preseeded_manifest()
+        manifest["competition_policy_version"] = COMPETITION_POLICY_VERSION - 1
+        errors = self._errors(self._write_manifest(manifest))
+        self.assertTrue(
+            any(
+                "competition_policy_version" in error and "predates" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_receipts_backed_only_by_blocked_or_undetermined_visits_fail(self) -> None:
+        for label, status, policy_status in (
+            ("blocked visit", "blocked", "blocked"),
+            ("undetermined visit", "success", None),
+        ):
+            with self.subTest(receipt=label):
+                manifest = self._stamp(new_manifest())
+                add_visit(
+                    manifest,
+                    self.run_dir,
+                    url=self.url,
+                    backend="web",
+                    view="full_text",
+                    status=status,
+                    content=(
+                        "retained primary text " * 10 if status == "success" else None
+                    ),
+                )
+                if policy_status is not None:
+                    manifest["visits"][-1]["policy_status"] = policy_status
+                errors = self._errors(self._write_manifest(manifest))
+                self.assertEqual(len(errors), 1, errors)
+                (error,) = errors
+                self.assertIn("competition policy:", error)
+                self.assertIn("src-01", error)
+                self.assertIn("visit", error)
+
+        # Unreferenced blocked_results are coverage records, not errors.
+        manifest = self._preseeded_manifest()
+        manifest["rounds"][0]["blocked_results"] = [
+            {
+                "url": "https://example.test/mlsp-winning-solution",
+                "rule_categories": ["slug_sequence", "phrase:winning solution"],
+                "basis": "direct",
+                "pointer": "audit-0001",
+            }
+        ]
+        self.assertEqual(self._errors(self._write_manifest(manifest)), [])
+
+    def test_background_scan_flags_competition_solution_prose(self) -> None:
+        (self.run_dir / "background.md").write_text(
+            background_text(self.registry)
+            + "\nThe MLSP 2013 birds winning solution used a first-place "
+            "ensemble that reached 0.954 private leaderboard.\n"
+        )
+        errors = self._validate_run(self.run_dir)
+        self.assertTrue(
+            any(
+                "competition policy: background.md matches" in error
+                and "winning solution" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_background_scan_allows_generic_leaderboard_discussion(self) -> None:
+        (self.run_dir / "background.md").write_text(
+            background_text(self.registry)
+            + "\nFor the MLSP 2013 birds task we review how the leaderboard "
+            "mechanism aggregates per-recording validation metrics into a "
+            "single ordering across species.\n"
+        )
+        self.assertEqual(self._validate_run(self.run_dir), [])
+
+    def test_non_mle_paths_skip_all_policy_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            manifest = new_manifest()
+            add_visit(
+                manifest,
+                run_dir,
+                url=self.url,
+                backend="web",
+                view="full_text",
+                status="success",
+                content="retained primary text " * 10,
+            )
+            (run_dir / "background_retrieval.json").write_text(json.dumps(manifest))
+            (run_dir / "background.md").write_text(
+                background_text(self.registry)
+                + "\nThe MLSP 2013 birds winning solution used a first-place "
+                "ensemble that reached 0.954 private leaderboard.\n"
+            )
+            self.assertEqual(self._validate_run(run_dir, with_manifest=True), [])
 
 
 def _base_experience() -> dict:

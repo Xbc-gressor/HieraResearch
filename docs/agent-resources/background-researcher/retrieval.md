@@ -14,6 +14,24 @@ targeted, which backends answered, and which sources were opened. It is
 append-only and written only through `tools/search_backends.py` — never
 hand-edit it or the `retrieval/` content files it points to.
 
+## Competition policy
+
+When the run targets a public competition, its rules ban that competition's
+own solutions and byproducts: winning/top solutions, kernels, notebooks, code
+repos, postmortems, leaderboards, private scores, and participant writeups —
+including publications *about* this competition's participants or results.
+Research generic methodology for the problem class instead, and never
+target-search the competition name or slug, the dataset's proper name, or
+participant identities for the above. Retrieval is adapter-only: no curl,
+wget, git, gh, browser, or any other network channel.
+
+The adapter enforces this at runtime. A blocked query or visit exits **2**
+with `query blocked by competition policy` / `visit blocked by competition
+policy` on stderr — distinct from backend failures (exit 1). `status` reports
+policy blocks separately from backend quota failures, and blocked items never
+appear in results or retrieval content. The right response is to rephrase as
+a generic methodology question, not to retry the same target.
+
 ## Manifest
 
 Every `search` call appends one round (`r-01`, `r-02`, …) holding that call's

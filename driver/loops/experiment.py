@@ -62,6 +62,7 @@ from . import background_audit
 from . import common
 from . import rounds
 from .common import RunBlocked
+from tools import competition_policy
 from tools.evaluation_budget import budget_status as objective_budget_status
 from tools.evaluation_budget import phase_c_attempts
 from tools.evaluation_budget import time_budget as run_time_budget
@@ -1753,7 +1754,9 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     except RuntimeError as exc:
         _or_block(run_dir, repo_root, cmd, events, str(exc))
     common.preflight_env(task, run_dir, repo_root, cmd)
-    write_metadata(run_dir, model, cli_path)
+    competition_id = (task_toml.get("mlebench") or {}).get("competition_id")
+    write_metadata(run_dir, model, cli_path, competition_id=competition_id)
+    _ensure_identity_profile(run_dir, task, competition_id)
     brief = ensure_brief(run_dir, task_toml)
     events.emit("objective_brief", path=str(run_dir / "objective_brief.json"),
                 metric=brief.get("metric"),
@@ -1795,6 +1798,26 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
             runner, store, task, tag, run_dir, repo_root, cmd, events,
             strategy,
             repairable=_background_researcher_invoked(run_dir))
+
+
+def _ensure_identity_profile(run_dir, task, competition_id) -> None:
+    """Write <run_dir>/task_identity_profile.json for MLE tasks (idempotent).
+
+    The retrieval adapter fails closed when a competition_id is known but no
+    parseable profile sits beside the manifest; non-MLE tasks get no file.
+    """
+    profile = competition_policy.derive_profile(task, competition_id)
+    if profile is None:
+        return
+    path = run_dir / "task_identity_profile.json"
+    if path.exists():
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+            return
+        except (OSError, json.JSONDecodeError):
+            pass
+    path.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
 
 
 def _background_researcher_invoked(run_dir) -> bool:
@@ -1932,14 +1955,17 @@ def _background_faithfulness_gate(runner, store, task, tag, run_dir,
 def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
                   model, cli_path, task_toml=None) -> None:
     """Finish any interrupted setup work and restore a runnable phase."""
+    task_toml = task_toml or common.load_task_toml(task, repo_root)
+    competition_id = (task_toml.get("mlebench") or {}).get("competition_id")
     metadata_path = run_dir / "run_metadata.json"
     if metadata_path.exists():
         for warning in warn_on_mismatch(run_dir, model, cli_path):
             events.emit("metadata_mismatch", warning=warning)
     else:
         # The run was killed before fresh setup reached write_metadata().
-        write_metadata(run_dir, model, cli_path)
-    ensure_brief(run_dir, task_toml or common.load_task_toml(task, repo_root))
+        write_metadata(run_dir, model, cli_path, competition_id=competition_id)
+    _ensure_identity_profile(run_dir, task, competition_id)
+    ensure_brief(run_dir, task_toml)
 
     common.preflight_env(task, run_dir, repo_root, cmd)
 
@@ -1962,8 +1988,7 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
         # in progress. Resume that setup phase before entering ideation.
         try:
             _invoke(runner, store, "background-researcher", task, tag, run_dir,
-                    extra={"objective": _objective_line(
-                        task_toml or common.load_task_toml(task, repo_root))})
+                    extra={"objective": _objective_line(task_toml)})
         except InvocationFailed as exc:
             _or_block(run_dir, repo_root, cmd, events,
                       f"background-researcher failed: {exc.problems}")

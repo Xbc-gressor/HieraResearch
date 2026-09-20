@@ -16,6 +16,8 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
+from tools.competition_policy import COMPETITION_POLICY_VERSION
+
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 PERMISSION_POLICY = "bypassPermissions+pre-tool-use-capability-hook"
@@ -87,10 +89,13 @@ def resolve_model(cli_model: str | None, run_dir: Path) -> tuple[str | None, str
     return cli_model, None
 
 
-def write_metadata(run_dir: Path, model: str, cli_path: str | None) -> dict:
+def write_metadata(run_dir: Path, model: str, cli_path: str | None,
+                   competition_id: str | None = None) -> dict:
     meta = collect_metadata(model, cli_path)
     repo_root = PROMPT_DIR.parent.parent
     meta["code"] = code_identity(repo_root)
+    meta["competition_id"] = competition_id
+    meta["competition_policy_version"] = COMPETITION_POLICY_VERSION
     cfg = run_dir / "framework_cfg.json"
     if cfg.is_file():
         meta["framework_config"] = json.loads(cfg.read_text(encoding="utf-8"))

@@ -34,6 +34,33 @@ An explicit `task_packet` may supply the task id when no installed task resolves
 If neither an installed task nor a packet resolves, stop and report what is
 missing.
 
+## Competition compliance
+
+This run may target a specific public competition (e.g. an MLE-bench task).
+Competition rules ban learning from that competition's own solutions. Scope
+your research accordingly:
+
+- **Allowed:** generic methodology — papers, textbooks, and practitioner
+  writing about the problem class, the data modality, model mechanisms, and
+  failure modes — plus task-local material (`TASK.md`, `prepare.py`, the
+  public data).
+- **Forbidden:** this competition's solutions and byproducts — its solutions,
+  winning methods, top solutions, kernels, notebooks, code repos,
+  postmortems, leaderboards, private scores, and participant writeups —
+  including papers or reports *about* this competition's participants or
+  results (publication status does not launder competition-specificity).
+  Never target-search the above using the competition name, its Kaggle slug,
+  the dataset's proper name, or known participant identities.
+- **Adapter-only retrieval:** every fetch goes through
+  `tools/search_backends.py`. Never retrieve material via curl, wget, git,
+  gh, a browser, or any other network channel; the Bash channel in this role
+  only runs the adapter commands.
+
+The adapter enforces this at runtime: a blocked query or visit exits 2 with
+`blocked by competition policy` on stderr. When that happens, rephrase the
+question as a generic methodology question — do not retry the same
+competition-specific target.
+
 ## Workflow
 
 The stage is one iterative research loop with a fixed endpoint. Dimensions,
@@ -188,10 +215,13 @@ optimizer design, pipeline construction, …):
   attractive claims.
 
 Recipe-shaped, bottleneck-shaped, and community-source questions are first
-class: ask how practitioners push this exact task shape under its declared
-budget ("300s single-GPU speedrun recipe" and "modded-nanogpt techniques" are
-forms to imitate, with this task's own constraint filled in). A question that
-names the task's real bottleneck beats a generic survey question.
+class, scoped to generic practice: ask how practitioners push this exact task
+shape under its declared budget ("300s single-GPU speedrun recipe" and
+"modded-nanogpt techniques" are forms to imitate, with this task's own
+constraint filled in). A question that names the task's real bottleneck beats
+a generic survey question. Hunting this competition's own solutions
+("<competition> winning solution") is prohibited — ask for the generic
+technique, never the contest artifact.
 
 Prefer hits that challenge your current picture over hits that confirm it.
 When a result contradicts a hypothesis you were about to register, that is a

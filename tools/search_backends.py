@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import competition_policy
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 4
@@ -239,7 +241,15 @@ def _validate_query_plan(
             errors.append(f"{label} must be an object")
             continue
         unknown = sorted(
-            set(query) - {"id", "text", "target_dimension_ids", "evidence_roles"}
+            set(query)
+            - {
+                "id",
+                "text",
+                "target_dimension_ids",
+                "evidence_roles",
+                "policy_status",
+                "policy_categories",
+            }
         )
         if unknown:
             errors.append(f"{label} has unknown fields {unknown}")
@@ -294,6 +304,14 @@ def validate_manifest(
     errors: list[str] = []
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"retrieval manifest schema_version must be {SCHEMA_VERSION}")
+    competition_id = manifest.get("competition_id")
+    if competition_id is not None and (
+        not isinstance(competition_id, str) or not competition_id.strip()
+    ):
+        errors.append("retrieval manifest competition_id must be a non-empty string")
+    policy_version = manifest.get("competition_policy_version")
+    if policy_version is not None and not isinstance(policy_version, int):
+        errors.append("retrieval manifest competition_policy_version must be an integer")
 
     rounds = manifest.get("rounds")
     if not isinstance(rounds, list):
@@ -347,6 +365,28 @@ def validate_manifest(
                 errors.append(f"{where}.query_ids contains unknown queries")
             if result.get("query_support") != len(set(result_query_ids or [])):
                 errors.append(f"{where}.query_support does not match distinct query_ids")
+            if result.get("policy_status") is not None and result.get(
+                "policy_status"
+            ) not in {"allowed", "blocked"}:
+                errors.append(f"{where}.policy_status must be allowed or blocked")
+
+        blocked_results = round_.get("blocked_results", [])
+        if not isinstance(blocked_results, list):
+            errors.append(f"{rwhere}.blocked_results must be a list")
+            blocked_results = []
+        for index, item in enumerate(blocked_results):
+            where = f"{rwhere}.blocked_results[{index}]"
+            if not isinstance(item, dict):
+                errors.append(f"{where} must be an object")
+                continue
+            if not isinstance(item.get("url"), str) or not item["url"]:
+                errors.append(f"{where}.url must be non-empty")
+            if not isinstance(item.get("rule_categories"), list):
+                errors.append(f"{where}.rule_categories must be a list")
+            if item.get("basis") not in {"direct", "inherited"}:
+                errors.append(f"{where}.basis must be direct or inherited")
+            if not isinstance(item.get("pointer"), str) or not item["pointer"]:
+                errors.append(f"{where}.pointer must reference an audit id")
 
         called_queries: set[str] = set()
         calls = round_.get("backend_calls", [])
@@ -362,14 +402,20 @@ def validate_manifest(
                 errors.append(f"{where}.query_id is unknown in {round_id}")
             else:
                 called_queries.add(call["query_id"])
-            if call.get("status") not in {"success", "empty", "failed"}:
-                errors.append(f"{where}.status must be success, empty, or failed")
+            if call.get("status") not in {"success", "empty", "failed", "blocked"}:
+                errors.append(
+                    f"{where}.status must be success, empty, failed, or blocked"
+                )
             if not isinstance(call.get("retrieved_at"), str) or not call["retrieved_at"]:
                 errors.append(f"{where}.retrieved_at must be non-empty")
             if not isinstance(call.get("backend_version"), str) or not call["backend_version"]:
                 errors.append(f"{where}.backend_version must be non-empty")
             if call.get("status") in {"success", "empty"} and "raw_response" not in call:
                 errors.append(f"{where}.raw_response must be retained")
+            if call.get("status") == "blocked" and not isinstance(
+                call.get("policy_categories"), list
+            ):
+                errors.append(f"{where}.policy_categories must be a list for a blocked call")
         missing_calls = sorted(query_ids - called_queries)
         if missing_calls:
             errors.append(f"{rwhere} queries have no backend call records: {missing_calls}")
@@ -383,8 +429,16 @@ def validate_manifest(
         if not isinstance(visit, dict):
             errors.append(f"{where} must be an object")
             continue
-        if visit.get("status") not in {"success", "failed"}:
-            errors.append(f"{where}.status must be success or failed")
+        if visit.get("status") not in {"success", "failed", "blocked"}:
+            errors.append(f"{where}.status must be success, failed, or blocked")
+        if visit.get("policy_status") is not None and visit.get(
+            "policy_status"
+        ) not in {"allowed", "blocked"}:
+            errors.append(f"{where}.policy_status must be allowed or blocked")
+        if visit.get("pointer") is not None and (
+            not isinstance(visit.get("pointer"), str) or not visit["pointer"]
+        ):
+            errors.append(f"{where}.pointer must reference an audit id")
         if not isinstance(visit.get("backend_version"), str) or not visit["backend_version"]:
             errors.append(f"{where}.backend_version must be non-empty")
         url = visit.get("url")
@@ -902,7 +956,7 @@ def _render_result_card(result: dict[str, Any]) -> str:
 
 
 def _round_query_outcomes(round_: dict[str, Any]) -> list[dict[str, str]]:
-    """Per-query outcome within one round: ok / empty (success, zero hits) / failed."""
+    """Per-query outcome: ok / empty (success, zero hits) / failed / blocked."""
     hit_queries: set[str] = set()
     for result in round_.get("results", []):
         if isinstance(result, dict):
@@ -921,6 +975,9 @@ def _round_query_outcomes(round_: dict[str, Any]) -> list[dict[str, str]]:
         statuses = call_statuses.get(qid, [])
         if qid in hit_queries:
             outcome = "ok"
+        elif statuses and all(status == "blocked" for status in statuses):
+            # policy-gate blocks are their own outcome, never empty/failed
+            outcome = "blocked"
         elif "empty" in statuses or "success" in statuses:
             # explicit empty first; bare success with zero hits is the T2-era fallback
             outcome = "empty"
@@ -1481,6 +1538,243 @@ def _next_query_number(manifest: dict[str, Any]) -> int:
     return highest + 1
 
 
+def _domain(url: str) -> str:
+    raw = str(url or "").strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        host = urllib.parse.urlsplit(raw).hostname or ""
+    except ValueError:
+        return ""
+    return host.lower().removeprefix("www.")
+
+
+def _stamp_policy(manifest: dict[str, Any], profile: dict | None) -> None:
+    if profile is None:
+        return
+    manifest["competition_id"] = profile.get("competition_id")
+    manifest["competition_policy_version"] = (
+        competition_policy.COMPETITION_POLICY_VERSION
+    )
+
+
+def _append_policy_audit(manifest_dir: Path, item: dict[str, Any]) -> str:
+    """Append one blocked item to the audit store and return its opaque id.
+
+    The store keeps blocked content out of the manifest while preserving a
+    local audit trail; receipts reference only the ``pa-NNNN`` id, and the
+    store path is never printed to stdout.
+    """
+    audit_dir = manifest_dir / ".policy_audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    path = audit_dir / "blocked-items.jsonl"
+    count = 0
+    if path.exists():
+        with path.open(encoding="utf-8") as handle:
+            count = sum(1 for line in handle if line.strip())
+    audit_id = f"pa-{count + 1:04d}"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"id": audit_id, **item}, ensure_ascii=False) + "\n")
+    return audit_id
+
+
+def _raw_row_key(row: Any) -> str:
+    if not isinstance(row, dict):
+        return ""
+    url = row.get("url")
+    if not isinstance(url, str) or not url:
+        paper_id = row.get("arxiv_id") or row.get("external_id")
+        url = f"https://arxiv.org/abs/{paper_id}" if paper_id else ""
+    return canonical_key(url) if url else ""
+
+
+def _filter_raw_response(raw_response: Any, blocked_keys: set[str]) -> Any:
+    """Drop blocked rows from the list portions of a retained backend payload
+    (jina ``data``, frozen ``matches``, deepxiv ``results``/``result``), so
+    blocked content is not reconstructable from the manifest."""
+    if not blocked_keys:
+        return raw_response
+    if isinstance(raw_response, list):
+        return [
+            row
+            for row in raw_response
+            if not _raw_row_key(row) or _raw_row_key(row) not in blocked_keys
+        ]
+    if not isinstance(raw_response, dict):
+        return raw_response
+    filtered = dict(raw_response)
+    for field in ("data", "matches", "results", "result"):
+        rows = filtered.get(field)
+        if not isinstance(rows, list):
+            continue
+        filtered[field] = [
+            row
+            for row in rows
+            if not _raw_row_key(row) or _raw_row_key(row) not in blocked_keys
+        ]
+    return filtered
+
+
+def _queries_identity_hit(
+    manifest: dict[str, Any], query_ids: Any, profile: dict
+) -> bool:
+    """Whether any of the given round queries identity-hits the profile."""
+    wanted = {str(q) for q in query_ids or []}
+    if not wanted:
+        return False
+    for round_ in manifest.get("rounds", []):
+        if not isinstance(round_, dict):
+            continue
+        for query in round_.get("queries", []):
+            if not isinstance(query, dict) or str(query.get("id")) not in wanted:
+                continue
+            hit, _ = competition_policy.identity_hit(str(query.get("text") or ""), profile)
+            if hit:
+                return True
+    return False
+
+
+def _visit_inherited_identity(
+    manifest: dict[str, Any], url: str, profile: dict
+) -> bool:
+    """Query-identity binding for a visit: the queries that surfaced this URL
+    (via allowed stored results) decide the inherited identity context."""
+    key = canonical_key(url)
+    query_ids: set[str] = set()
+    for round_ in manifest.get("rounds", []):
+        if not isinstance(round_, dict):
+            continue
+        for result in round_.get("results", []):
+            if not isinstance(result, dict) or result.get("canonical_key") != key:
+                continue
+            if result.get("policy_status") == "blocked":
+                continue
+            query_ids.update(str(q) for q in result.get("query_ids") or [])
+    return _queries_identity_hit(manifest, sorted(query_ids), profile)
+
+
+def _known_result_title(manifest: dict[str, Any], url: str) -> str | None:
+    key = canonical_key(url)
+    for round_ in manifest.get("rounds", []):
+        if not isinstance(round_, dict):
+            continue
+        for result in round_.get("results", []):
+            if isinstance(result, dict) and result.get("canonical_key") == key:
+                title = result.get("title")
+                if isinstance(title, str) and title.strip():
+                    return title
+    return None
+
+
+def _block_visit(
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    profile: dict,
+    *,
+    backend: str,
+    backend_version: str,
+    categories: list[str],
+    basis: str | None,
+    context: str,
+) -> int:
+    audit_item: dict[str, Any] = {
+        "kind": "visit",
+        "url": canonical_url(args.url),
+        "rule_categories": list(categories),
+        "basis": basis,
+        "context": _clip(context, 200),
+    }
+    title = _known_result_title(manifest, args.url)
+    if title:
+        audit_item["title"] = _clip(title, 300)
+    pointer = _append_policy_audit(args.manifest.parent, audit_item)
+    add_visit(
+        manifest,
+        args.manifest.parent,
+        url=args.url,
+        backend=backend,
+        view=args.view,
+        status="blocked",
+        backend_version=backend_version,
+        section=args.section,
+    )
+    visit = manifest["visits"][-1]
+    visit["policy_status"] = "blocked"
+    visit["policy_categories"] = list(categories)
+    visit["pointer"] = pointer
+    _stamp_policy(manifest, profile)
+    save_manifest(args.manifest, manifest)
+    print("visit blocked by competition policy", file=sys.stderr)
+    return competition_policy.POLICY_EXIT_CODE
+
+
+def _policy_filter_rows(
+    raw: list[dict[str, Any]],
+    calls: list[dict[str, Any]],
+    query_identity: dict[str, bool],
+    profile: dict,
+    manifest_dir: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split policy-blocked rows out of dispatch output: they never enter the
+    merge, their title/snippet/tldr leave the persisted raw_response, and the
+    content survives only in the audit store behind an opaque pointer."""
+    allowed: list[dict[str, Any]] = []
+    blocked_by_key: dict[str, dict[str, Any]] = {}
+    blocked_keys_by_call: dict[tuple[str, str], set[str]] = {}
+    for row in raw:
+        fields = {
+            "url": row.get("url"),
+            "title": row.get("title"),
+            "authors": row.get("authors"),
+            "snippet": row.get("snippet"),
+            "tldr": row.get("tldr"),
+        }
+        verdict = competition_policy.classify_result(
+            fields, query_identity.get(str(row.get("query_id")), False), profile
+        )
+        if verdict.action == "allow":
+            allowed.append(row)
+            continue
+        key = canonical_key(row.get("url", "")) or str(row.get("url") or "")
+        if key:
+            call_key = (str(row.get("query_id")), str(row.get("backend")))
+            blocked_keys_by_call.setdefault(call_key, set()).add(key)
+        entry = blocked_by_key.get(key)
+        if entry is None:
+            pointer = _append_policy_audit(
+                manifest_dir,
+                {
+                    "kind": "result",
+                    "url": row.get("url"),
+                    "title": _clip(row.get("title"), 300),
+                    "snippet": _clip(row.get("snippet"), 500),
+                    "rule_categories": list(verdict.categories),
+                    "basis": verdict.basis,
+                    "context": _clip(verdict.context, 200),
+                },
+            )
+            entry = {
+                "url": row.get("url"),
+                "domain": _domain(row.get("url", "")),
+                "rule_categories": list(verdict.categories),
+                "basis": verdict.basis,
+                "query_ids": [],
+                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                "pointer": pointer,
+            }
+            blocked_by_key[key] = entry
+        query_id = row.get("query_id")
+        if query_id and query_id not in entry["query_ids"]:
+            entry["query_ids"].append(query_id)
+    for call in calls:
+        blocked = blocked_keys_by_call.get(
+            (str(call.get("query_id")), str(call.get("backend")))
+        )
+        if blocked and call.get("raw_response") is not None:
+            call["raw_response"] = _filter_raw_response(call["raw_response"], blocked)
+    return allowed, list(blocked_by_key.values())
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     specs = _parse_cli_objects(
         args.query_spec,
@@ -1489,6 +1783,15 @@ def cmd_search(args: argparse.Namespace) -> int:
     )
     manifest = load_manifest(args.manifest)
     _reject_legacy_manifest(manifest)
+    resolution = competition_policy.resolve_profile(args.manifest)
+    if resolution.fail_closed_reason:
+        print(
+            "competition policy profile required but missing/unparseable: "
+            f"{resolution.fail_closed_reason}",
+            file=sys.stderr,
+        )
+        return competition_policy.POLICY_EXIT_CODE
+    profile = resolution.profile
     names = args.backend or (["frozen"] if args.frozen_corpus else [])
     if not names:
         print(
@@ -1537,10 +1840,82 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "errors": plan_errors}, indent=2), file=sys.stderr)
         return 1
 
+    # Competition-policy query gate: blocked queries are never dispatched.
+    dispatchable: list[dict[str, Any]] = []
+    policy_calls: list[dict[str, Any]] = []
+    query_identity: dict[str, bool] = {}
+    blocked_queries: list[dict[str, Any]] = []
+    for query in queries:
+        text = str(query.get("text") or "")
+        verdict = competition_policy.classify_query(text, profile)
+        if profile is not None:
+            hit, _ = competition_policy.identity_hit(text, profile)
+            query_identity[query["id"]] = hit
+        if verdict.action != "block":
+            if profile is not None:
+                query["policy_status"] = "allowed"
+            dispatchable.append(query)
+            continue
+        query["policy_status"] = "blocked"
+        query["policy_categories"] = list(verdict.categories)
+        blocked_queries.append(query)
+        policy_calls.append(
+            {
+                "query_id": query["id"],
+                "backend": "policy-gate",
+                "backend_version": str(competition_policy.COMPETITION_POLICY_VERSION),
+                "status": "blocked",
+                "policy_categories": list(verdict.categories),
+                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    rounds = manifest.setdefault("rounds", [])
+    round_id = f"r-{len(rounds) + 1:02d}"
+    if profile is not None and not dispatchable:
+        # All queries blocked: no backend is constructed (jina would raise
+        # without API keys); the round still records the gate receipts.
+        rounds.append(
+            {
+                "round_id": round_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "queries": queries,
+                "backend_calls": policy_calls,
+                "backend_failures": [],
+                "results": [],
+                "blocked_results": [],
+            }
+        )
+        _stamp_policy(manifest, profile)
+        save_manifest(args.manifest, manifest)
+        errors = validate_manifest(manifest, manifest_dir=args.manifest.parent)
+        print(
+            f"round {round_id} | queries: {len(queries)} | hits: 0 "
+            f"| blocked: {len(blocked_queries)} "
+            f"| validate: {'ok' if not errors else 'FAILED'}"
+        )
+        for query in blocked_queries:
+            print(
+                f"query blocked by competition policy: {query['id']} "
+                f"[{', '.join(query['policy_categories'])}]"
+            )
+        print(
+            "query blocked by competition policy: every query in this round "
+            "targeted competition-specific solution information; rewrite toward "
+            "generic methodology (problem type, modality, model family)",
+            file=sys.stderr,
+        )
+        if errors:
+            print(json.dumps({"ok": False, "errors": errors}, indent=2), file=sys.stderr)
+            return 1
+        return competition_policy.POLICY_EXIT_CODE
+
     backends, unavailable = build_backends(names, args.frozen_corpus)
-    raw, failures, calls = asyncio.run(dispatch_search(queries, backends, args.max_results))
+    raw, failures, calls = asyncio.run(
+        dispatch_search(dispatchable, backends, args.max_results)
+    )
     for failure in unavailable:
-        for query in queries:
+        for query in dispatchable:
             calls.append(
                 {
                     "query_id": query["id"],
@@ -1551,29 +1926,44 @@ def cmd_search(args: argparse.Namespace) -> int:
                     "error": failure["error"],
                 }
             )
+    blocked_results: list[dict[str, Any]] = []
+    if profile is not None:
+        raw, blocked_results = _policy_filter_rows(
+            raw, calls, query_identity, profile, args.manifest.parent
+        )
     results = merge_candidates(raw)
-    rounds = manifest.setdefault("rounds", [])
-    round_id = f"r-{len(rounds) + 1:02d}"
-    rounds.append(
-        {
-            "round_id": round_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "queries": queries,
-            "backend_calls": calls,
-            "backend_failures": unavailable + failures,
-            "results": results,
-        }
-    )
+    if profile is not None:
+        for result in results:
+            result["policy_status"] = "allowed"
+    round_: dict[str, Any] = {
+        "round_id": round_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "queries": queries,
+        "backend_calls": policy_calls + calls,
+        "backend_failures": unavailable + failures,
+        "results": results,
+    }
+    if profile is not None:
+        round_["blocked_results"] = blocked_results
+    rounds.append(round_)
+    _stamp_policy(manifest, profile)
     save_manifest(args.manifest, manifest)
     errors = validate_manifest(manifest, manifest_dir=args.manifest.parent)
     outcomes = _round_query_outcomes(rounds[-1])
     empty = [o["id"] for o in outcomes if o["outcome"] == "empty"]
     failed = [o["id"] for o in outcomes if o["outcome"] == "failed"]
+    blocked = [o["id"] for o in outcomes if o["outcome"] == "blocked"]
     summary = (
         f"round {round_id} | queries: {len(queries)} | hits: {len(results)} "
         f"| max_results: {args.max_results} | empty: {','.join(empty) or '-'} "
-        f"| failed: {','.join(failed) or '-'} | validate: {'ok' if not errors else 'FAILED'}"
+        f"| failed: {','.join(failed) or '-'}"
     )
+    if profile is not None:
+        summary += (
+            f" | blocked: {','.join(blocked) or '-'} "
+            f"| blocked results: {len(blocked_results)}"
+        )
+    summary += f" | validate: {'ok' if not errors else 'FAILED'}"
     round_failures = unavailable + failures
     if round_failures:
         summary += "\nfailures: " + "; ".join(
@@ -1586,21 +1976,59 @@ def cmd_search(args: argparse.Namespace) -> int:
             "(check backend credentials/quota, or widen the query)"
         )
     print(summary)
+    for query in blocked_queries:
+        print(
+            f"query blocked by competition policy: {query['id']} "
+            f"[{', '.join(query['policy_categories'])}]"
+        )
+    if blocked_queries:
+        print(
+            "query blocked by competition policy: rewrite blocked queries toward "
+            "generic methodology instead of this competition's solutions",
+            file=sys.stderr,
+        )
     for result in results:
         print()
         print(_render_result_card(result))
     if errors:
         print(json.dumps({"ok": False, "errors": errors}, indent=2), file=sys.stderr)
-    return 0 if results and not errors else 1
+    if results and not errors:
+        return 0
+    if not errors and not round_failures and blocked_results:
+        return competition_policy.POLICY_EXIT_CODE
+    return 1
 
 
 def cmd_visit(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     _reject_legacy_manifest(manifest)
+    resolution = competition_policy.resolve_profile(args.manifest)
+    if resolution.fail_closed_reason:
+        print(
+            "competition policy profile required but missing/unparseable: "
+            f"{resolution.fail_closed_reason}",
+            file=sys.stderr,
+        )
+        return competition_policy.POLICY_EXIT_CODE
+    profile = resolution.profile
     view = args.view
     if args.section and view != "section":
         print("visit failed: --section is only valid with --view section", file=sys.stderr)
         return 1
+    if profile is not None and competition_policy.is_kaggle_competition_url(
+        args.url, profile
+    ):
+        # the competition path alone is identity: no fetch at all
+        return _block_visit(
+            args,
+            manifest,
+            profile,
+            backend="policy-gate",
+            backend_version=str(competition_policy.COMPETITION_POLICY_VERSION),
+            categories=[competition_policy.RULE_KAGGLE_URL],
+            basis="direct",
+            context=args.url,
+        )
     try:
         note = None
         if args.frozen_corpus:
@@ -1623,6 +2051,31 @@ def cmd_visit(args: argparse.Namespace) -> int:
         elif arxiv_id(args.url) and view == "auto":
             attempts = _deepxiv_progressive_read(args.url, manifest)
             _retain_progressive_content(attempts, VISIT_CONTENT_STORE_CHARS)
+            if profile is not None:
+                combined = "\n\n".join(
+                    str(attempt["content"])
+                    for attempt in attempts
+                    if attempt["status"] == "success" and attempt.get("content")
+                )
+                verdict = competition_policy.classify_body(
+                    args.url,
+                    combined,
+                    _visit_inherited_identity(manifest, args.url, profile),
+                    profile,
+                )
+                if verdict.action == "block":
+                    return _block_visit(
+                        args,
+                        manifest,
+                        profile,
+                        backend="deepxiv",
+                        backend_version=(
+                            attempts[0]["backend_version"] if attempts else "unknown"
+                        ),
+                        categories=list(verdict.categories),
+                        basis=verdict.basis,
+                        context=verdict.context or "",
+                    )
             first_visit = len(manifest.get("visits", []))
             for attempt in attempts:
                 add_visit(
@@ -1638,6 +2091,9 @@ def cmd_visit(args: argparse.Namespace) -> int:
                     section=attempt["section"],
                     store_cap_hit=attempt.get("store_cap_hit", False),
                 )
+                if profile is not None and attempt["status"] == "success":
+                    manifest["visits"][-1]["policy_status"] = "allowed"
+            _stamp_policy(manifest, profile)
             save_manifest(args.manifest, manifest)
             body_attempts = [
                 attempt
@@ -1691,12 +2147,34 @@ def cmd_visit(args: argparse.Namespace) -> int:
             add_visit(manifest, args.manifest.parent, url=args.url, backend=backend,
                       view=view, status="failed", error=problem,
                       backend_version=backend_version, section=args.section)
+            _stamp_policy(manifest, profile)
             save_manifest(args.manifest, manifest)
             print(f"visit failed: {problem}", file=sys.stderr)
             return 1
+        if profile is not None:
+            verdict = competition_policy.classify_body(
+                args.url,
+                content,
+                _visit_inherited_identity(manifest, args.url, profile),
+                profile,
+            )
+            if verdict.action == "block":
+                return _block_visit(
+                    args,
+                    manifest,
+                    profile,
+                    backend=backend,
+                    backend_version=backend_version,
+                    categories=list(verdict.categories),
+                    basis=verdict.basis,
+                    context=verdict.context or "",
+                )
         add_visit(manifest, args.manifest.parent, url=args.url, backend=backend, view=view,
                   status="success", content=content, backend_version=backend_version,
                   section=args.section, note=note, store_cap_hit=store_cap_hit)
+        if profile is not None:
+            manifest["visits"][-1]["policy_status"] = "allowed"
+        _stamp_policy(manifest, profile)
         save_manifest(args.manifest, manifest)
         print(_render_head_view(canonical_url(args.url), content, args.manifest))
         return 0
@@ -1704,6 +2182,7 @@ def cmd_visit(args: argparse.Namespace) -> int:
         add_visit(manifest, args.manifest.parent, url=args.url, backend="auto", view=view,
                   status="failed", error=f"{type(exc).__name__}: {exc}",
                   backend_version="unknown", section=args.section)
+        _stamp_policy(manifest, profile)
         save_manifest(args.manifest, manifest)
         print(f"visit failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -1792,13 +2271,43 @@ def cmd_results(args: argparse.Namespace) -> int:
             )
             return 1
     results = round_.get("results", [])
-    print(
+    # Defense in depth: re-classify stored results before rendering.  Stored
+    # results are normally all allowed already; anything now blocked is
+    # withheld from stdout and counted, never printed.
+    profile = competition_policy.resolve_profile(args.manifest).profile
+    rendered: list[dict[str, Any]] = []
+    withheld = 0
+    for result in results:
+        if profile is not None and isinstance(result, dict):
+            fields = {
+                "url": result.get("url"),
+                "title": result.get("title"),
+                "authors": result.get("authors"),
+                "snippet": result.get("snippet"),
+                "tldr": result.get("tldr"),
+            }
+            verdict = competition_policy.classify_result(
+                fields,
+                _queries_identity_hit(manifest, result.get("query_ids"), profile),
+                profile,
+            )
+            if verdict.action == "block":
+                withheld += 1
+                continue
+        rendered.append(result)
+    blocked_total = len(round_.get("blocked_results") or []) + withheld
+    header = (
         f"round {round_.get('round_id')} | queries: {len(round_.get('queries', []))} "
         f"| hits: {len(results)}"
     )
-    for result in results:
+    if profile is not None or blocked_total:
+        header += f" | blocked: {blocked_total}"
+    print(header)
+    for result in rendered:
         print()
         print(_render_result_card(result))
+    if withheld:
+        print(f"\n[{withheld} result(s) withheld by competition policy]")
     return 0
 
 
@@ -1855,8 +2364,27 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"rounds: {len(rounds)} | queries: {total_queries} | "
         f"unique results: {len(global_view)} | visits: {len(visits)}",
         f"verification: {verification or '(no receipts)'}",
-        "dimensions (results / visits):",
     ]
+    # Policy blocks are an independent outcome, never folded into the
+    # empty/failed backend stats above.
+    blocked_queries = sum(
+        1
+        for round_ in rounds
+        for outcome in _round_query_outcomes(round_)
+        if outcome["outcome"] == "blocked"
+    )
+    blocked_results = sum(
+        len(round_["blocked_results"])
+        for round_ in rounds
+        if isinstance(round_.get("blocked_results"), list)
+    )
+    blocked_visits = sum(1 for visit in visits if visit.get("status") == "blocked")
+    if blocked_queries or blocked_results or blocked_visits:
+        lines.append(
+            f"policy blocks: queries: {blocked_queries} | "
+            f"results: {blocked_results} | visits: {blocked_visits}"
+        )
+    lines.append("dimensions (results / visits):")
     dims = sorted(set(dim_results) | set(dim_visits))
     if not dims:
         lines.append("  (no query targets recorded)")

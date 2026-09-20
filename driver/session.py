@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shlex
 import time
 
 import anyio
@@ -126,6 +127,67 @@ def _ledger_write_problem(name: str, tool_input: dict | None) -> str | None:
             return (f"Bash may not write {_LEDGER_FILENAME}: the ledger is "
                     "written only through `python tools/ledger.py` subcommands")
     return None
+
+
+# Retrieval-adapter confinement for bash_adapter_only roles (the background
+# researcher): Bash runs exactly one allowlisted adapter invocation — no
+# operators, substitution, or redirects — and --manifest stays inside the
+# run's own directory so a sibling run's record cannot be replayed.
+_PUNCTUATION_CHARS = "|&;()<>"
+_ADAPTER_ALLOWLIST = {
+    "tools/search_backends.py": ("search", "status", "results", "visit",
+                                 "read", "validate"),
+    "tools/background_contract.py": ("catalog", "validate"),
+}
+_ADAPTER_USAGE = ("run a single adapter command: `python "
+                  "tools/search_backends.py search|status|results|visit|read|"
+                  "validate ...` or `python tools/background_contract.py "
+                  "catalog|validate ...`")
+
+
+def adapter_command_verdict(command: str, run_dir: Path) -> str | None:
+    """None when the command is one allowlisted adapter invocation, else the
+    deny reason. Quoted arguments tokenize to a single word, so JSON payloads
+    carrying shell metacharacters stay legal."""
+    lexer = shlex.shlex(command, posix=True,
+                        punctuation_chars=_PUNCTUATION_CHARS)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return f"unparseable command; {_ADAPTER_USAGE}"
+    if not tokens:
+        return f"empty command; {_ADAPTER_USAGE}"
+    for token in tokens:
+        if all(char in _PUNCTUATION_CHARS for char in token):
+            return (f"shell operator {token!r} is not allowed — no pipes, "
+                    f"compound commands, subshells, or redirects; "
+                    f"{_ADAPTER_USAGE}")
+        if "`" in token or token.startswith("$("):
+            return f"command substitution is not allowed; {_ADAPTER_USAGE}"
+    if len(tokens) < 3 or tokens[0] not in ("python", "python3") \
+            or tokens[2] not in _ADAPTER_ALLOWLIST.get(tokens[1], ()):
+        return f"off the adapter allowlist; {_ADAPTER_USAGE}"
+    manifest = None
+    for index, token in enumerate(tokens):
+        if token == "--manifest":
+            if index + 1 >= len(tokens):
+                return "--manifest requires a value"
+            manifest = tokens[index + 1]
+            break
+        if token.startswith("--manifest="):
+            manifest = token.split("=", 1)[1]
+            break
+    if manifest is not None:
+        candidate = Path(manifest)
+        if not candidate.is_absolute():
+            candidate = Path(run_dir) / candidate
+        if not candidate.resolve().is_relative_to(Path(run_dir).resolve()):
+            return ("--manifest must stay inside this run's directory "
+                    f"({run_dir}); {_ADAPTER_USAGE}")
+    return None
+
+
 _DUMP_MAX_ENTRIES = 200
 _DUMP_MAX_BYTES = 256 * 1024
 
@@ -323,15 +385,19 @@ class SDKSessionRunner:
 
     # -- internals ------------------------------------------------------------
 
-    def _capability_hook(self, role: RoleDefinition, breaker: dict | None = None):
+    def _capability_hook(self, role: RoleDefinition, breaker: dict | None = None,
+                         run_dir: Path | None = None):
         """Fail-closed: deny every tool outside the role's positive set.
 
         A PreToolUse hook (not canUseTool — that callback is shadowed under
         bypassPermissions and never reached; hooks still run). When the role
         declares bash_patterns, Bash commands must also start with one of
-        those prefixes. The same hook hosts the repetition breaker: the same
-        (tool, input) call REPETITION_LIMIT times in a row trips it, later
-        calls are denied, and the drain interrupts the session.
+        those prefixes; bash_adapter_only instead confines Bash to the
+        retrieval-adapter allowlist (adapter_command_verdict), emitting a
+        policy_bash_denied event per refusal. The same hook hosts the
+        repetition breaker: the same (tool, input) call REPETITION_LIMIT
+        times in a row trips it, later calls are denied, and the drain
+        interrupts the session.
         """
         if breaker is None:
             breaker = new_breaker()
@@ -393,6 +459,15 @@ class SDKSessionRunner:
                         f"role {role.name} may not launch long objective work via "
                         f"Bash ({forbidden!r}); submit a driver_job receipt"
                     )
+            if name == "Bash" and role.bash_adapter_only:
+                command = (input_data.get("tool_input") or {}).get("command", "")
+                reason = adapter_command_verdict(command, Path(run_dir))
+                if reason is not None:
+                    # Deny-and-explain: a habitual curl gets a retryable
+                    # refusal; verbatim retries trip the repetition breaker.
+                    self.events.emit("policy_bash_denied",
+                                     command_head=command[:120], reason=reason)
+                    return deny(reason)
             return {}
 
         return hook
@@ -458,7 +533,8 @@ class SDKSessionRunner:
             mcp_servers={"receipts": server},
             hooks={"PreToolUse": [HookMatcher(matcher=None,
                                               hooks=[self._capability_hook(
-                                                  role, breaker)])]},
+                                                  role, breaker,
+                                                  run_dir=Path(ctx.run_dir))])]},
             **kwargs,
         )
 

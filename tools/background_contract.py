@@ -23,6 +23,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from competition_policy import (
+    COMPETITION_POLICY_VERSION,
+    resolve_profile,
+    scan_artifact_text,
+)
 from search_backends import (
     _VERIFICATION_RANK,
     _VIEW_VERIFICATION,
@@ -305,10 +310,57 @@ def _evidence_link_errors(
     return errors, valid
 
 
+def _competition_policy_profile(manifest_path: Path | None) -> dict[str, Any] | None:
+    """The resolved identity profile when the manifest sits in competition
+    scope; non-MLE and unresolvable ad-hoc paths stay ungated."""
+    if manifest_path is None:
+        return None
+    profile = resolve_profile(manifest_path).profile
+    if not profile or not str(profile.get("competition_id") or "").strip():
+        return None
+    return profile
+
+
+def _competition_policy_manifest_errors(
+    retrieval_manifest: dict[str, Any], profile: dict[str, Any]
+) -> list[str]:
+    """Fail closed on manifests that predate or contradict the resolved
+    competition identity."""
+    errors: list[str] = []
+    competition_id = str(profile.get("competition_id") or "").strip()
+    stamped = retrieval_manifest.get("competition_id")
+    if not isinstance(stamped, str) or not stamped.strip():
+        errors.append(
+            "competition policy: retrieval manifest competition_id is missing; "
+            f"the run resolves to competition {competition_id!r} and an "
+            "undetermined manifest fails closed"
+        )
+    elif stamped.strip() != competition_id:
+        errors.append(
+            f"competition policy: retrieval manifest competition_id {stamped!r} "
+            f"does not match the resolved competition {competition_id!r}"
+        )
+    version = retrieval_manifest.get("competition_policy_version")
+    if not isinstance(version, int):
+        errors.append(
+            "competition policy: retrieval manifest competition_policy_version "
+            f"is missing; a retrieval over competition {competition_id!r} must "
+            f"stamp version >= {COMPETITION_POLICY_VERSION}"
+        )
+    elif version < COMPETITION_POLICY_VERSION:
+        errors.append(
+            "competition policy: retrieval manifest competition_policy_version "
+            f"{version} predates {COMPETITION_POLICY_VERSION}; re-run retrieval "
+            "under the current policy"
+        )
+    return errors
+
+
 def _validate_sources(
     registry: dict[str, Any],
     retrieval_manifest: dict[str, Any] | None,
     manifest_dir: Path | None = None,
+    manifest_path: Path | None = None,
 ) -> tuple[list[str], dict[str, dict[str, Any]]]:
     errors: list[str] = []
     sources = registry.get("sources")
@@ -368,21 +420,42 @@ def _validate_sources(
 
     if retrieval_manifest is not None:
         errors.extend(validate_manifest(retrieval_manifest, manifest_dir))
+        policy_profile = _competition_policy_profile(manifest_path)
+        if policy_profile is not None:
+            errors.extend(
+                _competition_policy_manifest_errors(retrieval_manifest, policy_profile)
+            )
         # Receipt hard gate: every cited URL needs a tool-recorded receipt —
         # a search hit (snippet receipt) or a successful visit.  The tier of
         # that receipt is reported by source_verification, never gated here.
+        # Search-hit rows are inherently allowed (blocked rows are diverted to
+        # blocked_results); a visit counts only when policy-allowed whenever a
+        # competition profile resolves.
         receipt_keys = {
             result["canonical_key"] for result in merged_results(retrieval_manifest)
         }
-        receipt_keys.update(
-            visit["canonical_key"]
-            for visit in retrieval_manifest.get("visits", [])
-            if isinstance(visit, dict)
-            and visit.get("status") == "success"
-            and _nonempty(visit.get("canonical_key"))
-        )
+        policy_excluded_keys: set[str] = set()
+        for visit in retrieval_manifest.get("visits", []):
+            if not isinstance(visit, dict) or not _nonempty(visit.get("canonical_key")):
+                continue
+            if visit.get("status") == "success" and (
+                policy_profile is None or visit.get("policy_status") == "allowed"
+            ):
+                receipt_keys.add(visit["canonical_key"])
+            elif policy_profile is not None and visit.get("status") in {"success", "blocked"}:
+                policy_excluded_keys.add(visit["canonical_key"])
         for source_id, url in source_urls.items():
-            if canonical_key(url) not in receipt_keys:
+            key = canonical_key(url)
+            if key in receipt_keys:
+                continue
+            if key in policy_excluded_keys:
+                errors.append(
+                    f"competition policy: source {source_id} is backed only by "
+                    f"policy-blocked or undetermined visit receipts for {url}; "
+                    "the retrieval manifest must record an allowed visit or a "
+                    "search hit"
+                )
+            else:
                 errors.append(
                     f"source {source_id} has no retrieval receipt for {url}; "
                     "the retrieval manifest must record a search hit or a "
@@ -1995,6 +2068,7 @@ def validate_registry(
     ledger: dict[str, Any] | None = None,
     retrieval_manifest: dict[str, Any] | None = None,
     manifest_dir: Path | None = None,
+    manifest_path: Path | None = None,
     catalog: dict[str, Any] | None = None,
     dimension_strategy: str = DEFAULT_DIMENSION_STRATEGY,
     baseline_mechanisms: dict[str, Any] | None = None,
@@ -2004,7 +2078,7 @@ def validate_registry(
         registry, catalog=catalog, dimension_strategy=dimension_strategy
     )
     source_errors, source_by_id = _validate_sources(
-        registry, retrieval_manifest, manifest_dir=manifest_dir
+        registry, retrieval_manifest, manifest_dir=manifest_dir, manifest_path=manifest_path
     )
     errors.extend(source_errors)
     errors.extend(_validate_hypotheses(registry, source_by_id))
@@ -2415,12 +2489,24 @@ def mapping_number_presence(
     }
 
 
-def validate_background_markdown(path: Path, registry: dict[str, Any]) -> list[str]:
+def validate_background_markdown(
+    path: Path,
+    registry: dict[str, Any],
+    policy_profile: dict[str, Any] | None = None,
+) -> list[str]:
     """Keep the human hierarchy and structured guidance aligned with JSON."""
     text = path.read_text(errors="replace")
     marker = re.search(r"^## Search space registry\s*$", text, flags=re.MULTILINE)
     human = text[: marker.start()] if marker else text
     errors: list[str] = []
+    if policy_profile is not None:
+        # Product-side competition-policy scan over the full artifact (the
+        # text is the artifact's own content, so echoing it here is safe).
+        for hit in scan_artifact_text(text, policy_profile):
+            errors.append(
+                "competition policy: background.md matches "
+                f"{', '.join(hit['categories'])} near {hit['context']!r}"
+            )
     for heading in ("Dimension coverage", "Dimensions", "Relations", "Pitfalls"):
         if re.search(rf"^## {re.escape(heading)}\s*$", human, flags=re.MULTILINE) is None:
             errors.append(f"background.md is missing required '## {heading}' section")
@@ -3179,16 +3265,9 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         args.background, explicit_path=getattr(args, "catalog", None)
     )
     ledger = _load_json(args.ledger) if getattr(args, "ledger", None) else None
-    manifest = (
-        _load_json(args.retrieval_manifest)
-        if getattr(args, "retrieval_manifest", None)
-        else None
-    )
-    manifest_dir = (
-        args.retrieval_manifest.parent
-        if getattr(args, "retrieval_manifest", None)
-        else None
-    )
+    manifest_path = getattr(args, "retrieval_manifest", None)
+    manifest = _load_json(manifest_path) if manifest_path else None
+    manifest_dir = manifest_path.parent if manifest_path else None
     baseline_mechanisms = (
         _load_json(args.baseline_mechanisms)
         if getattr(args, "baseline_mechanisms", None)
@@ -3199,12 +3278,22 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         ledger=ledger,
         retrieval_manifest=manifest,
         manifest_dir=manifest_dir,
+        manifest_path=manifest_path,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
         baseline_mechanisms=baseline_mechanisms,
         number_gate=getattr(args, "number_gate", False),
     )
-    errors.extend(validate_background_markdown(args.background, registry))
+    # The product-side scan also applies when only --background is passed in a
+    # run dir: resolve the profile from the sibling retrieval manifest path.
+    policy_profile = _competition_policy_profile(
+        manifest_path
+        if manifest_path is not None
+        else args.background.parent / "background_retrieval.json"
+    )
+    errors.extend(
+        validate_background_markdown(args.background, registry, policy_profile=policy_profile)
+    )
     return registry, ledger, errors
 
 
