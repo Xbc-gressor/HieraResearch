@@ -125,6 +125,11 @@ Decide what to do from the file system, in this order:
 
 ## What You Do
 
+After resolving the write mode above, read each required context file once.
+Those contents are already in your context; repeated reads of unchanged content
+will be refused by the driver. Complete the checks required by the current
+write mode, then immediately carry out that mode and submit the receipt.
+
 1. Read your candidate brief (above), then `TASK.md` (its `## Evaluation
    Contract`) and `task.toml` `[constraints]`, then resolve the write mode. Read
    the candidate dir's `prepare.py` for context only. In write-mode 3, also

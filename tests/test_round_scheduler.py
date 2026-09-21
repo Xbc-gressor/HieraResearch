@@ -504,12 +504,20 @@ class ClimbCmd:
         ok = lambda stdout="": subprocess.CompletedProcess(args, 0, stdout, "")
 
         if "evaluation_budget.py" in joined:
+            # The strict attempt log is the per-candidate eval counter (the
+            # real helper reads the same file).
+            attempts = 0
+            log = self.run_dir / "evaluation_attempts.jsonl"
+            if log.exists():
+                attempts = sum(1 for line in
+                               log.read_text().splitlines() if line.strip())
             return ok(json.dumps({
                 "evaluations_done": self.reserved, "reached": False,
                 "phase_quota_remaining_seconds": self.quota,
                 "phase_quota_reached": (self.quota is not None
                                         and self.quota <= 0),
-                "per_candidate": []}))
+                "per_candidate": ([{"run_id": "000", "evals": attempts}]
+                                  if attempts else [])}))
         if "phase-c-action" in joined:
             return ok(json.dumps(self.phase_c_action))
         if "rewrite_bout.py" in joined:
@@ -1037,14 +1045,15 @@ class TuneBindingTests(unittest.TestCase):
 
     def test_failed_tune_charges_the_attempts_the_bout_consumed(self) -> None:
         """A progressed-then-failed bout gets exactly one reconciliation;
-        when that fails too, the blocked decision charges the paid attempts."""
+        when that fails too, the decision closes as an infra failure with
+        the paid attempts charged — demoted, so the round continues instead
+        of blocking the run."""
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._setup_run(Path(tmp))
             cmd = self._tune_cmd(Path(tmp), run_dir)
             cmd.phase_c_action = {"action": "run", "method": "hebo",
                                   "bout_trials": 24}
             from driver.events import EventsLog
-            from driver.loops.common import RunBlocked
             from driver.loops.experiment import _tune
             from driver.receipts import ReceiptStore
 
@@ -1060,11 +1069,16 @@ class TuneBindingTests(unittest.TestCase):
                 return {"kind": "phase_c", "run_id": "000", "returncode": 1}
 
             runner = FakeSessionRunner([])  # the reconciliation also dies
-            with self.assertRaises(RunBlocked):
-                _tune(runner, ReceiptStore(run_dir), "fake-task", "t1",
-                      run_dir, 1, Path(tmp), cmd, EventsLog(run_dir),
-                      job_runner=failing_job,
-                      selection=dict(cmd.tune_selection))
+
+            def tune(no, selection):
+                return _tune(runner, ReceiptStore(run_dir), "fake-task",
+                             "t1", run_dir, no, Path(tmp), cmd,
+                             EventsLog(run_dir), job_runner=failing_job,
+                             selection=selection)
+
+            # The production call path: the phase closes the bout's outcome
+            # itself (record + tune backoff), exactly as in a real round.
+            self.assertFalse(self._phase(Path(tmp), run_dir, cmd, tune))
             # exactly one reconciliation session was attempted
             self.assertEqual([name for name, _ in runner.calls],
                              ["tuner-orchestrator"])
@@ -1076,6 +1090,11 @@ class TuneBindingTests(unittest.TestCase):
             event = next(e for e in self._events(run_dir)
                          if e.get("kind") == "tune_reconcile_failed")
             self.assertEqual(event["run_id"], "000")
+            # Demoted, not blocked: the infra failure fed the per-candidate
+            # tune backoff and the run state never left the ledger's hands.
+            backoff = next(e for e in self._events(run_dir)
+                           if e.get("kind") == "tune_infra_failure")
+            self.assertEqual(backoff["consumed"], 2)
 
     def test_mismatched_receipt_is_never_reattributed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

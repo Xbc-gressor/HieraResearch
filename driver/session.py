@@ -18,6 +18,7 @@ import json
 import os
 import shlex
 import time
+from collections import Counter
 
 import anyio
 from pathlib import Path
@@ -41,6 +42,48 @@ RECEIPT_TOOL = "mcp__receipts__submit_receipt"
 # it, and a running one is cancelled at it regardless of whether the SDK is
 # streaming messages. The whole reserve stays free for submission export.
 TIME_REACHED_PROBLEM = "time budget reached"
+
+# Frozen failure-signature prefixes: the ONLY machine-readable problem
+# taxonomy consumed by run-level failure escalation (consecutive-seat-failure
+# trip, PLAN-block-escalation Wave 0/1). Order matters — the first matching
+# prefix wins, so the specific error-result subtypes must precede the generic
+# transport catch-all. New problem classes must be registered here before any
+# consumer classifies them; raw string matching at consumers is forbidden.
+# Role-postcondition strings deliberately carry no class of their own: they
+# fall through to "postcondition" and isomorphism is judged by role name.
+PROBLEM_CLASS_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("repetition_breaker", ("repetition breaker tripped:",)),
+    ("max_turns",
+     ("session ended with error result: error_max_turns",)),
+    ("idle_timeout",
+     ("session ended with error result: idle_timeout",)),
+    ("wall_limit", ("wall-clock limit",)),
+    ("time_budget", (TIME_REACHED_PROBLEM,)),
+    # First-turn error results that are not a bounded-role cutoff (API 402 at
+    # start, relay transients) share the generic error-result prefix.
+    ("transport", ("session ended with error result:",)),
+)
+
+
+def problem_class(problem: str) -> str:
+    """Classify one InvocationFailed problem string into the frozen enum."""
+    text = str(problem)
+    for name, prefixes in PROBLEM_CLASS_PREFIXES:
+        if any(text.startswith(prefix) for prefix in prefixes):
+            return name
+    return "postcondition"
+
+
+def invocation_problem_class(problems: list[str]) -> str:
+    """The class of an invocation's problem list: the first classified
+    non-postcondition problem wins (session-level cutoffs outrank the
+    "no accepted receipt" postcondition that accompanies them)."""
+    classes = [problem_class(str(problem)) for problem in problems]
+    for name in classes:
+        if name != "postcondition":
+            return name
+    return classes[0] if classes else "postcondition"
+
 # One "submit what you have" turn for soft-rescue roles at their wall limit.
 SOFT_RESCUE_GRACE_SECONDS = 180.0
 SOFT_RESCUE_MESSAGE = ("Wall-clock limit reached. Submit your current best "
@@ -145,16 +188,40 @@ _ADAPTER_USAGE = ("run a single adapter command: `python "
                   "catalog|validate ...`")
 
 
-def adapter_command_verdict(command: str, run_dir: Path) -> str | None:
-    """None when the command is one allowlisted adapter invocation, else the
-    deny reason. Quoted arguments tokenize to a single word, so JSON payloads
-    carrying shell metacharacters stay legal."""
+def _adapter_tokens(command: str) -> list[str] | None:
+    """Tokenize an adapter command, returning None for shell syntax errors."""
     lexer = shlex.shlex(command, posix=True,
                         punctuation_chars=_PUNCTUATION_CHARS)
     lexer.whitespace_split = True
     try:
         tokens = list(lexer)
     except ValueError:
+        return None
+    return tokens
+
+
+def _adapter_poll_command(command: str, run_dir: Path | None) -> bool:
+    """Whether *command* is a valid status/results adapter poll."""
+    tokens = _adapter_tokens(command)
+    if tokens is None or len(tokens) < 3:
+        return False
+    if tokens[0] not in ("python", "python3"):
+        return False
+    if tokens[2] not in ("status", "results"):
+        return False
+    if tokens[2] not in _ADAPTER_ALLOWLIST.get(tokens[1], ()):
+        return False
+    # Reuse the complete confinement/verdict path so an escaped manifest is
+    # never classified as a legitimate poll.
+    return adapter_command_verdict(command, Path(run_dir or ".")) is None
+
+
+def adapter_command_verdict(command: str, run_dir: Path) -> str | None:
+    """None when the command is one allowlisted adapter invocation, else the
+    deny reason. Quoted arguments tokenize to a single word, so JSON payloads
+    carrying shell metacharacters stay legal."""
+    tokens = _adapter_tokens(command)
+    if tokens is None:
         return f"unparseable command; {_ADAPTER_USAGE}"
     if not tokens:
         return f"empty command; {_ADAPTER_USAGE}"
@@ -192,8 +259,58 @@ _DUMP_MAX_ENTRIES = 200
 _DUMP_MAX_BYTES = 256 * 1024
 
 
+_REPEAT_HISTORY_LIMIT = 10
+_WINDOW_REPEAT_LIMIT = 4
+_CORRECTION_TRIP_LIMIT = 3
+
+
+def _read_repetition_state(breaker: dict, name: str,
+                           tool_input: dict | None,
+                           available_tools: set[str]) -> tuple[tuple | None, str | None]:
+    """Return the Read's file revision and its unchanged-content correction."""
+    if name != "Read" or not isinstance(tool_input, dict):
+        return None, None
+    raw_path = tool_input.get("file_path")
+    if not raw_path:
+        return None, None
+    path = str(Path(str(raw_path)).expanduser().resolve(strict=False))
+    try:
+        mtime = Path(path).stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    mtimes = breaker["read_mtimes"]
+    counts = breaker["read_counts"]
+    if path not in mtimes or mtimes[path] != mtime:
+        mtimes[path] = mtime
+        counts[path] = 0
+    counts[path] += 1
+    revision = (path, mtime)
+    if counts[path] < 8:
+        return revision, None
+    if {"Write", "Edit"} & available_tools:
+        next_step = "continue writing or editing and submit your receipt"
+    elif "Grep" in available_tools or "Bash" in available_tools:
+        next_step = "continue the remaining checks and submit your receipt"
+    else:
+        next_step = "use the context already obtained and submit your receipt"
+    return revision, (f"Read of {path} denied: its content is unchanged and already "
+                      f"in your context after {counts[path]} reads; {next_step}.")
+
+
 def new_breaker() -> dict:
-    return {"fp": None, "count": 0, "tripped": None}
+    return {
+        "fp": None,
+        "count": 0,
+        "tripped": None,
+        # PreToolUse sees denied intentions too. Keep the bounded history in
+        # the invocation breaker so a model cannot evade the window by
+        # repeating a call that was refused.
+        "history": [],
+        "correction_count": 0,
+        "continuous_corrected_fps": set(),
+        "read_counts": {},
+        "read_mtimes": {},
+    }
 
 
 def _jsonish(value) -> str:
@@ -394,14 +511,16 @@ class SDKSessionRunner:
         declares bash_patterns, Bash commands must also start with one of
         those prefixes; bash_adapter_only instead confines Bash to the
         retrieval-adapter allowlist (adapter_command_verdict), emitting a
-        policy_bash_denied event per refusal. The same hook hosts the
-        repetition breaker: the same (tool, input) call REPETITION_LIMIT
-        times in a row trips it, later calls are denied, and the drain
-        interrupts the session.
+        policy_bash_denied event per refusal. The same hook hosts layered
+        repetition protection: the strict consecutive breaker remains the
+        hard fallback, while a bounded call window and unchanged-file Read
+        cap issue corrective denies. Ignoring three corrective denies trips
+        the invocation breaker and interrupts the drain.
         """
         if breaker is None:
             breaker = new_breaker()
         allowed = set(role.tools) | {RECEIPT_TOOL}
+        adapter_run_dir = Path(run_dir or ".")
 
         def deny(reason: str) -> dict:
             return {
@@ -413,27 +532,97 @@ class SDKSessionRunner:
             }
 
         async def hook(input_data, tool_use_id, context):
-            fp = (input_data.get("tool_name", ""),
-                  json.dumps(input_data.get("tool_input"), sort_keys=True))
+            name = input_data.get("tool_name", "")
+            revision, read_problem = (_read_repetition_state(
+                breaker, name, input_data.get("tool_input"), allowed)
+                if name in allowed else (None, None))
+            # All repetition layers see the same content revision: a Read
+            # after a real edit is not a repetition of the earlier result.
+            fp = (name,
+                  json.dumps(input_data.get("tool_input"), sort_keys=True,
+                             default=str), revision)
             if fp == breaker["fp"]:
                 breaker["count"] += 1
             else:
                 breaker["fp"], breaker["count"] = fp, 1
+
+            history = breaker["history"]
+            history.append(fp)
+            del history[:-_REPEAT_HISTORY_LIMIT]
+            window_count = Counter(history)[fp]
+
+            # Adapter status/results are intentionally poll-like: the same
+            # command can be issued after a round changes without changing
+            # its input. Keep the call in history and retain the strict
+            # consecutive breaker, but do not apply the window correction.
+            adapter_poll = (
+                name == "Bash" and role.bash_adapter_only
+                and _adapter_poll_command(
+                    (input_data.get("tool_input") or {}).get("command", ""),
+                    adapter_run_dir,
+                )
+            )
+
             if breaker["tripped"] is None and breaker["count"] >= REPETITION_LIMIT:
                 breaker["tripped"] = (f"{fp[0]} invoked {breaker['count']}x "
                                       "with identical input")
             if breaker["tripped"] is not None:
-                return deny(f"repetition breaker tripped: {breaker['tripped']}")
+                reason = f"repetition breaker tripped: {breaker['tripped']}"
+                self.events.emit("policy_repetition_denied",
+                                 role=role.name,
+                                 invocation_id=context.get("invocation_id")
+                                 if isinstance(context, dict) else None,
+                                 tool=name, reason=reason, tripped=True)
+                return deny(reason)
+
+            correction = None
             if role.early_repeat_correct and breaker["count"] >= 2:
-                # Corrective deny, not a trip: refuse the wasted repeat with
-                # an explicit count so the model can break the loop itself;
-                # the hard breaker at REPETITION_LIMIT is unchanged.
-                return deny(
+                correction = (
                     f"repeated identical call #{breaker['count']} to {fp[0]} "
                     "with the same input; the earlier result is already in "
                     "your context — do not re-read; proceed to produce your "
                     "receipt/output.")
-            name = input_data.get("tool_name", "")
+            elif (not adapter_poll
+                  # Once this fingerprint has received the role-specific
+                  # continuous correction, let that path own its escalation
+                  # rather than issuing a second correction for the same
+                  # underlying repeat pattern.
+                  and fp not in breaker["continuous_corrected_fps"]
+                  and window_count >= _WINDOW_REPEAT_LIMIT):
+                correction = (
+                    f"repeated call to {fp[0]} appears {window_count} times "
+                    f"in the last {_REPEAT_HISTORY_LIMIT} tool calls; use the "
+                    "context already obtained and proceed to produce your "
+                    "receipt/output.")
+
+            # The path-based cap also catches loops diluted by offsets or
+            # enough other calls to stay below the window threshold.
+            if correction is None and read_problem is not None:
+                correction = read_problem
+
+            if correction is not None:
+                if role.early_repeat_correct and breaker["count"] >= 2:
+                    breaker["continuous_corrected_fps"].add(fp)
+                breaker["correction_count"] += 1
+                if breaker["correction_count"] >= _CORRECTION_TRIP_LIMIT:
+                    breaker["tripped"] = (
+                        f"corrective deny ignored {breaker['correction_count']}x "
+                        f"(latest: {correction})")
+                    reason = f"repetition breaker tripped: {breaker['tripped']}"
+                    self.events.emit("policy_repetition_denied",
+                                     role=role.name,
+                                     invocation_id=context.get("invocation_id")
+                                     if isinstance(context, dict) else None,
+                                     tool=name, reason=reason, tripped=True,
+                                     correction_count=breaker["correction_count"])
+                    return deny(reason)
+                self.events.emit("policy_repetition_denied",
+                                 role=role.name,
+                                 invocation_id=context.get("invocation_id")
+                                 if isinstance(context, dict) else None,
+                                 tool=name, reason=correction, tripped=False,
+                                 correction_count=breaker["correction_count"])
+                return deny(correction)
             if name not in allowed:
                 return deny(f"role {role.name} may not use tool {name}")
             ledger_problem = _ledger_write_problem(
@@ -461,13 +650,17 @@ class SDKSessionRunner:
                     )
             if name == "Bash" and role.bash_adapter_only:
                 command = (input_data.get("tool_input") or {}).get("command", "")
-                reason = adapter_command_verdict(command, Path(run_dir))
+                reason = adapter_command_verdict(command, adapter_run_dir)
                 if reason is not None:
                     # Deny-and-explain: a habitual curl gets a retryable
                     # refusal; verbatim retries trip the repetition breaker.
                     self.events.emit("policy_bash_denied",
                                      command_head=command[:120], reason=reason)
                     return deny(reason)
+            # A corrective deny was obeyed once the model reaches a genuinely
+            # allowed tool call. Policy-denied detours return above and do not
+            # masquerade as progress.
+            breaker["correction_count"] = 0
             return {}
 
         return hook

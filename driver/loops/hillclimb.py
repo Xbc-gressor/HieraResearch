@@ -1,6 +1,12 @@
 """Deterministic hillclimb baseline: one working copy, edit → preflight →
 reserve → run → record → keep/revert. Python owns everything the old
 monolithic session did by diligence; the editor session only edits.
+
+Block semantics (explicit exemption from the experiment loop's persisted
+blocked phase): this standalone loop has no ledger run_state, so its block
+is status-only — a ``blocked`` event plus ``active_stop_condition`` plus a
+non-zero CLI exit code. An external resume rebuilds from the TSV/history
+artifacts; nothing about the stop needs un-blocking.
 """
 
 from __future__ import annotations
@@ -63,6 +69,19 @@ def _resource_block(events, *, stage: str, exc: Exception) -> str:
     reason = f"resource unavailable ({stage}): {exc}"
     events.emit("blocked", reason=reason)
     return reason
+
+
+def _resource_strike(events, *, stage: str, exc: Exception,
+                     strikes: int) -> str | None:
+    """Lease-timeout semantics for the hillclimb loop's own steps: one
+    unavailable step is skipped (its unjudged edit reverted by the caller);
+    only two consecutive strikes block — this loop has no second candidate
+    to rotate to, but one transient shortage must not end the run."""
+    events.emit("resource_unavailable", stage=stage, reason=str(exc),
+                consecutive_strikes=strikes)
+    if strikes >= 2:
+        return _resource_block(events, stage=stage, exc=exc)
+    return None
 
 
 def _record_keep(run_dir: Path, step: int, score: float, desc: str) -> None:
@@ -379,11 +398,22 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 extra={"bootstrap": "create the initial working copy per the "
                                      "task contract's tiny-driver fallback"},
                 objective=objective)
-        except InvocationFailed as exc:
-            stop_condition = f"editor bootstrap failed: {exc.problems}"
-            events.emit("blocked", reason=stop_condition)
-            return _status(task, tag, run_dir, metric, stop_condition,
-                           repo_root, cmd)
+        except InvocationFailed:
+            # One bounded fresh retry, mirroring the main loop's retry shape:
+            # the failed session may have died on a transient, and a fresh
+            # session is cheap next to losing the whole run.
+            try:
+                last_editor = _editor_session(
+                    runner, store, task, tag, run_dir,
+                    extra={"bootstrap": "create the initial working copy per "
+                                         "the task contract's tiny-driver "
+                                         "fallback"},
+                    resume_from=None, objective=objective)
+            except InvocationFailed as exc:
+                stop_condition = f"editor bootstrap failed: {exc.problems}"
+                events.emit("blocked", reason=stop_condition)
+                return _status(task, tag, run_dir, metric, stop_condition,
+                               repo_root, cmd)
 
     # Baseline: exactly one evaluation of the unmodified copy.
     if not _tsv_rows(run_dir):
@@ -415,6 +445,9 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
 
     best_before = min(_finite_scores(run_dir), default=None)
     needs_editor = True
+    # Success in one lease stage must not erase another stage's failures.
+    resource_strikes = {"preflight": 0, "preflight_repair": 0,
+                        "run": 0, "crash_repair": 0}
     while True:
         if budget_status(run_dir, repo_root, cmd).get("reached"):
             break
@@ -447,10 +480,21 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
         try:
             proc = _preflight(task, run_dir, repo_root, cmd, task_toml)
         except ResourceUnavailable as exc:
-            # The edit is unjudged; restore the incumbent and block the run.
+            # The edit is unjudged: restore the incumbent. One shortage skips
+            # this step (the next editor turn re-proposes); two consecutive
+            # strikes block — the host cannot grant the declared resources.
             _revert(run_dir)
-            stop_condition = _resource_block(events, stage="preflight", exc=exc)
-            break
+            resource_strikes["preflight"] += 1
+            stop = _resource_strike(events, stage="preflight", exc=exc,
+                                    strikes=resource_strikes["preflight"])
+            if stop:
+                stop_condition = stop
+                break
+            outcome_note = ("your last edit was not judged: the host could "
+                            "not grant the task's resources in time and the "
+                            "working copy was reverted to the incumbent")
+            continue
+        resource_strikes["preflight"] = 0
         if proc.returncode != 0:
             # Preflight failures consume no slot; one diagnosis cycle, else
             # abandon the idea (restore best) and move on. The diagnosis is a
@@ -480,18 +524,35 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     extra={"diagnosis_verdict": verdict},
                     resume_from=last_editor, objective=objective)
             except InvocationFailed as exc:
-                stop_condition = f"editor repair failed: {exc.problems}"
-                events.emit("blocked", reason=stop_condition)
-                break
+                # Same settlement as an eval-branch repair failure: the
+                # unjudged edit is reverted and the idea abandoned — one dead
+                # repair session does not stop the run.
+                events.emit("editor_repair_failed", stage="preflight",
+                            problems=exc.problems)
+                _revert(run_dir)
+                outcome_note = ("your last edit's preflight repair session "
+                                "failed and the idea was abandoned (no "
+                                "evaluation budget was consumed); the working "
+                                "copy was reverted to the incumbent")
+                continue
             try:
                 still_failing = _preflight(task, run_dir, repo_root, cmd,
                                            task_toml).returncode != 0
             except ResourceUnavailable as exc:
                 _revert(run_dir)
-                stop_condition = _resource_block(events,
-                                                 stage="preflight_repair",
-                                                 exc=exc)
-                break
+                resource_strikes["preflight_repair"] += 1
+                stop = _resource_strike(events, stage="preflight_repair",
+                                        exc=exc,
+                                        strikes=resource_strikes["preflight_repair"])
+                if stop:
+                    stop_condition = stop
+                    break
+                outcome_note = ("your repaired edit was not judged: the host "
+                                "could not grant the task's resources in time "
+                                "and the working copy was reverted to the "
+                                "incumbent")
+                continue
+            resource_strikes["preflight_repair"] = 0
             if still_failing:
                 _revert(run_dir)
                 outcome_note = ("your repaired edit still failed candidate "
@@ -505,12 +566,23 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                                    repo_root, cmd, task_toml)
         except ResourceUnavailable as exc:
             # Nothing was charged and the edit is unjudged: restore the
-            # incumbent and block instead of recording a candidate crash.
+            # incumbent. One shortage skips the step; two consecutive
+            # strikes block — never record a candidate crash for a host
+            # shortage.
             _revert(run_dir)
-            stop_condition = _resource_block(events, stage="run", exc=exc)
-            break
+            resource_strikes["run"] += 1
+            stop = _resource_strike(events, stage="run", exc=exc,
+                                    strikes=resource_strikes["run"])
+            if stop:
+                stop_condition = stop
+                break
+            outcome_note = ("your last edit was not judged: the host could "
+                            "not grant the task's resources in time and the "
+                            "working copy was reverted to the incumbent")
+            continue
         if run is None:
             break  # normal budget completion (exit 4), never a crash
+        resource_strikes["run"] = 0
         log, rc = run
         score = _evaluate_outcome(log, rc, metric, required_patterns)
         step = len(_tsv_rows(run_dir))
@@ -544,11 +616,17 @@ def run_hillclimb(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     preflight_ok = _preflight(task, run_dir, repo_root, cmd,
                                               task_toml).returncode == 0
                 except ResourceUnavailable as exc:
-                    # The repaired edit is unjudged: block the run instead of
-                    # burning another editor session on a short-handed host.
-                    resource_shortage = _resource_block(
-                        events, stage="crash_repair", exc=exc)
+                    # The repaired edit is unjudged: strike. A single
+                    # shortage falls through to the abandon path (revert);
+                    # repeated strikes block the run.
+                    resource_strikes["crash_repair"] += 1
+                    shortage = _resource_strike(
+                        events, stage="crash_repair", exc=exc,
+                        strikes=resource_strikes["crash_repair"])
+                    if shortage is not None:
+                        resource_shortage = shortage
                     break
+                resource_strikes["crash_repair"] = 0
                 if preflight_ok:
                     repaired = True
                     break

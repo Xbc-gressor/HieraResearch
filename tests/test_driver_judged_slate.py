@@ -431,8 +431,8 @@ class JudgedSlateTests(unittest.TestCase):
 
     def _run(self, cmd: JudgedCmd, script: list) -> FakeSessionRunner:
         runner = FakeSessionRunner(script)
-        run_experiment(TASK, TAG, runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
+        runner.status = run_experiment(TASK, TAG, runner=runner, model="m",
+                                       repo_root=self.repo, cmd=cmd)
         return runner
 
     def _gen_dir(self) -> Path:
@@ -535,12 +535,14 @@ class JudgedSlateTests(unittest.TestCase):
         self._seed_run()
         cmd = JudgedCmd(self.repo)
         cmd.reached = [False]
-        with self.assertRaises(RuntimeError):
-            self._run(cmd, [
-                judge_entry(),
-                judge_entry(),
-                kill_entry(),                   # driver dies mid-plan
-            ])
+        # The simulated kill is an in-process exception: the boundary rule
+        # (P1) converts it into a persisted block, never a bare exit.
+        killed = self._run(cmd, [
+            judge_entry(),
+            judge_entry(),
+            kill_entry(),                   # driver dies mid-plan
+        ])
+        self.assertEqual(killed.status["phase"], "blocked")
         manifest_bytes = (self._gen_dir() / "generation.json").read_bytes()
         self.assertEqual(len(cmd._ledger()["records"]), 5)
 
@@ -574,13 +576,13 @@ class JudgedSlateTests(unittest.TestCase):
         self._seed_run()
         cmd = JudgedCmd(self.repo)
         cmd.reached = [False]
-        with self.assertRaises(RuntimeError):
-            self._run(cmd, [
-                judge_entry(),
-                judge_entry(),
-                plan_entry(),                     # slot 0 lands
-                kill_entry(),                     # slot 1 dies mid-plan
-            ])
+        killed = self._run(cmd, [
+            judge_entry(),
+            judge_entry(),
+            plan_entry(),                     # slot 0 lands
+            kill_entry(),                     # slot 1 dies mid-plan
+        ])
+        self.assertEqual(killed.status["phase"], "blocked")
         plan0_bytes = (self._gen_dir() / "plans" / "slot-0.json").read_bytes()
 
         cmd2 = JudgedCmd(self.repo)
@@ -646,37 +648,45 @@ class JudgedSlateTests(unittest.TestCase):
         self.assertIn("Prior attempt note", retry.inline_payload)
         self.assertNotIn("Prior attempt note", first.inline_payload)
 
-    def test_writer_budget_exhausted_blocks_and_resume_never_reinvokes(self) -> None:
+    def test_plan_budget_exhausted_aborts_generation_and_resume_skips_it(self) -> None:
         self._seed_run()
         cmd = JudgedCmd(self.repo)
-        cmd.reached = [False]
-        self._run(cmd, [
+        # round-1 generation check, pre-tuner check, round-2 completion check
+        cmd.reached = [False, True, True]
+        first = self._run(cmd, [
             judge_entry(),
             judge_entry(),
             {"fail": ["a"]},
             {"fail": ["b"]},
             {"fail": ["c"]},
         ])
-        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
+        # The attempt budget aborts the GENERATION, not the run: the manifest
+        # stands, nothing was admitted (the reserved ids never reached the
+        # ledger), and the run completes with the skip-suffixed annotation.
+        self.assertEqual(first.status["phase"], "completed")
+        self.assertEqual(
+            first.status["stop_condition"],
+            "evaluation_budget_reached_seats_skipped",
+        )
         plans = self._gen_dir() / "plans"
         self.assertFalse((plans / "slot-0.json").exists())
         self.assertEqual(
             json.loads((plans / "slot-0.attempts.json").read_text()),
             {"attempts": 3})
+        self.assertTrue(
+            (self._gen_dir() / "generation.aborted.json").is_file())
+        self.assertEqual(self._new_records(cmd), [])
+        self.assertIn("slate_generation_aborted", self._events())
 
         cmd2 = JudgedCmd(self.repo)
-        cmd2.reached = [False, False]
+        cmd2.reached = [True]
         runner2 = self._run(cmd2, [])  # empty script: any session is a bug
+        # The aborted generation is closed: resume never re-plans it.
         self.assertEqual([name for name, _ in runner2.calls], [])
-        self.assertEqual(cmd2._ledger().get("run_state", {}).get("phase"), "blocked")
-        events_path = (self.repo / "runs" / TASK / TAG
-                       / "driver_events.jsonl")
-        rows = [json.loads(line) for line in
-                events_path.read_text().splitlines() if line.strip()]
-        reasons = [r.get("reason") for r in rows if r.get("kind") == "blocked"]
-        self.assertIn("attempt budget exhausted", reasons[-1])
+        self.assertEqual(cmd2._ledger().get("run_state", {}).get("phase"),
+                         "completed")
 
-    def test_resume_with_both_seats_pending_uses_step0_pipeline(self) -> None:
+    def test_writer_budget_exhausted_skips_seats_then_streak_blocks(self) -> None:
         self._seed_run()
         cmd = JudgedCmd(self.repo)
         cmd.reached = [False, False]
@@ -688,30 +698,35 @@ class JudgedSlateTests(unittest.TestCase):
             {"fail": ["writer down"]},
             {"fail": ["writer still down"]},
         ])
-        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
+        # Each seat's exhausted writer budget skips the seat (aborted, no
+        # observation); the second isomorphic skip trips the run-level
+        # consecutive-failure breaker, so the run blocks with both seats
+        # honestly terminal instead of one pending behind a block.
+        ledger = cmd._ledger()
+        self.assertEqual(ledger.get("run_state", {}).get("phase"), "blocked")
         self.assertEqual(
             [r["status"] for r in self._new_records(cmd)],
-            ["pending", "pending"],
+            ["aborted", "aborted"],
+        )
+        events_path = (self.repo / "runs" / TASK / TAG
+                       / "driver_events.jsonl")
+        rows = [json.loads(line) for line in
+                events_path.read_text().splitlines() if line.strip()]
+        blocked = [r for r in rows if r.get("kind") == "blocked"]
+        self.assertIn("consecutive seat failures", blocked[-1]["reason"])
+        self.assertEqual(
+            [r["run_id"] for r in rows if r.get("kind") == "candidate_skipped"],
+            ["005", "006"],
         )
 
         cmd2 = JudgedCmd(self.repo)
-        cmd2.reached = [False, False, True]
-        runner2 = self._run(cmd2, [
-            writer_entry(),
-            extractor_entry(cmd2),
-            writer_entry(),
-            extractor_entry(cmd2),
-        ])
-        roles = [name for name, _ in runner2.calls]
-        # no re-judge, no re-plan, no new generation: pending seats resumed
-        self.assertEqual(
-            roles,
-            ["candidate-writer", "tunable-contract-extractor",
-             "candidate-writer", "tunable-contract-extractor"],
-        )
-        self.assertEqual(
-            [r["status"] for r in self._new_records(cmd2)], ["keep", "keep"])
-        self.assertEqual(cmd2._ledger().get("run_state", {}).get("phase"), "completed")
+        cmd2.reached = [True]
+        runner2 = self._run(cmd2, [])  # empty script: any session is a bug
+        # Both writer attempts were consumed and both seats are terminal:
+        # resume neither re-invokes a writer nor leaves pending work.
+        self.assertEqual([name for name, _ in runner2.calls], [])
+        self.assertEqual(cmd2._ledger().get("run_state", {}).get("phase"),
+                         "completed")
 
     # ---------- degraded cardinality (design 10.8) ----------
 

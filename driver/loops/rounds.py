@@ -449,14 +449,21 @@ def _commit_kept(run_dir, run_id, candidate, bout, result, repo_root, cmd,
         # until a later rebase succeeds (round_policy checks report currency).
         events.emit("rewrite_rebase_failed", run_id=run_id, bout=bout,
                     detail=(rebase.stderr or rebase.stdout or "")[-2000:])
-    try:
-        cmd(["python", "tools/ledger.py", "record-rewrite",
-             "--ledger", run_dir / "ledger.json", "--run-id", run_id,
-             "--score", str(reference), *report_args], repo_root)
-    except subprocess.CalledProcessError as exc:
-        events.emit("rewrite_ledger_failed", run_id=run_id, bout=bout,
-                    detail=(exc.stderr or str(exc))[-2000:])
-        return
+    # A refused record-rewrite would fork the journal (kept bout) from the
+    # ledger silently. One immediate retry absorbs a transient refusal; a
+    # repeated refusal is a tools-side failure and escalates (fail closed).
+    for attempt in range(2):
+        try:
+            cmd(["python", "tools/ledger.py", "record-rewrite",
+                 "--ledger", run_dir / "ledger.json", "--run-id", run_id,
+                 "--score", str(reference), *report_args], repo_root)
+            break
+        except subprocess.CalledProcessError as exc:
+            events.emit("rewrite_ledger_failed", run_id=run_id, bout=bout,
+                        attempt=attempt + 1,
+                        detail=(exc.stderr or str(exc))[-2000:])
+            if attempt == 1:
+                raise
     events.emit("rewrite_kept", run_id=run_id, bout=bout,
                 score=result["score"], reference=reference)
 

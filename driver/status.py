@@ -23,7 +23,8 @@ from .roles import REPO_ROOT, ledger_brief
 
 # Mirrors tools/semantic_evidence.LIFECYCLE_TERMINAL_STATUSES; driver/ stays
 # self-contained (tools/ is not an importable package for the driver).
-LIFECYCLE_TERMINAL_STATUSES = frozenset({"keep", "discard", "crash", "unevaluated"})
+LIFECYCLE_TERMINAL_STATUSES = frozenset(
+    {"keep", "discard", "crash", "unevaluated", "aborted"})
 
 
 def _integer(value) -> int:

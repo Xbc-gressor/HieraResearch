@@ -260,6 +260,10 @@ def main(argv: list[str] | None = None) -> int:
             session_concurrency=args.session_concurrency,
             rewrite_concurrency=args.rewrite_concurrency,
             cli_path=args.cli_path,
+            finalization=(
+                {"submission_command": args.submission_command,
+                 "data_dir": args.data_dir}
+                if args.submission_command else None),
         )
         print(json.dumps(status, indent=2, sort_keys=True))
         if args.submission_command and status.get("phase") == "completed":

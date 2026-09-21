@@ -1,17 +1,28 @@
 import json
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
+import threading
+from unittest import mock
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from driver.loops import experiment
+from driver.receipts import ReceiptStore
+from driver.events import EventsLog  # noqa: E402
 from driver.loops.background_audit import audit_completed  # noqa: E402
+from driver.loops.common import RunBlocked  # noqa: E402
 from driver.loops.experiment import (  # noqa: E402
+    _note_seat_progress,
+    _note_seat_skip,
     _phase_c_recover_close,
+    _reset_seat_skip_state,
     _validator_error_messages,
     run_experiment,
 )
@@ -126,6 +137,14 @@ class ExperimentCmd:
             for record in ledger["records"]:
                 if record["run_id"] == run_id:
                     record["status"] = "unevaluated"
+            self._save_ledger(ledger)
+            return self._ok("")
+        if "resolve-aborted" in joined:
+            run_id = args[args.index("--run-id") + 1]
+            ledger = self._ledger()
+            for record in ledger["records"]:
+                if record["run_id"] == run_id:
+                    record["status"] = "aborted"
             self._save_ledger(ledger)
             return self._ok("")
         if "set-phase" in joined:
@@ -297,6 +316,42 @@ class ExperimentTests(unittest.TestCase):
         self.assertIn("--semantic-policy coverage_attempt", init_call)
         self.assertIn("--scheduler-policy v3_2", init_call)
         self.assertNotIn("--inner-tuner-policy", init_call)
+
+    def test_candidate_writer_retry_is_decorrelated_and_persistent(self) -> None:
+        write_task(self.repo)
+        cmd = ExperimentCmd(self.repo)
+        cmd.reached = [False, False, True]
+        runner = FakeSessionRunner([
+            {"receipt": {"status": "ok", "background": "background.md",
+                         "retrieval_manifest": "background_retrieval.json"},
+             "side_effects": lambda ctx: write_background(ctx.run_dir)},
+            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
+             "side_effects": lambda ctx: cmd([
+                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
+                 self.repo)},
+            {"fail": ["writer repetition breaker tripped"]},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/000"},
+             "side_effects": writer_effect},
+            {"receipt": {"run_id": "000", "status": "keep",
+                         "ledger_updated": True},
+             "side_effects": self._extractor_side_effect(cmd, "keep")},
+            {"receipt": {"tuned_run_id": "none", "tuned": False,
+                         "ledger_updated": False}},
+        ])
+        run_experiment("fake-task", "t1", runner=runner, model="m",
+                       repo_root=self.repo, cmd=cmd)
+        writer_calls = [ctx for name, ctx in runner.calls
+                        if name == "candidate-writer"]
+        self.assertEqual(len(writer_calls), 2)
+        self.assertNotIn("retry_note", writer_calls[0].extra)
+        self.assertIn("retry_note", writer_calls[1].extra)
+        self.assertIn("writer repetition breaker tripped",
+                      writer_calls[1].extra["retry_note"])
+        self.assertIn("current write mode", writer_calls[1].extra["retry_note"])
+        self.assertNotIn("each read once", writer_calls[1].extra["retry_note"])
+        attempts = self.repo / "runs" / "fake-task" / "t1" / "candidates" / "000" / "writer.attempts.json"
+        self.assertEqual(json.loads(attempts.read_text())["attempts"], 2)
 
     def test_tuner_contradiction_corrected_in_same_session(self) -> None:
         write_task(self.repo)
@@ -992,6 +1047,489 @@ class ExperimentTests(unittest.TestCase):
             self.assertNotIn("--time-budget", call)
             self.assertNotIn("--deadline", call)
             self.assertIn("--max-evaluations 3", call)
+
+
+class CandidateRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        write_task(self.repo)
+        self.run = self.repo / "runs/fake-task/t1"
+        self.candidate = self.run / "candidates/001"
+        self.candidate.mkdir(parents=True)
+        (self.run / "framework_cfg.json").write_text('{"max_evaluations": 10}')
+        self.cmd = ExperimentCmd(self.repo)
+        self.cmd._save_ledger({"records": [{"run_id": "001", "status": "pending"}]})
+        experiment._reset_block_state(self.run)
+        experiment._reset_seat_skip_state(self.run)
+        self.store = ReceiptStore(self.run)
+        self.events = EventsLog(self.run)
+
+    def implement(self, runner):
+        experiment._implement_candidate(
+            runner, self.store, "fake-task", "t1", self.run, "001",
+            self.repo, self.cmd, self.events)
+
+    def test_fresh_extractor_retry_settles_its_new_evidence(self):
+        def evaluated(ctx):
+            (self.candidate / "tune_report.json").write_text(
+                '{"phase_a": {"best_warm_score": 0.1}}')
+
+        self.implement(FakeSessionRunner([
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/001"}, "side_effects": writer_effect},
+            {"fail": ["no accepted receipt"]},
+            {"fail": ["session ended with error result: error_max_turns"],
+             "side_effects": evaluated},
+        ]))
+        self.assertEqual(self.cmd._ledger()["records"][0]["status"], "keep")
+        self.assertFalse(any("resolve-aborted" in call for call in self.cmd.calls))
+
+    def test_blocked_writer_retry_preserves_its_attempt_for_resume(self):
+        def sibling_blocks(ctx):
+            with self.assertRaises(RunBlocked):
+                experiment._or_block(
+                    self.run, self.repo, self.cmd, self.events, "sibling blocked")
+
+        first = FakeSessionRunner([
+            {"fail": ["no accepted receipt"], "side_effects": sibling_blocks},
+        ])
+        with self.assertRaisesRegex(RunBlocked, "sibling blocked"):
+            self.implement(first)
+        self.assertEqual(json.loads((self.candidate / "writer.attempts.json")
+                                   .read_text())["attempts"], 1)
+        self.assertEqual(self.cmd._ledger()["records"][0]["status"], "pending")
+
+        experiment._reset_block_state(self.run)
+
+        def settled(ctx):
+            self.cmd(["python", "tools/ledger.py", "record-run", "--run-id", "001"],
+                     self.repo)
+
+        resumed = FakeSessionRunner([
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/001"}, "side_effects": writer_effect},
+            {"receipt": {"run_id": "001", "status": "keep", "ledger_updated": True},
+             "side_effects": settled},
+        ])
+        self.implement(resumed)
+        self.assertEqual(json.loads((self.candidate / "writer.attempts.json")
+                                   .read_text())["attempts"], 2)
+        self.assertEqual(self.cmd._ledger()["records"][0]["status"], "keep")
+
+    def test_resume_skips_a_writer_that_succeeded_on_its_last_attempt(self):
+        def interrupted(ctx):
+            raise RuntimeError("process interrupted before extractor settlement")
+
+        first = FakeSessionRunner([
+            {"fail": ["no accepted receipt"]},
+            {"receipt": {"status": "written", "wrote": True,
+                         "candidate_dir": "candidates/001"}, "side_effects": writer_effect},
+            {"side_effects": interrupted},
+        ])
+        with self.assertRaisesRegex(RuntimeError, "process interrupted"):
+            self.implement(first)
+        self.assertEqual(json.loads((self.candidate / "writer.attempts.json")
+                                   .read_text())["attempts"], 2)
+
+        def settled(ctx):
+            self.cmd(["python", "tools/ledger.py", "record-run", "--run-id", "001"],
+                     self.repo)
+
+        resumed = FakeSessionRunner([
+            {"receipt": {"run_id": "001", "status": "keep", "ledger_updated": True},
+             "side_effects": settled}])
+        self.implement(resumed)
+        self.assertEqual([name for name, ctx in resumed.calls], ["tunable-contract-extractor"])
+        self.assertEqual(self.cmd._ledger()["records"][0]["status"], "keep")
+
+
+class SeatSkipStreakTests(unittest.TestCase):
+    """The run-level consecutive-failure breaker (P3): isolated skips settle
+    as skips; a streak of isomorphic skips (same role + frozen problem
+    class) blocks the run."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        write_task(self.repo)
+        self.run_dir = self.repo / "runs" / "fake-task" / "t1"
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "framework_cfg.json").write_text(
+            json.dumps({"max_evaluations": 3}))
+        self.cmd = ExperimentCmd(self.repo)
+        self.events = EventsLog(self.run_dir)
+        _reset_seat_skip_state(self.run_dir)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _note(self, role: str, problems: list[str]) -> None:
+        _note_seat_skip(self.run_dir, self.repo, self.cmd, self.events,
+                        role=role, problems=problems, run_id="001")
+
+    def test_two_isomorphic_skips_trip_and_block(self) -> None:
+        self._note("candidate-writer", ["writer down"])
+        with self.assertRaises(RunBlocked):
+            self._note("candidate-writer", ["writer still down"])
+        self.assertEqual(
+            self.cmd._ledger().get("run_state", {}).get("phase"), "blocked")
+        self.assertIn("consecutive seat failures",
+                      self.cmd._ledger()["run_state"]["active_stop_condition"])
+        self.assertIn("problem_class=postcondition",
+                      self.cmd._ledger()["run_state"]["active_stop_condition"])
+
+    def test_success_resets_and_other_signatures_do_not_accumulate(self) -> None:
+        # Same role, different frozen problem classes: separate streaks.
+        self._note("candidate-writer",
+                   ["session ended with error result: error_max_turns"])
+        self._note("candidate-writer", ["writer down"])
+        # A completed seat resets the running streak.
+        _note_seat_progress(self.run_dir)
+        self._note("candidate-writer", ["writer down"])
+        # Different roles never share a streak.
+        self._note("tunable-contract-extractor", ["extractor down"])
+        self.assertIsNone(self.cmd._ledger().get("run_state"))
+
+    def test_successful_ideation_resets_the_failure_streak(self) -> None:
+        self._note("idea-generator", ["generator unavailable"])
+        actions = experiment._ideate(
+            FakeSessionRunner([{"receipt": {"actions": []}}]),
+            ReceiptStore(self.run_dir), "fake-task", "t1", self.run_dir, 0,
+            self.repo, self.cmd, self.events,
+            task_toml=experiment.common.load_task_toml(
+                "fake-task", self.repo),
+        )
+        self.assertEqual(actions, [])
+        self._note("idea-generator", ["generator unavailable again"])
+        self.assertIsNone(self.cmd._ledger().get("run_state"))
+
+
+class DegradedDeliveryTests(unittest.TestCase):
+    """P6: persist block, drain channels, settle, then export best-effort."""
+
+    SUBMISSION = (
+        "python -c \"open('submission.csv', 'w').write("
+        "'Id,Probability\\n1,0.5\\n')\""
+    )
+    MALFORMED_SUBMISSION = (
+        "python -c \"open('submission.csv', 'w').write('ok')\""
+    )
+    FAILING = "python -c \"import sys; sys.exit(3)\""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        write_task(self.repo)
+        self.run_dir = self.repo / "runs" / "fake-task" / "t1"
+        self.run_dir.mkdir(parents=True)
+        write_background(self.run_dir)
+        (self.run_dir / "framework_cfg.json").write_text(
+            json.dumps({"max_evaluations": 3, "per_runtime_limit": None,
+                        "dimension_strategy": "catalog_subset",
+                        "deadline": time.time() + 600}))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _ledger_with(self, statuses: dict[str, str]) -> None:
+        self.run_dir.joinpath("ledger.json").write_text(json.dumps({
+            "records": [
+                {"run_id": run_id, "status": status,
+                 **({"final_best_score": 0.5} if status == "keep" else {})}
+                for run_id, status in statuses.items()
+            ]}))
+
+    def _block(self, finalization, statuses=None, cmd=None) -> dict:
+        self._ledger_with(statuses or {"000": "keep", "001": "pending"})
+        cmd = cmd or ExperimentCmd(self.repo)
+        cmd.fail_next.add("ledger.py brief")
+        status = run_experiment(
+            "fake-task", "t1", runner=FakeSessionRunner([]), model="m",
+            repo_root=self.repo, cmd=cmd, finalization=finalization)
+        self.assertEqual(status["phase"], "blocked")
+        return status
+
+    def _events(self) -> list[dict]:
+        path = self.run_dir / "driver_events.jsonl"
+        return [json.loads(line) for line in
+                path.read_text().splitlines() if line.strip()]
+
+    def test_block_exports_submission_and_annotates(self) -> None:
+        status = self._block({"submission_command": self.SUBMISSION,
+                              "data_dir": str(self.repo / "data")})
+        self.assertIn("degraded_submit", status["stop_condition"])
+        self.assertTrue((self.run_dir / "submission.csv").is_file())
+        # The pending seat settled deterministically: zero attempts →
+        # aborted (never a crash observation on an innocent point).
+        ledger = json.loads((self.run_dir / "ledger.json").read_text())
+        self.assertEqual(
+            [r["status"] for r in ledger["records"]], ["keep", "aborted"])
+        rows = self._events()
+        self.assertIn("candidate_skipped",
+                      [row["kind"] for row in rows])
+        delivery = [row for row in rows
+                    if row["kind"] == "degraded_submit"][-1]
+        self.assertEqual(delivery["status"], "success")
+
+    def test_annotation_failure_keeps_the_original_block_durable(self) -> None:
+        class AnnotationFailCmd(ExperimentCmd):
+            def __init__(self, repo: Path) -> None:
+                super().__init__(repo)
+                self.block_writes = 0
+
+            def __call__(self, args, repo_root, **kwargs):
+                joined = " ".join(str(arg) for arg in args)
+                if "set-phase" in joined and "--phase blocked" in joined:
+                    self.block_writes += 1
+                    if self.block_writes == 2:
+                        raise subprocess.CalledProcessError(
+                            1, args, stderr="annotation unavailable")
+                return super().__call__(args, repo_root, **kwargs)
+
+        status = self._block(
+            {"submission_command": self.SUBMISSION, "data_dir": "x"},
+            cmd=AnnotationFailCmd(self.repo),
+        )
+        self.assertEqual(status["phase"], "blocked")
+        self.assertNotIn("degraded_submit", status["stop_condition"])
+        self.assertTrue((self.run_dir / "submission.csv").is_file())
+        failures = [row for row in self._events()
+                    if row["kind"] == "degraded_submit_annotation_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("annotation unavailable", failures[0]["error"])
+
+    def test_malformed_submission_is_not_annotated_as_delivered(self) -> None:
+        status = self._block({
+            "submission_command": self.MALFORMED_SUBMISSION,
+            "data_dir": str(self.repo / "data"),
+        })
+        self.assertNotIn("degraded_submit", status["stop_condition"])
+        delivery = [row for row in self._events()
+                    if row["kind"] == "degraded_submit"][-1]
+        self.assertEqual(delivery["status"], "failed")
+        self.assertIn("no usable header/rows", delivery["error"])
+
+    def test_cleanup_of_two_pending_seats_still_exports(self) -> None:
+        status = self._block(
+            {"submission_command": self.SUBMISSION, "data_dir": "x"},
+            {"000": "keep", "001": "pending", "002": "pending"})
+        self.assertIn("degraded_submit", status["stop_condition"])
+        self.assertTrue((self.run_dir / "submission.csv").is_file())
+        self.assertEqual(experiment._seat_skip_count(self.run_dir), 0)
+
+    def test_settlement_exception_keeps_the_original_block_durable(self) -> None:
+        with mock.patch.object(experiment, "_settle_for_delivery",
+                               side_effect=RuntimeError("settlement unavailable")):
+            status = self._block(
+                {"submission_command": self.SUBMISSION, "data_dir": "x"})
+        self.assertEqual(status["phase"], "blocked")
+        self.assertIn("JSONDecodeError", status["stop_condition"])
+        failures = [r for r in self._events()
+                    if r["kind"] == "degraded_submit" and r["status"] == "failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("settlement unavailable", failures[0]["error"])
+
+    def test_delivery_waits_for_inflight_evaluation_before_settling(self) -> None:
+        self._ledger_with({"000": "keep", "001": "pending", "002": "pending"})
+        cfg_path = self.run_dir / "framework_cfg.json"
+        cfg = json.loads(cfg_path.read_text())
+        cfg["pipeline"] = {"session_concurrency": 2}
+        cfg_path.write_text(json.dumps(cfg))
+        run_dir = self.run_dir
+
+        class InflightCmd(ExperimentCmd):
+            def __call__(self, args, repo_root, **kw):
+                if "evaluation_budget.py" in str(args):
+                    return self._ok(json.dumps({"reached": False,
+                        "per_candidate": [{"run_id": "002", "evals": 1}]}))
+                return super().__call__(args, repo_root, **kw)
+
+        cmd = InflightCmd(self.repo)
+        started, blocker_returned = threading.Event(), threading.Event()
+        events = EventsLog(run_dir)
+
+        def implement(runner, store, task, tag, run, run_id, *args, **kw):
+            if run_id == "001":
+                self.assertTrue(started.wait(5))
+                try:
+                    experiment._or_block(run, self.repo, cmd, events,
+                                         "another channel blocked")
+                finally:
+                    blocker_returned.set()
+            else:
+                started.set()
+                self.assertTrue(blocker_returned.wait(5))
+                (run / "candidates/002/tune_report.json").write_text(
+                    '{"phase_a": {"best_warm_score": 0.1}}')
+                experiment._refuse_if_blocked(run)
+
+        def resume(*args, **kw):
+            experiment._implement_seats(
+                None, None, "fake-task", "t1", run_dir, ["001", "002"],
+                self.repo, cmd, events, None)
+
+        with mock.patch.object(experiment, "_resume_setup", side_effect=resume), \
+                mock.patch.object(experiment, "_implement_candidate", side_effect=implement):
+            status = run_experiment(
+                "fake-task", "t1", runner=FakeSessionRunner([]), model="m",
+                repo_root=self.repo, cmd=cmd,
+                finalization={"submission_command": self.SUBMISSION, "data_dir": "x"})
+        self.assertEqual(status["phase"], "blocked")
+        self.assertEqual([r["status"] for r in cmd._ledger()["records"]],
+                         ["keep", "aborted", "keep"])
+        self.assertTrue((run_dir / "submission.csv").is_file())
+
+    def test_no_settled_incumbent_skips_the_delivery(self) -> None:
+        self._ledger_with({"001": "pending"})
+        cmd = ExperimentCmd(self.repo)
+        cmd.fail_next.add("ledger.py brief")
+        status = run_experiment(
+            "fake-task", "t1", runner=FakeSessionRunner([]), model="m",
+            repo_root=self.repo, cmd=cmd,
+            finalization={"submission_command": self.SUBMISSION,
+                          "data_dir": "x"})
+        self.assertEqual(status["phase"], "blocked")
+        self.assertNotIn("degraded_submit", status["stop_condition"])
+        self.assertFalse((self.run_dir / "submission.csv").exists())
+        delivery = [row for row in self._events()
+                    if row["kind"] == "degraded_submit"][-1]
+        self.assertEqual(delivery["status"], "skipped")
+
+    def test_pending_warm_score_settles_before_incumbent_check(self) -> None:
+        self._ledger_with({"001": "pending"})
+        candidate_dir = self.run_dir / "candidates" / "001"
+        candidate_dir.mkdir(parents=True)
+        candidate_dir.joinpath("tune_report.json").write_text(
+            '{"phase_a": {"best_warm_score": 0.1}}')
+        cmd = ExperimentCmd(self.repo)
+        cmd.fail_next.add("ledger.py brief")
+        status = run_experiment(
+            "fake-task", "t1", runner=FakeSessionRunner([]), model="m",
+            repo_root=self.repo, cmd=cmd,
+            finalization={"submission_command": self.SUBMISSION,
+                          "data_dir": "x"})
+        self.assertEqual(status["phase"], "blocked")
+        self.assertIn("degraded_submit", status["stop_condition"])
+        self.assertTrue((self.run_dir / "submission.csv").is_file())
+        self.assertEqual(cmd._ledger()["records"][0]["status"], "keep")
+
+    def test_failed_export_does_not_defer_the_block(self) -> None:
+        status = self._block({"submission_command": self.FAILING,
+                              "data_dir": "x"})
+        self.assertNotIn("degraded_submit", status["stop_condition"])
+        self.assertFalse((self.run_dir / "submission.csv").exists())
+        delivery = [row for row in self._events()
+                    if row["kind"] == "degraded_submit"][-1]
+        self.assertEqual(delivery["status"], "failed")
+
+    def test_timeout_terminates_the_submission_process_group(self) -> None:
+        started = self.repo / "descendant-started"
+        survived = self.repo / "descendant-survived"
+        child = self.repo / "submission-child.py"
+        child.write_text(
+            "from pathlib import Path\n"
+            "import sys, time\n"
+            "Path(sys.argv[2]).touch()\n"
+            "time.sleep(0.8)\n"
+            "Path(sys.argv[1]).touch()\n"
+        )
+        parent = self.repo / "submission-parent.py"
+        parent.write_text(
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2], "
+            "sys.argv[3]])\n"
+            "time.sleep(60)\n"
+        )
+        command = shlex.join([
+            sys.executable, str(parent), str(child), str(survived), str(started),
+        ])
+        self._ledger_with({"000": "keep"})
+        experiment._delivery_cfg[str(self.run_dir)] = {
+            "task": "fake-task",
+            "submission_command": command,
+            "data_dir": str(self.repo / "data"),
+        }
+        self.addCleanup(experiment._reset_seat_skip_state, self.run_dir)
+        now = time.time()
+        cfg_path = self.run_dir / "framework_cfg.json"
+        cfg = json.loads(cfg_path.read_text())
+        cfg["deadline"] = now + 60.5
+        cfg_path.write_text(json.dumps(cfg))
+        ticks = iter((now, now + 60.0))
+
+        with mock.patch.object(
+                experiment.time, "time",
+                side_effect=lambda: next(ticks, now + 60.0)):
+            annotation = experiment._attempt_degraded_delivery(
+                self.run_dir, self.repo, ExperimentCmd(self.repo),
+                EventsLog(self.run_dir))
+
+        self.assertIsNone(annotation)
+        delivery = [row for row in self._events()
+                    if row["kind"] == "degraded_submit"][-1]
+        self.assertEqual(delivery["status"], "timeout")
+        self.assertTrue(started.is_file())
+        time.sleep(1.0)
+        self.assertFalse(survived.exists())
+
+    def test_no_finalization_contract_no_attempt(self) -> None:
+        status = self._block(None)
+        self.assertNotIn("degraded_submit", status["stop_condition"])
+        self.assertFalse((self.run_dir / "submission.csv").exists())
+        self.assertEqual(
+            [row["kind"] for row in self._events()].count("degraded_submit"),
+            0)
+
+
+class UnhandledExceptionBoundaryTests(unittest.TestCase):
+    """Wave 0 (P1): every unhandled exception ends as a persisted block —
+    never a traceback exit with the ledger still claiming running."""
+
+    def test_bare_exception_becomes_persisted_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_task(repo)
+            run_dir = repo / "runs" / "fake-task" / "t1"
+            run_dir.mkdir(parents=True)
+            write_background(run_dir)
+            (run_dir / "framework_cfg.json").write_text(
+                json.dumps({"max_evaluations": 3, "per_runtime_limit": None,
+                            "dimension_strategy": "catalog_subset"}))
+            (run_dir / "ledger.json").write_text(json.dumps({
+                "records": [{"run_id": "000", "status": "keep",
+                             "final_best_score": 0.5}]}))
+
+            class ExplodingCmd(ExperimentCmd):
+                def __init__(self, repo: Path) -> None:
+                    super().__init__(repo)
+                    self.fired = False
+
+                def __call__(self, args, repo_root, check=True,
+                             capture=True, **kw):
+                    joined = " ".join(str(a) for a in args)
+                    if not self.fired and "ledger.py brief" in joined:
+                        self.fired = True
+                        raise RuntimeError("scheduler store exploded")
+                    return super().__call__(args, repo_root, check=check,
+                                            capture=capture, **kw)
+
+            cmd = ExplodingCmd(repo)
+            status = run_experiment("fake-task", "t1",
+                                    runner=FakeSessionRunner([]), model="m",
+                                    repo_root=repo, cmd=cmd)
+            self.assertEqual(status["phase"], "blocked")
+            self.assertIn("unhandled RuntimeError",
+                          status["stop_condition"])
+            events_path = run_dir / "driver_events.jsonl"
+            rows = [json.loads(line) for line in
+                    events_path.read_text().splitlines() if line.strip()]
+            unhandled = [row for row in rows
+                         if row["kind"] == "unhandled_exception"]
+            self.assertEqual(len(unhandled), 1)
+            self.assertIn("scheduler store exploded",
+                          unhandled[0]["traceback"])
 
 
 if __name__ == "__main__":

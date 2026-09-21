@@ -43,6 +43,63 @@ def _run(command: list[str], cwd: Path, timeout: float) -> int:
         unregister_child(proc)
 
 
+def run_submission(*, task: str, run_dir: Path, data_dir: Path | str,
+                   submission_command: str, deadline: float) -> tuple[int, dict]:
+    """Run and validate one deadline-bound submission command."""
+    command = _command(submission_command, task=task, run_dir=run_dir,
+                       data_dir=data_dir)
+    started = time.time()
+    remaining = deadline - started
+    if remaining <= 0:
+        return 124, {
+            "status": "deadline_expired",
+            "started_at_unix": started,
+            "command": command,
+        }
+    try:
+        rc = _run(command, run_dir, remaining)
+    except subprocess.TimeoutExpired:
+        ended = time.time()
+        return 124, {
+            "status": "timeout",
+            "started_at_unix": started,
+            "ended_at_unix": ended,
+            "elapsed_seconds": ended - started,
+            "command": command,
+        }
+    except OSError as exc:
+        ended = time.time()
+        return 1, {
+            "status": "failed",
+            "returncode": 1,
+            "started_at_unix": started,
+            "ended_at_unix": ended,
+            "elapsed_seconds": ended - started,
+            "command": command,
+            "error": str(exc),
+        }
+
+    ended = time.time()
+    result = {
+        "status": "failed",
+        "returncode": rc,
+        "started_at_unix": started,
+        "ended_at_unix": ended,
+        "elapsed_seconds": ended - started,
+        "command": command,
+    }
+    if rc == 0:
+        try:
+            result["validation"] = validate_submission(
+                run_dir / "submission.csv")
+        except (OfficialPreflightError, OSError) as exc:
+            result["error"] = str(exc)
+        else:
+            result["status"] = "success"
+    effective_rc = 0 if result["status"] == "success" else (rc or 1)
+    return effective_rc, result
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--task", required=True)
@@ -61,38 +118,13 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest = {"task": a.task, "run_dir": str(run_dir),
                 "deadline_unix": a.deadline, "submission": {}, "grader": {}}
-    sub = _command(a.submission_command, task=a.task, run_dir=run_dir, data_dir=data_dir)
-    started = time.time()
-    remaining = a.deadline - started
-    if remaining <= 0:
-        manifest["submission"] = {"status": "deadline_expired", "started_at_unix": started}
-        rc = 124
-    else:
-        try:
-            rc = _run(sub, run_dir, remaining)
-            status = "failed"
-            if rc == 0:
-                try:
-                    validate_submission(run_dir / "submission.csv")
-                except (OfficialPreflightError, OSError):
-                    pass
-                else:
-                    status = "success"
-            manifest["submission"] = {"status": status, "returncode": rc,
-                                       "started_at_unix": started, "ended_at_unix": time.time(),
-                                       "elapsed_seconds": time.time() - started,
-                                       "command": sub}
-            if status != "success":
-                rc = rc or 1
-        except subprocess.TimeoutExpired:
-            rc = 124
-            manifest["submission"] = {"status": "timeout", "started_at_unix": started,
-                                       "ended_at_unix": time.time(), "command": sub}
-        except OSError as exc:
-            rc = 1
-            manifest["submission"] = {"status": "failed", "returncode": rc,
-                                       "started_at_unix": started, "ended_at_unix": time.time(),
-                                       "command": sub, "error": str(exc)}
+    rc, manifest["submission"] = run_submission(
+        task=a.task,
+        run_dir=run_dir,
+        data_dir=data_dir,
+        submission_command=a.submission_command,
+        deadline=a.deadline,
+    )
     if rc == 0:
         grader = _command(a.grader_command, task=a.task, run_dir=run_dir, data_dir=data_dir)
         gs = time.time()

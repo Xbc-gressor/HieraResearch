@@ -420,6 +420,33 @@ class HillclimbTests(unittest.TestCase):
 
 
 class ResourceShortageTests(unittest.TestCase):
+    def test_preflight_success_does_not_reset_evaluation_lease_failures(self):
+        from driver.resources import ResourceUnavailable
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_task(repo)
+            run = repo / "runs/fake-task/t1"
+            run.mkdir(parents=True)
+            (run / "framework_cfg.json").write_text('{"max_evaluations": 10}')
+            (run / "results.tsv").write_text(
+                "step\tscore\tstatus\tdescription\n0\t-0.5\tkeep\tbaseline\n")
+            (run / "train.py").write_text("# baseline")
+            (run / "best.py").write_text("# baseline")
+            runner = FakeSessionRunner([
+                {"receipt": {"edited": True, "summary": "change"},
+                 "side_effects": edit_train_py(f"# change {i}")} for i in range(3)])
+            cmd = FakeCmd(repo, [])
+            with mock.patch.object(hillclimb, "_preflight",
+                                   return_value=FakeCmd._ok("")), \
+                    mock.patch.object(hillclimb, "_reserve_and_run", side_effect=[
+                        ResourceUnavailable("no free device"),
+                        ResourceUnavailable("no free device"), None]):
+                status = run_hillclimb("fake-task", "t1", runner=runner, model="m",
+                                       repo_root=repo, cmd=cmd)
+            self.assertIn("resource unavailable", status["active_stop_condition"])
+            self.assertEqual(len(runner.calls), 2)
+            self.assertEqual((run / "train.py").read_text(), "# baseline")
+
     @mock.patch("driver.loops.hillclimb._reserve")
     @mock.patch("driver.loops.hillclimb.task_resource_lease")
     def test_shortage_is_never_charged_as_an_evaluation(self, lease, reserve):

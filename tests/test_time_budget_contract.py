@@ -38,7 +38,7 @@ from driver.session import (  # noqa: E402
     InvocationFailed,
     SDKSessionRunner,
 )
-from ledger import cmd_set_phase, resolve_unevaluated  # noqa: E402
+from ledger import cmd_set_phase, resolve_aborted, resolve_unevaluated  # noqa: E402
 from driver.status import _derive_state  # noqa: E402
 from process_group import terminate_group  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
@@ -654,6 +654,90 @@ class LedgerDeadlineTests(unittest.TestCase):
             self.assertEqual(
                 _derive_state(stored, cfg, 0),
                 ("completed", "time_budget_reached"))
+
+
+class AbortedSettlementTests(unittest.TestCase):
+    """resolve-aborted: the evidence-neutral seat-skip settlement
+    (PLAN-block-escalation Wave 1)."""
+
+    def _pending_ledger(self, tmp: Path) -> Path:
+        registry = fixture_registry()
+        terminal = record("000", "fresh", [], complete_point(registry),
+                          score=0.5, status="keep")
+        pending = record("001", "improve", ["000"], complete_point(registry),
+                         score=float("inf"), status="pending",
+                         prior_records=[terminal])
+        pending["final_best_score"] = None
+        ledger = {
+            "task": "hard-interactions", "tag": "t",
+            "metric": "validation_loss",
+            "search_space": space_receipt(registry),
+            "search_space_state": empty_search_space_state(),
+            "dag_revision": 3,
+            "records": [terminal, pending],
+            "experience": {"dag_revision": 3},
+        }
+        ledger_path = tmp / "ledger.json"
+        ledger_path.write_text(json.dumps(ledger))
+        return ledger_path
+
+    def test_pending_becomes_aborted_without_observation_or_dag_bump(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = self._pending_ledger(Path(tmp))
+            before = json.loads(ledger_path.read_text())
+            resolved = resolve_aborted(ledger_path, "hard-interactions",
+                                       "001", ["writer down"])
+            self.assertEqual(resolved["status"], "aborted")
+            self.assertIsNone(resolved["final_best_score"])
+            self.assertEqual(resolved["aborted_receipt"]["kind"],
+                             "seat_aborted_infra_failure")
+            self.assertEqual(resolved["aborted_receipt"]["problems"],
+                             ["writer down"])
+            after = json.loads(ledger_path.read_text())
+            # No DAG bump and no attempt observation, although the record
+            # carries a semantic point (a keep/discard/crash settlement
+            # would have captured one): a skipped seat is not evidence.
+            self.assertEqual(after["dag_revision"], before["dag_revision"])
+            self.assertEqual(after["records"][1].get("dag_revision"),
+                             before["records"][1].get("dag_revision"))
+            self.assertEqual(after.get("attempt_observations", []), [])
+            self.assertIsNotNone(
+                after["records"][1]["semantic_point"].get("point_id"))
+            # The aborted record counts as lifecycle-terminal for phase
+            # derivation (completions are not held hostage by a skip).
+            cfg = {"max_evaluations": 1}
+            self.assertEqual(_derive_state(after, cfg, 1)[0], "completed")
+
+    def test_aborted_refuses_existing_objective_evidence(self) -> None:
+        for evidence in ("warm_score", "attempt"):
+            with self.subTest(evidence=evidence), tempfile.TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                ledger_path = self._pending_ledger(run)
+                before = ledger_path.read_bytes()
+                if evidence == "warm_score":
+                    candidate = run / "candidates/001"
+                    candidate.mkdir(parents=True)
+                    (candidate / "tune_report.json").write_text(
+                        '{"phase_a": {"best_warm_score": 0.1}}')
+                else:
+                    from evaluation_budget import ATTEMPT_KIND, ATTEMPT_LOG
+                    (run / ATTEMPT_LOG).write_text(json.dumps({
+                        "schema_version": 1, "kind": ATTEMPT_KIND, "run_id": "001",
+                        "attempt_id": "a", "phase": "warmstart", "method": "direct", "params": {}}) + "\n")
+                with self.assertRaisesRegex(ValueError, "evidence|attempt|score"):
+                    resolve_aborted(ledger_path, "hard-interactions", "001", ["session failed"])
+                self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_aborted_is_idempotent_and_refuses_terminal_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = self._pending_ledger(Path(tmp))
+            resolve_aborted(ledger_path, "hard-interactions", "001", ["a"])
+            again = resolve_aborted(ledger_path, "hard-interactions",
+                                    "001", ["a"])
+            self.assertEqual(again["status"], "aborted")
+            with self.assertRaisesRegex(ValueError, "must be pending"):
+                resolve_aborted(ledger_path, "hard-interactions", "000",
+                                ["a"])
 
 
 if __name__ == "__main__":

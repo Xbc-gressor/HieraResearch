@@ -344,13 +344,23 @@ class RewriteLoopTests(unittest.TestCase):
         )
 
         # the failed session's partial edit is rolled back to the bout
-        # snapshot before the run blocks, so the replayed bout re-snapshots
-        # the clean file
+        # snapshot before the candidate is backed off, so the replayed bout
+        # re-snapshots the clean file; one dead editor session does not
+        # block the run — the second consecutive failure excludes the
+        # candidate, and with nothing else selectable the run ends with the
+        # honest backoff stop condition.
         self.assertEqual((self.candidate() / "train.py").read_text(), V1)
-        self.assertIn("editor invocation failed",
+        self.assertIn("editor/lease failures excluded all candidates",
                       status["active_stop_condition"])
         self.assertFalse(
             (self.candidate() / "_rewrite" / "bouts.jsonl").exists())
+        events_path = self.repo / "runs" / "fake-task" / "t1" \
+            / "driver_events.jsonl"
+        rows = [json.loads(line) for line in
+                events_path.read_text().splitlines() if line.strip()]
+        editor_failures = [row for row in rows
+                           if row["kind"] == "rewrite_editor_failed"]
+        self.assertEqual(len(editor_failures), 2)
 
     def test_budget_exhausted_mid_bout_reverts_edit(self) -> None:
         cmd = FakeCmd(self.repo, eval_script=[{"exit": 4}])

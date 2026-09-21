@@ -808,11 +808,19 @@ def run_faithfulness_gate(
             batch, exc = failed
             error = [str(p) for p in exc.problems]
             judged.append(_batch_record(batch, None, None, error=error))
+            # A pre-seeded frozen background cannot be rewritten, so an
+            # unavailable judge is recorded as audit_unavailable and the run
+            # proceeds (the unfaithful_irreparable_warning precedent); the
+            # generation path stays fail-closed. audit_unavailable is not
+            # terminal-ok: a later resume retries the audit with a healthy
+            # judge.
+            outcome = "judge_failed" if repair is not None \
+                else "audit_unavailable"
             rounds.append(
                 {
                     "attempt": attempt,
                     "audited_at": datetime.now(timezone.utc).isoformat(),
-                    "outcome": "judge_failed",
+                    "outcome": outcome,
                     "batches": judged,
                 }
             )
@@ -820,11 +828,13 @@ def run_faithfulness_gate(
             sources = judged[-1]["source_keys"]
             events.emit(
                 "background_faithfulness_audit",
-                outcome="judge_failed",
+                outcome=outcome,
                 attempt=attempt,
                 batch=judged[-1]["labels"],
                 sources=sources,
             )
+            if repair is None:
+                return
             or_block(
                 f"background faithfulness judge failed on batch"
                 f" {len(judged)}/{len(batches)}"

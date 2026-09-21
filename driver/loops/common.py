@@ -14,7 +14,13 @@ from ..roles import REPO_ROOT, ROLES, InvocationContext
 
 
 class RunBlocked(Exception):
-    """Raised to unwind the loop after block() persisted the blocked phase."""
+    """Stop accepting work and unwind to the run boundary.
+
+    Only ``_or_block``/``_refuse_if_blocked`` raise this. The first blocker
+    persists the blocked phase; the joined boundary retries an unsuccessful
+    persistence before returning status. Helpers report fatal conditions as
+    ordinary exceptions, never as a bare RunBlocked with no stop recorded.
+    """
 
 
 def run_cmd(args, repo_root, check=True, capture=True, cwd=None, **kw) -> subprocess.CompletedProcess:
@@ -73,7 +79,11 @@ def preflight_env(task, run_dir, repo_root, cmd) -> None:
     if mlebench:
         public_env = mlebench.get("public_data_env")
         if not isinstance(public_env, str) or not public_env:
-            raise RunBlocked(f"tasks/{task}/task.toml declares invalid public_data_env")
+            # Ordinary exception: the run_experiment boundary converts it into
+            # a persisted blocked phase (never a bare RunBlocked — that would
+            # exit 0 with the ledger still claiming running).
+            raise RuntimeError(
+                f"tasks/{task}/task.toml declares invalid public_data_env")
         from tools.mlebench_stage import stage_public
 
         if os.environ.get("MLEBENCH_PRESTAGED") == "1":

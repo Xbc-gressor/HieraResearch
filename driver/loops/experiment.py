@@ -39,8 +39,10 @@ import json
 import math
 import os
 import subprocess
+import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -56,14 +58,14 @@ from ..roles import (
     driver_job_handoff_problem,
     record_status,
 )
-from ..session import InvocationFailed
+from ..session import InvocationFailed, invocation_problem_class
 from ..status import budget_status, compact_status
 from . import background_audit
 from . import common
 from . import phase_c
 from . import rounds
 from .common import RunBlocked
-from tools import competition_policy
+from tools import competition_policy, mlebench_finalize
 from tools.evaluation_budget import budget_status as objective_budget_status
 from tools.evaluation_budget import phase_c_attempts
 from tools.evaluation_budget import time_budget as run_time_budget
@@ -160,9 +162,17 @@ def _scheduler_stopped(run_dir: Path) -> bool:
 
 def _invoke(runner, store, role_name, task, tag, run_dir, *,
             run_id=None, round_no=None, extra=None, resume_from=None,
-            inline_payload=None) -> dict:
+            inline_payload=None, writer_attempt_dir=None) -> dict:
     """Invoke one role and return its persisted receipt plus invocation id."""
-    _refuse_if_blocked(run_dir)
+    # Admission and attempt reservation are atomic with respect to a sibling
+    # blocking the run. Never spend an attempt on a refused session, and never
+    # hold the block lock while the admitted session runs.
+    with _block_lock:
+        reason = _block_reason.get(str(run_dir))
+        if reason is not None:
+            raise RunBlocked(reason)
+        if writer_attempt_dir is not None:
+            _register_candidate_writer_attempt(writer_attempt_dir)
     inv_id = store.issue_invocation_id()
     resume = (store.load_session_id(role_name, resume_from)
               if resume_from is not None else None)
@@ -288,11 +298,13 @@ def _invoke_with_driver_jobs(
 # valid), and run_experiment unwinds once the channels have joined.
 _block_lock = threading.Lock()
 _block_reason: dict[str, str] = {}  # run_dir -> first block reason
+_block_persisted: set[str] = set()
 
 
 def _reset_block_state(run_dir) -> None:
     with _block_lock:
         _block_reason.pop(str(run_dir), None)
+        _block_persisted.discard(str(run_dir))
 
 
 def _refuse_if_blocked(run_dir) -> None:
@@ -303,15 +315,239 @@ def _refuse_if_blocked(run_dir) -> None:
 
 
 def _or_block(run_dir, repo_root, cmd, events, reason: str):
-    """Persist a blocked phase (first blocker only), then unwind."""
+    """Stop new work and persist the first blocker before unwinding.
+
+    Delivery belongs to the joined run boundary, never a seat's stack:
+    another channel may still be producing objective evidence. A failed
+    persistence is not a persisted block; the boundary may retry it.
+    """
+    key = str(run_dir)
     with _block_lock:
-        first = str(run_dir) not in _block_reason
-        _block_reason.setdefault(str(run_dir), reason)
-    if first:
-        common.block(run_dir, repo_root, cmd, events, reason)
-    else:
-        events.emit("blocked_secondary", reason=reason)
-    raise RunBlocked(reason)
+        original = _block_reason.setdefault(key, reason)
+        if key not in _block_persisted:
+            common.block(run_dir, repo_root, cmd, events, original)
+            _block_persisted.add(key)
+        else:
+            events.emit("blocked_secondary", reason=reason)
+    raise RunBlocked(original)
+
+
+def _finish_blocked_run(run_dir, repo_root, cmd, events) -> None:
+    """After all channels join, attempt delivery without losing the block."""
+    key = str(run_dir)
+    with _block_lock:
+        reason = _block_reason.get(key)
+        persisted = key in _block_persisted
+    if reason is None:
+        return
+    if not persisted:
+        # A worker's persistence failure can accompany another worker's
+        # RunBlocked. Do not let the latter mask a non-durable stop.
+        try:
+            _or_block(run_dir, repo_root, cmd, events, reason)
+        except RunBlocked:
+            pass
+    try:
+        annotation = _attempt_degraded_delivery(run_dir, repo_root, cmd, events)
+    except Exception as exc:  # best effort, including settlement/formatting
+        events.emit("degraded_submit", status="failed", error=repr(exc))
+        return
+    if annotation:
+        # The original block is already durable even if annotation fails.
+        try:
+            common.set_phase(run_dir, repo_root, cmd, "blocked",
+                             stop_condition=f"{reason}; {annotation}")
+        except Exception as exc:  # best-effort annotation, block is durable
+            detail = getattr(exc, "stderr", None) or str(exc)
+            events.emit("degraded_submit_annotation_failed",
+                        error=str(detail)[-1500:])
+
+
+# =============================================================================
+# Seat skips, run-level consecutive-failure trip, degraded delivery
+# =============================================================================
+#
+# P1/P3: one failed session settles deterministically — its seat is skipped
+# (ledger `aborted`: terminal, no observation, no DAG bump) and the run
+# continues. Only a STREAK of consecutive skips with isomorphic failure
+# signatures (same role + same frozen problem class, see
+# session.problem_class) is systemic degradation and blocks the run. A seat
+# that completes normally resets the streak.
+
+_SEAT_SKIP_TRIP_LIMIT = 2
+_seat_skip_state: dict[str, dict] = {}
+# run_dir -> {"task", "submission_command", "data_dir"}: the operator's
+# finalization contract, registered by run_experiment when automatic
+# finalization is configured.
+_delivery_cfg: dict[str, dict] = {}
+
+
+def _seat_skip_trip_limit(run_dir: Path) -> int:
+    """Consecutive isomorphic skips that block the run
+    (framework_cfg ``pipeline.seat_skip_trip_limit``; default 2)."""
+    try:
+        section = json.loads((run_dir / "framework_cfg.json").read_text(
+            encoding="utf-8")).get("pipeline")
+    except (OSError, json.JSONDecodeError):
+        return _SEAT_SKIP_TRIP_LIMIT
+    value = section.get("seat_skip_trip_limit") if isinstance(section, dict) \
+        else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return _SEAT_SKIP_TRIP_LIMIT
+    return value
+
+
+def _reset_seat_skip_state(run_dir) -> None:
+    with _block_lock:
+        _seat_skip_state.pop(str(run_dir), None)
+    _delivery_cfg.pop(str(run_dir), None)
+
+
+def _seat_skip_count(run_dir) -> int:
+    with _block_lock:
+        return int(_seat_skip_state.get(str(run_dir), {}).get("count", 0))
+
+
+def _note_seat_progress(run_dir) -> None:
+    """One seat completed normally: the consecutive-skip streak restarts."""
+    with _block_lock:
+        state = _seat_skip_state.get(str(run_dir))
+        if state is not None:
+            state["signature"] = None
+            state["streak"] = 0
+
+
+def _note_seat_skip(run_dir, repo_root, cmd, events, *, role, problems,
+                    run_id=None) -> None:
+    """Register one skipped seat. A streak of consecutive isomorphic skips
+    (same role + problem class) trips the run-level breaker and blocks."""
+    problems = [str(p) for p in problems]
+    signature = (str(role),
+                 invocation_problem_class(problems or ["postcondition"]))
+    with _block_lock:
+        state = _seat_skip_state.setdefault(
+            str(run_dir), {"signature": None, "streak": 0, "count": 0})
+        state["count"] += 1
+        if state["signature"] == signature:
+            state["streak"] += 1
+        else:
+            state["signature"] = signature
+            state["streak"] = 1
+        streak = state["streak"]
+    if streak >= _seat_skip_trip_limit(run_dir):
+        _or_block(
+            run_dir, repo_root, cmd, events,
+            f"consecutive seat failures ({streak}x) with isomorphic "
+            f"signature (role={signature[0]}, "
+            f"problem_class={signature[1]}): systemic degradation, "
+            "not an isolated failure")
+
+
+def _skip_candidate(run_dir, repo_root, cmd, events, run_id, *, role,
+                    problems, count_failure=True) -> None:
+    """End a failed seat from its current evidence, then register the failure.
+
+    A retry may have run objectives or even settled the record before its
+    session failed. Only a still-pending seat with no objective evidence can
+    be aborted. Block cleanup uses the same settlement without adding a new
+    failure to the run's streak.
+    """
+    problems = [str(p) for p in problems]
+    if record_status(run_dir, run_id) in ("pending", None):
+        view = budget_status(run_dir, repo_root, cmd)
+        row = next((r for r in view.get("per_candidate", [])
+                    if r.get("run_id") == str(run_id)), {})
+        candidate_dir = run_dir / "candidates" / str(run_id)
+        if int(row.get("evals") or 0) > 0 \
+                or _finite_warm_score(candidate_dir) is not None:
+            _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
+        else:
+            try:
+                cmd(["python", "tools/ledger.py", "resolve-aborted",
+                     "--ledger", run_dir / "ledger.json", "--run-id", str(run_id),
+                     "--problems", json.dumps(problems)], repo_root)
+            except subprocess.CalledProcessError as exc:
+                _or_block(run_dir, repo_root, cmd, events,
+                          f"resolve-aborted refused for {run_id}: "
+                          f"{(exc.stderr or str(exc)).strip()[-1500:]}")
+    events.emit("candidate_skipped", run_id=str(run_id), role=str(role),
+                problem_class=invocation_problem_class(
+                    problems or ["postcondition"]),
+                outcome=record_status(run_dir, run_id), problems=problems[:5])
+    if count_failure:
+        _note_seat_skip(run_dir, repo_root, cmd, events, role=role,
+                       problems=problems, run_id=str(run_id))
+
+
+def _settle_for_delivery(run_dir, run_id, repo_root, cmd, events) -> None:
+    """Close a pending seat after channels drain; cleanup is not a new fault."""
+    if record_status(run_dir, run_id) in ("pending", None):
+        _skip_candidate(run_dir, repo_root, cmd, events, run_id,
+                        role="driver", count_failure=False,
+                        problems=["seat pending at block: settled for "
+                                  "degraded delivery"])
+
+
+def _attempt_degraded_delivery(run_dir, repo_root, cmd, events) -> str | None:
+    """One best-effort export after the block persists and channels drain.
+
+    Requires an operator finalization contract, a settled keep/discard
+    incumbent, and enough remaining deadline; everything else is skipped
+    loudly (event) and the persisted block remains unchanged. Returns the
+    ``degraded_submit`` annotation on success."""
+    delivery = _delivery_cfg.get(str(run_dir))
+    if delivery is None:
+        return None
+    try:
+        cfg = json.loads((run_dir / "framework_cfg.json").read_text(
+            encoding="utf-8"))
+        deadline = float(cfg.get("deadline"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        deadline = float("nan")
+    remaining = deadline - time.time()
+    records = _ledger_records(run_dir)
+    if not math.isfinite(remaining) or remaining < 60:
+        settled = [r for r in records
+                   if r.get("status") in ("keep", "discard")]
+        events.emit("degraded_submit", status="skipped",
+                    remaining_seconds=(remaining if math.isfinite(remaining)
+                                       else None),
+                    settled_candidates=len(settled))
+        return None
+    for record in records:
+        if str(record.get("status") or "pending") == "pending":
+            _settle_for_delivery(run_dir, str(record.get("run_id")),
+                                 repo_root, cmd, events)
+    records = _ledger_records(run_dir)
+    settled = [r for r in records
+               if r.get("status") in ("keep", "discard")]
+    if not settled:
+        events.emit("degraded_submit", status="skipped",
+                    remaining_seconds=remaining, settled_candidates=0)
+        return None
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        events.emit("degraded_submit", status="skipped", remaining_seconds=remaining)
+        return None
+    _, result = mlebench_finalize.run_submission(
+        task=delivery["task"],
+        run_dir=run_dir,
+        data_dir=delivery["data_dir"],
+        submission_command=delivery["submission_command"],
+        deadline=deadline,
+    )
+    status = result["status"]
+    if status == "deadline_expired":
+        status = "skipped"
+    events.emit(
+        "degraded_submit",
+        status=status,
+        returncode=result.get("returncode"),
+        error=result.get("error"),
+        started_at_unix=result.get("started_at_unix"),
+        ended_at_unix=result.get("ended_at_unix"),
+    )
+    return "degraded_submit" if status == "success" else None
 
 
 def _complete_run(run_dir, repo_root, cmd, events, terminal_leftover=False,
@@ -320,7 +556,26 @@ def _complete_run(run_dir, repo_root, cmd, events, terminal_leftover=False,
 
     ``stop_condition`` names the actual early-stop cause (quiescent,
     scheduler stop, unspendable budget tail); the None default keeps the
-    budget/clock-derived reason for normal exhaustion completions."""
+    budget/clock-derived reason for normal exhaustion completions. A run
+    that skipped seats is always suffixed so the completion annotation can
+    be audited (P4)."""
+    if _seat_skip_count(run_dir):
+        if stop_condition is None:
+            try:
+                cfg = json.loads((run_dir / "framework_cfg.json").read_text(
+                    encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cfg = {}
+            budget = cfg.get("max_evaluations")
+            deadline = cfg.get("deadline")
+            stop_condition = (
+                "time_budget_reached"
+                if (not isinstance(budget, int) or isinstance(budget, bool))
+                and isinstance(deadline, (int, float))
+                and not isinstance(deadline, bool)
+                else "evaluation_budget_reached"
+            )
+        stop_condition = f"{stop_condition}_seats_skipped"
     try:
         common.set_phase(run_dir, repo_root, cmd, "completed",
                          stop_condition=stop_condition,
@@ -374,12 +629,26 @@ def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
 
 def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
             events, task_toml=None) -> list[dict]:
-    """Generate one action batch and ensure every returned action was admitted."""
+    """Generate one action batch and ensure every returned action was admitted.
+
+    Degradation (P3/P4): a failed ideation retry no longer blocks — the
+    generation degrades to its admitted subset (an empty generation flows
+    into the zero-progress → quiescent completion), the event records it,
+    and the run-level streak breaker catches a systemic pattern. The
+    judged-slate arm is deliberately NOT covered: its admission is atomic,
+    so partial degradation there would violate the manifest contract."""
     objective = _objective_line(task_toml or {})
 
     def admitted_missing(actions: list[dict]) -> list[str]:
         admitted = {r.get("run_id") for r in _ledger_records(run_dir)}
         return [a.get("run_id") for a in actions if a.get("run_id") not in admitted]
+
+    def degrade(reason: str, problems: list[str]) -> list[dict]:
+        events.emit("generation_degraded", round_no=round_no, reason=reason)
+        _note_seat_skip(run_dir, repo_root, cmd, events,
+                        role="idea-generator", problems=problems)
+        # Empty generation: flows into zero-progress → quiescent completion.
+        return []
 
     try:
         receipt, _ = _invoke(runner, store, "idea-generator", task, tag,
@@ -387,8 +656,10 @@ def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
                              extra={"objective": objective})
     except InvocationFailed:
         receipt = None
-    if receipt is not None and not admitted_missing(receipt.get("actions", [])):
-        return receipt.get("actions", [])
+    else:
+        if not admitted_missing(receipt.get("actions", [])):
+            _note_seat_progress(run_dir)
+            return receipt.get("actions", [])
     # one retry whose context reconciles against what is already admitted
     note = {
         "reconcile_note":
@@ -401,12 +672,25 @@ def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
         receipt, _ = _invoke(runner, store, "idea-generator", task, tag,
                              run_dir, round_no=round_no, extra=note)
     except InvocationFailed as exc:
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"idea-generator failed: {exc.problems}")
+        return degrade(f"idea-generator failed after retry: {exc.problems}",
+                       [str(p) for p in exc.problems])
     missing = admitted_missing(receipt.get("actions", []))
     if missing:
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"idea actions not admitted after retry: {missing}")
+        admitted = {r.get("run_id") for r in _ledger_records(run_dir)}
+        subset = [action for action in receipt.get("actions", [])
+                  if action.get("run_id") in admitted]
+        if not subset:
+            return degrade(
+                f"idea actions not admitted after retry: {missing}",
+                [f"actions not admitted after retry: {missing}"])
+        events.emit("generation_degraded", round_no=round_no,
+                    missing_run_ids=missing)
+        _note_seat_skip(run_dir, repo_root, cmd, events,
+                        role="idea-generator",
+                        problems=[f"actions not admitted after retry: "
+                                  f"{missing}"])
+        return subset
+    _note_seat_progress(run_dir)
     return receipt.get("actions", [])
 
 
@@ -461,6 +745,44 @@ def _slate_cmd(run_dir, repo_root, cmd, events, args, what: str):
                   f"judged-slate {what} failed: {detail}")
 
 
+def _generation_abort_path(gen_dir: Path) -> Path:
+    return gen_dir / "generation.aborted.json"
+
+
+def _generation_aborted(gen_dir: Path) -> bool:
+    return _generation_abort_path(gen_dir).is_file()
+
+
+def _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events, *,
+                            reason: str, role: str,
+                            problems: list[str]) -> None:
+    """Abort one generation whose plan phase cannot complete within its
+    attempt budget, instead of blocking the run on a permanent re-block loop.
+
+    At this point the ledger was never touched (admission is atomic and
+    comes later), so the generation's reserved run ids are safely reusable
+    by the next generation. The marker artifact closes the generation for
+    `_find_open_slate_generation`; the skip feeds the run-level streak
+    breaker, so a systemically dead plan-writer still blocks."""
+    manifest = json.loads(
+        (gen_dir / "generation.json").read_text(encoding="utf-8"))
+    problems = [str(p) for p in problems]
+    _generation_abort_path(gen_dir).write_text(
+        json.dumps({
+            "schema_version": 1,
+            "kind": "slate_generation_aborted",
+            "gen_no": manifest.get("gen_no"),
+            "generation_id": manifest.get("generation_id"),
+            "reason": reason,
+            "problems": problems[:10],
+        }, indent=2) + "\n", encoding="utf-8")
+    events.emit("slate_generation_aborted", gen_no=manifest.get("gen_no"),
+                generation_id=manifest.get("generation_id"), reason=reason,
+                problems=problems[:5])
+    _note_seat_skip(run_dir, repo_root, cmd, events, role=role,
+                    problems=problems)
+
+
 def _find_open_slate_generation(run_dir: Path) -> tuple[Path, int, dict | None]:
     """The generation this round resumes into: (gen_dir, gen_no, manifest).
 
@@ -469,7 +791,9 @@ def _find_open_slate_generation(run_dir: Path) -> tuple[Path, int, dict | None]:
     be resumed (or, for a binding violation, blocked by the caller).  When no
     manifest exists or the newest is fully admitted, ``manifest`` is None and
     (gen_dir, gen_no) name the next generation, whose provisional artifacts
-    may be overwritten.
+    may be overwritten.  A tail generation carrying the abort marker is
+    closed: the next generation starts fresh (its reserved ids never reached
+    the ledger and are reusable).
     """
     semantic = run_dir / ".semantic"
     count = (
@@ -478,6 +802,9 @@ def _find_open_slate_generation(run_dir: Path) -> tuple[Path, int, dict | None]:
     )
     if count:
         gen_dir = semantic / f"gen-{count:04d}"
+        if _generation_aborted(gen_dir):
+            gen_no = count + 1
+            return semantic / f"gen-{gen_no:04d}", gen_no, None
         manifest = json.loads(
             (gen_dir / "generation.json").read_text(encoding="utf-8"))
         seats = _slate_seat_records(run_dir, manifest)
@@ -800,6 +1127,87 @@ def _slate_plan_retry_note(problems: list[str]) -> str:
 _SLATE_WRITER_ATTEMPTS = 3
 
 
+# candidate-writer gets one initial invocation and one decorrelated retry.
+# The counter lives under the candidate so a process restart or external
+# resume cannot silently mint another writer session.
+_CANDIDATE_WRITER_ATTEMPTS = 2
+
+
+def _candidate_writer_attempts_path(candidate_dir: Path) -> Path:
+    return candidate_dir / "writer.attempts.json"
+
+
+def _candidate_writer_failure_path(candidate_dir: Path) -> Path:
+    return candidate_dir / "writer.failure.json"
+
+
+def _candidate_writer_attempts(candidate_dir: Path) -> dict:
+    path = _candidate_writer_attempts_path(candidate_dir)
+    if not path.exists():
+        return {"attempts": 0}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"WARNING: corrupted writer attempts file "
+              f"{path}: {exc}", file=sys.stderr)
+        return {"attempts": 0}
+    return data if isinstance(data, dict) else {"attempts": 0}
+
+
+def _candidate_writer_failure(candidate_dir: Path) -> list[str]:
+    path = _candidate_writer_failure_path(candidate_dir)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"WARNING: corrupted writer failure file "
+              f"{path}: {exc}", file=sys.stderr)
+        return []
+    return [str(problem) for problem in data] if isinstance(data, list) else []
+
+
+def _register_candidate_writer_attempt(candidate_dir: Path) -> int:
+    """Persist the next writer attempt before starting its session."""
+    path = _candidate_writer_attempts_path(candidate_dir)
+    data = _candidate_writer_attempts(candidate_dir)
+    attempts = int(data.get("attempts", 0)) + 1
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"attempts": attempts}) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return attempts
+
+
+def _record_candidate_writer_success(candidate_dir: Path, invocation_id: int) -> None:
+    path = _candidate_writer_attempts_path(candidate_dir)
+    data = _candidate_writer_attempts(candidate_dir)
+    data["completed_invocation_id"] = invocation_id
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _record_candidate_writer_failure(candidate_dir: Path, problems: list[str]) -> None:
+    path = _candidate_writer_failure_path(candidate_dir)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps([str(problem) for problem in problems]) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _candidate_writer_retry_note(problems: list[str]) -> str:
+    items = "\n".join(f"- {problem}" for problem in problems)
+    return (
+        "\n\n--- Prior candidate-writer attempt note ---\n"
+        "The previous candidate-writer attempt failed for these reasons:\n"
+        f"{items}\n"
+        "Complete the checks required by the current write mode, then carry "
+        "out that mode and submit the receipt; do not repeat reads of the "
+        "same context already obtained.\n"
+    )
+
+
 def _slot_attempts_path(plans_dir, slot_no) -> Path:
     return plans_dir / f"slot-{slot_no}.attempts.json"
 
@@ -833,8 +1241,14 @@ def _register_slate_writer_attempt(plans_dir, slot_no) -> int:
 
 
 def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
-                        round_no, repo_root, cmd, events) -> None:
-    """One plan per seat; only missing or invalid plans are (re)written."""
+                        round_no, repo_root, cmd, events) -> bool:
+    """One plan per seat; only missing or invalid plans are (re)written.
+
+    Returns False when the generation was aborted: the attempt budget for
+    some seat's plan ran out — invocation failures and schema-invalid
+    receipts both consume it — the abort marker closes the generation, and
+    the caller proceeds with a fresh generation instead of re-blocking on
+    every resume (the reserved ids never reached the ledger)."""
     plans_dir = gen_dir / "plans"
     plans_dir.mkdir(parents=True, exist_ok=True)
     route_arm = _slate_route_arm(run_dir)
@@ -854,10 +1268,14 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
                 continue
         if _slate_writer_attempts_used(plans_dir, slot["slot"]) \
                 >= _SLATE_WRITER_ATTEMPTS:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"slate-plan-writer attempt budget exhausted for slot "
-                      f"{slot['slot']} ({_SLATE_WRITER_ATTEMPTS} attempts, no "
-                      f"valid plan)")
+            reason = (f"slate-plan-writer attempt budget exhausted for slot "
+                      f"{slot['slot']} ({_SLATE_WRITER_ATTEMPTS} attempts, "
+                      f"no valid plan)")
+            _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events,
+                                    reason=reason,
+                                    role="slate-plan-writer",
+                                    problems=[reason])
+            return False
         route_memory_path = None
         if route_arm:
             point_path = plans_dir / f"slot-{slot['slot']}.point.json"
@@ -878,8 +1296,7 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
         payload = _slate_plan_payload(
             slot, pool_doc, context_doc, route_memory_path,
             objective_text=objective_text)
-        receipt = None
-        while receipt is None:
+        while True:
             attempt = _register_slate_writer_attempt(plans_dir, slot["slot"])
             try:
                 receipt, _ = _invoke(
@@ -887,17 +1304,21 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
                     run_id=slot["run_id"], round_no=round_no, extra=extra,
                     inline_payload=payload)
             except InvocationFailed as exc:
-                if attempt >= _SLATE_WRITER_ATTEMPTS:
-                    _or_block(run_dir, repo_root, cmd, events,
-                              f"slate-plan-writer failed for slot "
-                              f"{slot['slot']} (attempt {attempt}/"
-                              f"{_SLATE_WRITER_ATTEMPTS}): {exc.problems}")
-                payload = payload + _slate_plan_retry_note(exc.problems)
-        problems = _slate_plan_problems(receipt, slot, route_arm)
-        if problems:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"slate plan for slot {slot['slot']} is invalid: "
-                      f"{problems}")
+                problems = [str(p) for p in exc.problems]
+            else:
+                problems = _slate_plan_problems(receipt, slot, route_arm)
+                if not problems:
+                    break  # a valid plan for this seat
+            if attempt >= _SLATE_WRITER_ATTEMPTS:
+                reason = (f"slate plan for slot {slot['slot']} could not be "
+                          f"produced within {_SLATE_WRITER_ATTEMPTS} "
+                          f"attempts: {problems}")
+                _abort_slate_generation(run_dir, gen_dir, repo_root, cmd,
+                                        events, reason=reason,
+                                        role="slate-plan-writer",
+                                        problems=problems)
+                return False
+            payload = payload + _slate_plan_retry_note(problems)
         plan = {key: receipt[key]
                 for key in ("slot", "idea", "change", "candidate_name",
                             "route_provenance")
@@ -906,6 +1327,8 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
         tmp.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n",
                        encoding="utf-8")
         os.replace(tmp, plan_path)
+        _note_seat_progress(run_dir)
+    return True
 
 
 def _admit_slate(run_dir, gen_dir, repo_root, cmd, events) -> None:
@@ -1068,8 +1491,9 @@ def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
         _or_block(run_dir, repo_root, cmd, events,
                   f"judged-slate generation {manifest['gen_no']} violates the "
                   f"atomic-admission contract: {detail}")
-    _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
-                        round_no, repo_root, cmd, events)
+    if not _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir,
+                               manifest, round_no, repo_root, cmd, events):
+        return []  # generation aborted: seats were never admitted
     _admit_slate(run_dir, gen_dir, repo_root, cmd, events)
     events.emit("slate_admitted", gen_no=manifest["gen_no"],
                 generation_id=manifest["generation_id"],
@@ -1129,14 +1553,17 @@ def _finite_warm_score(candidate_dir: Path) -> float | None:
 
 
 def _settle_at_deadline(run_dir, run_id, repo_root, cmd, events) -> None:
-    """Deterministic settlement of a pending candidate once the run's cutoff
-    has passed — ledger subcommands only, no session.
+    """Deterministic settlement of a pending candidate — ledger subcommands
+    only, no session.
 
     Three-way, by on-disk evidence: no objective attempt → unevaluated;
     a finite warm score in the tune report → set-tuning + record-run (the
     extractor's own step 3c replayed; auto status keep/discard); attempts
     but no finite score → unevaluated when every attempt was cut off by the
-    time budget, else crash.
+    time budget, else crash. Originally the run-cutoff settlement, now also
+    the deterministic close for a repair-exhausted extractor seat with
+    evidence: only durable facts decide, never a session (fidelity before
+    attribution).
     """
     if record_status(run_dir, run_id) in ("keep", "discard", "crash",
                                          "unevaluated"):
@@ -1148,7 +1575,7 @@ def _settle_at_deadline(run_dir, run_id, repo_root, cmd, events) -> None:
     attempts = int(row.get("evals") or 0)
     warm = _finite_warm_score(candidate_dir)
     ledger = run_dir / "ledger.json"
-    if attempts == 0 or (warm is None and int(
+    if warm is None and (attempts == 0 or int(
             row.get("time_cutoff_evals") or 0) == attempts):
         if _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
             events.emit("candidate_settled_at_deadline", run_id=run_id,
@@ -1374,23 +1801,47 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
     candidate_dir = run_dir / "candidates" / run_id
     objective = _objective_line(task_toml or common.load_task_toml(task, repo_root))
     writer_extra = {"candidate_dir": str(candidate_dir), "objective": objective}
+    writer_attempts = _candidate_writer_attempts(candidate_dir)
+    writer_inv = writer_attempts.get("completed_invocation_id")
+    if writer_inv is None and int(writer_attempts.get("attempts", 0)) \
+            >= _CANDIDATE_WRITER_ATTEMPTS:
+        # No successful writer stage survived the previous process. Close
+        # from current evidence (aborted only for a zero-product seat);
+        # the run-level streak breaker catches repeated failures.
+        _skip_candidate(
+            run_dir, repo_root, cmd, events, run_id,
+            role="candidate-writer",
+            problems=_candidate_writer_failure(candidate_dir)
+            or ["candidate-writer attempt budget exhausted "
+                f"({_CANDIDATE_WRITER_ATTEMPTS} attempts)"],
+        )
+        return
     # Resolved once per candidate implementation so every extractor retry of
     # this candidate sees the identical donor binding.
     donor_extra = _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events)
-    try:
-        _, writer_inv = _invoke(runner, store, "candidate-writer", task, tag,
-                                run_dir, run_id=run_id, extra=writer_extra)
-    except InvocationFailed as exc:
-        # invocation failure: no crash evidence exists — retry once, then block
+    while writer_inv is None:
+        attempt = int(_candidate_writer_attempts(candidate_dir).get("attempts", 0)) + 1
+        retry_problems = _candidate_writer_failure(candidate_dir)
+        extra = writer_extra
+        if attempt > 1:
+            extra = dict(writer_extra)
+            extra["retry_note"] = _candidate_writer_retry_note(
+                [str(problem) for problem in retry_problems]
+                or ["the previous attempt did not produce an accepted receipt"]
+            )
         try:
-            _, writer_inv = _invoke(runner, store, "candidate-writer", task,
-                                    tag, run_dir, run_id=run_id,
-                                    extra=writer_extra)
-        except InvocationFailed as retry_exc:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"candidate-writer failed for {run_id}: "
-                      f"retry: {retry_exc.problems}; "
-                      f"first attempt: {exc.problems}")
+            _, writer_inv = _invoke(
+                runner, store, "candidate-writer", task, tag, run_dir,
+                run_id=run_id, extra=extra, writer_attempt_dir=candidate_dir)
+        except InvocationFailed as exc:
+            _record_candidate_writer_failure(candidate_dir, exc.problems)
+            if attempt >= _CANDIDATE_WRITER_ATTEMPTS:
+                _skip_candidate(
+                    run_dir, repo_root, cmd, events, run_id,
+                    role="candidate-writer", problems=exc.problems)
+                return
+        else:
+            _record_candidate_writer_success(candidate_dir, writer_inv)
     try:
         receipt, extractor_inv = _invoke_with_driver_jobs(
             runner, store, "tunable-contract-extractor", task, tag, run_dir,
@@ -1407,6 +1858,7 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             _settle_unevaluated(runner, store, task, tag, run_dir, run_id,
                                 candidate_dir, donor_extra, extractor_inv,
                                 repo_root, cmd, events, job_runner)
+        _note_seat_progress(run_dir)
         return
 
     # Branch on durable evidence (spec Error handling):
@@ -1414,10 +1866,12 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
     #    settle from the on-disk report instead of diagnosing.
     if _time_reached(run_dir):
         _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
+        _note_seat_progress(run_dir)
         return
     # 1. stop condition reached + zero attempts → resolve-unevaluated (call+catch)
     if budget_status(run_dir, repo_root, cmd).get("reached") and \
             _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
+        _note_seat_progress(run_dir)
         return
     # 2. actual failure receipt → crash diagnosis
     evidence = _failure_evidence(candidate_dir, problems)
@@ -1431,6 +1885,7 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             verdict = "abandon"
         if verdict == "abandon":
             _record_crash(run_dir, run_id, repo_root, cmd)
+            _note_seat_progress(run_dir)
             return
         try:  # fix verdicts go back to the repair-capable extractor session
             _invoke_with_driver_jobs(
@@ -1442,11 +1897,14 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                 ),
                 resume_from=extractor_inv, repo_root=repo_root,
                 job_runner=job_runner)
+            _note_seat_progress(run_dir)
             return
         except InvocationFailed as exc2:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"extractor repair failed for {run_id}: {exc2.problems}")
-    # 3. no evidence → one fresh retry, then block
+            _skip_candidate(run_dir, repo_root, cmd, events, run_id,
+                            role="tunable-contract-extractor",
+                            problems=exc2.problems)
+            return
+    # 3. no evidence yet → one fresh retry, then settle its current evidence
     try:
         _invoke_with_driver_jobs(
             runner, store, "tunable-contract-extractor", task, tag,
@@ -1456,8 +1914,11 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             ), repo_root=repo_root,
             job_runner=job_runner)
     except InvocationFailed as exc3:
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"extractor failed for {run_id}: {exc3.problems}")
+        _skip_candidate(run_dir, repo_root, cmd, events, run_id,
+                        role="tunable-contract-extractor",
+                        problems=exc3.problems)
+        return
+    _note_seat_progress(run_dir)
 
 
 # =============================================================================
@@ -1632,10 +2093,14 @@ def _tune(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
     selection and recovery used by the complete-bout and legacy policies.
     """
     if selection is None:
-        return _tune_session(runner, store, task, tag, run_dir, round_no,
-                             repo_root, cmd, events, job_runner)
-    return _tune_pinned(runner, store, task, tag, run_dir, round_no,
-                        repo_root, cmd, events, job_runner, selection)
+        receipt = _tune_session(runner, store, task, tag, run_dir, round_no,
+                                repo_root, cmd, events, job_runner)
+    else:
+        receipt = _tune_pinned(runner, store, task, tag, run_dir, round_no,
+                               repo_root, cmd, events, job_runner, selection)
+    if receipt.get("outcome_status") != "infra_failure":
+        _note_seat_progress(run_dir)
+    return receipt
 
 
 def _tune_pinned(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
@@ -1729,11 +2194,30 @@ def _settle_pinned_tune(runner, store, task, tag, run_dir, round_no, repo_root,
                     first_failure=note, problems=problems,
                     snapshot_before=_snapshot_counts(before),
                     snapshot_after=_snapshot_counts(after))
-        _close_failed_tune(run_dir, repo_root, cmd, events, selection,
-                           phase_c_before=before["phase_c_attempts"])
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"tuner bout failed: {note}; reconciliation failed: "
-                  f"{problems}")
+        # Demotion (P3): the bout ended in a progressed-but-failed state and
+        # its reconciliation session failed too. The decision closes as an
+        # infra failure through the normal outcome path — which also feeds
+        # the per-candidate tune backoff — and the round continues; the
+        # run-level streak breaker catches a systemic pattern.
+        receipt = {
+            "tuned_run_id": run_id, "tuned": False, "ledger_updated": False,
+            "outcome_status": "infra_failure",
+            "outcome_reason": "tune_reconcile_failed",
+            "outcome_detail": f"{note}; reconciliation failed: {problems}",
+            "snapshot_counts": _snapshot_counts(after),
+        }
+        try:
+            _note_seat_skip(run_dir, repo_root, cmd, events,
+                            role="tuner-orchestrator", problems=problems,
+                            run_id=run_id)
+        except RunBlocked:
+            # The streak trip wins: close the bout's decision before
+            # unwinding so the blocked run leaves no open scheduler
+            # decision behind.
+            _close_failed_tune(run_dir, repo_root, cmd, events, selection,
+                               phase_c_before=before["phase_c_attempts"])
+            raise
+        return receipt
     if reconciled.get("tuned") and not _tune_flag(
             run_dir, reconciled.get("tuned_run_id", "none")):
         _close_failed_tune(run_dir, repo_root, cmd, events, selection,
@@ -2119,11 +2603,29 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
     _ensure_identity_profile(run_dir, task, competition_id)
     ensure_brief(run_dir, task_toml)
 
+    # A prior block may have named prepare itself as the failure. The resume
+    # path otherwise never re-runs prepare, so a block+resume cycle would
+    # silently bypass the failed premise: re-run it under the same failure
+    # condition and block again if it still fails (Wave 0.4).
+    ledger_path = run_dir / "ledger.json"
+    if ledger_path.exists():
+        try:
+            prior_state = (json.loads(ledger_path.read_text(
+                encoding="utf-8")).get("run_state") or {})
+        except (OSError, json.JSONDecodeError):
+            prior_state = {}
+        if prior_state.get("phase") == "blocked" and str(
+                prior_state.get("active_stop_condition") or ""
+        ).startswith("prepare_command failed"):
+            try:
+                common.run_prepare(task, task_toml, repo_root, cmd)
+            except RuntimeError as exc:
+                _or_block(run_dir, repo_root, cmd, events, str(exc))
+
     common.preflight_env(task, run_dir, repo_root, cmd)
 
     # Status consumers must not keep seeing a stale terminal phase after an
     # explicit resume has started making progress again.
-    ledger_path = run_dir / "ledger.json"
     if ledger_path.exists():
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
         stale_phase = ledger.get("run_state", {}).get("phase")
@@ -2386,15 +2888,32 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    k_eval=None, proposer_arm=None, time_budget=None,
                    deadline=None, final_reserve=None, round_options=None,
                    session_concurrency=None, rewrite_concurrency=None,
-                   cli_path=None,
+                   cli_path=None, finalization=None,
                    cmd=common.run_cmd, job_runner=execute_driver_job) -> dict:
-    """Set up or resume a run, then advance it until blocked or complete."""
+    """Set up or resume a run, then advance it until blocked or complete.
+
+    ``finalization`` ({"submission_command", "data_dir"}) registers the
+    operator's export contract for the degraded-delivery attempt. After a
+    persisted block and all channels have joined, the run boundary attempts
+    a best-effort submission.csv from the settled evidence.
+
+    Boundary rule (P1): every failure ends as either a deterministic
+    continue or a persisted block — an unhandled exception is converted to a
+    blocked phase here, never a traceback exit with the ledger still
+    claiming running."""
     run_dir = repo_root / "runs" / task / tag
     events = EventsLog(run_dir)
     task_toml = common.load_task_toml(task, repo_root)
     store = ReceiptStore(run_dir)
     _reset_block_state(run_dir)
+    _reset_seat_skip_state(run_dir)
     rounds.reset_tune_backoff(run_dir)
+    if finalization and finalization.get("submission_command"):
+        _delivery_cfg[str(run_dir)] = {
+            "task": task,
+            "submission_command": finalization["submission_command"],
+            "data_dir": str(finalization.get("data_dir") or ""),
+        }
     _arm_exit_hooks()  # main thread: SIGTERM must reach leased child groups
 
     try:
@@ -2601,5 +3120,17 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             round_no += 1
     except RunBlocked:
         pass
+    except Exception as exc:  # noqa: BLE001 - the boundary rule (P1)
+        # Every unhandled failure becomes a persisted block; the traceback
+        # rides along in the event stream so an external observer can tell
+        # "died with a traceback" apart from "died into blocked".
+        events.emit("unhandled_exception", error=repr(exc),
+                    traceback=traceback.format_exc()[-4000:])
+        try:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"unhandled {type(exc).__name__}: {exc}")
+        except RunBlocked:
+            pass
 
+    _finish_blocked_run(run_dir, repo_root, cmd, events)
     return compact_status(task, tag, run_dir, repo_root=repo_root, cmd=cmd)

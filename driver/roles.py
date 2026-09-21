@@ -91,10 +91,9 @@ class RoleDefinition:
     # run's own directory.
     bash_adapter_only: bool = False
     # Early corrective denies for consecutive identical (tool, input) calls
-    # BEFORE the hard repetition trip: #2..#LIMIT-1 are denied with an
-    # explicit count while the invocation stays alive. Reserved for roles
-    # with an observed read-loop attractor (slate-plan-writer, 2026-09-16:
-    # 75/79 sessions lost to byte-identical Reads the CLI could not dissuade).
+    # BEFORE the hard repetition trip. Roles with an observed read-loop
+    # attractor opt in; the session hook also applies its bounded window and
+    # corrective-escalation rules.
     early_repeat_correct: bool = False
     # Long objective commands are driver-owned. These substrings keep an agent
     # from bypassing the typed job handoff and orphaning a GPU process.
@@ -308,8 +307,11 @@ ROLES: dict[str, RoleDefinition] = {
             "candidate_dir": "str",
         },
         postconditions=(candidate_train_py_exists,),
-        # Observed max 874s across three MLE cells (2026-09-19 calibration);
-        # 960s left only 9% headroom, violating the far-above-maximum rule.
+        # A bounded implementation path: healthy writers finish well below
+        # this cap; varied junk turns still cannot consume an unbounded
+        # invocation.
+        max_turns=40,
+        early_repeat_correct=True,
         wall_limit_seconds=1800.0,
         soft_rescue=True,
     ),

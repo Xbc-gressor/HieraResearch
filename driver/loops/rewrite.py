@@ -23,6 +23,11 @@ any reservation, so their failures cost nothing (revert + reverted_crash).
 An unverified edit never survives: on budget exhaustion mid-bout the edit
 is rolled back and the run ends normally; after a hard kill mid-bout the
 replayed bout restores train.py from its existing snapshot (tool-side).
+
+Block semantics (explicit exemption from the experiment loop's persisted
+blocked phase): this standalone loop has no ledger run_state, so its block
+is status-only — a ``blocked`` event plus ``active_stop_condition`` plus a
+non-zero CLI exit code.
 """
 
 from __future__ import annotations
@@ -584,14 +589,23 @@ def run_rewrite(task, tag, *, runner, model, noise_margin=0.0, max_bouts=12,
     # Candidates without a finite score reference cannot be adjudicated at
     # all (current_best fails); they sit out the rest of the run.
     dead: set[Path] = set()
+    # Per-candidate backoff for editor-session and lease failures, mirroring
+    # the tuner backoff: a persistently failing candidate is re-selected
+    # immediately otherwise and can burn the whole run's editor sessions.
+    # Two consecutive failures exclude the candidate for the rest of the run.
+    backoff: dict[Path, int] = {}
+    excluded: set[Path] = set()
+    progressed = False
+    budget_ended = False
     halt = False
     while not halt:
         if budget_status(run_dir, repo_root, cmd).get("reached"):
+            budget_ended = True
             break
         active = [
             (candidate, _load_bouts(candidate))
             for candidate in candidates
-            if candidate not in dead
+            if candidate not in dead and candidate not in excluded
         ]
         active = [
             (candidate, bouts)
@@ -607,25 +621,40 @@ def run_rewrite(task, tag, *, runner, model, noise_margin=0.0, max_bouts=12,
                                    runner, store, metric, noise_margin,
                                    context, task_toml, repo_root, cmd, events)
             except ResourceUnavailable as exc:
-                # Transient host shortage: the unjudged edit was reverted and
-                # no budget was spent.  Block instead of retrying, so a host
-                # without a free device cannot burn editor sessions.
-                stop_condition = f"resource unavailable: {exc}"
+                # Lease_timeout semantics (aligned with the rounds path): the
+                # unjudged edit was reverted and no budget was spent, so only
+                # this candidate's turn ends; repeated failures exclude it
+                # via backoff instead of blocking the whole run.
+                backoff[candidate] = backoff.get(candidate, 0) + 1
                 events.emit("resource_unavailable", candidate=candidate.name,
-                            reason=str(exc))
-                events.emit("blocked", reason=stop_condition)
-                halt = True
-                break
+                            reason=str(exc),
+                            consecutive_failures=backoff[candidate])
+                if backoff[candidate] >= 2:
+                    excluded.add(candidate)
+                continue
             except InvocationFailed as exc:
-                stop_condition = f"editor invocation failed: {exc.problems}"
-                events.emit("blocked", reason=stop_condition)
-                halt = True
-                break
+                # The failed session's edit was already rolled back inside
+                # _run_bout; one candidate's dead editor session does not
+                # stop the run (same settlement as the rounds path).
+                backoff[candidate] = backoff.get(candidate, 0) + 1
+                events.emit("rewrite_editor_failed", candidate=candidate.name,
+                            problems=[str(p) for p in exc.problems],
+                            consecutive_failures=backoff[candidate])
+                if backoff[candidate] >= 2:
+                    excluded.add(candidate)
+                continue
+            backoff.pop(candidate, None)
+            progressed = progressed or result["status"] == "done"
             if result["status"] == "budget":
                 halt = True
+                budget_ended = True
                 break
             if result["status"] == "no_reference":
                 dead.add(candidate)
+    if excluded and not progressed and not budget_ended:
+        stop_condition = (
+            f"editor/lease failures excluded all candidates "
+            f"({len(excluded)} backed off)")
 
     return _status(task, tag, run_dir, metric, candidates, stop_condition,
                    repo_root, cmd)

@@ -41,11 +41,15 @@ NONCRASH_TERMINAL_STATUSES = {"keep", "discard"}
 # Every status a record can hold once its lifecycle is over. `unevaluated` is
 # terminal but is NOT evidence: the candidate was admitted after the objective
 # budget was exhausted and never ran, so it belongs here and not in
-# TERMINAL_STATUSES, which gates what may be cited as an observation.
-LIFECYCLE_TERMINAL_STATUSES = {"keep", "discard", "crash", "unevaluated"}
+# TERMINAL_STATUSES, which gates what may be cited as an observation. `aborted`
+# is the infrastructure-failure twin: the seat was skipped (writer/extractor
+# budget exhausted, degraded generation) without a product, so it must not
+# become a crash observation on an innocent semantic point either.
+LIFECYCLE_TERMINAL_STATUSES = {"keep", "discard", "crash", "unevaluated",
+                               "aborted"}
 # Terminal states that yield no usable parameter observation, and therefore no
 # parent-incumbent binding to preserve.
-NO_OBSERVATION_TERMINAL_STATUSES = {"crash", "unevaluated"}
+NO_OBSERVATION_TERMINAL_STATUSES = {"crash", "unevaluated", "aborted"}
 
 MAX_DIMENSION_TARGETS = 16
 MAX_HYPOTHESIS_TARGETS = 32

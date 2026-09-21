@@ -894,6 +894,86 @@ def cmd_resolve_unevaluated(args) -> int:
     return 0
 
 
+@_mutation
+def resolve_aborted(
+    ledger_path: Path,
+    task_name: str,
+    run_id: str,
+    problems: list[str],
+) -> dict:
+    """Resolve one seat as ``aborted``: the implementation chain failed as an
+    infrastructure failure, so the seat is skipped without an observation.
+
+    Deliberately evidence-neutral like ``resolve_unevaluated``: no attempt
+    observation is captured (a zero-product infra failure must not raise the
+    crash-rate prior of an innocent semantic point) and the DAG revision is
+    not touched, so a skipped seat never demands an experience refresh.
+    """
+    config = load_task_config(task_name)
+    ledger_path = Path(ledger_path)
+    data = _load_ledger(ledger_path, for_update=True)
+    record = _get_record(data, run_id)
+    if record is None:
+        raise ValueError(f"no record for run_id {run_id}; add-record first")
+    _require_p1_record(record, run_id)
+    if record.get("status") == "aborted":
+        return record
+    if record.get("status") != "pending":
+        raise ValueError(
+            f"record {run_id} must be pending before aborted resolution "
+            f"(is {record.get('status')!r})"
+        )
+    strict = budget_status(ledger_path.parent)
+    candidate = next((row for row in strict["per_candidate"]
+                      if row["run_id"] == run_id), {})
+    report_path = ledger_path.parent / "candidates" / run_id / "tune_report.json"
+    report = (json.loads(report_path.read_text(encoding="utf-8"))
+              if report_path.is_file() else {})
+    scores = (record.get("final_best_score"), record.get("best_warm_score"),
+              (report.get("phase_a") or {}).get("best_warm_score"))
+    has_score = any(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) for value in scores)
+    if int(candidate.get("evals") or 0) > 0 or has_score:
+        raise ValueError(
+            f"record {run_id} has objective evidence; "
+            "settle its attempts/score instead of aborting")
+    _preserve_descendant_bindings(data, run_id)
+    record["metric"] = data.get("metric")
+    record["status"] = "aborted"
+    record["final_best_score"] = None
+    record["aborted_receipt"] = {
+        "schema_version": 1,
+        "kind": "seat_aborted_infra_failure",
+        "problems": [str(problem) for problem in problems],
+    }
+    _save_ledger(ledger_path, data)
+    _write_loop_state(ledger_path, data, config)
+    return record
+
+
+def cmd_resolve_aborted(args) -> int:
+    task_name = args.task or infer_task_name([Path(args.ledger)])
+    if not task_name:
+        raise SystemExit("could not infer task; pass --task")
+    try:
+        problems = json.loads(args.problems) if args.problems else []
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--problems must be a JSON array: {exc}") from None
+    if not isinstance(problems, list):
+        raise SystemExit("--problems must be a JSON array of strings")
+    try:
+        record = resolve_aborted(
+            Path(args.ledger),
+            task_name,
+            args.run_id,
+            [str(problem) for problem in problems],
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    print(json.dumps(record, indent=2))
+    return 0
+
+
 def cmd_percentile(args) -> int:
     data = _load_ledger(Path(args.ledger))
     result = _percentile(data, args.run_id, args.field)
@@ -1322,6 +1402,16 @@ def build_parser() -> argparse.ArgumentParser:
     unevaluated = sub.add_parser("resolve-unevaluated", parents=[common])
     unevaluated.add_argument("--run-id", required=True)
     unevaluated.set_defaults(func=cmd_resolve_unevaluated)
+
+    aborted = sub.add_parser(
+        "resolve-aborted",
+        parents=[common],
+        help="Skip one pending seat as an infrastructure failure (no observation)",
+    )
+    aborted.add_argument("--run-id", required=True)
+    aborted.add_argument("--problems", default=None,
+                         help="JSON array of the failure problems to persist")
+    aborted.set_defaults(func=cmd_resolve_aborted)
 
     pct = sub.add_parser("percentile", parents=[common])
     pct.add_argument("--run-id", required=True)

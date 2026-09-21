@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -19,8 +20,52 @@ from driver.session import (  # noqa: E402
     FakeSessionRunner,
     InvocationFailed,
     SDKSessionRunner,
+    invocation_problem_class,
     new_breaker,
+    problem_class,
 )
+
+
+class ProblemClassTests(unittest.TestCase):
+    """The frozen failure-signature enum: the ONLY input the run-level
+    consecutive-failure breaker may consume (PLAN-block-escalation)."""
+
+    def test_frozen_prefixes_classify(self) -> None:
+        cases = {
+            "repetition breaker tripped: Read invoked 5x with identical input":
+                "repetition_breaker",
+            "repetition breaker tripped: corrective deny ignored 3x (latest: …)":
+                "repetition_breaker",
+            "session ended with error result: error_max_turns": "max_turns",
+            "session ended with error result: idle_timeout": "idle_timeout",
+            "wall-clock limit 1800s reached": "wall_limit",
+            "wall-clock limit 1800s reached without a receipt": "wall_limit",
+            "wall-clock limit 1800s reached; rescue turn produced no receipt":
+                "wall_limit",
+            "time budget reached": "time_budget",
+            "time budget reached mid-session": "time_budget",
+            "session ended with error result: error_during_execution":
+                "transport",
+            "no accepted receipt": "postcondition",
+            "plan slot 1 != seat slot 0": "postcondition",
+        }
+        for problem, expected in cases.items():
+            self.assertEqual(problem_class(problem), expected, problem)
+
+    def test_invocation_class_prefers_the_session_level_cutoff(self) -> None:
+        # A bounded-role cutoff accompanies "no accepted receipt"; the
+        # cutoff, not the postcondition, is the failure's class.
+        self.assertEqual(
+            invocation_problem_class(
+                ["no accepted receipt",
+                 "session ended with error result: error_max_turns"]),
+            "max_turns",
+        )
+        self.assertEqual(
+            invocation_problem_class(["no accepted receipt"]),
+            "postcondition",
+        )
+        self.assertEqual(invocation_problem_class([]), "postcondition")
 
 
 def make_ctx(run_dir: Path, **kw) -> InvocationContext:
@@ -53,13 +98,19 @@ class CapabilityHookTests(unittest.TestCase):
             verdict = asyncio.run(hook({"tool_name": name, "tool_input": {}}, None, {}))
             self.assertEqual(verdict, {}, name)
 
-    def test_repetition_breaker_trips_on_identical_calls(self) -> None:
+    def test_repetition_breaker_trips_after_window_correction(self) -> None:
         runner = SDKSessionRunner(model="m", events=EventsLog(Path(tempfile.mkdtemp())))
         breaker = new_breaker()
         hook = runner._capability_hook(SIMPLE_ROLE, breaker)
         call = {"tool_name": "Read", "tool_input": {"file_path": "train.py"}}
-        for _ in range(REPETITION_LIMIT - 1):
+        for _ in range(3):
             self.assertEqual(asyncio.run(hook(call, None, {})), {})
+        correction = asyncio.run(hook(call, None, {}))
+        self.assertEqual(
+            correction["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("last 10 tool calls",
+                      correction["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIsNone(breaker["tripped"])
         verdict = asyncio.run(hook(call, None, {}))
         decision = verdict["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
@@ -72,14 +123,19 @@ class CapabilityHookTests(unittest.TestCase):
         self.assertEqual(verdict["hookSpecificOutput"]["permissionDecision"],
                          "deny")
 
-    def test_repetition_breaker_resets_on_changed_input(self) -> None:
+    def test_window_correction_keeps_strict_count_reset(self) -> None:
         runner = SDKSessionRunner(model="m", events=EventsLog(Path(tempfile.mkdtemp())))
         breaker = new_breaker()
         hook = runner._capability_hook(SIMPLE_ROLE, breaker)
-        for i in range(REPETITION_LIMIT * 2):
+        verdicts = []
+        for i in range(8):
             call = {"tool_name": "Read",
                     "tool_input": {"file_path": f"f{i % 2}.py"}}
-            self.assertEqual(asyncio.run(hook(call, None, {})), {})
+            verdicts.append(asyncio.run(hook(call, None, {})))
+        self.assertEqual(
+            verdicts[6]["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(
+            verdicts[7]["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIsNone(breaker["tripped"])
 
 
@@ -105,7 +161,7 @@ class EarlyRepeatCorrectionTests(unittest.TestCase):
                 call = {"tool_name": "Read",
                         "tool_input": {"file_path": "TASK.md"}}
                 self.assertEqual(asyncio.run(hook(call, None, {})), {})
-                for expected in (2, 3, 4):
+                for expected in (2, 3):
                     decision = asyncio.run(
                         hook(call, None, {}))["hookSpecificOutput"]
                     self.assertEqual(decision["permissionDecision"], "deny")
@@ -114,6 +170,7 @@ class EarlyRepeatCorrectionTests(unittest.TestCase):
                     self.assertIsNone(breaker["tripped"])
                 decision = asyncio.run(
                     hook(call, None, {}))["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
                 self.assertIn("repetition breaker",
                               decision["permissionDecisionReason"])
                 self.assertIsNotNone(breaker["tripped"])
@@ -123,27 +180,122 @@ class EarlyRepeatCorrectionTests(unittest.TestCase):
             with self.subTest(role=role_name):
                 breaker = new_breaker()
                 hook = self._role_hook(role_name, breaker)
-                a = {"tool_name": "Read", "tool_input": {"file_path": "a.md"}}
-                b = {"tool_name": "Read", "tool_input": {"file_path": "b.md"}}
-                self.assertEqual(asyncio.run(hook(a, None, {})), {})
-                self.assertEqual(
-                    asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
-                    ["permissionDecision"], "deny")
-                self.assertEqual(asyncio.run(hook(b, None, {})), {})  # reset
-                self.assertEqual(asyncio.run(hook(a, None, {})), {})  # fresh
-                self.assertEqual(
-                    asyncio.run(hook(a, None, {}))["hookSpecificOutput"]
-                    ["permissionDecision"], "deny")
+                for path in ("a.md", "b.md", "c.md"):
+                    call = {"tool_name": "Read",
+                            "tool_input": {"file_path": path}}
+                    self.assertEqual(asyncio.run(hook(call, None, {})), {})
+                    self.assertEqual(breaker["correction_count"], 0)
+                    decision = asyncio.run(hook(call, None, {}))[
+                        "hookSpecificOutput"]
+                    self.assertEqual(decision["permissionDecision"], "deny")
+                    self.assertEqual(breaker["correction_count"], 1)
+                    self.assertIsNone(breaker["tripped"])
 
-    def test_roles_without_the_flag_keep_the_silent_prefix(self) -> None:
+    def test_roles_without_the_flag_use_window_then_hard_trip(self) -> None:
         breaker = new_breaker()
         runner = SDKSessionRunner(
             model="m", events=EventsLog(Path(tempfile.mkdtemp())))
         hook = runner._capability_hook(SIMPLE_ROLE, breaker)
         call = {"tool_name": "Read", "tool_input": {"file_path": "f.py"}}
-        for _ in range(REPETITION_LIMIT - 1):
+        for _ in range(3):
             self.assertEqual(asyncio.run(hook(call, None, {})), {})
+        self.assertEqual(
+            asyncio.run(hook(call, None, {}))["hookSpecificOutput"]
+            ["permissionDecision"], "deny")
         self.assertIsNone(breaker["tripped"])
+
+
+class LayeredRepeatProtectionTests(unittest.TestCase):
+    def test_sliding_cycles_correct_then_trip(self) -> None:
+        role = SIMPLE_ROLE
+        for pattern, first_correction, trip in (("ABC", 10, 12),
+                                                 ("AB", 7, 9)):
+            with self.subTest(pattern=pattern), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                breaker = new_breaker()
+                hook = SDKSessionRunner(
+                    model="m", events=EventsLog(run_dir)
+                )._capability_hook(role, breaker, run_dir)
+                decisions = {}
+                for i in range(trip):
+                    path = f"{pattern[i % len(pattern)]}.md"
+                    verdict = asyncio.run(hook(
+                        {"tool_name": "Read", "tool_input": {"file_path": path}},
+                        None, {}))
+                    if verdict:
+                        decisions[i + 1] = verdict["hookSpecificOutput"]
+                self.assertEqual(first_correction, min(decisions))
+                self.assertIn("repetition breaker",
+                              decisions[trip]["permissionDecisionReason"])
+                self.assertIsNotNone(breaker["tripped"])
+
+    def test_edit_then_read_uses_the_new_file_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            target = run_dir / "train.py"
+            target.write_text("x = 0\n")
+            breaker = new_breaker()
+            hook = SDKSessionRunner(
+                model="m", events=EventsLog(run_dir)
+            )._capability_hook(ROLES["candidate-writer"], breaker, run_dir)
+            for i in range(8):
+                read = {"tool_name": "Read", "tool_input":
+                        {"file_path": str(target)}}
+                self.assertEqual(asyncio.run(hook(read, None, {})), {})
+                edit = {"tool_name": "Edit", "tool_input": {
+                    "file_path": str(target), "old_string": f"x = {i}",
+                    "new_string": f"x = {i + 1}"}}
+                self.assertEqual(asyncio.run(hook(edit, None, {})), {})
+                stamp = target.stat().st_mtime_ns
+                target.write_text(f"x = {i + 1}\n")
+                os.utime(target, ns=(stamp + 1, stamp + 1))
+            self.assertIsNone(breaker["tripped"])
+
+    def test_adapter_status_results_are_window_exempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            breaker = new_breaker()
+            hook = SDKSessionRunner(
+                model="m", events=EventsLog(run_dir)
+            )._capability_hook(ROLES["background-researcher"], breaker, run_dir)
+            commands = [
+                "python tools/search_backends.py status --manifest m.json",
+                "python tools/search_backends.py results --manifest m.json",
+            ] * 5
+            for command in commands:
+                self.assertEqual(asyncio.run(hook(
+                    {"tool_name": "Bash", "tool_input": {"command": command}},
+                    None, {})), {})
+            self.assertIsNone(breaker["tripped"])
+
+    def test_unchanged_file_cap_resets_after_mtime_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            target = run_dir / "large.md"
+            target.write_text("old", encoding="utf-8")
+            breaker = new_breaker()
+            hook = SDKSessionRunner(
+                model="m", events=EventsLog(run_dir)
+            )._capability_hook(SIMPLE_ROLE, breaker, run_dir)
+            for i in range(7):
+                self.assertEqual(asyncio.run(hook(
+                    {"tool_name": "Read", "tool_input":
+                     {"file_path": str(target), "offset": i}},
+                    None, {})), {})
+            denied = asyncio.run(hook(
+                {"tool_name": "Read", "tool_input":
+                 {"file_path": str(target), "offset": 7}}, None, {}))
+            self.assertIn("unchanged",
+                          denied["hookSpecificOutput"]["permissionDecisionReason"])
+            self.assertIsNone(breaker["tripped"])
+            target.write_text("new", encoding="utf-8")
+            os.utime(target, None)
+            for i in range(7):
+                self.assertEqual(asyncio.run(hook(
+                    {"tool_name": "Read", "tool_input":
+                     {"file_path": str(target), "offset": i + 8}},
+                    None, {})), {})
+            self.assertIsNone(breaker["tripped"])
 
 
 class BashPatternTests(unittest.TestCase):

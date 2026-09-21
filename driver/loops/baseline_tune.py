@@ -62,14 +62,24 @@ def _tuning_finalized(run_dir: Path) -> bool:
     return isinstance(report, dict) and report.get("applied_to_base_params") is True
 
 
+class _BaselineBudgetExhausted(phase_c.PhaseCBoutFailure):
+    """The single bout cannot run another trial: the run's normal tail.
+
+    Deliberately narrow — only the trial-cap refusal raises it, so a real
+    bout failure (action/close/finalize refusal, crashed job) still blocks
+    per the baseline loop's no-seat-to-skip contract."""
+
+
 def _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
                       job_runner=execute_driver_job) -> None:
     """Run candidate 000's single HEBO bout until it finalizes.
 
-    A crashed stage stays open for a later driver launch to resume; the
-    shared bout loop reports the failure and this baseline loop blocks the
-    run (its only recovery is interactive). A budget-exhausted stage closes
-    terminally and finalizes with its scored trials.
+    A crashed stage gets one in-loop retry of the interrupted stage
+    (mirroring round_v1's resume_once) and otherwise stays open for a later
+    driver launch to resume. A budget-exhausted bout that can no longer run
+    is the run's normal tail, not a failure: the loop completes and the
+    report's scored trials apply through the shared finalize path when they
+    can.
     """
     counter = iter(range(1, 10_000))
 
@@ -82,13 +92,21 @@ def _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
         cap = int(action.get("bout_trials") or 0)
         if isinstance(remaining, int):
             cap = min(cap, remaining)
+        if cap <= 0:
+            raise _BaselineBudgetExhausted(
+                "no objective budget remaining for the bout")
         return cap
 
     try:
         phase_c.run_single_bout(
             task, tag, run_dir, BASELINE_RUN_ID, repo_root, cmd, job_runner,
             next_invocation_id=lambda: next(counter),
-            trial_cap_fn=trial_cap, round_no=0)
+            trial_cap_fn=trial_cap, round_no=0, resume_once=True)
+    except _BaselineBudgetExhausted as exc:
+        # The budget is spent and the bout cannot run another trial: this is
+        # the run's normal tail — complete rather than block (there is no
+        # seat to skip; the open stage stays resumable for a later launch).
+        events.emit("baseline_bout_budget_exhausted", detail=str(exc))
     except phase_c.PhaseCBoutFailure as exc:
         _or_block(run_dir, repo_root, cmd, events, f"baseline bout: {exc}")
 
@@ -145,5 +163,15 @@ def run_baseline_tune(task, tag, *, runner, model, repo_root=REPO_ROOT,
         _complete_run(run_dir, repo_root, cmd, events)
     except RunBlocked:
         pass
+    except Exception as exc:  # noqa: BLE001 - the boundary rule (P1)
+        import traceback
+
+        events.emit("unhandled_exception", error=repr(exc),
+                    traceback=traceback.format_exc()[-4000:])
+        try:
+            _or_block(run_dir, repo_root, cmd, events,
+                      f"unhandled {type(exc).__name__}: {exc}")
+        except RunBlocked:
+            pass
 
     return compact_status(task, tag, run_dir, repo_root=repo_root, cmd=cmd)
