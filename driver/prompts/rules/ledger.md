@@ -49,7 +49,7 @@ Other mutations remain:
   for another DEEP segment.
   `set-tuning --mark-tuned` is disabled, so there is no second close path;
 - `record-run` for the lower-is-better score and keep/discard/crash state;
-- `set-experience` for a complete validated derived snapshot;
+- `set-experience` for driver-owned atomic patch publication;
 - `set-phase` and `loop-state` for run control and the derived brief.
 
 Each parameter-transfer receipt captures its exact parent record in the
@@ -168,8 +168,7 @@ per-record aggregates. Never hand-edit or truncate the reservation log.
 
 ## Experience boundary
 
-Raw records are the durable history. `experience` (schema 4; schema 3 stays readable) is a bounded
-regenerated belief snapshot: `summary`, `promising_regions`, `lessons`,
+Raw records are the durable history. `experience` (schema 5) is an incrementally maintained interpretation: `summary`, `promising_regions`, `lessons`,
 `bottlenecks`, plus two bounded target collections, `dimension_evidence`
 (at most 16 entries) and `hypothesis_evidence` (at most 32 entries), each
 target appearing at most once per collection. Target evidence is replaceable
@@ -179,7 +178,8 @@ mutates the frozen registry. Cited `evidence_edge_ids` name persisted
 semantic receipts; they are attribution evidence, and comparator coverage
 does not prove causality.
 
-Each target entry carries `target_id`, `evaluation_state`, `assessment`,
+Each target entry stores stable ID, scope, basis revision and judgments. Its derived
+consumer view includes `target_id`, `evaluation_state`, `assessment`,
 `recommended_status`, `claim`, `evidence_run_ids` (0–5 unique terminal
 target-related runs), `evidence_edge_ids` (0–5 unique persisted
 target-touching edges), `comparator_coverage`, `confidence`, `uncertainty`,
@@ -257,20 +257,18 @@ point (`components.experience_prior` and per-hypothesis context counts), and
 repeated negative carrier contexts push a point down the acquisition ranking.
 Pruned content is excluded from proposals outright.
 
-Validate before storing a snapshot:
+The experience role returns an `updates` patch through its receipt. The driver
+prepares delta context, records the attempted revision, and invokes
+`ledger.py set-experience --context <context.json> --from-json <patch.json>`.
+The helper validates references and the input binding, then publishes the
+merged experience and runtime transitions atomically. Models do not execute
+these mutations.
 
-```bash
-python tools/background_contract.py validate-experience \
-  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
-  --experience <experience.json>
-python tools/ledger.py set-experience \
-  --ledger <run_dir>/ledger.json --background <run_dir>/background.md \
-  --from-json <experience.json>
-```
-
-`ledger.dag_revision` advances only when a result becomes graph-visible or an
-existing result changes. Incremental DAG rendering and bounded Top/Bottom
-anchors remain unchanged. At every quiescent completed non-empty round, a
-positive terminal DAG delta must be processed by `set-experience` before the
-next semantic admission or final completion. A belief no-op advances only the
-helper-owned DAG cursor; it does not increment `generation`.
+Publication requires all records terminal and no slate selection/admission in
+flight. Freshness is advisory: missing or stale experience does not prevent
+admission or completion. A failed attempt preserves the old content and overlay;
+the same revision is not retried. New DAG evidence enables a new attempt covering
+all unprocessed changes. Empty updates advance only the processed cursor.
+Per-entry judgment versions prevent untouched old recommendations from advancing
+state transitions when another entry changes. Brief exposes lag and update outcome.
+The slate's bound experience and runtime revisions must still match at admission.

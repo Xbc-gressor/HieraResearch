@@ -33,10 +33,6 @@ class PromptTests(unittest.TestCase):
             text = (PROMPT_DIR / role.prompt_file).read_text(encoding="utf-8")
             self.assertIsNone(banned.search(text), role.prompt_file)
 
-    def test_extractor_prompt_cedes_resolve_unevaluated(self) -> None:
-        text = (PROMPT_DIR / "tunable-contract-extractor.md").read_text(
-            encoding="utf-8")
-        self.assertNotIn("resolve-unevaluated", text)
 
     def test_rules_file_exists(self) -> None:
         self.assertTrue((PROMPT_DIR / "rules" / "ledger.md").exists())

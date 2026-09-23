@@ -68,34 +68,31 @@ def _role(**overrides) -> RoleDefinition:
 
 
 class RefreshCutoffTests(unittest.TestCase):
-    def test_cutoff_during_first_call_or_retry_does_not_block(self):
-        for gates, calls in (([False, True], 1), ([False, False, True], 2)):
-            with self.subTest(calls=calls), tempfile.TemporaryDirectory() as tmp:
-                run_dir = Path(tmp)
-                with mock.patch.object(experiment, "_time_reached", side_effect=gates), \
-                        mock.patch.object(experiment, "_invoke", side_effect=InvocationFailed(
-                            "experience-extractor", ["time budget reached"])) as invoke, \
-                        mock.patch.object(experiment, "_brief", return_value={}), \
-                        mock.patch.object(experiment, "_or_block") as block:
-                    experiment._refresh(None, None, "toy", "r1", run_dir,
-                                        ROOT, None, EventsLog(run_dir))
-                self.assertEqual(invoke.call_count, calls)
-                block.assert_not_called()
-                self.assertEqual(len(_events(run_dir, "refresh_skipped")), 1)
-
-    def test_real_refresh_failure_before_cutoff_still_blocks(self):
+    def test_refresh_is_skipped_at_cutoff(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
-            with mock.patch.object(experiment, "_time_reached", return_value=False), \
-                    mock.patch.object(experiment, "_invoke", side_effect=InvocationFailed(
-                        "experience-extractor", ["invalid receipt"])) as invoke, \
-                    mock.patch.object(experiment, "_brief", return_value={}), \
-                    mock.patch.object(experiment, "_or_block") as block:
-                experiment._refresh(None, None, "toy", "r1", run_dir,
-                                    ROOT, None, EventsLog(run_dir))
-            self.assertEqual(invoke.call_count, 2)
-            block.assert_called_once()
-            self.assertEqual(_events(run_dir, "refresh_skipped"), [])
+            with mock.patch.object(experiment, "_time_reached", return_value=True), \
+                    mock.patch.object(experiment, "_invoke") as invoke:
+                self.assertFalse(experiment._refresh(None, None, "toy", "r1", run_dir,
+                                                    ROOT, None, EventsLog(run_dir)))
+            invoke.assert_not_called()
+
+    def test_refresh_failure_preserves_search_without_retry(self):
+        for reason in ("no receipt", "API failure", "time budget reached"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                (run_dir / "ledger.json").write_text('{"dag_revision": 1}')
+                cmd = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{"ready": true}', ''))
+                with mock.patch.object(experiment, "_time_reached", return_value=False), \
+                        mock.patch.object(experiment, "_invoke", side_effect=InvocationFailed(
+                            "experience-extractor", [reason])) as invoke, \
+                        mock.patch.object(experiment, "_or_block") as block:
+                    self.assertFalse(experiment._refresh(None, None, "toy", "r1", run_dir,
+                                                        ROOT, cmd, EventsLog(run_dir)))
+                invoke.assert_called_once()
+                block.assert_not_called()
+                self.assertIn("--error", cmd.call_args.args[0])
+                self.assertEqual(len(_events(run_dir, "experience_update_failed")), 1)
 
 
 class _Result:
@@ -569,10 +566,11 @@ class DeadlineSettlementTests(unittest.TestCase):
             "records": [{"run_id": "001", "status": "pending"}]}))
         if warm is not None:
             (candidate / "tune_report.json").write_text(json.dumps({
-                "phase_a": {"best_warm_score": warm}}))
+                "phase_a": {"status": "ok", "best_warm_score": warm}}))
         events = EventsLog(run_dir)
         experiment._settle_at_deadline(run_dir, "001", tmp, cmd, events)
-        return run_dir, _events(run_dir, "candidate_settled_at_deadline")
+        return run_dir, (_events(run_dir, "candidate_settled_at_deadline")
+                         + _events(run_dir, "candidate_settled"))
 
     def test_zero_attempts_resolve_unevaluated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -581,7 +579,7 @@ class DeadlineSettlementTests(unittest.TestCase):
             self.assertEqual(cmd.ledger_calls, ["resolve-unevaluated"])
             self.assertEqual(settled[0]["outcome"], "unevaluated")
 
-    def test_finite_warm_score_replays_the_extractor_close(self) -> None:
+    def test_valid_warm_score_settles_without_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cmd = _SettleCmd(4, 0, resolve_ok=False)
             _, settled = self._run(Path(tmp), cmd, warm=0.42)
@@ -667,9 +665,8 @@ class LedgerDeadlineTests(unittest.TestCase):
                 phase="completed", stop_condition=None, budget=None)
             (run_dir / "framework_cfg.json").write_text(json.dumps({
                 "max_evaluations": None, "deadline": time.time() + 3600}))
-            with self.assertRaisesRegex(SystemExit, "terminal DAG delta"), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                cmd_set_phase(args)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_phase(args), 0)
             (run_dir / "framework_cfg.json").write_text(json.dumps({
                 "max_evaluations": None, "deadline": time.time() - 10}))
             with contextlib.redirect_stdout(io.StringIO()):

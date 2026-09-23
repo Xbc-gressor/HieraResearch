@@ -800,9 +800,12 @@ class ConcurrentClimbTests(unittest.TestCase):
                     runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir,
                     1, {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
                     EventsLog(run_dir),
-                    tune=lambda no, selection: {"tuned": False},
+                    tune=lambda no, selection: self.fail("notune invoked deep tuning"),
                     config=config)
             self.assertTrue(progressed)
+            self.assertEqual(rounds._tune_reserve(
+                run_dir, Path(tmp), lambda *a, **kw: self.fail("notune priced tuning"),
+                enabled=False), 0.0)
             events = [json.loads(line) for line in
                       (run_dir / "driver_events.jsonl").read_text().splitlines()
                       if line.strip()]
@@ -1285,19 +1288,16 @@ class RoundLoopTests(unittest.TestCase):
                 {"receipt": {"status": "written", "wrote": True,
                              "candidate_dir": "candidates/000"},
                  "side_effects": writer_effect},
-                {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-                 "side_effects": extractor_keep},
             ])
             run_experiment("fake-task", "t1", runner=runner, model="m",
-                           repo_root=repo, cmd=cmd,
+                           repo_root=repo, cmd=cmd, job_runner=cmd.evaluate,
                            semantic_policy="coverage_attempt",
                            scheduler_policy="round_v1", time_budget=3600)
             self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
             # the TUNE bout is driver-owned: no tuner-orchestrator session
             roles = [name for name, _ in runner.calls]
             self.assertEqual(roles, ["background-researcher", "idea-generator",
-                                     "candidate-writer",
-                                     "tunable-contract-extractor"])
+                                     "candidate-writer"])
             self.assertEqual(
                 [call for call in cmd.round_calls if not call.startswith("overhead")],
                 ["status", "begin", "select --kind rewrite", "select --kind tune",

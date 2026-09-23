@@ -398,23 +398,6 @@ def kill_entry():
     return {"side_effects": boom}
 
 
-def extractor_entry(cmd: JudgedCmd):
-    entry: dict = {}
-
-    def effect(ctx):
-        ledger = cmd._ledger()
-        for record in ledger["records"]:
-            if record["run_id"] == ctx.run_id:
-                record["status"] = "keep"
-        cmd._save_ledger(ledger)
-        entry["receipt"] = {
-            "run_id": ctx.run_id,
-            "status": "keep",
-            "ledger_updated": True,
-        }
-
-    entry["side_effects"] = effect
-    return entry
 
 
 def tuner_entry():
@@ -458,7 +441,7 @@ class JudgedSlateTests(unittest.TestCase):
     def _run(self, cmd: JudgedCmd, script: list) -> FakeSessionRunner:
         runner = FakeSessionRunner(script)
         runner.status = run_experiment(TASK, TAG, runner=runner, model="m",
-                                       repo_root=self.repo, cmd=cmd)
+                                       repo_root=self.repo, cmd=cmd, job_runner=cmd.evaluate)
         return runner
 
     def _gen_dir(self) -> Path:
@@ -487,9 +470,9 @@ class JudgedSlateTests(unittest.TestCase):
             plan_entry(),
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd),
+
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         roles = [name for name, _ in runner.calls]
@@ -497,8 +480,8 @@ class JudgedSlateTests(unittest.TestCase):
             roles,
             ["slate-judge", "slate-judge",
              "slate-plan-writer", "slate-plan-writer",
-             "candidate-writer", "tunable-contract-extractor",
-             "candidate-writer", "tunable-contract-extractor",
+             "candidate-writer",
+             "candidate-writer",
              "tuner-orchestrator"],
         )
         # judges start fresh sessions and receive the prepared payload inline
@@ -528,6 +511,12 @@ class JudgedSlateTests(unittest.TestCase):
              "slate_manifested", "slate_admitted"],
         )
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
+        from experience_updates import publication_boundary
+        # Use the receipts written by actual admit-slate, not a guessed shape.
+        completed = cmd._ledger()
+        self.assertTrue(publication_boundary(cmd.run_dir, completed))
+        completed["records"] = completed["records"][:-1]
+        self.assertFalse(publication_boundary(cmd.run_dir, completed))
 
     def test_judge_correction_resumes_the_same_session(self) -> None:
         self._seed_run()
@@ -540,9 +529,9 @@ class JudgedSlateTests(unittest.TestCase):
             plan_entry(),
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd),
+
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         roles = [name for name, _ in runner.calls]
@@ -578,9 +567,9 @@ class JudgedSlateTests(unittest.TestCase):
             plan_entry(),
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd2),
+
             writer_entry(),
-            extractor_entry(cmd2),
+
             tuner_entry(),
         ])
         roles = [name for name, _ in runner2.calls]
@@ -588,8 +577,8 @@ class JudgedSlateTests(unittest.TestCase):
         self.assertEqual(
             roles,
             ["slate-plan-writer", "slate-plan-writer",
-             "candidate-writer", "tunable-contract-extractor",
-             "candidate-writer", "tunable-contract-extractor",
+             "candidate-writer",
+             "candidate-writer",
              "tuner-orchestrator"],
         )
         self.assertEqual(
@@ -616,9 +605,9 @@ class JudgedSlateTests(unittest.TestCase):
         runner2 = self._run(cmd2, [
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd2),
+
             writer_entry(),
-            extractor_entry(cmd2),
+
             tuner_entry(),
         ])
         plan_calls = [ctx for name, ctx in runner2.calls
@@ -645,9 +634,9 @@ class JudgedSlateTests(unittest.TestCase):
             plan_entry(),                    # slot 0, inline retry lands
             plan_entry(),                    # slot 1, first attempt
             writer_entry(),
-            extractor_entry(cmd),
+
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
@@ -695,8 +684,8 @@ class JudgedSlateTests(unittest.TestCase):
             judge_entry(), judge_entry(),
             plan_entry(route_error=error),
             plan_entry(), plan_entry(),
-            writer_entry(), extractor_entry(cmd),
-            writer_entry(), extractor_entry(cmd), tuner_entry(),
+            writer_entry(),
+            writer_entry(),  tuner_entry(),
         ])
         self.assertEqual(runner.status["phase"], "completed")
         plans = [ctx for name, ctx in runner.calls if name == "slate-plan-writer"]
@@ -825,7 +814,7 @@ class JudgedSlateTests(unittest.TestCase):
         runner = self._run(cmd, [
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         roles = [name for name, _ in runner.calls]
@@ -840,7 +829,7 @@ class JudgedSlateTests(unittest.TestCase):
         self.assertEqual(len(self._new_records(cmd)), 1)
         extractor_ctx = next(
             ctx for name, ctx in runner.calls
-            if name == "tunable-contract-extractor"
+            if name == "candidate-writer"
         )
         self.assertEqual(extractor_ctx.extra["screening_k_eval"], 2)
         self.assertEqual(extractor_ctx.extra["screening_target_k_eval"], 3)
@@ -853,7 +842,7 @@ class JudgedSlateTests(unittest.TestCase):
         runner = self._run(cmd, [
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         roles = [name for name, _ in runner.calls]
@@ -871,9 +860,9 @@ class JudgedSlateTests(unittest.TestCase):
             plan_entry(),
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd),
+
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         roles = [name for name, _ in runner.calls]
@@ -937,14 +926,14 @@ class JudgedSlateDonorBindingTests(unittest.TestCase):
     def _run(self, cmd: JudgedCmd, script: list) -> FakeSessionRunner:
         runner = FakeSessionRunner(script)
         run_experiment(TASK, TAG, runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
+                       repo_root=self.repo, cmd=cmd, job_runner=cmd.evaluate)
         return runner
 
     def _extractor_contexts(self, runner: FakeSessionRunner) -> list:
         return [
             ctx
             for name, ctx in runner.calls
-            if name == "tunable-contract-extractor"
+            if name == "candidate-writer"
         ]
 
     def test_generation_binds_one_snapshot_across_seats(self) -> None:
@@ -953,26 +942,15 @@ class JudgedSlateDonorBindingTests(unittest.TestCase):
         cmd.reached = [False, False, False, False, True]
         run_dir = self._run_dir()
 
-        def seat1_entry():
-            """Seat 1 screens, then a strictly better donor finalizes."""
-            entry: dict = {}
-
-            def effect(ctx):
+        evaluated = cmd.evaluate
+        def move_frontier(role, ctx, request, **kwargs):
+            result = evaluated(role, ctx, request, **kwargs)
+            if ctx.run_id == "006":
                 ledger = cmd._ledger()
-                for record in ledger["records"]:
-                    if record["run_id"] == ctx.run_id:
-                        record["status"] = "keep"
-                better = _donor_record(run_dir, "009", score=0.1)
-                ledger["records"].append(better)
+                ledger["records"].append(_donor_record(run_dir, "009", score=0.1))
                 cmd._save_ledger(ledger)
-                entry["receipt"] = {
-                    "run_id": ctx.run_id,
-                    "status": "keep",
-                    "ledger_updated": True,
-                }
-
-            entry["side_effects"] = effect
-            return entry
+            return result
+        cmd.evaluate = move_frontier
 
         runner = self._run(cmd, [
             judge_entry(),
@@ -980,9 +958,8 @@ class JudgedSlateDonorBindingTests(unittest.TestCase):
             plan_entry(),
             plan_entry(),
             writer_entry(),
-            seat1_entry(),
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
@@ -1030,9 +1007,9 @@ class JudgedSlateDonorBindingTests(unittest.TestCase):
             plan_entry(),
             plan_entry(),
             writer_entry(),
-            extractor_entry(cmd),
+
             writer_entry(),
-            extractor_entry(cmd),
+
             tuner_entry(),
         ])
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
@@ -1153,7 +1130,7 @@ class CoverageArmRegressionTests(unittest.TestCase):
             tuner_entry(),
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
+                       repo_root=self.repo, cmd=cmd, job_runner=cmd.evaluate)
         roles = [name for name, _ in runner.calls]
         self.assertEqual(
             roles, ["idea-generator", "tuner-orchestrator"] * 2)

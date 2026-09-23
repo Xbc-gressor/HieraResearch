@@ -40,7 +40,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, InvocationContext]:
 def test_warmstart_job_argv_is_foreground_and_driver_derived(tmp_path: Path) -> None:
     repo, ctx = _fixture(tmp_path)
     argv, log, run_id = build_driver_job(
-        "tunable-contract-extractor",
+        "driver",
         ctx,
         {"kind": "warmstart", "run_id": "007", "k_eval": 2},
         repo_root=repo,
@@ -70,7 +70,7 @@ def test_shared_environment_used_by_preflight_and_evaluation(tmp_path: Path) -> 
         argv = call.args[0]
         assert argv[argv.index("--project") + 1] == project
     argv, _, _ = build_driver_job(
-        "tunable-contract-extractor", ctx,
+        "driver", ctx,
         {"kind": "warmstart", "run_id": "007", "k_eval": 2}, repo_root=repo,
     )
     assert argv[argv.index("--project") + 1] == project
@@ -83,7 +83,7 @@ def test_warmstart_job_passes_the_bound_donor_snapshot(tmp_path: Path) -> None:
         ctx.run_dir / ".scheduler" / "donors" / "donor-abc123.json"
     )
     argv, _, _ = build_driver_job(
-        "tunable-contract-extractor",
+        "driver",
         ctx,
         {"kind": "warmstart", "run_id": "007", "k_eval": 2},
         repo_root=repo,
@@ -96,7 +96,7 @@ def test_warmstart_job_no_donor_binding_adds_no_flag(tmp_path: Path) -> None:
     repo, ctx = _fixture(tmp_path)
     ctx.extra["donor_binding"] = "no_donor"
     argv, _, _ = build_driver_job(
-        "tunable-contract-extractor",
+        "driver",
         ctx,
         {"kind": "warmstart", "run_id": "007", "k_eval": 2},
         repo_root=repo,
@@ -286,17 +286,17 @@ def test_driver_job_resume_preserves_original_extra(tmp_path: Path) -> None:
     store = ReceiptStore(run_dir)
     runner = FakeSessionRunner([
         {"receipt": {
-            "run_id": "007", "status": "driver_job", "ledger_updated": False,
-            "driver_job": {"kind": "warmstart", "run_id": "007", "k_eval": 2},
+            "tuned_run_id": "007", "tuned": False, "ledger_updated": False,
+            "driver_job": {"kind": "phase_c", "run_id": "007", "method": "bo", "trial_cap": 10},
         }},
-        {"receipt": {"run_id": "007", "status": "keep", "ledger_updated": True}},
+        {"receipt": {"tuned_run_id": "007", "tuned": True, "ledger_updated": True}},
     ])
 
     def job_runner(role, ctx, request, *, repo_root):
         return {"kind": "warmstart", "run_id": "007", "returncode": 0}
 
     _invoke_with_driver_jobs(
-        runner, store, "tunable-contract-extractor", "toy", "r1", run_dir,
+        runner, store, "tuner-orchestrator", "toy", "r1", run_dir,
         run_id="007", extra={"candidate_dir": "/candidate", "diagnosis_verdict": "fix"},
         repo_root=tmp_path, job_runner=job_runner,
     )

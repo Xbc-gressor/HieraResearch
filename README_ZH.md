@@ -115,7 +115,7 @@ background-researcher: 解析维度策略 → 多后端知识侦察 → backgrou
         ↓
 (若声明 provided entrypoint) 作为 all-baselines 根节点原样复制并评估一次默认配置
         ↓
-(每个已完成的非空轮次后) experience-extractor: 提炼全局经验 → ledger.json experience 块
+(静止边界、有未处理变化时) experience-extractor: 提交经验 patch → driver 原子发布
         ↓
 idea-generator:
     SELECT-1: got_select.py decide → 获取图行动与数字父代
@@ -125,16 +125,11 @@ idea-generator:
         ↓
 对每个行动: tools/new_candidate.py --skip-entrypoint → 创建候选目录(prepare.py + 精简 _candidate_brief.json)
         ↓
-candidate-writer: 读取候选简报 (idea + 数字父代 + semantic_point) → 写 candidate/train.py
+candidate-writer: 实现 train.py + PARAM_SCHEMA/make_model，建议 K 个 warm configs 与搜索范围
         ↓
-step 0+1: tunable-contract-extractor
-    ① 制作 PARAM_SCHEMA + 重构 make_model
-    ② 提出 K 个热启动配置 + SEARCH_SPACE
-    ③ 评估 K 个配置(一个 config→score 函数; 没有单独的官方运行)
-       → 对每次崩溃调用 crash-diagnosis 角色(修复配置或修复代码)
-       → 构建 BASE_PARAMS, 记录 best_warm_score
-       → extractor 调用 record-run (final_best_score=best_warm_score + keep/discard status)
-         + set-tuning (元数据, 无 --mark-tuned) 到 ledger.json
+driver: 检查、安装搜索范围、物化继承/全局 donor → warmstart_eval 评估 K_eval 个配置
+       → 成功：应用最佳 BASE_PARAMS，set-tuning + record-run，无模型收尾
+       → 需要修复：续接原 writer，修复后重新检查与评估
         ↓
 (每轮一次) tuner-orchestrator:
     tune_tools.py select-candidate → 从整个种群中选择一个符合条件的候选方案
@@ -142,7 +137,7 @@ step 0+1: tunable-contract-extractor
     → finalize_tuning.py 验证终态后统一应用参数并原地关闭 report + ledger (无重新运行)
 ```
 
-上述协议原先是单一主会话内的约定，现已全部落入 driver 代码：循环按顺序为每个角色调用一个 SDK 会话，会话只持路径与紧凑 id，通过 `mcp__receipts__submit_receipt` 返回 receipt；driver 校验 receipt 与后置条件，不满足则在同一会话内纠正跟进，直至升级。角色工具能力由 fail-closed 的 PreToolUse hook 强制（`Agent`/`Task`/`Skill` 一律拒绝），崩溃诊断由 `crash-diagnosis` 角色完成。
+上述协议原先是单一主会话内的约定，现已全部落入 driver 代码：循环按顺序为每个角色调用一个 SDK 会话，会话只持路径与紧凑 id，通过 `mcp__receipts__submit_receipt` 返回 receipt；driver 校验 receipt 与后置条件，不满足则在同一会话内纠正跟进，直至升级。角色工具能力由 fail-closed 的 PreToolUse hook 强制（`Agent`/`Task`/`Skill` 一律拒绝），候选筛选故障由原 writer 根据 driver 反馈诊断修复；其他调用保留既有诊断路径。
 
 ### 4.3 两层搜索架构
 
@@ -154,11 +149,8 @@ step 0+1: tunable-contract-extractor
 
 **内层搜索（解耦调优）**：每个候选方案结构内的超参数搜索，分为两个阶段，**与外层搜索解耦**：
 
-- **Step 0+1**（tunable-contract-extractor；一个角色会话完成；对每个候选方案运行）：
-  ① 行为保持地重构构造逻辑为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）+ 声明 `PARAM_SCHEMA`
-  ② provided entrypoint 仅使用一个原始默认配置；其他候选结合**血统证据**与数据提出 K=5 个热启动配置 + 数据驱动的 `SEARCH_SPACE`；一致性预检 + `check-search-space` + `apply_search_space`
-  ③ **评估 K 个配置**（warmstart_eval；顺序/可恢复）；**对每次崩溃调用 crash-diagnosis 角色**（config-invalid → 修复配置；code-incompatible → 最小化修复代码 ≤10 次）；全部通过 → 写 `BASE_PARAMS`=最佳-K′ + `phase_a`，记录 `best_warm_score`；无法修复 → 记录 `status:crash`
-  深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
+- **Step 0+1**：writer 交付参数化代码、warm 配置与范围建议；driver 负责机械准备、按 K_eval 筛选并结算。provided entrypoint 仅评估原始默认配置；普通候选按 `tuner.K` 提案。需要修复时续接作者，代码变更后按实现版本重新评估。有效报告无需模型确认，warm screening 不标记为 deep-tuned。
+  `round.tune_bouts=0` 仍执行本阶段，不启动深度调优；deferred configs 不妨碍结束，rewrite 由自己的配置控制。
 
 - **Step 2（解耦渐进式深度调优）**（tuner-orchestrator；**每轮在整个运行上运行一次**，而非每个候选方案）：
   - 默认 scheduler `anchor_transfer_challenger_v1`：seed roots 到齐后立即给当时最优候选一个 INITIAL bout，在保留 challenger 与两个 DEEP segment 硬预算的前提下继续生成，然后初始化 late challenger 并花两个 DEEP segment。第一段 DEEP 有正收益则继续同一候选，否则切换到另一个已初始化候选。与 `anchor_challenger_v1` 的区别是 global-donor 转移：后续候选从 run-global donor（当时最优的已调优候选，按代冻结为不可变快照）暖启动，global_donor 候选的第一个 bout 是 10-eval TRANSFERRED segment（必备 donor 行已在 Phase A 评估）。该赛程只与 inner policy `hebo24-transfer10-hebo10` 配对，且要求 K_eval >= 3（lineage 与 donor 两个筛选角色）。`anchor_challenger_v1`（无 donor 转移的同一赛程）、`v3_2` 和 legacy percentile/alternation 调度器作为显式对照臂保留。
@@ -172,7 +164,7 @@ step 0+1: tunable-contract-extractor
 
 原 `.claude/agents/` 子智能体已随 Claude Code runtime 一起退役，迁移为 driver 角色：prompt 位于 `driver/prompts/`，由 `driver/roles.py` 注册（prompt 文件、正向工具能力集、receipt schema、driver 侧后置条件），每次调用是一个独立的 Claude Agent SDK 会话。会话不返回自由文本——通过进程内 MCP 工具 `mcp__receipts__submit_receipt` 提交 schema 校验的 receipt，持久化在 `<run_dir>/receipts/` 下并按 `invocation_id` 关联；后置条件不满足时 driver 在同一会话内发起纠正跟进（至多 `role.corrective_attempts` 次），再失败则抛 `InvocationFailed`，由循环按角色升级。会话 id 在 init 时即持久化，被杀的会话可用 `resume=<session_id>` 恢复。
 
-当前角色：`background-researcher`、`idea-generator`、`experience-extractor`、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator`、`crash-diagnosis`、`hillclimb-editor`。原 `autoresearch-experiment` 主代理的编排职责已确定性化为 `driver/loops/experiment.py`（hillclimb 基线为 `driver/loops/hillclimb.py` + `hillclimb-editor` 角色）。
+当前角色：`background-researcher`、`idea-generator`、`experience-extractor`、`candidate-writer`、`tuner-orchestrator`、`crash-diagnosis`、`hillclimb-editor`。原 `autoresearch-experiment` 主代理的编排职责已确定性化为 `driver/loops/experiment.py`（hillclimb 基线为 `driver/loops/hillclimb.py` + `hillclimb-editor` 角色）。
 
 ### 5.1 driver 实验循环
 
@@ -182,9 +174,9 @@ step 0+1: tunable-contract-extractor
 - 初始化新的 `runs/<task>/<tag>/`（先调用 `background-researcher`；若任务声明 provided entrypoint，则先登记并评估该基线，否则循环通过 `fresh` 自举）
 - 写入 `run_metadata.json`（模型、SDK/CLI 版本、权限策略、prompt 哈希）；恢复运行时对漂移发出 `metadata_mismatch` 警告——记录并警告，绝不拒绝
 - 按**轮次**推进循环：一代 ≤B 个想法经过 step 0+1，然后一次解耦深度调优步骤
-- 依次调用 `idea-generator`（SELECT + IDEATE）、`candidate-writer`、`tunable-contract-extractor`、`tuner-orchestrator` 角色会话
+- 依次调用 `idea-generator`（SELECT + IDEATE）、`candidate-writer`、`tuner-orchestrator` 角色会话
 - 用 `crash-diagnosis` 角色进行崩溃分析
-- 无单独的候选运行或日志解析阶段；extractor/tuner 各自使用 `record-run` + `set-tuning` 记录分数
+- 无单独的候选运行或日志解析阶段；driver/tuner 分别使用 `record-run` + `set-tuning` 记录分数
 - 通过 `tools/ledger.py` 维护 `ledger.json` 和派生的 `loop_state.md`
 - 拥有预算检查、升级链与崩溃恢复；持续直到硬停止条件（`blocked` 事件带具体原因）
 
@@ -220,43 +212,19 @@ Search space registry 中的每个来源必须在 retrieval manifest 中有工�
 
 ### 5.4 experience-extractor
 
-每个已完成的非空轮次后运行一次，从 DAG 增量、Top/Bottom 锚点、机械语义点差异中提炼有界全局经验（schema 3）。除通用 promising regions / lessons / bottlenecks 外，还生成双层 `dimension_evidence` / `hypothesis_evidence` 信念；其引用边 id、逐边观测、评估状态与比较计数只取自 `background_contract.py target-evidence`，绝不从 Top/Bottom 窗口重建。信念只"建议"运行时状态：`set-experience` 成功后调用一次 `ledger.py apply-space-state`，由确定性 helper 拥有所有 append-only `search_space_state` 转移（两阶段剪枝、基线保护、重开即追加）。不把点成员关系当因果，永不改写 background、映射、策略收据或原始观测。
+工具按未处理 DAG delta 提供事实和相关旧条目；experience-extractor 只解释变化，通过 receipt 返回稳定 ID 的增量 patch。driver 校验引用和快照绑定，原子合并 schema 5 经验与合规的状态转移。空更新只推进处理游标；失败保留旧经验，同 revision 不重复调用，准入和完成不依赖经验新鲜度。发布仍限于 all-terminal 且无 slate 选择/准入在途的边界。planner/rewrite 读取相关经验及当前事实，judge 输入保持隔离。
 
 ### 5.5 candidate-writer
 
-将账本记录的想法实现到候选目录的 `train.py` 中。**输入仅是候选目录**——它通过 `ledger.py show` 读取自己的账本记录以获取 `idea` + `source_run_ids`，派生父 `train.py` 引用，编写行为取决于文件系统状态，适应三种情况：
+读取候选简报、任务契约和相关 lineage，实现语义变化并交付 `train.py`、`_warm_configs.json`、`_search_space.json`。保留 primary parent 的当前实现和参数，对新 dimension 设计合理范围与配置。只拥有 Read/Write/Edit/Glob，不运行训练或写 ledger。
 
-- 目标目录已有 `train.py`（提供的基线）：不写；按原样保留；返回 `wrote: false`
-- `source_run_ids` 为空（`fresh`）：若任务声明了 provided baseline，先阅读它作为评估表面与文件约定的参考（不是父代、不是可编辑快照），再按记录的完整语义点从头编写；不得复制 baseline，也不得偷偷换成另一个更简单的点
-- `source_run_ids` 是数字父 run ids（`improve`/`crossover`）：使用父代代码实现想法，同时保持与 `semantic_point` 一致
+### 5.6 driver 候选评估
 
-职责：
-- 通过 `ledger.py show` 读取 idea + 数字父代 + semantic_point + policy_receipt
-- 读取从 source_run_ids 派生的父 `train.py`
-- `fresh` 时，若任务声明了 provided baseline，先阅读任务根上的该实现作为参考，再从头编写
-- 读取只读 `prepare.py` 以理解评估 API
-- 仅写目标候选的 `train.py`
-
-不做：
-- 提出想法
-- 提取调优器合约（之后由 `tunable-contract-extractor` 完成）
-- 运行实验
-- 解析结果
-- 修改 `prepare.py`
-
-### 5.6 tunable-contract-extractor
-
-Step 0+1：在候选 `train.py` 准备好后运行，在一个角色会话中完成所有事情：
-
-① 行为保持地将构造逻辑重构为 `make_model(<task-input>, params)`（首个参数与返回对象的接口由任务的 Evaluation Contract 定义）并声明 `PARAM_SCHEMA`（仅列出可调参数 + 类型，无范围/默认值）
-② provided entrypoint 仅使用一个原始默认配置；非 fresh 候选从 primary parent 的完整代码快照开始，并把其已应用 incumbent 精确投影为强制 warm config 0（记录 copied/reset/new/dropped、父代 durable applied snapshot 与 hash）；该控制保证 tuning win 可继承，但 receipt 明确标为 semantic `unverified`，不冒充语义因果比较；其余候选结合**血统证据**（`lineage-evidence`）与数据提出热启动配置及 `SEARCH_SPACE`
-③ 评估所选配置（`warmstart_eval`；强制先保留 inherited control、顺序/可恢复/崩溃时停止）；**对每次崩溃调用 `crash-diagnosis` 角色**（config-invalid → 修复配置 / code-incompatible → 最小化修复代码 ≤10 次）直到通过 → 写 `BASE_PARAMS`=全部有限 warm row（包括 inherited control）中的最优项 + `phase_a`，并把完整 transfer/control/score receipt 写入 ledger；control 的 role 只约束语义归因，不剥夺优化资格；无法修复 → 记录 `status:crash`
-
-主循环在 `candidate-writer` 返回后对每个新候选方案运行一次此操作。深度调优（step 2）被解耦；所有候选方案在此停在 step 0+1。
+`driver/candidate_evaluation.py` 编排 schema/space 检查、继承与 donor 物化，并通过 driver job 执行 warm screening。成功报告经 ledger 校验后直接结算；失败反馈续接开发会话，无法恢复则按证据结束候选。provided anchor 保留初始 no-op 检查，不能有效评估时阻止搜索。
 
 ### 5.7 tuner-orchestrator
 
-Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运行一次**，每次至多运行**一个调优 bout**，其 objective 评估数由 inner policy 决定（默认 `hebo24-hebo20` 为 24/10/10）。**无热启动**——`phase_a` 是 step 0+1（extractor）输出用作输入。
+Step 2（解耦渐进式调优，设计 §15）：**每轮在整个运行上运行一次**，每次至多运行**一个调优 bout**，其 objective 评估数由 inner policy 决定（默认 `hebo24-hebo20` 为 24/10/10）。**无热启动**——`phase_a` 是 step 0+1（driver）输出用作输入。
 
 流程：
 
@@ -309,10 +277,10 @@ python tools/new_candidate.py <task-name> <tag> <run_id> --from-candidate <best_
 
 ```bash
 python tools/ledger.py add-record      ...   # idea-generator 创建记录 (带 --op)
-python tools/ledger.py set-tuning      ...   # extractor 填充 Phase-A 调优元数据（无 --mark-tuned）
+python tools/ledger.py set-tuning      ...   # driver 填充 Phase-A 调优元数据（无 --mark-tuned）
 python tools/finalize_tuning.py        ...   # 终态 Phase C 的唯一正常关闭路径：应用参数并统一更新 ledger
-python tools/ledger.py set-experience --background <background.md> ...   # 校验后写全局 experience 块
-python tools/ledger.py record-run      ...   # extractor 用 warm config-eval 最佳调用: 写 final_best_score + 计算 keep/discard/crash
+python tools/ledger.py set-experience --background <background.md> ...   # driver 校验并原子合并经验 patch（需 --context）
+python tools/ledger.py record-run      ...   # driver 用 warm config-eval 最佳调用: 写 final_best_score + 计算 keep/discard/crash
 python tools/ledger.py percentile      ...   # 按字段的跨记录百分位 (tuner 门控 / select-candidate 使用; 只读)
 python tools/ledger.py evaluations     ...   # 预算检查: 跨记录的 Σ trials_attempted（旧记录回退到 trials_completed）
 python tools/ledger.py loop-state      ...   # 从 ledger.json 重新生成 loop_state.md
@@ -482,7 +450,7 @@ model = make_model(dataset, BASE_PARAMS)
 
 1. 在 `tasks/<task-name>/` 下创建任务目录
 2. 添加 `TASK.md`、`task.toml`、`pyproject.toml`、`prepare.py`。可选地添加 `train.py` 如果提供用户基线（作为预设 `fresh` 方向）；可以省略——循环通过 `fresh` 候选方案自举，candidate-writer 从头生成每个 `train.py`
-   - `TASK.md` 必须包含 `## Evaluation Contract` 部分（验证器检查）：声明候选训练表面、官方评分表面、报告表面、调优器评估表面（如果有）和行为规则。此合约指导 candidate-writer / tunable-contract-extractor / tuner-orchestrator；更具体 = 自主实验期间更少漂移
+   - `TASK.md` 必须包含 `## Evaluation Contract` 部分（验证器检查）：声明候选训练表面、官方评分表面、报告表面、调优器评估表面（如果有）和行为规则。此合约指导 candidate-writer / driver / tuner-orchestrator；更具体 = 自主实验期间更少漂移
 3. 在 `task.toml` 中声明：
    - 指标
    - `[evaluation]` 评估函数名：`score_fn`（官方评分函数），对于支持调优的任务，单一 `config → score` 测试函数（`[evaluation].score_fn`；官方 = 调优表面；签名 `score_fn(make_model, params)`；热启动评估和 Phase C 都调用它；没有单独的官方运行）。函数名放在配置中；相应的语义在 TASK.md Evaluation Contract 中

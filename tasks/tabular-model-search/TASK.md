@@ -26,7 +26,7 @@ where `make_model` is evaluated against that function by the tuner scripts.
 - **Construct**: the candidate's `train.py` exposes `make_model(dataset, params)`
   returning an unfitted sklearn-style estimator (`.fit` / `.predict`), plus the
   tuner contract (`PARAM_SCHEMA`, `SEARCH_SPACE`, `BASE_PARAMS`) that
-  `tunable-contract-extractor` writes at step 0+1.
+  `candidate-writer` and driver writes at step 0+1.
 - **Train**: `prepare.load_datasets()` returns `DatasetSplit` items; train only
   on `dataset.x_train` / `dataset.y_train`.
 - **Score**: `evaluation.score_fn` (`prepare.evaluate_config(make_model, params)`)
@@ -140,7 +140,7 @@ uv --directory tasks/tabular-model-search sync
 python tools/new_candidate.py tabular-model-search <tag> <run_id> --skip-entrypoint
 
 # 3. Once train.py + _warm_configs.json exist (candidate-writer +
-#    tunable-contract-extractor), score the K warm configs against evaluate_config
+#    candidate-writer and driver), score the K warm configs against evaluate_config
 #    in the task-local uv env (step 0+1):
 #    (--project selects the task env without chdir, so the repo-relative paths below resolve)
 uv --project tasks/tabular-model-search run python tools/tuners/warmstart_eval.py \
@@ -150,7 +150,7 @@ uv --project tasks/tabular-model-search run python tools/tuners/warmstart_eval.p
 ```
 
 Normally the experiment loop drives this through its agents
-(`tunable-contract-extractor` for step 0+1, `tuner-orchestrator` for the decoupled
+(`candidate-writer` and driver for step 0+1, `tuner-orchestrator` for the decoupled
 deep-tuning), not by hand. Candidate files under `runs/` are
 intentionally outside git.
 
@@ -160,7 +160,7 @@ There is **no run-log summary** — a candidate is never run as a script. The tu
 scripts call `prepare.evaluate_config(make_model, params)` (warm-start eval +
 Phase C) and the score is written straight to `ledger.json` via `tools/ledger.py`:
 
-- `tunable-contract-extractor` (step 0+1) records the warm-start best as the
+- `driver` (step 0+1) records the warm-start best as the
   candidate's `final_best_score` (= `best_warm_score`) with `ledger.py record-run`,
   and the warm metadata with `set-tuning` (no `--mark-tuned`).
 - `tuner-orchestrator`, if it selects the candidate, calls

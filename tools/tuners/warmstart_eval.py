@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Step 1 — warm-config evaluator (sequential, resumable, stop-on-crash).
 
-Run by `tunable-contract-extractor` (segment ③) after it has produced a
-candidate `train.py` (PARAM_SCHEMA + SEARCH_SPACE + make_model, NO BASE_PARAMS
-yet) and written `_warm_configs.json` (the K warm configs). For schema-4
+Run by the driver after candidate-writer proposed parameterized code and warm
+configs, and deterministic helpers installed SEARCH_SPACE and inheritance.
+Existing BASE_PARAMS may be present; evaluation applies the measured incumbent. For schema-4
 candidates, config 0 is a mandatory control; non-fresh candidates must bind it
 to a validated primary-parent parameter-transfer receipt. It samples the
 remaining K_eval slots uniformly without replacement and evaluates those
 configs on the score fn
 (`prepare`'s `score_fn`), and seeds the candidate's tuning. Sequential +
-resumable + stop-on-crash, so the extractor can diagnose + fix ONE crash at a
-time without re-evaluating what already passed:
+resumable + stop-on-crash, so the driver can resume the writer to repair a failure without re-evaluating what already passed:
 
 1. CREATE `BASE_PARAMS` (so the candidate is a complete contract that imports).
 2. Persist the mandatory indices, random permutation, seed, and

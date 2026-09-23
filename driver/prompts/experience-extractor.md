@@ -1,181 +1,69 @@
-
 # Experience Extractor
 
-Regenerate the bounded `ledger.experience` belief snapshot after every completed
-non-empty round when the driver invokes you at a quiescent refresh
-boundary. Raw ledger records are the durable history. Your output is a
-replaceable interpretation of that history, not an edit to observations or the
-frozen search space.
+Explain the new evidence and return only necessary changes to existing experience.
+The driver supplies `experience_context`: read this JSON first. It contains the
+unprocessed DAG delta, related existing entries, target evidence, and a lookup
+directory. For a specific missing context, Read `targets/<target-id>.json`,
+`runs/<run-id>.json`, or `entries/<entry-id>.json` in that directory. Glob may
+locate IDs. Do not read the full ledger, old snapshots, or all lookup files.
 
-The snapshot is two-level: display-only generic interpretation (`summary`,
-`promising_regions`, `lessons`, `bottlenecks`) plus gated per-target
-`dimension_evidence` and `hypothesis_evidence` entries. Generic prose is never
-an acquisition input. A target entry only recommends a runtime status; the
-deterministic `apply-space-state` helper decides and appends the actual
-transitions.
+Tools own scores, statuses, evaluation depth, comparison coverage, carrier
+contexts, IDs, generations and revisions. You own interpretations, caveats and
+recommendations. Existing entries include their basis revision: they are prior
+interpretations, not judgments on the newly arrived evidence. Unchanged entries
+are retained automatically. Update an entry only when needed; delete obsolete
+entries by stable ID. An empty updates list is a valid abstention.
 
-Candidates have two independent structures:
+Membership and implementation ancestry do not establish causality. Same-point
+comparisons are implementation evidence. Direct comparisons require validated
+same-child-code control/treatment pairs with a pinned parent snapshot and no
+shared-key reset. Ordinary inherited config-0 controls remain confounded. Read
+`direct_comparator_capability` and the computed target evidence; never infer
+causal isolation from a point diff, tuning improvement, or prose.
 
-- numeric `source_run_ids`: implementation ancestry in the development DAG;
-- complete `semantic_point`: attribution to the frozen background space.
+Read carrier counts only when `carrier_contexts.complete` is true. Truncating a
+mixed carrier context can falsely make it unanimous. Cite the returned run and
+edge IDs together; never invent coverage or omit contrary observations to pass
+a recommendation gate. Scores are lower-is-better; crashes are failures, not
+missing successes or semantic counterevidence.
 
-Membership and parent point diffs do not establish causality. A candidate may
-change implementation while staying at the same point, and a point may differ
-while several concrete code changes move together.
+## Receipt
 
-## Inputs
-
-You receive `run_dir`. Read only bounded helper views:
-
-```bash
-python tools/ledger.py brief --ledger <run_dir>/ledger.json
-python tools/got_graph.py render --ledger <run_dir>/ledger.json \
-  --incremental --top 3 --bottom 3 --format json
-python tools/background_contract.py target-evidence \
-  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
-  --max-dimensions 16 --max-hypotheses 32 --max-edges-per-target 5
-python tools/background_contract.py render \
-  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
-  --max-hypotheses 6
-python tools/background_contract.py lineage \
-  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
-  --compact --limit 8
-python tools/ledger.py show --ledger <run_dir>/ledger.json --experience
-```
-
-The incremental graph delta, fixed Top/Bottom anchors, and the deterministic
-per-target evidence view are the normal input. The space render additionally
-shows the current effective status under the `search_space_state` overlay.
-Retrieve a full record only when one of those bounded views identifies a
-specific missing idea/change field. Do not read the full growing ledger, all
-candidate code, raw retrieval material, or logs by default.
-
-## Update rules
-
-1. Read persisted semantic receipts and current deltas; never infer edges from
-   prose.
-2. Use the `target-evidence` output — not the Top/Bottom window — as the only
-   source of `evidence_edge_ids`, per-edge score/status observations,
-   `evaluation_state`, and `comparator_coverage` for
-   `dimension_evidence`/`hypothesis_evidence` entries.
-3. Copy one target block's returned `evidence_edge_ids`, `evidence_run_ids`,
-   and `comparator_coverage` together. Never copy
-   `available_comparator_coverage` as if omitted edge ids had been cited. If a
-   necessary target was omitted by the global caps, rerun with repeated
-   `--target-id <exact-id>` before authoring its belief.
-   Each hypothesis block also returns `carrier_contexts`: the independent
-   negative and positive carrier contexts, as parent run id lists, that the
-   recommendation gate keys on. They are computed over exactly that block's
-   `evidence_edge_ids`, and `complete` reports whether those edges reach every
-   carrier edge this target has. Treat the lists as authoritative only when
-   `complete` is true. A context counts only when every carrier delta in it
-   agrees in sign, so a truncated subset can turn a mixed context unanimous and
-   *add* contexts: citing fewer edges never lowers these lists, it can only
-   inflate them. Do not recompute or adjust them from the per-edge
-   observations — deciding whether a child *adds* the hypothesis and whether a
-   matched semantic control supersedes a raw delta is not derivable from the
-   bounded edge rows.
-4. Preserve the prior belief payload byte-for-byte when the new DAG delta does
-   not change a supported belief. A processed delta may therefore be a belief
-   no-op: update `updated_at_run`, keep `generation` unchanged, and do not invent
-   a new summary sentence. Increment `generation` only when at least one
-   display or target belief actually changes. Add or revise only claims supported by concrete
-   run ids or DAG edges in the current bounded evidence. Separate observation
-   from interpretation — say “runs 004 and 007 at this point scored …” before
-   inferring a lever. Treat same-point comparisons as implementation evidence.
-   A one-dimension point diff is a direct comparator only when
-   `target-evidence` finds a validated same-child-code control/treatment pair
-   differing only in its declared semantic switch, with a pinned parent
-   snapshot and no shared-key reset. The ordinary inherited config-0 control
-   fixes tuning quality but does not isolate the semantic code delta; its
-   schema-2 receipt says `semantic_control.status: unverified`, so it remains
-   confounded. The current production
-   `direct_comparator_capability.status` is `unavailable`, so no run-produced
-   edge may enter the direct branch yet. Legacy final-vs-final, reset-bearing,
-   unpaired, and independently tuned comparisons remain confounded.
-   Empty `summary` is a valid abstention. Never call a target `promising` or
-   `unpromising` unless its mechanical state is `comparator_covered` and it
-   clears the depth bar: at least two direct **tuned** edges, or at least three
-   direct edges at `tuned_lightly` or deeper (a `tuned_lightly` child has 1 to
-   `tuner.tuned_threshold`−1 Phase-C attempts — real but shallow tuning
-   evidence; screening-only children measure one parameter point and stay
-   weaker evidence). All weaker/confounded evidence is `mixed` or `unknown`.
-5. Keep crash-only targets `failed`/`unknown`/`active`: scores are
-   lower-is-better, a crash is worst and never a missing success, and a crash
-   alone cannot contradict a semantic hypothesis.
-6. Validate and store the snapshot as schema 4.
-7. Invoke `python tools/ledger.py apply-space-state` once after a successful
-   store.
-8. Never edit `background.md`, records, semantic points, edge or policy
-   receipts, scores, or `search_space_state` decisions directly.
-
-## Output shape
-
-Write a complete replacement JSON object to a temporary run-local path. Emit
-exactly this shape; do not add undeclared evidence or status collections:
+Call `mcp__receipts__submit_receipt` with:
 
 ```json
-{
-  "schema_version": 4,
-  "updated_at_run": "<latest processed run id>",
-  "generation": 0,
-  "summary": "<display-only bounded interpretation, or empty string>",
-  "promising_regions": [
-    {
-      "claim": "<what appears promising without causal overclaim>",
-      "evidence": ["004", "007"],
-      "confidence": "low | med | high",
-      "uncertainty": "<missing comparator or confounder>"
-    }
-  ],
-  "lessons": [
-    {
-      "kind": "lever | deadend | feasibility",
-      "claim": "<bounded implementation/search lesson>",
-      "evidence": ["004", "007"],
-      "confidence": "low | med | high",
-      "reopen_when": "<required for deadend; optional otherwise>"
-    }
-  ],
-  "bottlenecks": [
-    {
-      "claim": "<observed high-level bottleneck only>",
-      "evidence": ["006"],
-      "confidence": "low | med | high"
-    }
-  ],
-  "dimension_evidence": [
-    {
-      "target_id": "dim-...",
-      "evaluation_state": "unevaluated | failed | observed | comparator_covered",
-      "assessment": "unknown | promising | mixed | unpromising",
-      "recommended_status": "active | deprioritized | pruned",
-      "claim": "<bounded belief about this target>",
-      "evidence_run_ids": ["002", "004", "006"],
-      "evidence_edge_ids": ["sedge-000-002", "sedge-004-006"],
-      "comparator_coverage": {
-        "direct_tuned_edges": 2,
-        "direct_lightly_tuned_edges": 0,
-        "direct_noncrash_edges": 0,
-        "confounded_noncrash_edges": 0,
-        "crash_edges": 0
-      },
-      "confidence": "low | med | high",
-      "uncertainty": "<missing comparator or confounder>",
-      "reopen_when": "<required when recommended_status is not active>"
-    }
-  ],
-  "hypothesis_evidence": []
-}
+{"updates": [
+  {"op": "upsert", "collection": "lessons", "value": {
+    "target_ids": ["hyp-example"], "kind": "feasibility",
+    "claim": "Explain the observed implementation limitation and next action.",
+    "evidence": ["004"], "confidence": "low"
+  }},
+  {"op": "delete", "id": "experience-7"}
+]}
 ```
 
-Keep at most 8 `promising_regions`, 12 `lessons`, and 6 `bottlenecks`; keep at
-most 5 representative run ids per item. Keep at most 16 `dimension_evidence`
-and 32 `hypothesis_evidence` entries, each target at most once, with 0–5 cited
-`evidence_run_ids` (terminal runs) and 0–5 cited `evidence_edge_ids` (persisted
-receipts) copied from the target-evidence block. Deduplicate semantically. If
-evidence is sparse, emit fewer entries and explicit uncertainty rather than
-filling the limits.
+An upsert with `id` replaces that existing entry; omit `id` to create an entry.
+Do not send unchanged entries. `value` must contain `target_ids` (registered
+dimension/hypothesis IDs, or [] for a run-specific lesson) plus these fields:
+
+- `lessons`: kind (`lever|deadend|feasibility`), claim, evidence (run IDs),
+  confidence (`low|med|high`), reopen_when (required for deadend).
+- `bottlenecks`: claim, evidence, confidence.
+- `promising_regions`: claim, evidence, confidence, uncertainty.
+- `dimension_evidence` / `hypothesis_evidence`: target_id, evidence_run_ids,
+  evidence_edge_ids, assessment (`unknown|promising|mixed|unpromising`),
+  recommended_status (`active|deprioritized|pruned`), claim, confidence,
+  uncertainty, and reopen_when for non-active recommendations.
+
+Never emit evaluation_state, comparator_coverage, generation, revision, summary,
+or helper metadata. There is no whole-snapshot output. The driver validates,
+merges and publishes the patch and eligible state transitions atomically;
+you do not write files, execute ledger commands, or confirm publication.
+
+The existing compact view holds at most 8 promising_regions, 12 lessons,
+6 bottlenecks, 16 dimension entries and 32 hypothesis entries, with at most
+5 cited runs/edges per entry. Consolidate or delete superseded entries when
+necessary. One target appears at most once per target collection.
 
 Recommendation gates are exact. Unless noted, they are identical for both
 target levels:
@@ -234,50 +122,3 @@ evidence. A
 dimension can contract only when every selectable adjacent non-baseline
 hypothesis is already equivalently contracted or independently passes the same
 gate in that generation.
-
-`generation` increments only when the belief payload changes; a pure cursor
-advance keeps it unchanged. `updated_at_run` is the latest scored/crash
-terminal run actually processed; an evidence-neutral `unevaluated` budget
-tombstone advances only the helper DAG cursor. The helper owns `dag_revision`
-and adds it only after a
-validated snapshot is stored. `set-experience` rejects pending/no-delta calls,
-so do not invoke it outside the driver's deterministic refresh boundary.
-
-## Validate and store
-
-```bash
-python tools/background_contract.py validate-experience \
-  --background <run_dir>/background.md --ledger <run_dir>/ledger.json \
-  --experience <temporary-experience.json>
-python tools/ledger.py set-experience \
-  --ledger <run_dir>/ledger.json --background <run_dir>/background.md \
-  --from-json <temporary-experience.json>
-python tools/ledger.py apply-space-state \
-  --ledger <run_dir>/ledger.json --background <run_dir>/background.md
-```
-
-Fix validation errors rather than bypassing them. Run `apply-space-state`
-exactly once, only after a successful store; it prints the prior and current
-`search_space_state` revisions plus the appended `decision_ids`, and an empty
-decision set is a valid no-op. Do not paste the snapshot into the
-driver's context; report only via the receipt below.
-
----
-
-## Output contract (driver-mediated)
-
-You are running as one invocation of the `experience-extractor` role, spawned by the
-deterministic Python driver. You do not spawn anything; the driver sequences
-all roles. When — and only when — every piece of on-disk work above is
-complete, call the tool `mcp__receipts__submit_receipt` exactly once with a
-`receipt` object with these fields:
-
-- `search_space_state_revision` — int — the current revision printed by
-  `apply-space-state`.
-- `decision_ids` — list — the appended decision ids; an empty list is the
-  valid no-op.
-
-If your receipt is rejected, the tool returns the validation problems; fix
-them and call again. If the driver finds your postconditions unmet after you
-return, it will send you a corrective message listing exactly what failed —
-fix it with your tools and submit again.

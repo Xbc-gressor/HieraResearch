@@ -642,7 +642,7 @@ def initialize_run(
             raise ValueError(f"{target}: tuner must be an object")
         current = section.get("K")
         # Frozen per run for the same reason as K_eval: K fixes how many warm
-        # configs the extractor proposes per candidate, so K - K_eval is the
+        # configs the writer proposes per candidate, so K - K_eval is the
         # deferred-config count every promoted candidate's FIRST bout inherits.
         # Changing it mid-run would make earlier and later candidates'
         # screening and first-bout composition incomparable.
@@ -800,7 +800,7 @@ def main() -> int:
         type=int,
         metavar="COUNT",
         help=(
-            "how many warm configs the tunable-contract-extractor proposes "
+            "how many warm configs candidate-writer proposes "
             "per candidate (minimum 2; template default 5). K - K_eval of "
             "them are DEFERRED to the promoted candidate's first tuning "
             "bout. Frozen once run artifacts exist"

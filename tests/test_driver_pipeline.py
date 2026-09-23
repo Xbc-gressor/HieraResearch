@@ -18,7 +18,7 @@ from driver.events import EventsLog  # noqa: E402
 from driver.loops import rounds  # noqa: E402
 from driver.loops.experiment import run_experiment  # noqa: E402
 from driver.receipts import ReceiptStore  # noqa: E402
-from driver.roles import ROLES, InvocationContext, record_is_terminal  # noqa: E402
+from driver.roles import ROLES, InvocationContext  # noqa: E402
 from driver.session import FakeSessionRunner, SDKSessionRunner  # noqa: E402
 from tests.test_driver_experiment import (  # noqa: E402
     ExperimentCmd,
@@ -69,7 +69,6 @@ class RoleRunner:
 
 
 WRITER_SECONDS = 0.6
-EXTRACTOR_TURN_SECONDS = 0.1
 JOB_SECONDS = 0.2
 
 
@@ -91,22 +90,12 @@ def _seat_handlers(cmd: PipelineCmd, seat_ids: list[str]) -> dict:
         return {"status": "written", "wrote": True,
                 "candidate_dir": str(ctx.run_dir / "candidates" / ctx.run_id)}
 
-    def extractor(ctx):
-        time.sleep(EXTRACTOR_TURN_SECONDS)
-        if "driver_job_result" not in ctx.extra:
-            return {"run_id": ctx.run_id, "status": "driver_job",
-                    "ledger_updated": False,
-                    "driver_job": {"kind": "warmstart", "run_id": ctx.run_id,
-                                   "k_eval": 3}}
-        cmd(["python", "tools/ledger.py", "record-run", "--run-id", ctx.run_id,
-             "--status", "keep"], cmd.repo)
-        return {"run_id": ctx.run_id, "status": "keep", "ledger_updated": True}
 
     def tuner(ctx):
         return {"tuned_run_id": "none", "tuned": False, "ledger_updated": False}
 
     return {"background-researcher": background, "idea-generator": ideas,
-            "candidate-writer": writer, "tunable-contract-extractor": extractor,
+            "candidate-writer": writer,
             "tuner-orchestrator": tuner}
 
 
@@ -124,6 +113,9 @@ class GpuChannel:
             self.jobs.append(request["run_id"])
             time.sleep(JOB_SECONDS)
             self.busy_seconds += JOB_SECONDS
+        candidate = ctx.run_dir / "candidates" / ctx.run_id
+        (candidate / "tune_report.json").write_text(
+            '{"phase_a": {"status": "ok", "best_warm_score": 0.1}}')
         return {"kind": request["kind"], "run_id": request["run_id"],
                 "returncode": 0}
 
@@ -156,14 +148,14 @@ class SessionChannelTests(unittest.TestCase):
         statuses = {r["run_id"]: r["status"] for r in cmd._ledger()["records"]}
         self.assertEqual(statuses, {"000": "keep", "001": "keep"})
         self.assertEqual(sorted(gpu.jobs), ["000", "001"])
-        serial = 2 * (WRITER_SECONDS + 2 * EXTRACTOR_TURN_SECONDS + JOB_SECONDS)
+        serial = 2 * (WRITER_SECONDS + JOB_SECONDS)
         self.assertLess(wall, serial * 0.8,
                         f"wall {wall:.2f}s should be well below the serial "
                         f"sum {serial:.2f}s")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles[:2], ["background-researcher", "idea-generator"])
         self.assertEqual(roles.count("candidate-writer"), 2)
-        self.assertEqual(roles.count("tunable-contract-extractor"), 4)
+        self.assertEqual(len(gpu.jobs), 2)
         events = [json.loads(line)["kind"] for line in
                   (cmd.run_dir / "driver_events.jsonl").read_text().splitlines()]
         self.assertEqual(events.count("seat_started"), 2)
@@ -177,10 +169,8 @@ class SessionChannelTests(unittest.TestCase):
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(
-            roles[2:8],
-            ["candidate-writer", "tunable-contract-extractor",
-             "tunable-contract-extractor", "candidate-writer",
-             "tunable-contract-extractor", "tunable-contract-extractor"])
+            roles[2:4],
+            ["candidate-writer", "candidate-writer"])
         self.assertEqual(gpu.jobs, ["000", "001"])
 
 
@@ -195,9 +185,8 @@ class UnevaluatedReceiptTests(unittest.TestCase):
 
     def test_driver_settles_a_zero_attempt_candidate_at_the_stop(self) -> None:
         cmd = ExperimentCmd(self.repo)
-        # round start F, seat check F, then the budget is reached for the
-        # seat check F, then the budget is reached for every later check
-        cmd.reached = [False, True, True]
+        # The cutoff remains reached through settlement and loop completion.
+        cmd.reached = [False] + [True] * 8
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
@@ -209,13 +198,10 @@ class UnevaluatedReceiptTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            # the extractor never got an objective slot: it says so instead
-            # of hand-editing the ledger, and the driver resolves the record
-            {"receipt": {"run_id": "000", "status": "unevaluated",
-                         "ledger_updated": False}},
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd,
+                       job_runner=lambda *a, **k: {"returncode": 4},
                        semantic_policy="coverage_attempt",
                        scheduler_policy="v3_2")
         record = cmd._ledger()["records"][0]
@@ -223,30 +209,12 @@ class UnevaluatedReceiptTests(unittest.TestCase):
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         self.assertTrue(any("resolve-unevaluated" in call for call in cmd.calls))
 
-    def test_postcondition_accepts_the_unevaluated_receipt(self) -> None:
-        run_dir = self.repo / "runs" / "fake-task" / "t1"
-        run_dir.mkdir(parents=True)
-        (run_dir / "ledger.json").write_text(json.dumps(
-            {"records": [{"run_id": "000", "status": "pending"}]}))
-        ctx = InvocationContext(task="fake-task", tag="t1", run_dir=run_dir,
-                                invocation_id=4, run_id="000")
-        self.assertIsNotNone(record_is_terminal(ctx))
-        ReceiptStore(run_dir).persist_receipt(
-            "tunable-contract-extractor", 4,
-            {"run_id": "000", "status": "unevaluated", "ledger_updated": False})
-        self.assertIsNone(record_is_terminal(ctx))
-        # a receipt that claims a terminal write the ledger does not show
-        ReceiptStore(run_dir).persist_receipt(
-            "tunable-contract-extractor", 4,
-            {"run_id": "000", "status": "keep", "ledger_updated": True},
-            allow_replace=True)
-        self.assertIsNotNone(record_is_terminal(ctx))
 
 
 class LedgerWriteProtectionTests(unittest.TestCase):
     def _hook(self):
         runner = SDKSessionRunner(model="m", events=EventsLog(Path(tempfile.mkdtemp())))
-        return runner._capability_hook(ROLES["tunable-contract-extractor"])
+        return runner._capability_hook(ROLES["tuner-orchestrator"])
 
     def _verdict(self, hook, name, tool_input):
         return asyncio.run(hook({"tool_name": name, "tool_input": tool_input},
@@ -308,7 +276,7 @@ class JobReconcileTests(unittest.TestCase):
             jobs_dir.mkdir()
             live = sp.Popen(["sleep", "30"])
             try:
-                (jobs_dir / "tunable-contract-extractor-0001.json").write_text(
+                (jobs_dir / "driver-0001.json").write_text(
                     json.dumps({"status": "running", "pid": live.pid,
                                 "run_id": "007"}))
                 _reconcile_running_jobs(jobs_dir, "008")  # other candidate: queue

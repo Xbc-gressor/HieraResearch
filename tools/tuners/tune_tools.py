@@ -101,7 +101,7 @@ def _read_search_space(train_path: Path) -> dict:
 
 
 def _read_param_schema(train_path: Path) -> dict:
-    """PARAM_SCHEMA dict via AST literal_eval — the schema the extractor writes
+    """PARAM_SCHEMA dict via AST literal_eval — the schema the candidate author writes
     before SEARCH_SPACE exists. Each value is a kind declaration:
       "int" | "float" | ("float", "log") | ("categorical", [opt, ...])."""
     try:
@@ -858,7 +858,7 @@ def lint_contract(train_path: Path, *, require_base_params: bool = True) -> dict
     }
 
 
-def lint_schema(train_path: Path) -> dict:
+def lint_schema(train_path: Path, *, allow_materialized: bool = False) -> dict:
     """Schema-mode contract lint (step 0, before SEARCH_SPACE/BASE_PARAMS exist):
     PARAM_SCHEMA is a valid kind/options declaration and make_model is a function.
     Returns {ok, keys, kinds, make_model_defined, make_model_called, errors[]}."""
@@ -878,7 +878,7 @@ def lint_schema(train_path: Path) -> dict:
     ]
 
     for stray in ("SEARCH_SPACE", "BASE_PARAMS"):
-        if stray in syms:
+        if stray in syms and not allow_materialized:
             errors.append({
                 "code": "stray_symbol",
                 "detail": f"{stray} must be absent during schema extraction",
@@ -4554,7 +4554,7 @@ def cmd_render_failure(args) -> int:
 
 
 def cmd_lint_schema(args) -> int:
-    result = lint_schema(args.candidate_path)
+    result = lint_schema(args.candidate_path, allow_materialized=args.allow_materialized)
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
 
@@ -4784,6 +4784,8 @@ def build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("lint-schema",
                         help="Schema-mode lint: make_model + PARAM_SCHEMA (step 0, before SEARCH_SPACE exists).")
     ls.add_argument("--candidate-path", required=True, type=Path)
+    ls.add_argument("--allow-materialized", action="store_true",
+                    help="Accept existing SEARCH_SPACE/BASE_PARAMS during candidate preparation")
     ls.set_defaults(func=cmd_lint_schema)
 
     sm = sub.add_parser("select-method", help="Pick the Phase C method from a candidate's SEARCH_SPACE.")

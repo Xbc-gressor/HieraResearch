@@ -172,6 +172,7 @@ def _write_run(
                     {
                         "kind": "feasibility",
                         "claim": "Mirror bounds never crashed.",
+                        "target_ids": ["dim-bounds"],
                         "evidence": ["000"],
                         "confidence": "high",
                     }
@@ -179,6 +180,7 @@ def _write_run(
                 "bottlenecks": [
                     {
                         "claim": "Rosenbrock plateaus without covariance.",
+                        "target_ids": ["dim-step"],
                         "evidence": ["001"],
                         "confidence": "low",
                     }
@@ -572,3 +574,23 @@ def test_trace_window_prefers_this_run_over_source_history(tmp_path) -> None:
     assert "eval-000001 (_traces/)" in traces
     assert "eval-000045 (_traces_src/)" in traces
     assert "eval-000041" not in traces  # source history fills the remainder
+
+
+def test_live_lessons_follow_ancestry_without_seed_and_import_ids_stay_separate(tmp_path):
+    run = tmp_path / 'run'
+    run.mkdir()
+    live = {'records': [{'run_id': '001', 'source_run_ids': ['000']},
+                        {'run_id': '000', 'source_run_ids': []}],
+            'experience': {'lessons': [
+                {'id': 'experience-1', 'claim': 'retain parent guard', 'evidence': ['000'], 'basis_dag_revision': 2},
+                {'id': 'experience-2', 'claim': 'unrelated local lesson', 'evidence': ['099']}]}}
+    (run / 'ledger.json').write_text(json.dumps(live))
+    text = '\n'.join(rewrite_context._experience_lines(run, set(), set(), '001'))
+    assert 'retain parent guard' in text and 'unrelated local lesson' not in text
+    (run / 'experience.seed.json').write_text(json.dumps({'lessons': [
+        {'claim': 'same numeric id from source', 'evidence': ['000']},
+        {'claim': 'imported target lesson', 'target_ids': ['hyp-step-csa']}]}))
+    text = '\n'.join(rewrite_context._experience_lines(run, set(), {'hyp-step-csa'}, '001'))
+    assert 'same numeric id from source' not in text
+    assert 'imported target lesson' in text and 'Imported historical reference' in text
+    assert 'retain parent guard' in text

@@ -108,6 +108,25 @@ def make_model(params):
             {"SEARCH_SPACE", "BASE_PARAMS"},
         )
 
+    def test_preparation_accepts_installed_contract_and_changed_schema(self):
+        tmp, path = self._candidate(
+            'PARAM_SCHEMA = {"x": "int", "y": "int"}\n'
+            'SEARCH_SPACE = {"x": ("int", 1, 3)}\n'
+            'BASE_PARAMS = {"x": 1}\n'
+            'def make_model(params):\n    return params\n'
+        )
+        self.addCleanup(tmp.cleanup)
+        self.assertTrue(lint_schema(path, allow_materialized=True)["ok"])
+        apply_search_space.apply(path, {"x": ["int", 1, 3], "y": ["int", 1, 2]},
+                                 replace_schema=True)
+        self.assertEqual(set(_read_search_space(path)), {"x", "y"})
+        path.write_text(path.read_text().replace('"x": "int", "y": "int"', '"y": "int"'))
+        apply_search_space.apply(path, {"y": ["int", 1, 2]}, replace_schema=True)
+        self.assertEqual(set(_read_search_space(path)), {"y"})
+        # Preparation must not silently mask duplicate runtime definitions.
+        path.write_text(path.read_text() + 'PARAM_SCHEMA = {"x": "int"}\n')
+        self.assertFalse(lint_schema(path, allow_materialized=True)["ok"])
+
     def test_contract_rejects_schema_mode_and_invalid_log_bounds(self) -> None:
         tmp, path = self._candidate(
             """

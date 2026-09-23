@@ -339,32 +339,29 @@ class Run:
         beliefs: list[dict] | None = None,
         dimension_beliefs: list[dict] | None = None,
     ) -> None:
-        self.experience.write_text(
-            json.dumps(
-                {
-                    "schema_version": EXPERIENCE_SCHEMA_VERSION,
-                    "updated_at_run": updated_at_run,
-                    "generation": generation,
-                    "summary": (
-                        "Comparator evidence against the filtered hypothesis."
-                        if beliefs or dimension_beliefs
-                        else ""
-                    ),
-                    "promising_regions": [],
-                    "lessons": [],
-                    "bottlenecks": [],
-                    "dimension_evidence": dimension_beliefs or [],
-                    "hypothesis_evidence": beliefs or [],
-                }
-            )
-        )
-        self._cli(
-            "ledger.py", "set-experience",
-            "--ledger", str(self.ledger),
-            "--task", "hard-interactions",
-            "--background", str(self.background),
-            "--from-json", str(self.experience),
-        )
+        stored = self._stored()
+        prior = stored.get("experience") or {}
+        updates = []
+        for field, items in (("dimension_evidence", dimension_beliefs or []),
+                             ("hypothesis_evidence", beliefs or [])):
+            old = {i["target_id"]: i for i in prior.get(field, [])}
+            for item in items:
+                value = {k: v for k, v in item.items()
+                         if k not in {"evaluation_state", "comparator_coverage"}}
+                value["target_ids"] = [item["target_id"]]
+                update = {"op": "upsert", "collection": field, "value": value}
+                if item["target_id"] in old:
+                    update["id"] = old.pop(item["target_id"])["id"]
+                updates.append(update)
+            updates.extend({"op": "delete", "id": item["id"]} for item in old.values())
+        self.experience.write_text(json.dumps({"updates": updates}))
+        context = self.experience.with_name("experience-context.json")
+        self._cli("ledger.py", "experience-context", "--ledger", str(self.ledger),
+                  "--background", str(self.background), "--output", str(context))
+        return json.loads(self._cli(
+            "ledger.py", "set-experience", "--ledger", str(self.ledger),
+            "--task", "hard-interactions", "--background", str(self.background),
+            "--context", str(context), "--from-json", str(self.experience)).stdout)
 
     def apply_space_state(self) -> dict:
         """Apply pruning decisions; this must never advance the DAG cursor."""
@@ -456,11 +453,8 @@ def check_round_lifecycle(registry: dict) -> None:
 
         # Stage one: comparator-covered contradiction deprioritizes the target.
         edges = ["sedge-000-001", "sedge-000-002"]
-        run.set_experience(1, "002", [_belief(["000", "001", "002"], edges)])
-        assert run.apply_space_state() == {
-            "ok": True, "prior_revision": 0, "revision": 1,
-            "decision_ids": ["sdec-000001"],
-        }
+        published = run.set_experience(1, "002", [_belief(["000", "001", "002"], edges)])
+        assert published["decision_ids"] == ["sdec-000001"]
 
         # A deprioritized target still gets its reserved budget lane, and that
         # new direct comparison is the fresh evidence stage two requires.
@@ -470,11 +464,8 @@ def check_round_lifecycle(registry: dict) -> None:
         )
         run.record_run("003", 0.61)
         edges.append("sedge-000-003")
-        run.set_experience(2, "003", [_belief(["000", "001", "002", "003"], edges)])
-        assert run.apply_space_state() == {
-            "ok": True, "prior_revision": 1, "revision": 2,
-            "decision_ids": ["sdec-000002"],
-        }
+        published = run.set_experience(2, "003", [_belief(["000", "001", "002", "003"], edges)])
+        assert published["decision_ids"] == ["sdec-000002"]
 
         stored = json.loads(run.ledger.read_text())
         assert validate_registry(registry, ledger=stored) == []
@@ -507,7 +498,7 @@ def check_round_lifecycle(registry: dict) -> None:
         # earlier signal and reopens it; inner re-tuning never would.
         run.add_record("004", "improve", ["003"], baseline, state_revision=2)
         run.record_run("004", 0.70)
-        run.set_experience(
+        published = run.set_experience(
             3,
             "004",
             [
@@ -522,10 +513,8 @@ def check_round_lifecycle(registry: dict) -> None:
                 )
             ],
         )
-        assert run.apply_space_state() == {
-            "ok": True, "prior_revision": 2, "revision": 3,
-            "decision_ids": ["sdec-000003"],
-        }
+        assert published["decision_ids"] == ["sdec-000003"]
+        assert run.apply_space_state()["decision_ids"] == []
         assert any(selects_target(item) for item in run.propose()["proposals"])
 
         final = json.loads(run.ledger.read_text())

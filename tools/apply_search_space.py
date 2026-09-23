@@ -2,18 +2,17 @@
 """Deterministically rewrite a candidate's SEARCH_SPACE with a finalized space.
 
 The data-driven sibling of `apply_base_params.py`: where that writes BASE_PARAMS,
-this writes SEARCH_SPACE. Used after the inducer proposes a space and
+this writes SEARCH_SPACE. Used after the candidate author proposes a space and
 `tune_tools.py check-search-space` validates it — the finalized space
 lands here, never by a fuzzy string edit. AST-locates the module-level
 `SEARCH_SPACE = {...}` assignment and replaces ONLY its value node, so
 BASE_PARAMS / make_model / imports cannot be clobbered.
 
 Guards (hard-reject with nonzero exit, never a partial write):
-- SEARCH_SPACE must exist as a module-level assignment whose value is a *pure
-  literal dict* (anything computed is rejected — splicing would drop it).
-- The new space's keys must exactly match the existing SEARCH_SPACE keys. The
-  key set is the schema (which params are tunable, fixed by the extractor);
-  ranges/options may change, the key set may not.
+- Existing SEARCH_SPACE must be a module-level pure literal dict; otherwise
+  insert one after PARAM_SCHEMA.
+- New keys and types must match PARAM_SCHEMA. Existing SEARCH_SPACE keys must
+  also match unless --replace-schema installs an author-updated schema.
 - Each entry must be a valid `(kind, ...)` tuple (float/int/categorical).
 - The rewritten file must still parse (re-checked before writing).
 
@@ -59,7 +58,7 @@ def _as_entry(value):
 
 
 def _format_space(space: dict, key_order: list[str]) -> str:
-    ordered = list(key_order) + [k for k in space if k not in key_order]
+    ordered = [k for k in key_order if k in space] + [k for k in space if k not in key_order]
     lines = ["{"]
     for key in ordered:
         lines.append(f"    {key!r}: {_as_entry(space[key])!r},")
@@ -114,7 +113,7 @@ def _insertion_anchor(tree: ast.Module):
     return last_assign
 
 
-def apply(candidate_path: Path, space: dict) -> dict:
+def apply(candidate_path: Path, space: dict, *, replace_schema: bool = False) -> dict:
     if not isinstance(space, dict):
         raise SystemExit("SEARCH_SPACE input must be an object")
     bad = [
@@ -158,7 +157,7 @@ def apply(candidate_path: Path, space: dict) -> dict:
                 "SEARCH_SPACE is not a pure literal dict (an entry is a computed "
                 "expression); refusing to splice"
             )
-        if set(current) != set(space):
+        if set(current) != set(space) and not replace_schema:
             raise SystemExit(
                 f"key mismatch: SEARCH_SPACE has {sorted(current)}, new has {sorted(space)} "
                 "(the key set is the schema and may not change)"
@@ -201,9 +200,11 @@ def main() -> int:
     parser.add_argument("--candidate-path", required=True, type=Path)
     parser.add_argument("--space-json", required=True, type=Path,
                         help="JSON file with the finalized SEARCH_SPACE to write")
+    parser.add_argument("--replace-schema", action="store_true",
+                        help="Prepare a changed child schema; PARAM_SCHEMA remains authoritative")
     args = parser.parse_args()
     space = json.loads(args.space_json.read_text())
-    print(json.dumps(apply(args.candidate_path, space)))
+    print(json.dumps(apply(args.candidate_path, space, replace_schema=args.replace_schema)))
     return 0
 
 

@@ -75,21 +75,8 @@ def _derive_state(ledger: dict | None, framework_cfg: dict,
             record.get("status") in LIFECYCLE_TERMINAL_STATUSES
             for record in records
         )
-        dag_revision = ledger.get("dag_revision", 0)
-        experience = (
-            ledger.get("experience")
-            if isinstance(ledger.get("experience"), dict) else {}
-        )
-        experience_cursor = experience.get("dag_revision", 0)
-        stale_experience = (
-            _is_int(dag_revision)
-            and _is_int(experience_cursor)
-            and dag_revision > experience_cursor
-        )
         if not lifecycle_terminal:
             return "running", "budget_reached_pending_resolution"
-        if stale_experience:
-            return "running", "final_experience_refresh_required"
         return "completed", (
             "evaluation_budget_reached" if evaluations_reached
             else "time_budget_reached"

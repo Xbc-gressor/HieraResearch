@@ -1159,11 +1159,11 @@ class LedgerIntegrationTests(unittest.TestCase):
 
             stale = brief()
             self.assertEqual(stale["experience_dag_delta"], 1)
-            self.assertTrue(stale["semantic_admission_blocked"])
+            self.assertFalse(stale["semantic_admission_blocked"])
             self.assertTrue(stale["experience_refresh_required"])
 
             ledger["records"][0]["status"] = "pending"
-            self.assertTrue(brief()["semantic_admission_blocked"])
+            self.assertFalse(brief()["semantic_admission_blocked"])
             self.assertFalse(brief()["experience_refresh_required"])
 
             ledger["records"][0]["status"] = "keep"
@@ -1186,6 +1186,7 @@ class LedgerIntegrationTests(unittest.TestCase):
         entry["dag_revision"] = 1
         prior = empty_experience("000", generation=0)
         prior["dag_revision"] = 0
+        prior["schema_version"] = 5
         ledger = {
             "task": "hard-interactions",
             "tag": "noop-refresh",
@@ -1204,31 +1205,31 @@ class LedgerIntegrationTests(unittest.TestCase):
             replacement_path = tmp_path / "experience.json"
             background_path.write_text(background_text(registry))
             ledger_path.write_text(json.dumps(ledger))
-            replacement = empty_experience("000", generation=0)
-            replacement_path.write_text(json.dumps(replacement))
+            replacement_path.write_text(json.dumps({"updates": []}))
             args = types.SimpleNamespace(
                 ledger=str(ledger_path),
                 task="hard-interactions",
                 background=str(background_path),
                 catalog=None,
                 from_json=replacement_path,
+                context=ledger_path.with_name("context.json"),
             )
 
+            from experience_updates import binding
+            args.context.write_text(json.dumps({"snapshot": binding(json.loads(ledger_path.read_text()))}))
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(cmd_set_experience(args), 0)
             result = json.loads(output.getvalue())
             stored = json.loads(ledger_path.read_text())
 
-            self.assertFalse(result["belief_changed"])
+            self.assertEqual(result["decision_ids"], [])
             self.assertEqual(stored["experience"]["generation"], 0)
             self.assertEqual(stored["experience"]["dag_revision"], 1)
 
             before = ledger_path.read_bytes()
-            with self.assertRaisesRegex(
-                SystemExit, "no unprocessed terminal DAG delta"
-            ):
-                cmd_set_experience(args)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_experience(args), 2)
             self.assertEqual(ledger_path.read_bytes(), before)
 
     def test_pending_record_rejects_experience_refresh_without_mutation(self) -> None:
@@ -1252,7 +1253,7 @@ class LedgerIntegrationTests(unittest.TestCase):
             replacement_path = tmp_path / "experience.json"
             background_path.write_text(background_text(registry))
             ledger_path.write_text(json.dumps(ledger))
-            replacement_path.write_text(json.dumps(empty_experience("000")))
+            replacement_path.write_text(json.dumps({"updates": []}))
             before = ledger_path.read_bytes()
             args = types.SimpleNamespace(
                 ledger=str(ledger_path),
@@ -1260,13 +1261,16 @@ class LedgerIntegrationTests(unittest.TestCase):
                 background=str(background_path),
                 catalog=None,
                 from_json=replacement_path,
+                context=ledger_path.with_name("context.json"),
             )
 
-            with self.assertRaisesRegex(SystemExit, "record is still pending"):
-                cmd_set_experience(args)
+            from experience_updates import binding
+            args.context.write_text(json.dumps({"snapshot": binding(ledger)}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_set_experience(args), 2)
             self.assertEqual(ledger_path.read_bytes(), before)
 
-    def test_final_completion_requires_terminal_delta_refresh(self) -> None:
+    def test_final_completion_allows_terminal_delta(self) -> None:
         registry = fixture_registry()
         baseline = complete_point(registry)
         entry = record("000", "fresh", [], baseline, score=0.5, status="keep")
@@ -1297,14 +1301,6 @@ class LedgerIntegrationTests(unittest.TestCase):
                 budget=0,
             )
 
-            with self.assertRaisesRegex(
-                SystemExit, "terminal DAG delta remains unprocessed"
-            ):
-                cmd_set_phase(args)
-            self.assertEqual(ledger_path.read_bytes(), before)
-
-            ledger["experience"]["dag_revision"] = 1
-            ledger_path.write_text(json.dumps(ledger))
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cmd_set_phase(args), 0)
             stored = json.loads(ledger_path.read_text())
@@ -1354,7 +1350,7 @@ class LedgerIntegrationTests(unittest.TestCase):
                 budget=0,
             )
             with self.assertRaisesRegex(
-                SystemExit, "pending records must be resolved"
+                SystemExit, "record is still pending"
             ):
                 cmd_set_phase(args)
             self.assertEqual(ledger_path.read_bytes(), before)
@@ -1441,16 +1437,21 @@ class LedgerIntegrationTests(unittest.TestCase):
             stored = json.loads(ledger_path.read_text())
             self.assertEqual(stored["dag_revision"], 2)
 
-            replacement_path.write_text(
-                json.dumps(empty_experience("000", generation=0))
-            )
+            replacement_path.write_text(json.dumps({"updates": []}))
             refresh_args = types.SimpleNamespace(
                 ledger=str(ledger_path),
                 task="hard-interactions",
                 background=str(background_path),
                 catalog=None,
                 from_json=replacement_path,
+                context=ledger_path.with_name("context.json"),
             )
+            from experience_updates import binding
+            refresh_data = json.loads(ledger_path.read_text())
+            if refresh_data.get("experience"):
+                refresh_data["experience"]["schema_version"] = 5
+                ledger_path.write_text(json.dumps(refresh_data))
+            refresh_args.context.write_text(json.dumps({"snapshot": binding(refresh_data)}))
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cmd_set_experience(refresh_args), 0)
             refreshed = json.loads(ledger_path.read_text())
@@ -1583,16 +1584,21 @@ class LedgerIntegrationTests(unittest.TestCase):
             stored = json.loads(ledger_path.read_text())
             self.assertEqual(stored["dag_revision"], 2)
 
-            replacement_path.write_text(
-                json.dumps(empty_experience("000", generation=0))
-            )
+            replacement_path.write_text(json.dumps({"updates": []}))
             refresh_args = types.SimpleNamespace(
                 ledger=str(ledger_path),
                 task="hard-interactions",
                 background=str(background_path),
                 catalog=None,
                 from_json=replacement_path,
+                context=ledger_path.with_name("context.json"),
             )
+            from experience_updates import binding
+            refresh_data = json.loads(ledger_path.read_text())
+            if refresh_data.get("experience"):
+                refresh_data["experience"]["schema_version"] = 5
+                ledger_path.write_text(json.dumps(refresh_data))
+            refresh_args.context.write_text(json.dumps({"snapshot": binding(refresh_data)}))
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cmd_set_experience(refresh_args), 0)
 
@@ -1716,7 +1722,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             str(raised.exception),
         )
 
-    def test_add_record_rejects_unprocessed_terminal_delta_before_admission(
+    def test_stale_experience_still_validates_admission_receipt(
         self,
     ) -> None:
         baseline = complete_point(self.registry)
@@ -1758,8 +1764,8 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             ledger_path.write_text(json.dumps(ledger))
             background_path.write_text(background_text(self.registry))
             point_path.write_text(json.dumps(self.filtered))
-            # The cadence gate must fire before the deliberately invalid
-            # selection receipt can be considered.
+            # Stale experience permits admission checks, but an invalid
+            # selection receipt still fails.
             receipt_path.write_text("{}")
             before = ledger_path.read_bytes()
             args = types.SimpleNamespace(
@@ -1781,7 +1787,7 @@ class StateAwareSelectionLifecycleTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(
-                SystemExit, "terminal DAG evidence must be refreshed"
+                SystemExit, "stale policy receipt"
             ):
                 cmd_add_record(args)
             self.assertEqual(ledger_path.read_bytes(), before)

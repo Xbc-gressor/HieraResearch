@@ -152,15 +152,15 @@ def _experience_snapshot_receipt(experience: Any) -> dict[str, Any]:
     generation = experience.get("generation")
     updated_at_run = experience.get("updated_at_run")
     if (
-        experience.get("schema_version") not in {3, 4}
+        experience.get("schema_version") not in {3, 4, 5}
         or not isinstance(generation, int)
         or isinstance(generation, bool)
         or generation < 0
-        or not isinstance(updated_at_run, str)
-        or not updated_at_run.isdigit()
+        or not ((experience.get("schema_version") == 5 and generation == 0 and updated_at_run is None)
+                or (isinstance(updated_at_run, str) and updated_at_run.isdigit()))
     ):
         raise ContractError(
-            "ledger.experience must be a valid schema-3/4 snapshot with generation "
+            "ledger.experience must be a valid experience snapshot with generation "
             "and numeric updated_at_run before gain prediction"
         )
     return {
@@ -235,16 +235,13 @@ def build_gain_context(
         refresh = _experience_refresh_status(ledger)
     except ValueError as exc:
         raise ContractError(f"invalid experience refresh state: {exc}") from None
-    if refresh["semantic_admission_blocked"]:
-        raise ContractError(
-            "stale experience: process the terminal DAG delta before building "
-            "another semantic acquisition context"
-        )
     errors = validate_proposal_set(proposal_set)
     if errors:
         raise ContractError("invalid proposal set: " + "; ".join(errors))
     experience = ledger.get("experience")
     receipt = _experience_snapshot_receipt(experience)
+    from experience_updates import project_experience
+    experience = project_experience(ledger, actionable_only=True)
     gain_directions = mechanical_gain_directions(ledger, experience)
     conditioning_by_point = {
         proposal["point_id"]: acquisition_conditioning(
@@ -888,6 +885,9 @@ def _prediction_map(
             "revision": None,
         }
     has_experience_snapshot = expected_experience["revision"] is not None
+    if ledger is not None:
+        from experience_updates import project_experience
+        experience = project_experience({**ledger, "experience": experience}, actionable_only=True)
     gain_directions = mechanical_gain_directions(ledger or {}, experience)
     if schema_version == LEGACY_PREDICTION_SCHEMA_VERSION:
         if set(value) != {"schema_version", "proposal_set_revision", "predictions"}:
@@ -1664,11 +1664,6 @@ def cmd_select(args: argparse.Namespace) -> int:
         refresh = _experience_refresh_status(ledger)
     except ValueError as exc:
         raise ContractError(f"invalid experience refresh state: {exc}") from None
-    if refresh["semantic_admission_blocked"]:
-        raise ContractError(
-            "stale experience: process the terminal DAG delta before selecting "
-            "another semantic point"
-        )
     records = ledger.get("records", [])
     if not isinstance(records, list):
         raise ContractError("ledger.records must be a list")

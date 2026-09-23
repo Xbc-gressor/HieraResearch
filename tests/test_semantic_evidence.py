@@ -1500,3 +1500,147 @@ class TestSchema7TransferRequirement(unittest.TestCase):
             "policy_receipt": {"schema_version": 7},
         }
         self.assertEqual(validate_parameter_transfer_evidence(record), [])
+
+
+class IncrementalExperienceTests(unittest.TestCase):
+    def setUp(self):
+        self.registry = fixture_registry()
+        self.ledger = belief_ledger(self.registry)
+        self.ledger.pop('experience', None)
+        for i, record in enumerate(self.ledger['records'], 1):
+            record['dag_revision'] = i
+        self.ledger['dag_revision'] = len(self.ledger['records'])
+
+    def test_patch_preserves_other_entries_and_empty_only_advances_cursor(self):
+        from experience_updates import build_context, merge_patch
+        data = self.ledger
+        patch = {'updates': [{'op': 'upsert', 'collection': 'lessons', 'value': {
+            'kind': 'lever', 'claim': 'retain working implementation',
+            'evidence': ['000'], 'target_ids': [], 'confidence': 'low'}}]}
+        first = merge_patch(data, self.registry, build_context(data, self.registry), patch)
+        item = copy.deepcopy(first['experience']['lessons'][0])
+        first['dag_revision'] += 1
+        first['records'][-1]['dag_revision'] = first['dag_revision']
+        second = merge_patch(first, self.registry, build_context(first, self.registry), {'updates': []})
+        self.assertEqual(second['experience']['lessons'][0], item)
+        self.assertEqual(second['experience']['generation'], first['experience']['generation'])
+        self.assertEqual(second['experience']['dag_revision'], second['dag_revision'])
+        second['dag_revision'] += 1
+        second['records'][-1]['dag_revision'] = second['dag_revision']
+        context = build_context(second, self.registry)
+        third = merge_patch(second, self.registry, context,
+                            {'updates': [{'op': 'delete', 'id': item['id']}]})
+        self.assertEqual(third['experience']['lessons'], [])
+
+    def test_invalid_reference_or_binding_cannot_mutate_snapshot(self):
+        from experience_updates import build_context, merge_patch
+        original = copy.deepcopy(self.ledger)
+        context = build_context(self.ledger, self.registry)
+        patch = {'updates': [{'op': 'upsert', 'collection': 'lessons', 'value': {
+            'kind': 'lever', 'claim': 'bad reference', 'evidence': ['999'],
+            'target_ids': [], 'confidence': 'low'}}]}
+        with self.assertRaises(ValueError):
+            merge_patch(self.ledger, self.registry, context, patch)
+        self.assertEqual(self.ledger, original)
+        self.ledger['dag_revision'] += 1
+        with self.assertRaisesRegex(ValueError, 'snapshot'):
+            merge_patch(self.ledger, self.registry, context, {'updates': []})
+
+    def test_unrelated_old_record_does_not_expand_delta_context(self):
+        from experience_updates import build_context
+        self.ledger['experience'] = {'schema_version': 5, 'generation': 0,
+            'dag_revision': 3, 'updated_at_run': '002', 'summary': '',
+            **{k: [] for k in ('lessons','bottlenecks','promising_regions',
+                              'dimension_evidence','hypothesis_evidence')}}
+        self.ledger['dag_revision'] = 4
+        self.ledger['records'][-1]['dag_revision'] = 4
+        first = build_context(self.ledger, self.registry)
+        old = copy.deepcopy(self.ledger['records'][0])
+        old.update(run_id='099', dag_revision=1, semantic_point={}, semantic_edges=[],
+                   idea='irrelevant historical prose ' * 10000)
+        self.ledger['records'].insert(0, old)
+        self.assertEqual(build_context(self.ledger, self.registry), first)
+
+    def test_failed_attempt_is_not_a_freshness_gate_and_new_delta_retries(self):
+        from ledger_core import experience_refresh_status
+        self.ledger['experience_update'] = {
+            'attempted_dag_revision': self.ledger['dag_revision'],
+            'status': 'failed', 'error': 'no receipt'}
+        view = experience_refresh_status(self.ledger)
+        self.assertFalse(view['semantic_admission_blocked'])
+        self.assertFalse(view['experience_refresh_required'])
+        self.assertGreater(view['experience_dag_delta'], 0)
+        self.ledger['dag_revision'] += 1
+        self.ledger['records'][-1]['dag_revision'] = self.ledger['dag_revision']
+        self.assertTrue(experience_refresh_status(self.ledger)['experience_refresh_required'])
+
+    def test_provisional_slate_blocks_publication_before_pending_records(self):
+        import tempfile
+        from experience_updates import publication_boundary
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertTrue(publication_boundary(root, self.ledger))
+            gen = root / '.semantic/gen-0001'
+            gen.mkdir(parents=True)
+            (gen / 'pool.json').write_text('{}')
+            self.assertFalse(publication_boundary(root, self.ledger))
+
+    def test_old_judgment_cannot_advance_after_related_evidence_changes(self):
+        from experience_updates import build_context, merge_patch, project_experience
+        from search_space_state import append_experience_transitions
+        from tests.test_background_contract import _comparator_covered_entry
+        value = _comparator_covered_entry()
+        value.pop('evaluation_state')
+        value.pop('comparator_coverage')
+        value['target_ids'] = [value['target_id']]
+        patch = {'updates': [{'op': 'upsert', 'collection': 'hypothesis_evidence', 'value': value}]}
+        first = merge_patch(self.ledger, self.registry, build_context(self.ledger, self.registry), patch)
+        self.assertEqual(len(append_experience_transitions(self.registry, first)), 1)
+        overlay = copy.deepcopy(first['search_space_state'])
+        old_entry = copy.deepcopy(first['experience']['hypothesis_evidence'][0])
+        # A corrected result is new related evidence. Until reassessed, neither
+        # another lesson nor cursor-only progress may reinterpret the old claim.
+        first['dag_revision'] += 1
+        first['records'][-1]['dag_revision'] = first['dag_revision']
+        first['records'][-1]['status'] = 'crash'
+        first['records'][-1]['final_best_score'] = float('inf')
+        lesson = {'updates': [{'op': 'upsert', 'collection': 'lessons', 'value': {
+            'kind': 'feasibility', 'claim': 'investigate the new crash',
+            'evidence': ['003'], 'target_ids': [], 'confidence': 'low'}}]}
+        second = merge_patch(first, self.registry, build_context(first, self.registry), lesson)
+        self.assertEqual(append_experience_transitions(self.registry, second), [])
+        self.assertEqual(second['search_space_state'], overlay)
+        self.assertEqual(second['experience']['hypothesis_evidence'][0], old_entry)
+        self.assertEqual(project_experience(second, actionable_only=True)['hypothesis_evidence'], [])
+        self.assertLess(project_experience(second)['hypothesis_evidence'][0]
+                        ['comparator_coverage']['direct_tuned_edges'], 2)
+        # Re-submitting that recommendation against corrected evidence fails.
+        second['dag_revision'] += 1
+        patch['updates'][0]['id'] = old_entry['id']
+        with self.assertRaises(ValueError):
+            merge_patch(second, self.registry, build_context(second, self.registry), patch)
+
+    def test_patch_schema_errors_are_rejected_before_publication(self):
+        from experience_updates import build_context, merge_patch
+        context = build_context(self.ledger, self.registry)
+        for value in ({'target_id': 'hyp-data-filtered', 'target_ids': [], 'assessment': []},
+                      {'target_id': 'hyp-data-filtered', 'target_ids': [], 'evidence_edge_ids': None},
+                      {'target_ids': [], 'evaluation_state': 'observed'}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                merge_patch(self.ledger, self.registry, context, {'updates': [
+                    {'op': 'upsert', 'collection': 'hypothesis_evidence', 'value': value}]})
+        with self.assertRaises(ValueError):
+            merge_patch(self.ledger, self.registry, context, {'updates': [{'op': []}]})
+        self.assertNotIn('experience', self.ledger)
+
+    def test_empty_publication_without_observations_preserves_selection_binding(self):
+        from experience_updates import build_context, merge_patch
+        from ledger_core import experience_receipt
+        from semantic_search import _experience_snapshot_receipt
+        for record in self.ledger['records']:
+            record['status'] = 'aborted'
+            record['final_best_score'] = None
+        result = merge_patch(self.ledger, self.registry, build_context(self.ledger, self.registry), {'updates': []})
+        self.assertEqual(result['experience']['dag_revision'], result['dag_revision'])
+        self.assertIsNone(result['experience']['updated_at_run'])
+        self.assertEqual(_experience_snapshot_receipt(result['experience']), experience_receipt(result))

@@ -36,7 +36,6 @@ from .experiment import (
     _ensure_provided_baseline,
     _init_run_extra,
     _or_block,
-    _refresh,
     _resume_setup,
     _setup,
 )
@@ -156,10 +155,6 @@ def run_baseline_tune(task, tag, *, runner, model, repo_root=REPO_ROOT,
         if not _tuning_finalized(run_dir):
             _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
                               job_runner)
-        brief = _brief(run_dir, repo_root, cmd)
-        if brief.get("experience_refresh_required"):
-            _refresh(runner, store, task, tag, run_dir, repo_root, cmd,
-                     events)
         _complete_run(run_dir, repo_root, cmd, events)
     except RunBlocked:
         pass

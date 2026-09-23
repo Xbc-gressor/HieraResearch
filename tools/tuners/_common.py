@@ -1443,7 +1443,7 @@ def read_prior_infeasible_trials(report_path: Path) -> list[dict]:
 
 
 def read_deferred_configs(report_path: Path) -> list[dict]:
-    """Warm configs the extractor PROPOSED but did NOT evaluate at step 0+1
+    """Warm configs the author PROPOSED but did NOT evaluate at step 0+1
     (the K − K_eval deferred ones). They carry `params` only (no score) and are
     evaluated at the start of the initialization segment if this candidate is
     selected — BO enqueues them as initial trials, grid evaluates them before

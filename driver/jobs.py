@@ -222,8 +222,8 @@ def build_driver_job(
         raise DriverJobError("task env.project must be a non-empty string")
 
     if kind == "warmstart":
-        if role_name != "tunable-contract-extractor":
-            raise DriverJobError("warmstart jobs belong to tunable-contract-extractor")
+        if role_name != "driver":
+            raise DriverJobError("warmstart jobs belong to the driver")
         k_eval = _positive_int(request.get("k_eval"), "driver_job.k_eval")
         expected_k_eval = ctx.extra.get("screening_k_eval")
         if expected_k_eval is not None:

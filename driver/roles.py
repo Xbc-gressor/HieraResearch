@@ -118,17 +118,6 @@ def driver_job_handoff_problem(role_name: str, receipt: dict) -> str | None:
     job = receipt.get("driver_job")
     if not isinstance(job, dict):
         return None
-    if role_name == "tunable-contract-extractor":
-        if (
-            receipt.get("status") == "driver_job"
-            and receipt.get("ledger_updated") is False
-            and job.get("kind") == "warmstart"
-        ):
-            return None
-        return (
-            "extractor driver_job requires status='driver_job', "
-            "ledger_updated=false, and kind='warmstart'"
-        )
     if role_name == "tuner-orchestrator":
         if (
             receipt.get("tuned") is False
@@ -210,6 +199,14 @@ def background_artifacts_exist(ctx: InvocationContext) -> str | None:
     return f"missing background artifacts: {missing}" if missing else None
 
 
+def candidate_submission_ready(ctx: InvocationContext) -> str | None:
+    """Development produced train.py or an explicit reason to abandon."""
+    receipt = _own_receipt(ctx, "candidate-writer") or {}
+    if receipt.get("status") == "abandon":
+        return None if str(receipt.get("reason") or "").strip() else "abandon requires a reason"
+    return candidate_train_py_exists(ctx)
+
+
 def candidate_train_py_exists(ctx: InvocationContext) -> str | None:
     """candidates/<run_id>/train.py exists."""
     path = ctx.run_dir / "candidates" / str(ctx.run_id) / "train.py"
@@ -223,29 +220,6 @@ def _own_receipt(ctx: InvocationContext, role_name: str) -> dict | None:
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
-
-def record_is_terminal(ctx: InvocationContext) -> str | None:
-    """the ledger record for run_id is keep/discard/crash (written via
-    record-run); the one exception is the zero-attempt budget-exhausted path,
-    where the receipt says status=unevaluated, ledger_updated=false and the
-    record stays pending for the driver to resolve."""
-    status = record_status(ctx.run_dir, str(ctx.run_id))
-    if status in ("keep", "discard", "crash"):
-        return None
-    receipt = _own_receipt(ctx, "tunable-contract-extractor") or {}
-    if receipt.get("status") == "unevaluated" \
-            and receipt.get("ledger_updated") is False \
-            and status in ("pending", "unevaluated"):
-        return None
-    return f"record {ctx.run_id} status is {status!r}, expected keep/discard/crash"
-
-
-def refresh_flag_cleared(ctx: InvocationContext) -> str | None:
-    """ledger brief reports experience_refresh_required == false."""
-    brief = ledger_brief(ctx.run_dir)
-    if brief.get("experience_refresh_required"):
-        return "experience_refresh_required still true after refresh"
-    return None
 
 
 def actions_admitted(ctx: InvocationContext) -> str | None:
@@ -304,34 +278,14 @@ ROLES: dict[str, RoleDefinition] = {
         tools=("Read", "Write", "Edit", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
-            "status": ("enum", "written", "existing"),
+            "status": ("enum", "written", "existing", "abandon"),
+            "reason": "?str",
             "wrote": "bool",
             "candidate_dir": "str",
         },
-        postconditions=(candidate_train_py_exists,),
-        # A bounded implementation path: healthy writers finish well below
-        # this cap; varied junk turns still cannot consume an unbounded
-        # invocation.
-        max_turns=40,
+        postconditions=(candidate_submission_ready,),
         early_repeat_correct=True,
-        wall_limit_seconds=1800.0,
         soft_rescue=True,
-    ),
-    "tunable-contract-extractor": RoleDefinition(
-        name="tunable-contract-extractor",
-        prompt_file="tunable-contract-extractor.md",
-        tools=("Read", "Edit", "Write", "Bash", "Glob"),
-        disallowed=_BASE_DISALLOWED,
-        receipt_schema={
-            "run_id": "str",
-            "status": ("enum", "keep", "discard", "crash", "unevaluated",
-                       "driver_job"),
-            "ledger_updated": "bool",
-            "driver_job": "?dict",
-        },
-        postconditions=(record_is_terminal,),
-        forbidden_bash_substrings=("warmstart_eval.py", "nohup "),
-        wall_limit_seconds=900.0,
     ),
     "tuner-orchestrator": RoleDefinition(
         name="tuner-orchestrator",
@@ -359,13 +313,9 @@ ROLES: dict[str, RoleDefinition] = {
     "experience-extractor": RoleDefinition(
         name="experience-extractor",
         prompt_file="experience-extractor.md",
-        tools=("Read", "Write", "Bash"),
-        disallowed=_BASE_DISALLOWED,
-        receipt_schema={
-            "search_space_state_revision": "int",
-            "decision_ids": "list",
-        },
-        postconditions=(refresh_flag_cleared,),
+        tools=("Read", "Glob"),
+        disallowed=_BASE_DISALLOWED + ("Write", "Edit", "Bash"),
+        receipt_schema={"updates": "list"},
         wall_limit_seconds=900.0,
         soft_rescue=True,
     ),

@@ -10,7 +10,7 @@ Six sections, fixed order:
                       newest (_traces/) first, source history (_traces_src/)
                       filling the remainder, with the stderr tail attached
                       for crashes;
-3. Experience       — experience.seed.json lessons/bottlenecks in full, plus
+3. Experience       — related live ledger lessons and optional imported references, plus
                       the dimension/hypothesis evidence hitting this point;
 4. Semantic point   — the selected assignments anchored to the run-level
                       background.md registry (matching relations and guidance
@@ -241,52 +241,37 @@ def _traces_lines(candidate: Path) -> list[str]:
     return lines
 
 
-def _experience_lines(run_dir: Path, dimension_ids: set, hypothesis_ids: set) -> list[str]:
-    experience = _load_json(run_dir / "experience.seed.json")
-    if experience is None:
-        return [NONE]
-    lines = ["### Lessons"]
-    lessons = experience.get("lessons") or []
-    if not lessons:
-        lines.append(NONE)
-    for item in lessons:
-        evidence = ", ".join(str(run_id) for run_id in item.get("evidence") or [])
-        lines.append(
-            f"- [{item.get('kind')}/{item.get('confidence')}] "
-            f"{_text(item.get('claim'))} (evidence: {evidence})"
-        )
-    lines.append("### Bottlenecks")
-    bottlenecks = experience.get("bottlenecks") or []
-    if not bottlenecks:
-        lines.append(NONE)
-    for item in bottlenecks:
-        evidence = ", ".join(str(run_id) for run_id in item.get("evidence") or [])
-        lines.append(
-            f"- [{item.get('confidence')}] {_text(item.get('claim'))} "
-            f"(evidence: {evidence})"
-        )
-    lines.append("### Evidence on this semantic point")
-    hits = [
-        item
-        for field, wanted in (
-            ("dimension_evidence", dimension_ids),
-            ("hypothesis_evidence", hypothesis_ids),
-        )
-        for item in experience.get(field) or []
-        if isinstance(item, dict) and item.get("target_id") in wanted
-    ]
-    if not hits:
-        lines.append(NONE)
-    for item in hits:
-        coverage = json.dumps(
-            item.get("comparator_coverage"), ensure_ascii=False, sort_keys=True
-        )
-        lines.append(
-            f"- {item.get('target_id')}: state={item.get('evaluation_state')} "
-            f"assessment={item.get('assessment')} confidence={item.get('confidence')} "
-            f"coverage={coverage} | {_text(item.get('claim'))}"
-        )
-    return lines
+def _experience_lines(run_dir: Path, dimension_ids: set, hypothesis_ids: set,
+                      run_id: str) -> list[str]:
+    from experience_updates import project_experience, related
+    ledger = _load_json(run_dir / "ledger.json") or {}
+    by_id = {r["run_id"]: r for r in ledger.get("records", [])}
+    ancestry, pending = set(), [run_id]
+    while pending:
+        ident = pending.pop()
+        if ident not in ancestry:
+            ancestry.add(ident)
+            pending.extend(by_id.get(ident, {}).get("source_run_ids", []))
+    wanted = dimension_ids | hypothesis_ids
+    lines = []
+    sources = [("Live experience (local evidence IDs)", project_experience(ledger), ancestry)]
+    seed = _load_json(run_dir / "experience.seed.json")
+    if seed is not None:
+        provenance = _load_json(run_dir / "experience.seed.source.json") or {}
+        sources.append(("Imported historical reference (source evidence IDs; "
+                        + str(provenance.get("source", "imported run")) + ")",
+                        seed, set(provenance.get("run_ids", []))))
+    for label, experience, run_ids in sources:
+        items = [(field, item) for field in
+                 ("lessons", "bottlenecks", "promising_regions", "dimension_evidence", "hypothesis_evidence")
+                 for item in experience.get(field, [])
+                 if related(item, wanted, run_ids)]
+        if not items:
+            continue
+        lines.append("### " + label)
+        for field, item in items:
+            lines.append("- " + json.dumps({"collection": field, **item}, ensure_ascii=False, sort_keys=True))
+    return lines or [NONE]
 
 
 def _guidance_hit(scope, union: dict) -> bool:
@@ -502,7 +487,7 @@ def render_context(candidate, sections=None) -> str:
     bodies = {
         "bout_history": _bout_history_lines(candidate),
         "traces": _traces_lines(candidate),
-        "experience": _experience_lines(run_dir, dimension_ids, hypothesis_ids),
+        "experience": _experience_lines(run_dir, dimension_ids, hypothesis_ids, candidate.name),
         "background": _semantic_point_lines(registry, selected),
         "sources": _source_material_lines(registry, retrieval, run_dir, selected),
         "status": _status_lines(candidate, manifest),

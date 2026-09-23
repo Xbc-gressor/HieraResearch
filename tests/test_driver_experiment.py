@@ -57,6 +57,16 @@ allow_dependencies = false
     (task_dir / "train.py").write_text("# provided baseline\n")
 
 
+_run_experiment = run_experiment
+
+
+def run_experiment(*args, **kwargs):
+    cmd = kwargs.get("cmd")
+    if isinstance(cmd, ExperimentCmd):
+        kwargs.setdefault("job_runner", cmd.evaluate)
+    return _run_experiment(*args, **kwargs)
+
+
 class ExperimentCmd:
     """Fakes tools/ helpers. brief_queue/reached_queue drive loop progress."""
 
@@ -100,6 +110,15 @@ class ExperimentCmd:
                 raise subprocess.CalledProcessError(
                     1, args, "", f"helper refused: {marker}")
 
+        if "ledger.py experience-context" in joined:
+            output = Path(args[args.index("--output") + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("{}")
+            return self._ok('{"ready": true}')
+        if "ledger.py experience-attempt" in joined:
+            return self._ok('{}')
+        if "ledger.py set-experience" in joined:
+            return self._ok('{"ok": true, "decision_ids": []}')
         if "init_run.py" in joined:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             (self.run_dir / "framework_cfg.json").write_text(
@@ -166,8 +185,18 @@ class ExperimentCmd:
             run_id = args[4]  # ["python", script, task, tag, run_id, ...]
             (self.run_dir / "candidates" / run_id).mkdir(parents=True,
                                                          exist_ok=True)
+            if "--provided-baseline" in args:
+                (self.run_dir / "candidates" / run_id / "train.py").write_text(
+                    (self.repo / "tasks/fake-task/train.py").read_text())
             return self._ok("")
         return self._ok("{}")
+
+    def evaluate(self, role, ctx, request, *, repo_root):
+        assert role == "driver" and request["kind"] == "warmstart"
+        candidate = ctx.run_dir / "candidates" / ctx.run_id
+        (candidate / "tune_report.json").write_text(json.dumps({
+            "phase_a": {"status": "ok", "best_warm_score": 0.1}}))
+        return {"kind": "warmstart", "run_id": ctx.run_id, "returncode": 0}
 
     @staticmethod
     def _ok(stdout: str):
@@ -176,7 +205,11 @@ class ExperimentCmd:
 
 def writer_effect(ctx):
     target = ctx.run_dir / "candidates" / str(ctx.run_id) / "train.py"
-    target.write_text("# implemented\n")
+    if not ctx.extra.get("expect"):
+        target.write_text("# implemented\n")
+    (target.parent / "_warm_configs.json").write_text('[{"x": 1}]')
+    (target.parent / "_search_space.json").write_text('{"x": ["int", 1, 3]}')
+    (target.parent / "_candidate_brief.json").write_text('{"source_run_ids": []}')
 
 
 def write_background(run_dir: Path) -> None:
@@ -270,15 +303,6 @@ class ExperimentTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _extractor_side_effect(self, cmd: ExperimentCmd, status: str):
-        def effect(ctx):
-            ledger = cmd._ledger()
-            for record in ledger["records"]:
-                if record["run_id"] == ctx.run_id:
-                    record["status"] = status
-            cmd._save_ledger(ledger)
-        return effect
-
     def test_seedless_full_round_then_budget_completion(self) -> None:
         write_task(self.repo)
         cmd = ExperimentCmd(self.repo)
@@ -294,8 +318,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
@@ -306,7 +328,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["background-researcher", "idea-generator",
-                                 "candidate-writer", "tunable-contract-extractor",
+                                 "candidate-writer",
                                  "tuner-orchestrator"])
         self.assertEqual(
             sum("background_contract.py validate" in call for call in cmd.calls),
@@ -333,9 +355,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep",
-                         "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
@@ -368,8 +387,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             # contradiction: claims tuned 000 but the ledger has no tune flag
             {"receipt": {"tuned_run_id": "000", "tuned": True,
                          "ledger_updated": True}},
@@ -384,6 +401,8 @@ class ExperimentTests(unittest.TestCase):
         jobs = []
 
         def job_runner(role, ctx, request, *, repo_root):
+            if request["kind"] == "warmstart":
+                return cmd.evaluate(role, ctx, request, repo_root=repo_root)
             jobs.append(request)
             ledger = cmd._ledger()
             ledger["records"][0]["tune"] = True
@@ -422,8 +441,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"receipt": {"tuned_run_id": "000", "tuned": True,
                          "ledger_updated": True}},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
@@ -453,7 +470,7 @@ class ExperimentTests(unittest.TestCase):
         ]
         cmd.reached = [False, True, True]
         runner = FakeSessionRunner([
-            {"receipt": {"search_space_state_revision": 1, "decision_ids": []}},
+            {"receipt": {"updates": []}},
             {"receipt": {"actions": []}},
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
@@ -472,8 +489,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "existing", "wrote": False,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
@@ -484,70 +499,52 @@ class ExperimentTests(unittest.TestCase):
         roles = [name for name, _ in runner.calls]
         self.assertNotIn("idea-generator", roles)
 
-    def test_extractor_failure_budget_exhausted_resolves_unevaluated(self) -> None:
+    def test_warmstart_budget_exhausted_resolves_unevaluated(self):
         write_task(self.repo)
         cmd = ExperimentCmd(self.repo)
-        cmd.reached = [False, True, True, True]
-        runner = FakeSessionRunner([
-            {"receipt": {"status": "ok", "background": "background.md",
-                         "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: write_background(ctx.run_dir)},
-            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
-             "side_effects": lambda ctx: cmd([
-                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
-                 self.repo)},
-            {"receipt": {"status": "written", "wrote": True,
-                         "candidate_dir": "candidates/000"},
-             "side_effects": writer_effect},
-            {"fail": ["budget exhausted mid-extraction"]},
-        ])
-        run_experiment("fake-task", "t1", runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
-        self.assertTrue(any("resolve-unevaluated" in c for c in cmd.calls))
-        self.assertNotEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
+        cmd.run_dir.mkdir(parents=True)
+        candidate = cmd.run_dir / "candidates/001"
+        candidate.mkdir(parents=True)
+        cmd._save_ledger({"records": [{"run_id": "001", "status": "pending"}]})
+        (cmd.run_dir / "framework_cfg.json").write_text("{}")
+        runner = FakeSessionRunner([{"receipt": {"status": "written", "wrote": True,
+             "candidate_dir": str(candidate)}, "side_effects": writer_effect}])
+        experiment._implement_candidate(
+            runner, ReceiptStore(cmd.run_dir), "fake-task", "t1", cmd.run_dir,
+            "001", self.repo, cmd, EventsLog(cmd.run_dir),
+            job_runner=lambda *a, **k: {"returncode": 4})
+        self.assertEqual(cmd._ledger()["records"][0]["status"], "unevaluated")
+        self.assertEqual(len(runner.calls), 1)
 
-    def test_extractor_failure_with_evidence_resumes_failed_session(self) -> None:
+    def test_warmstart_failure_resumes_author_and_rechecks(self):
         write_task(self.repo)
         cmd = ExperimentCmd(self.repo)
-        cmd.reached = [False, False, False, True]
-
-        def failed_extractor(ctx):
-            report = ctx.run_dir / "candidates" / str(ctx.run_id) / "tune_report.json"
-            report.write_text(json.dumps({"phase_a": {"status": "failed"}}))
-
+        run = cmd.run_dir
+        candidate = run / "candidates/001"
+        candidate.mkdir(parents=True)
+        cmd._save_ledger({"records": [{"run_id": "001", "status": "pending"}]})
+        (cmd.run_dir / "framework_cfg.json").write_text("{}")
+        def repair(ctx):
+            (candidate / "train.py").write_text("# repaired\n")
         runner = FakeSessionRunner([
-            {"receipt": {"status": "ok", "background": "background.md",
-                         "retrieval_manifest": "background_retrieval.json"},
-             "side_effects": lambda ctx: write_background(ctx.run_dir)},
-            {"receipt": {"actions": [{"run_id": "000", "op": "fresh"}]},
-             "side_effects": lambda ctx: cmd([
-                 "python", "tools/ledger.py", "add-record", "--run-id", "000"],
-                 self.repo)},
-            {"receipt": {"status": "written", "wrote": True,
-                         "candidate_dir": "candidates/000"},
+            {"receipt": {"status": "written", "wrote": True, "candidate_dir": str(candidate)},
              "side_effects": writer_effect},
-            {"fail": ["warm evaluation failed"],
-             "side_effects": failed_extractor},
-            {"receipt": {"verdict": "code_incompatible", "summary": "repair",
-                         "evidence": ["tune_report.json"]}},
-            {"receipt": {"run_id": "000", "status": "keep",
-                         "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
-            {"receipt": {"tuned_run_id": "none", "tuned": False,
-                         "ledger_updated": False}},
-        ])
-
-        run_experiment("fake-task", "t1", runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
-
-        extractor_calls = [ctx for name, ctx in runner.calls
-                           if name == "tunable-contract-extractor"]
-        self.assertEqual(len(extractor_calls), 2)
-        self.assertEqual(
-            extractor_calls[1].resume_session_id,
-            f"fake-sess-{extractor_calls[0].invocation_id:04d}",
-        )
-        self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
+            {"receipt": {"status": "written", "wrote": True, "candidate_dir": str(candidate)},
+             "side_effects": repair}])
+        calls = []
+        def evaluate(role, ctx, request, **kw):
+            calls.append(request)
+            if len(calls) == 1:
+                (candidate / "tune_report.json").write_text('{"phase_a": {"status": "crashed"}}')
+                return {"returncode": 3, "log_tail": "invalid configuration"}
+            return cmd.evaluate(role, ctx, request, **kw)
+        experiment._implement_candidate(runner, ReceiptStore(run), "fake-task", "t1", run,
+                                         "001", self.repo, cmd, EventsLog(run), job_runner=evaluate)
+        self.assertEqual(cmd._ledger()["records"][0]["status"], "keep")
+        self.assertEqual([name for name, ctx in runner.calls], ["candidate-writer"] * 2)
+        self.assertEqual(runner.calls[1][1].resume_session_id, "fake-sess-0001")
+        self.assertIn("invalid configuration", runner.calls[1][1].extra["repair_feedback"])
+        self.assertEqual(len(calls), 2)
 
     def _seed_resumed_run(self, records: list[dict]) -> None:
         """A run killed after setup: cfg/background exist, no metadata."""
@@ -567,8 +564,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"receipt": {"actions": []}},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
@@ -577,7 +572,7 @@ class ExperimentTests(unittest.TestCase):
                        repo_root=self.repo, cmd=cmd)
         roles = [name for name, _ in runner.calls]
         # the pending record is implemented BEFORE any idea-generator run
-        self.assertEqual(roles, ["candidate-writer", "tunable-contract-extractor",
+        self.assertEqual(roles, ["candidate-writer",
                                  "idea-generator", "tuner-orchestrator"])
         writer_ctx = runner.calls[0][1]
         self.assertEqual(writer_ctx.run_id, "000")
@@ -680,8 +675,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"fail": ["tuner session died"]},
             # fresh reconciliation returns a CONTRADICTORY receipt (ledger has
             # no tune flag for 000); with no live tuner session the corrective
@@ -703,28 +696,24 @@ class ExperimentTests(unittest.TestCase):
         self.assertIn("tuner session died",
                       tuner_calls[1].extra["reconcile_note"])
 
-    def test_provided_baseline_extractor_failure_blocks_with_detail(self) -> None:
+    def test_provided_baseline_unrecoverable_failure_blocks(self):
         write_task(self.repo, provided=True)
         cmd = ExperimentCmd(self.repo)
         runner = FakeSessionRunner([
             {"receipt": {"status": "ok", "background": "background.md",
                          "retrieval_manifest": "background_retrieval.json"},
              "side_effects": lambda ctx: write_background(ctx.run_dir)},
-            {"receipt": {"status": "existing", "wrote": False,
-                         "candidate_dir": "candidates/000"},
+            {"receipt": {"status": "existing", "wrote": False, "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"fail": ["no accepted receipt",
-                      "session ended with error result: error_max_turns"]},
+            {"receipt": {"status": "abandon", "wrote": False, "candidate_dir": "candidates/000",
+                         "reason": "cannot adapt the original baseline"}},
         ])
-        run_experiment("fake-task", "t1", runner=runner, model="m",
-                       repo_root=self.repo, cmd=cmd)
+        run_experiment("fake-task", "t1", runner=runner, model="m", repo_root=self.repo,
+                       cmd=cmd, job_runner=lambda *a, **k: {"returncode": 3})
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "blocked")
-        events = (cmd.run_dir / "driver_events.jsonl").read_text()
-        self.assertIn("provided baseline could not be evaluated", events)
-        self.assertIn("no accepted receipt", events)
-        self.assertIn("error_max_turns", events)
-        self.assertTrue(any("record-run" in c and "--status crash" in c
-                            for c in cmd.calls))
+        self.assertNotIn("idea-generator", [name for name, _ in runner.calls])
+        self.assertIn("cannot adapt", (cmd.run_dir / "driver_events.jsonl").read_text())
+        self.assertEqual(cmd._ledger()["records"][0]["status"], "aborted")
 
     def test_phase_c_recover_close_reports_refusal_detail(self) -> None:
         run_dir = self.repo / "runs" / "fake-task" / "t1"
@@ -782,9 +771,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep",
-                         "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
@@ -793,7 +779,6 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["idea-generator", "candidate-writer",
-                                 "tunable-contract-extractor",
                                  "tuner-orchestrator"])
         # the frozen artifacts are validated once and left untouched
         self.assertEqual(
@@ -876,9 +861,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep",
-                         "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
@@ -888,7 +870,6 @@ class ExperimentTests(unittest.TestCase):
         roles = [name for name, _ in runner.calls]
         self.assertEqual(roles, ["background-faithfulness-judge",
                                  "idea-generator", "candidate-writer",
-                                 "tunable-contract-extractor",
                                  "tuner-orchestrator"])
         artifact = json.loads(
             (cmd.run_dir / "background_faithfulness.json").read_text())
@@ -958,8 +939,6 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
             {"receipt": {"tuned_run_id": "none", "tuned": False,
                          "ledger_updated": False}},
         ])
@@ -1001,16 +980,13 @@ class ExperimentTests(unittest.TestCase):
             {"receipt": {"status": "existing", "wrote": False,
                          "candidate_dir": "candidates/000"},
              "side_effects": writer_effect},
-            {"receipt": {"run_id": "000", "status": "keep", "ledger_updated": True},
-             "side_effects": self._extractor_side_effect(cmd, "keep")},
         ])
         run_experiment("fake-task", "t1", runner=runner, model="m",
                        repo_root=self.repo, cmd=cmd)
         self.assertEqual(cmd._ledger()["records"][0]["run_id"], "000")
         roles = [name for name, _ in runner.calls]
         self.assertNotIn("idea-generator", roles)
-        self.assertEqual(roles, ["candidate-writer",
-                                 "tunable-contract-extractor"])
+        self.assertEqual(roles, ["candidate-writer"])
 
     def test_resume_blocks_when_baseline_record_lost(self) -> None:
         # ledger has records but no 000: retrofitting the control is
@@ -1069,22 +1045,15 @@ class CandidateRecoveryTests(unittest.TestCase):
     def implement(self, runner):
         experiment._implement_candidate(
             runner, self.store, "fake-task", "t1", self.run, "001",
-            self.repo, self.cmd, self.events)
+            self.repo, self.cmd, self.events, job_runner=self.cmd.evaluate)
 
-    def test_fresh_extractor_retry_settles_its_new_evidence(self):
-        def evaluated(ctx):
-            (self.candidate / "tune_report.json").write_text(
-                '{"phase_a": {"best_warm_score": 0.1}}')
-
-        self.implement(FakeSessionRunner([
-            {"receipt": {"status": "written", "wrote": True,
-                         "candidate_dir": "candidates/001"}, "side_effects": writer_effect},
-            {"fail": ["no accepted receipt"]},
-            {"fail": ["session ended with error result: error_max_turns"],
-             "side_effects": evaluated},
-        ]))
+    def test_valid_report_settles_before_any_failed_session_can_run(self):
+        (self.candidate / "tune_report.json").write_text(
+            '{"phase_a": {"status": "ok", "best_warm_score": 0.2161099781414916}}')
+        runner = FakeSessionRunner([])
+        self.implement(runner)
         self.assertEqual(self.cmd._ledger()["records"][0]["status"], "keep")
-        self.assertFalse(any("resolve-aborted" in call for call in self.cmd.calls))
+        self.assertEqual(runner.calls, [])
 
     def test_blocked_writer_retry_preserves_its_attempt_for_resume(self):
         def sibling_blocks(ctx):
@@ -1110,38 +1079,26 @@ class CandidateRecoveryTests(unittest.TestCase):
         resumed = FakeSessionRunner([
             {"receipt": {"status": "written", "wrote": True,
                          "candidate_dir": "candidates/001"}, "side_effects": writer_effect},
-            {"receipt": {"run_id": "001", "status": "keep", "ledger_updated": True},
-             "side_effects": settled},
         ])
         self.implement(resumed)
         self.assertEqual(json.loads((self.candidate / "writer.attempts.json")
                                    .read_text())["attempts"], 2)
         self.assertEqual(self.cmd._ledger()["records"][0]["status"], "keep")
 
-    def test_resume_skips_a_writer_that_succeeded_on_its_last_attempt(self):
-        def interrupted(ctx):
-            raise RuntimeError("process interrupted before extractor settlement")
-
+    def test_resume_skips_a_writer_that_already_delivered(self):
         first = FakeSessionRunner([
             {"fail": ["no accepted receipt"]},
             {"receipt": {"status": "written", "wrote": True,
-                         "candidate_dir": "candidates/001"}, "side_effects": writer_effect},
-            {"side_effects": interrupted},
-        ])
+                         "candidate_dir": "candidates/001"}, "side_effects": writer_effect}])
+        def interrupted(*args, **kwargs):
+            raise RuntimeError("process interrupted before evaluation")
         with self.assertRaisesRegex(RuntimeError, "process interrupted"):
-            self.implement(first)
-        self.assertEqual(json.loads((self.candidate / "writer.attempts.json")
-                                   .read_text())["attempts"], 2)
-
-        def settled(ctx):
-            self.cmd(["python", "tools/ledger.py", "record-run", "--run-id", "001"],
-                     self.repo)
-
-        resumed = FakeSessionRunner([
-            {"receipt": {"run_id": "001", "status": "keep", "ledger_updated": True},
-             "side_effects": settled}])
+            experiment._implement_candidate(first, self.store, "fake-task", "t1", self.run,
+                "001", self.repo, self.cmd, self.events, job_runner=interrupted)
+        self.assertEqual(json.loads((self.candidate / "writer.attempts.json").read_text())["attempts"], 2)
+        resumed = FakeSessionRunner([])
         self.implement(resumed)
-        self.assertEqual([name for name, ctx in resumed.calls], ["tunable-contract-extractor"])
+        self.assertEqual(resumed.calls, [])
         self.assertEqual(self.cmd._ledger()["records"][0]["status"], "keep")
 
 
@@ -1189,7 +1146,7 @@ class SeatSkipStreakTests(unittest.TestCase):
         _note_seat_progress(self.run_dir)
         self._note("candidate-writer", ["writer down"])
         # Different roles never share a streak.
-        self._note("tunable-contract-extractor", ["extractor down"])
+        self._note("slate-plan-writer", ["planner down"])
         self.assertIsNone(self.cmd._ledger().get("run_state"))
 
     def test_successful_ideation_resets_the_failure_streak(self) -> None:
@@ -1362,7 +1319,7 @@ class DegradedDeliveryTests(unittest.TestCase):
                 started.set()
                 self.assertTrue(blocker_returned.wait(5))
                 (run / "candidates/002/tune_report.json").write_text(
-                    '{"phase_a": {"best_warm_score": 0.1}}')
+                    '{"phase_a": {"status": "ok", "best_warm_score": 0.1}}')
                 experiment._refuse_if_blocked(run)
 
         def resume(*args, **kw):
@@ -1402,7 +1359,7 @@ class DegradedDeliveryTests(unittest.TestCase):
         candidate_dir = self.run_dir / "candidates" / "001"
         candidate_dir.mkdir(parents=True)
         candidate_dir.joinpath("tune_report.json").write_text(
-            '{"phase_a": {"best_warm_score": 0.1}}')
+            '{"phase_a": {"status": "ok", "best_warm_score": 0.1}}')
         cmd = ExperimentCmd(self.repo)
         cmd.fail_next.add("ledger.py brief")
         status = run_experiment(
@@ -1534,3 +1491,37 @@ class UnhandledExceptionBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncrementalRefreshIntegrationTests(unittest.TestCase):
+    def test_failed_updates_are_nonfatal_and_not_retried_on_same_revision(self):
+        from tools.validate_background import Run
+        from tests.fixtures import complete_point
+        registry = fixture_registry()
+        for outcome in ({'fail': ['missing receipt']},
+                        {'receipt': {'updates': [{'op': 'delete', 'id': 'unknown'}]}},
+                        {'receipt': {'updates': []}}):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                run = Run(root, registry)
+                run.add_record('000', 'fresh', [], complete_point(registry))
+                run.record_run('000', 0.45)
+                before = json.loads(run.ledger.read_text())
+                runner = FakeSessionRunner([outcome])
+                def cmd(args, cwd, check=True):
+                    return subprocess.run([sys.executable, *map(str, args[1:])],
+                                          cwd=cwd, check=check, text=True, capture_output=True)
+                store = ReceiptStore(root)
+                published = experiment._refresh(runner, store, 'hard-interactions', 't',
+                                                root, ROOT, cmd, EventsLog(root))
+                after = json.loads(run.ledger.read_text())
+                self.assertEqual(published, outcome == {'receipt': {'updates': []}})
+                self.assertEqual(after['records'], before['records'])
+                if not published:
+                    self.assertEqual(after.get('experience'), before.get('experience'))
+                    self.assertEqual(after['experience_update']['status'], 'failed')
+                    self.assertEqual(after['search_space_state'], before['search_space_state'])
+                self.assertFalse(experiment._refresh(runner, store, 'hard-interactions', 't',
+                                                    root, ROOT, cmd, EventsLog(root)))
+                self.assertEqual(len(runner.calls), 1)
+                self.assertNotEqual(after.get('run_state', {}).get('phase'), 'blocked')

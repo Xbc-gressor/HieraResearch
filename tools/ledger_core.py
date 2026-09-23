@@ -13,8 +13,12 @@ import json
 import math
 from typing import Any, Optional, TypedDict
 
-from semantic_evidence import LIFECYCLE_TERMINAL_STATUSES
-from semantic_space import digest
+if __package__:
+    from .semantic_evidence import LIFECYCLE_TERMINAL_STATUSES
+    from .semantic_space import digest
+else:
+    from semantic_evidence import LIFECYCLE_TERMINAL_STATUSES
+    from semantic_space import digest
 
 
 class LedgerRecord(TypedDict, total=False):
@@ -263,14 +267,21 @@ def experience_refresh_status(data: dict) -> dict:
         for record in records
     )
     delta = dag_revision - cursor
+    update = data.get("experience_update") or {}
+    attempted = update.get("attempted_dag_revision", 0)
+    if not isinstance(attempted, int) or isinstance(attempted, bool) or not 0 <= attempted <= dag_revision:
+        raise ValueError("invalid experience attempt cursor")
     return {
         "dag_revision": dag_revision,
         "experience_dag_revision": raw_cursor,
         "experience_cursor": cursor,
         "experience_dag_delta": delta,
         "all_records_terminal": all_terminal,
-        "semantic_admission_blocked": delta > 0,
-        "experience_refresh_required": all_terminal and delta > 0,
+        "semantic_admission_blocked": False,
+        "experience_attempted_dag_revision": attempted,
+        "experience_update_status": update.get("status"),
+        "experience_update_error": update.get("error"),
+        "experience_refresh_required": all_terminal and delta > 0 and dag_revision > attempted,
     }
 
 

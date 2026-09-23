@@ -23,8 +23,8 @@ The high-level lifecycle is:
 
 Within one generation the admitted seats are implemented on a bounded
 session channel (``pipeline.session_concurrency`` driver threads): while one
-seat's extractor is blocked on its warm-screening job, another seat's writer
-or extractor runs. The GPU channel stays serial (the device lease), each
+seat's driver is waiting on its warm-screening job, another seat's writer
+runs. The GPU channel stays serial (the device lease), each
 candidate's own chain stays ordered, and the admission gates are unchanged,
 so evaluation facts and attribution are exactly those of the serial loop.
 
@@ -46,6 +46,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .. import candidate_evaluation
 from ..events import EventsLog
 from ..jobs import DriverJobError, _arm_exit_hooks, execute_driver_job
 from ..metadata import warn_on_mismatch, write_metadata
@@ -592,40 +593,43 @@ def _time_reached(run_dir) -> bool:
     return bool(run_time_budget(run_dir).get("time_reached"))
 
 
-def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> None:
-    """Refresh bounded experience, with one artifact-aware retry.
-
-    Skipped once the run's cutoff has passed: the final refresh is the one
-    session that used to run past the deadline (two deadline_expired
-    submissions), and completion no longer depends on it (set-phase
-    tolerates the unprocessed terminal delta at the cutoff)."""
+def _refresh(runner, store, task, tag, run_dir, repo_root, cmd, events) -> bool:
+    """Publish one incremental interpretation; failures preserve the last view."""
     if _time_reached(run_dir):
         events.emit("refresh_skipped", reason="time_reached")
-        return
+        return False
+    revision = json.loads((run_dir / "ledger.json").read_text()).get("dag_revision", 0)
+    context_path = run_dir / ".experience" / f"revision-{revision}" / "context.json"
+    base = ["python", "tools/ledger.py"]
+    ledger_args = ["--ledger", run_dir / "ledger.json"]
+    background = ["--background", run_dir / "background.md"]
+    prepared = cmd(base + ["experience-context", *ledger_args, *background,
+                           "--output", context_path], repo_root)
+    if not json.loads(prepared.stdout)["ready"]:
+        return False
+    attempt = base + ["experience-attempt", *ledger_args, "--context", context_path]
+    cmd(attempt, repo_root)
     try:
-        _invoke(runner, store, "experience-extractor", task, tag, run_dir)
-        return
-    except InvocationFailed:
-        # A refresh may have started before cutoff and been cancelled at it.
-        # Re-entering the session gate would turn normal exhaustion into a
-        # blocked run, consuming finalization time on an external resume.
-        if _time_reached(run_dir):
-            events.emit("refresh_skipped", reason="time_reached")
-            return
-    try:  # one retry with reconciliation context, then block
-        brief = _brief(run_dir, repo_root, cmd)
-        _invoke(runner, store, "experience-extractor", task, tag, run_dir,
-                extra={"reconcile_note":
-                       "prior refresh failed postconditions; current ledger brief: "
-                       + json.dumps(brief, sort_keys=True)})
-        return
+        receipt, _ = _invoke(runner, store, "experience-extractor", task, tag, run_dir,
+                          extra={"experience_context": str(context_path)})
     except InvocationFailed as exc:
-        # Also covers cutoff during reconciliation or the retry itself.
-        if _time_reached(run_dir):
-            events.emit("refresh_skipped", reason="time_reached")
-            return
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"experience refresh failed: {exc.problems}")
+        error = json.dumps(exc.problems, ensure_ascii=False)
+    else:
+        patch_path = context_path.with_name("patch.json")
+        patch_path.write_text(json.dumps({"updates": receipt["updates"]}, ensure_ascii=False))
+        published = cmd(base + ["set-experience", *ledger_args, *background,
+                               "--context", context_path, "--from-json", patch_path],
+                        repo_root, check=False)
+        if published.returncode == 0:
+            events.emit("experience_published", **json.loads(published.stdout))
+            return True
+        if published.returncode != 2:
+            raise subprocess.CalledProcessError(published.returncode, published.args,
+                                                published.stdout, published.stderr)
+        error = published.stdout.strip()
+    cmd(attempt + ["--error", error], repo_root)
+    events.emit("experience_update_failed", error=error)
+    return False
 
 
 def _ideate(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
@@ -1134,9 +1138,9 @@ def _slate_plan_retry_note(problems: list[str]) -> str:
 _SLATE_WRITER_ATTEMPTS = 3
 
 
-# candidate-writer gets one initial invocation and one decorrelated retry.
-# The counter lives under the candidate so a process restart or external
-# resume cannot silently mint another writer session.
+# Retain two consecutive failed-session attempts per candidate. Successful
+# author/repair continuations reset the failure streak, not the lifetime log.
+# Persist both across invocations so restart cannot reset failed recovery.
 _CANDIDATE_WRITER_ATTEMPTS = 2
 
 
@@ -1180,7 +1184,8 @@ def _register_candidate_writer_attempt(candidate_dir: Path) -> int:
     data = _candidate_writer_attempts(candidate_dir)
     attempts = int(data.get("attempts", 0)) + 1
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps({"attempts": attempts}) + "\n",
+    data["attempts"] = attempts
+    tmp.write_text(json.dumps(data) + "\n",
                    encoding="utf-8")
     os.replace(tmp, path)
     return attempts
@@ -1305,6 +1310,11 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
         payload = _slate_plan_payload(
             slot, pool_doc, context_doc, route_memory_path,
             objective_text=objective_text)
+        from tools.experience_updates import related_view
+        ledger_data = json.loads((run_dir / "ledger.json").read_text())
+        experience = related_view(ledger_data, slot["point"], slot["carrier"].get("parents", []))
+        if experience:
+            payload += "\nRelevant experience (basis revisions are historical; facts are current):\n" + json.dumps(experience, ensure_ascii=False) + "\n"
         while True:
             attempt = _register_slate_writer_attempt(plans_dir, slot["slot"])
             try:
@@ -1518,21 +1528,6 @@ def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
 # =============================================================================
 
 
-def _failure_evidence(candidate_dir: Path,
-                      problems: list[str] | None = None) -> str | None:
-    """The diagnosis input: the durable report path when it exists, plus the
-    failed invocation's own problems, so the diagnoser sees both the artifact
-    and why the session could not finish."""
-    report = candidate_dir / "tune_report.json"
-    if not report.exists():
-        return None
-    evidence = str(report)
-    if problems:
-        evidence += ("\n\nextractor invocation problems:\n"
-                     + "\n".join(f"- {p}" for p in problems))
-    return evidence
-
-
 def _resolve_unevaluated(run_dir, run_id, repo_root, cmd) -> bool:
     """Call-and-catch: the helper itself enforces all four preconditions."""
     try:
@@ -1567,10 +1562,10 @@ def _settle_at_deadline(run_dir, run_id, repo_root, cmd, events) -> None:
 
     Three-way, by on-disk evidence: no objective attempt → unevaluated;
     a finite warm score in the tune report → set-tuning + record-run (the
-    extractor's own step 3c replayed; auto status keep/discard); attempts
+    validated applied result; auto status keep/discard); attempts
     but no finite score → unevaluated when every attempt was cut off by the
     time budget, else crash. Originally the run-cutoff settlement, now also
-    the deterministic close for a repair-exhausted extractor seat with
+    the deterministic close for a repair-exhausted candidate with
     evidence: only durable facts decide, never a session (fidelity before
     attribution).
     """
@@ -1593,21 +1588,8 @@ def _settle_at_deadline(run_dir, run_id, repo_root, cmd, events) -> None:
         # Refused (e.g. the record already carries a score): a record left
         # pending would block set-phase completed at the cutoff, so fall
         # through to the crash settlement like a refused set-tuning.
-    if warm is not None:
-        try:
-            cmd(["python", "tools/ledger.py", "set-tuning", "--ledger", ledger,
-                 "--run-id", run_id,
-                 "--from-report", candidate_dir / "tune_report.json"], repo_root)
-            cmd(["python", "tools/ledger.py", "record-run", "--ledger", ledger,
-                 "--run-id", run_id, "--final-best-score", str(warm)], repo_root)
-        except subprocess.CalledProcessError as exc:
-            events.emit("candidate_settlement_failed", run_id=run_id,
-                        detail=(exc.stderr or str(exc))[-2000:])
-        else:
-            events.emit("candidate_settled_at_deadline", run_id=run_id,
-                        outcome=record_status(run_dir, run_id),
-                        best_warm_score=warm, attempts=attempts)
-            return
+    if candidate_evaluation.settle(run_dir, run_id, repo_root, cmd, events):
+        return
     _record_crash(run_dir, run_id, repo_root, cmd)
     events.emit("candidate_settled_at_deadline", run_id=run_id,
                 outcome="crash", attempts=attempts)
@@ -1724,7 +1706,7 @@ def _candidate_donor_binding(run_dir, run_id, repo_root, cmd, events) -> dict:
 
 
 def _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events) -> dict:
-    """The extractor invocation's donor binding for one candidate.
+    """The candidate's donor binding for one candidate.
 
     Empty under every other policy pair.  A judged-slate seat reads its
     generation manifest's immutable binding, so a donor frontier that moves
@@ -1749,7 +1731,7 @@ def _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events) -> dict:
     return {"donor_binding": "bound", "donor_snapshot": str(snapshot_path)}
 
 
-def _extractor_extra(run_dir: Path, run_id: str, candidate_dir: Path,
+def _candidate_extra(run_dir: Path, run_id: str, candidate_dir: Path,
                      **extra) -> dict:
     actual, target = _screening_contract(run_dir, run_id)
     return {
@@ -1760,179 +1742,144 @@ def _extractor_extra(run_dir: Path, run_id: str, candidate_dir: Path,
     }
 
 
-def _settle_unevaluated(runner, store, task, tag, run_dir, run_id,
-                        candidate_dir, donor_extra, extractor_inv, repo_root,
-                        cmd, events, job_runner) -> None:
-    """The extractor reported a zero-attempt candidate at a reached stop
-    condition; the driver owns that lifecycle resolution.
-
-    ``resolve-unevaluated`` proves the stop condition and the zero attempts
-    itself. When it refuses (the budget is not actually exhausted), the
-    session is resumed once with that fact so it re-requests its job; a
-    second unsupported claim blocks the run rather than leaving a pending
-    seat behind.
-    """
-    if record_status(run_dir, run_id) in ("keep", "discard", "crash",
-                                         "unevaluated"):
-        return
-    if _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
-        events.emit("candidate_unevaluated", run_id=run_id)
-        return
-    note = ("Your receipt claimed status=unevaluated, but the run's stop "
-            "condition has not been reached and resolve-unevaluated refused. "
-            "Continue the extractor procedure: request the warmstart "
-            "driver_job (or record the candidate's real outcome) and submit "
-            "a terminal receipt.")
-    try:
-        receipt, _ = _invoke_with_driver_jobs(
-            runner, store, "tunable-contract-extractor", task, tag, run_dir,
-            run_id=run_id,
-            extra=_extractor_extra(run_dir, run_id, candidate_dir,
-                                   reconcile_note=note, **donor_extra),
-            resume_from=extractor_inv, repo_root=repo_root,
-            job_runner=job_runner)
-    except InvocationFailed as exc:
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"extractor could not settle unevaluated claim for "
-                  f"{run_id}: {exc.problems}")
-    if receipt.get("status") == "unevaluated" and record_status(
-            run_dir, run_id) == "pending" and not _resolve_unevaluated(
-            run_dir, run_id, repo_root, cmd):
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"extractor repeated an unsupported unevaluated claim for "
-                  f"{run_id}")
+def _candidate_artifacts(candidate_dir):
+    return tuple((candidate_dir / name).read_bytes()
+                 if (candidate_dir / name).is_file() else None
+                 for name in ("train.py", "_warm_configs.json", "_search_space.json"))
 
 
 def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                           cmd, events, job_runner=execute_driver_job,
                           task_toml=None) -> None:
-    """candidate-writer + extractor with evidence-branched escalation."""
+    """The author develops/repairs; the driver prepares, evaluates and settles."""
     candidate_dir = run_dir / "candidates" / run_id
-    objective = _objective_line(task_toml or common.load_task_toml(task, repo_root))
-    writer_extra = {"candidate_dir": str(candidate_dir), "objective": objective}
-    writer_attempts = _candidate_writer_attempts(candidate_dir)
-    writer_inv = writer_attempts.get("completed_invocation_id")
-    if writer_inv is None and int(writer_attempts.get("attempts", 0)) \
-            >= _CANDIDATE_WRITER_ATTEMPTS:
-        # No successful writer stage survived the previous process. Close
-        # from current evidence (aborted only for a zero-product seat);
-        # the run-level streak breaker catches repeated failures.
-        _skip_candidate(
-            run_dir, repo_root, cmd, events, run_id,
-            role="candidate-writer",
-            problems=_candidate_writer_failure(candidate_dir)
-            or ["candidate-writer attempt budget exhausted "
-                f"({_CANDIDATE_WRITER_ATTEMPTS} attempts)"],
-        )
-        return
-    # Resolved once per candidate implementation so every extractor retry of
-    # this candidate sees the identical donor binding.
-    donor_extra = _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events)
-    while writer_inv is None:
-        attempt = int(_candidate_writer_attempts(candidate_dir).get("attempts", 0)) + 1
-        retry_problems = _candidate_writer_failure(candidate_dir)
-        extra = writer_extra
-        if attempt > 1:
-            extra = dict(writer_extra)
-            extra["retry_note"] = _candidate_writer_retry_note(
-                [str(problem) for problem in retry_problems]
-                or ["the previous attempt did not produce an accepted receipt"]
-            )
-        try:
-            _, writer_inv = _invoke(
-                runner, store, "candidate-writer", task, tag, run_dir,
-                run_id=run_id, extra=extra, writer_attempt_dir=candidate_dir)
-        except InvocationFailed as exc:
-            _record_candidate_writer_failure(candidate_dir, exc.problems)
-            if attempt >= _CANDIDATE_WRITER_ATTEMPTS:
-                _skip_candidate(
-                    run_dir, repo_root, cmd, events, run_id,
-                    role="candidate-writer", problems=exc.problems)
-                return
-        else:
-            _record_candidate_writer_success(candidate_dir, writer_inv)
-    try:
-        receipt, extractor_inv = _invoke_with_driver_jobs(
-            runner, store, "tunable-contract-extractor", task, tag, run_dir,
-            run_id=run_id,
-            extra=_extractor_extra(
-                run_dir, run_id, candidate_dir, **donor_extra
-            ),
-            repo_root=repo_root, job_runner=job_runner)
-    except InvocationFailed as exc:
-        problems = exc.problems
-        extractor_inv = exc.invocation_id
-    else:
-        if receipt.get("status") == "unevaluated":
-            _settle_unevaluated(runner, store, task, tag, run_dir, run_id,
-                                candidate_dir, donor_extra, extractor_inv,
-                                repo_root, cmd, events, job_runner)
-        _note_seat_progress(run_dir)
-        return
+    task_toml = task_toml or common.load_task_toml(task, repo_root)
+    provided = run_id == "000" and bool(task_toml.get("seed", {}).get("provided"))
+    extra = _candidate_extra(run_dir, run_id, candidate_dir,
+                             objective=_objective_line(task_toml),
+                             **_resolve_donor_extra(run_dir, run_id, repo_root, cmd, events))
+    if provided:
+        extra.update(screening_k_eval=1, screening_target_k_eval=1,
+                     provided_baseline=True)
+    brief_path = candidate_dir / "_candidate_brief.json"
+    if brief_path.is_file():
+        parents = json.loads(brief_path.read_text()).get("source_run_ids") or []
+        if parents:
+            lineage = cmd(["python", "tools/tuners/tune_tools.py", "lineage-evidence",
+                           "--run-dir", run_dir, "--source-run-ids", ",".join(parents)],
+                          repo_root)
+            (candidate_dir / "_lineage_evidence.json").write_text(lineage.stdout)
+            extra["lineage_evidence"] = str(candidate_dir / "_lineage_evidence.json")
+    state = _candidate_writer_attempts(candidate_dir)
+    writer_inv = state.get("completed_invocation_id")
+    need_writer = writer_inv is None
+    repair_required = False
+    problems = _candidate_writer_failure(candidate_dir)
+    failed_sessions = int(state.get("consecutive_failures", 0))
 
-    # Branch on durable evidence (spec Error handling):
-    # 0. past the run's cutoff no session (diagnosis, repair) may start:
-    #    settle from the on-disk report instead of diagnosing.
-    if _time_reached(run_dir):
-        _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
-        _note_seat_progress(run_dir)
-        return
-    # 1. stop condition reached + zero attempts → resolve-unevaluated (call+catch)
-    if budget_status(run_dir, repo_root, cmd).get("reached") and \
-            _resolve_unevaluated(run_dir, run_id, repo_root, cmd):
-        _note_seat_progress(run_dir)
-        return
-    # 2. actual failure receipt → crash diagnosis
-    evidence = _failure_evidence(candidate_dir, problems)
-    if evidence:
-        try:
-            verdict = common.crash_diagnose(
-                runner, store, task, tag, run_dir, evidence)["verdict"]
-        except InvocationFailed as exc:
-            events.emit("crash_diagnosis_failed", run_id=run_id,
-                        problems=exc.problems)
-            verdict = "abandon"
-        if verdict == "abandon":
-            _record_crash(run_dir, run_id, repo_root, cmd)
+    def finish_failure(detail, *, abandoned=False):
+        if candidate_evaluation.settle(run_dir, run_id, repo_root, cmd, events):
             _note_seat_progress(run_dir)
             return
-        try:  # fix verdicts go back to the repair-capable extractor session
-            _invoke_with_driver_jobs(
-                runner, store, "tunable-contract-extractor", task, tag,
-                run_dir, run_id=run_id,
-                extra=_extractor_extra(
-                    run_dir, run_id, candidate_dir,
-                    diagnosis_verdict=verdict, **donor_extra
-                ),
-                resume_from=extractor_inv, repo_root=repo_root,
-                job_runner=job_runner)
-            _note_seat_progress(run_dir)
-            return
-        except InvocationFailed as exc2:
-            _skip_candidate(run_dir, repo_root, cmd, events, run_id,
-                            role="tunable-contract-extractor",
-                            problems=exc2.problems)
-            return
-    # 3. no evidence yet → one fresh retry, then settle its current evidence
-    try:
-        _invoke_with_driver_jobs(
-            runner, store, "tunable-contract-extractor", task, tag,
-            run_dir, run_id=run_id,
-            extra=_extractor_extra(
-                run_dir, run_id, candidate_dir, **donor_extra
-            ), repo_root=repo_root,
-            job_runner=job_runner)
-    except InvocationFailed as exc3:
         _skip_candidate(run_dir, repo_root, cmd, events, run_id,
-                        role="tunable-contract-extractor",
-                        problems=exc3.problems)
-        return
-    _note_seat_progress(run_dir)
+                        role="candidate-writer", problems=detail,
+                        count_failure=not abandoned and not provided)
+        if provided:
+            _or_block(run_dir, repo_root, cmd, events,
+                      "provided baseline could not be evaluated: " + "; ".join(detail))
+        if abandoned:
+            _note_seat_progress(run_dir)
 
-
-# =============================================================================
-# Decoupled tuning
-# =============================================================================
+    while True:
+        _refuse_if_blocked(run_dir)
+        if candidate_evaluation.settle(run_dir, run_id, repo_root, cmd, events):
+            _note_seat_progress(run_dir)
+            return
+        if _time_reached(run_dir):
+            _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
+            if provided and record_status(run_dir, run_id) not in ("keep", "discard"):
+                _or_block(run_dir, repo_root, cmd, events,
+                          "provided baseline lacks a valid control evaluation")
+            return
+        if need_writer:
+            if failed_sessions >= _CANDIDATE_WRITER_ATTEMPTS:
+                finish_failure(problems)
+                return
+            before = _candidate_artifacts(candidate_dir)
+            writer_extra = dict(extra)
+            initial_anchor = provided and not _candidate_writer_attempts(candidate_dir).get("baseline_received")
+            if initial_anchor:
+                writer_extra["expect"] = "status: existing, wrote: false"
+            if problems:
+                writer_extra["repair_feedback"] = json.dumps(problems, ensure_ascii=False)
+                writer_extra["retry_note"] = _candidate_writer_retry_note(problems)
+            try:
+                receipt, writer_inv = _invoke(
+                    runner, store, "candidate-writer", task, tag, run_dir,
+                    run_id=run_id, extra=writer_extra, resume_from=writer_inv,
+                    writer_attempt_dir=candidate_dir)
+            except InvocationFailed as exc:
+                problems = [str(p) for p in exc.problems]
+                writer_inv = exc.invocation_id
+                failed_sessions += 1
+                _record_candidate_writer_failure(candidate_dir, problems)
+                state = _candidate_writer_attempts(candidate_dir)
+                state["consecutive_failures"] = failed_sessions
+                _candidate_writer_attempts_path(candidate_dir).write_text(json.dumps(state))
+                continue  # the session store rejects poisoned resume contexts
+            if initial_anchor and (receipt.get("status") != "existing"
+                                   or receipt.get("wrote")
+                                   or _candidate_artifacts(candidate_dir)[0] != before[0]):
+                _or_block(run_dir, repo_root, cmd, events,
+                          "provided-baseline writer violates existing/false no-op")
+            failed_sessions = 0
+            _record_candidate_writer_success(candidate_dir, writer_inv)
+            state = _candidate_writer_attempts(candidate_dir)
+            state["consecutive_failures"] = 0
+            if initial_anchor:
+                state["baseline_received"] = True
+            _candidate_writer_attempts_path(candidate_dir).write_text(json.dumps(state))
+            if receipt.get("status") == "abandon":
+                finish_failure([receipt.get("reason") or "author abandoned candidate"], abandoned=True)
+                return
+            if repair_required and _candidate_artifacts(candidate_dir) == before:
+                finish_failure(problems + ["repair returned unchanged candidate artifacts"])
+                return
+        problems = candidate_evaluation.prepare(candidate_dir, repo_root, cmd, extra)
+        if not problems:
+            job_ctx = InvocationContext(task=task, tag=tag, run_dir=run_dir,
+                                        invocation_id=store.issue_invocation_id(),
+                                        run_id=run_id, extra=extra)
+            try:
+                result = job_runner("driver", job_ctx,
+                                    {"kind": "warmstart", "run_id": run_id,
+                                     "k_eval": extra["screening_k_eval"]},
+                                    repo_root=repo_root)
+            except ResourceUnavailable as exc:
+                if not budget_status(run_dir, repo_root, cmd).get("reached"):
+                    _or_block(run_dir, repo_root, cmd, events,
+                              f"candidate {run_id} resource unavailable: {exc}")
+                _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
+                if provided and record_status(run_dir, run_id) not in ("keep", "discard"):
+                    _or_block(run_dir, repo_root, cmd, events,
+                              "provided baseline lacks a valid control evaluation")
+                return
+            except (DriverJobError, OSError, subprocess.SubprocessError) as exc:
+                result = {"kind": "warmstart", "accepted": False, "error": str(exc)}
+            if candidate_evaluation.settle(run_dir, run_id, repo_root, cmd, events):
+                _note_seat_progress(run_dir)
+                return
+            if result.get("returncode") == 4 or budget_status(run_dir, repo_root, cmd).get("reached"):
+                _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
+                if provided and record_status(run_dir, run_id) not in ("keep", "discard"):
+                    _or_block(run_dir, repo_root, cmd, events,
+                              "provided baseline lacks a valid control evaluation")
+                return
+            problems = ["warm screening did not produce a valid applied result: "
+                        + json.dumps(result, ensure_ascii=False)]
+        _record_candidate_writer_failure(candidate_dir, problems)
+        need_writer = True
+        repair_required = True
 
 
 def _tuner_reconcile(runner, store, task, tag, run_dir, round_no, reason: str,
@@ -2727,66 +2674,8 @@ def _provided_baseline(runner, store, task, tag, run_dir, repo_root, cmd,
          "--description", f"Task-provided baseline: {entrypoint}"], repo_root)
     cmd(["python", "tools/new_candidate.py", task, tag, "000",
          "--provided-baseline"], repo_root)
-    try:
-        receipt, _ = _invoke(runner, store, "candidate-writer", task, tag,
-                             run_dir, run_id="000",
-                             extra={"candidate_dir":
-                                    str(run_dir / "candidates" / "000"),
-                                    "expect": "status: existing, wrote: false"})
-        if receipt.get("status") != "existing" or receipt.get("wrote"):
-            _or_block(run_dir, repo_root, cmd, events,
-                      "provided-baseline writer receipt violates existing/false")
-    except InvocationFailed as exc:
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"provided-baseline writer failed: {exc.problems}")
-    _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
-                                        "000", repo_root, cmd, events,
-                                        job_runner)
-
-
-def _implement_candidate_extractor_only(runner, store, task, tag, run_dir,
-                                        run_id, repo_root, cmd, events,
-                                        job_runner=execute_driver_job) -> None:
-    """Provided baseline: extractor step 0+1 only; a crash BLOCKS the run
-    (the protocol forbids searching on without the control)."""
-    candidate_dir = run_dir / "candidates" / run_id
-    try:
-        _invoke_with_driver_jobs(
-            runner, store, "tunable-contract-extractor", task, tag, run_dir,
-            run_id=run_id,
-            extra={"candidate_dir": str(candidate_dir)}, repo_root=repo_root,
-            job_runner=job_runner)
-        return
-    except InvocationFailed as exc:
-        problems = [str(p) for p in exc.problems]
-    evidence = _failure_evidence(candidate_dir, problems)
-    repair_problems = None
-    if evidence:
-        try:
-            verdict = common.crash_diagnose(
-                runner, store, task, tag, run_dir, evidence)["verdict"]
-        except InvocationFailed as exc:
-            events.emit("crash_diagnosis_failed", run_id=run_id,
-                        problems=exc.problems)
-            verdict = "abandon"
-        if verdict != "abandon":
-            try:
-                _invoke_with_driver_jobs(
-                    runner, store, "tunable-contract-extractor", task,
-                    tag, run_dir, run_id=run_id,
-                    extra={"candidate_dir": str(candidate_dir),
-                           "diagnosis_verdict": verdict},
-                    repo_root=repo_root, job_runner=job_runner)
-                return
-            except InvocationFailed as exc:
-                repair_problems = [str(p) for p in exc.problems]
-    _record_crash(run_dir, run_id, repo_root, cmd)
-    detail = "; ".join(problems)
-    if repair_problems:
-        detail += f"; repair failed: {'; '.join(repair_problems)}"
-    _or_block(run_dir, repo_root, cmd, events,
-              "provided baseline could not be evaluated; crash recorded: "
-              + detail)
+    _implement_candidate(runner, store, task, tag, run_dir, "000", repo_root,
+                         cmd, events, job_runner=job_runner)
 
 
 def _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
@@ -3019,9 +2908,6 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     else:
                         _resolve_unevaluated(run_dir, pending_id, repo_root, cmd)
                 brief = _brief(run_dir, repo_root, cmd)
-                if brief.get("experience_refresh_required"):
-                    _refresh(runner, store, task, tag, run_dir, repo_root,
-                             cmd, events)
                 _complete_run(run_dir, repo_root, cmd, events,
                               stop_condition=(
                                   "budget_reached_tune_backoff_no_success"
@@ -3034,9 +2920,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # -----------------------------------------------------------------
             refreshed = False
             if brief is not None and brief.get("experience_refresh_required"):
-                _refresh(runner, store, task, tag, run_dir, repo_root, cmd,
-                         events)
-                refreshed = True
+                refreshed = _refresh(runner, store, task, tag, run_dir, repo_root,
+                                     cmd, events)
 
             # -----------------------------------------------------------------
             # Round steps 2+3 under round_v1: generate until the cycle's

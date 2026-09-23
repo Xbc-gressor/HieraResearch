@@ -318,12 +318,6 @@ def admit_record(data: dict, request: AdmissionRequest) -> dict:
         refresh = experience_refresh_status(data)
     except ValueError as exc:
         raise AdmissionError(f"invalid experience refresh state: {exc}") from None
-    if refresh["semantic_admission_blocked"]:
-        raise AdmissionError(
-            "stale experience: terminal DAG evidence must be refreshed before "
-            "another semantic candidate is admitted; resolve any already-pending "
-            "siblings first"
-        )
 
     registry, catalog, dimension_strategy = _resolve_space(request, data)
     if get_record(data, request.run_id) is not None:
@@ -640,12 +634,6 @@ def admit_slate_atomic(data: dict, request: SlateAdmissionRequest) -> list[dict]
         refresh = experience_refresh_status(data)
     except ValueError as exc:
         raise AdmissionError(f"invalid experience refresh state: {exc}") from None
-    if refresh["semantic_admission_blocked"]:
-        raise AdmissionError(
-            "stale experience: terminal DAG evidence must be refreshed before "
-            "another semantic candidate is admitted; resolve any already-pending "
-            "siblings first"
-        )
 
     registry, catalog, dimension_strategy = _resolve_space(request, data)
     data["search_space"] = data.get("search_space") or space_receipt(registry)

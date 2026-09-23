@@ -51,7 +51,7 @@ score differently. The outer loop's induced objective is
     F(s) = inf { f(x) : x ∈ π⁻¹(s) },
 
 the best score achievable at that semantic point. The inner loop
-(`tunable-contract-extractor` warm-start plus `tuner-orchestrator`
+(driver-owned warm screening plus `tuner-orchestrator`
 progressive tuning bouts) searches within one fiber and approximates `F(s)`
 incrementally; every scored candidate `x` yields only an upper bound
 `f(x) ≥ F(π(x))`, and each tuning bout tightens that candidate's bound. The
@@ -201,7 +201,7 @@ resolves a pending candidate with zero objective attempts. It proves the stop
 and zero candidate attempts, stores an `unevaluated_receipt` pinned to the
 exact attempt log, and advances the lifecycle DAG cursor without creating
 score evidence. A time-budget receipt does not invent a fake evaluation cap.
-Final completion still waits for the resulting per-round experience refresh.
+Final completion does not require experience to catch up with this lifecycle delta.
 
 ## Persisted edges are attribution deltas
 
@@ -243,8 +243,8 @@ of mutating a flag, so `S_r` is a pure function of the whole decision log.
 The loop at revision `r`:
 
     select point s ∈ S_r -> candidate x with π(x) = s and persisted edge
-    receipts -> observations f(x) (a crash is +inf) -> bounded schema-4
-    belief regenerated over the ledger -> deterministic validated decision
+    receipts -> observations f(x) (a crash is +inf) -> schema-5 explanation patch
+    merged with unchanged entries -> deterministic validated decision
     transition -> revision r+1 -> the next proposal filters/orders over
     S_{r+1}.
 
@@ -267,3 +267,10 @@ only at quiescent round boundaries, and propose → select → `add-record`
 completes before candidate implementation begins, so no decision transition
 can invalidate an in-flight selection. Concurrent admission awaits an explicit
 revision contract.
+
+Experience freshness is advisory. Failed updates preserve the last valid view
+and runtime overlay; retries wait for new DAG evidence. Each entry carries its
+own judgment generation and basis DAG revision. Unchanged interpretations cannot
+advance contraction/reopening against new evidence. Empty patches only advance
+the processed cursor. Publication requires all records terminal and no provisional
+slate pool or frozen unadmitted generation; bound slate revisions remain exact.

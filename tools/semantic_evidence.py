@@ -20,14 +20,24 @@ import math
 import re
 from typing import Any
 
-from semantic_space import (
-    dimension_map,
-    hypothesis_map,
-    point_diff,
-    selected_assignments,
-    space_revision,
-    validate_point,
-)
+if __package__:
+    from .semantic_space import (
+        dimension_map,
+        hypothesis_map,
+        point_diff,
+        selected_assignments,
+        space_revision,
+        validate_point,
+    )
+else:
+    from semantic_space import (
+        dimension_map,
+        hypothesis_map,
+        point_diff,
+        selected_assignments,
+        space_revision,
+        validate_point,
+    )
 
 
 EDGE_SCHEMA_VERSION = 1
@@ -42,7 +52,7 @@ NONCRASH_TERMINAL_STATUSES = {"keep", "discard"}
 # terminal but is NOT evidence: the candidate was admitted after the objective
 # budget was exhausted and never ran, so it belongs here and not in
 # TERMINAL_STATUSES, which gates what may be cited as an observation. `aborted`
-# is the infrastructure-failure twin: the seat was skipped (writer/extractor
+# is the infrastructure-failure twin: the seat was skipped (candidate development
 # budget exhausted, degraded generation) without a product, so it must not
 # become a crash observation on an innocent semantic point either.
 LIFECYCLE_TERMINAL_STATUSES = {"keep", "discard", "crash", "unevaluated",

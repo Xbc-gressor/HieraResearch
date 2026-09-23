@@ -29,7 +29,7 @@ from prepare import evaluate_config
 # ---------------------------------------------------------------------------
 # Tuner contract: tunable keys (PARAM_SCHEMA) + the safe-baseline config
 # (DEFAULT_PARAMS = the original hyperparameter values). SEARCH_SPACE and
-# BASE_PARAMS are written later per candidate by tunable-contract-extractor /
+# BASE_PARAMS are written later per candidate by driver-owned warm screening /
 # warmstart_eval — do not add them here.
 # ---------------------------------------------------------------------------
 

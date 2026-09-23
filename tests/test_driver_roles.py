@@ -53,7 +53,7 @@ class ContextTests(unittest.TestCase):
 class RegistryTests(unittest.TestCase):
     EXPECTED = {
         "background-researcher", "idea-generator", "candidate-writer",
-        "tunable-contract-extractor", "tuner-orchestrator",
+        "tuner-orchestrator",
         "experience-extractor", "crash-diagnosis", "hillclimb-editor",
         "rewrite-editor", "slate-judge", "slate-plan-writer",
         "background-faithfulness-judge",
@@ -95,10 +95,8 @@ class RegistryTests(unittest.TestCase):
             "background-researcher": ("Read", "Write", "Bash", "Glob"),
             "idea-generator": ("Read", "Write", "Bash", "Glob"),
             "candidate-writer": ("Read", "Write", "Edit", "Glob"),
-            "tunable-contract-extractor":
-                ("Read", "Edit", "Write", "Bash", "Glob"),
             "tuner-orchestrator": ("Read", "Write", "Edit", "Bash", "Glob"),
-            "experience-extractor": ("Read", "Write", "Bash"),
+            "experience-extractor": ("Read", "Glob"),
             "crash-diagnosis": ("Read", "Bash", "Glob", "Grep"),
             "hillclimb-editor": ("Read", "Write", "Edit", "Bash", "Glob"),
             "rewrite-editor": ("Read", "Write", "Edit", "Glob", "Grep"),
@@ -149,7 +147,7 @@ class LedgerAccessorTests(unittest.TestCase):
     `brief` deliberately omits per-record data (no `records` key), so
     `record_status` and `actions_admitted` read `ledger.json` directly
     (reading is allowed; only hand-editing is banned). `brief` does carry
-    `experience_refresh_required`, which `refresh_flag_cleared` consumes.
+    `experience_refresh_required`, which the driver uses to schedule optional updates.
     """
 
     def _write_briefable_ledger(
@@ -183,23 +181,8 @@ class LedgerAccessorTests(unittest.TestCase):
             self.assertEqual(record_status(run_dir, "003"), "keep")
             self.assertIsNone(record_status(run_dir, "999"))
 
-    def test_record_is_terminal_postcondition(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp)
-            role = ROLES["tunable-contract-extractor"]
-            ctx = make_ctx(run_dir, run_id="003")
-            self._write_briefable_ledger(run_dir, [
-                {"run_id": "003", "status": "pending"},
-            ])
-            problems = [p for check in role.postconditions if (p := check(ctx))]
-            self.assertTrue(any("003" in p for p in problems))
-            self._write_briefable_ledger(run_dir, [
-                {"run_id": "003", "status": "keep"},
-            ])
-            problems = [p for check in role.postconditions if (p := check(ctx))]
-            self.assertEqual(problems, [])
 
-    def test_refresh_flag_cleared_postcondition(self) -> None:
+    def test_experience_receipt_does_not_require_model_publication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             role = ROLES["experience-extractor"]
@@ -207,7 +190,7 @@ class LedgerAccessorTests(unittest.TestCase):
             records = [{"run_id": "003", "status": "keep", "op": "improve"}]
             self._write_briefable_ledger(run_dir, records, dag_revision=1)
             problems = [p for check in role.postconditions if (p := check(ctx))]
-            self.assertTrue(any("experience_refresh_required" in p for p in problems))
+            self.assertEqual(problems, [])
             self._write_briefable_ledger(
                 run_dir, records, dag_revision=1,
                 experience={"dag_revision": 1})

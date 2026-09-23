@@ -93,7 +93,7 @@ def capture_attempt_observation(data: dict[str, Any], record: dict[str, Any]) ->
     bout rewrites both it and ``best_warm_score``, which is exactly why the
     classification cannot read them back.  The first write for a run id wins,
     except that a crash may be replaced once by a later finite screening
-    result when the repair-capable extractor completes the same candidate.
+    result when the repaired candidate completes evaluation.
     """
     run_id = str(record.get("run_id"))
     store = data.setdefault(OBSERVATION_STORE_KEY, [])

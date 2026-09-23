@@ -21,7 +21,6 @@ from background_contract import (  # noqa: E402
     mapping_number_presence,
     result_number_matches,
     validate_experience,
-    validate_experience_replacement,
     validate_registry,
 )
 from competition_policy import (  # noqa: E402
@@ -1108,36 +1107,6 @@ class ExperienceSchema3Tests(unittest.TestCase):
                 errors = validate_experience(experience, registry, ledger)
                 self.assertTrue(any(needle in error for error in errors), errors)
 
-    def test_replacement_generation_changes_only_when_belief_payload_changes(
-        self,
-    ) -> None:
-        registry = fixture_registry()
-        ledger = belief_ledger(registry)
-        prior = _base_experience()
-        prior.update({"generation": 7, "dag_revision": ledger["dag_revision"]})
-        ledger["experience"] = copy.deepcopy(prior)
-
-        # Processing another DAG cursor with the same bounded belief is an
-        # epistemic no-op: run/cursor metadata may advance, but generation does
-        # not pretend that a new belief was learned.
-        same_belief = copy.deepcopy(prior)
-        same_belief.pop("dag_revision")
-        self.assertEqual(
-            validate_experience_replacement(same_belief, ledger),
-            [],
-        )
-
-        changed_belief = copy.deepcopy(same_belief)
-        changed_belief["summary"] = "The structured bounded belief changed."
-        errors = validate_experience_replacement(changed_belief, ledger)
-        self.assertTrue(
-            any("generation must be 8" in error for error in errors), errors
-        )
-        changed_belief["generation"] = 8
-        self.assertEqual(
-            validate_experience_replacement(changed_belief, ledger),
-            [],
-        )
 
 
 if __name__ == "__main__":

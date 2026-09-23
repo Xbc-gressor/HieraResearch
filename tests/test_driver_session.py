@@ -358,13 +358,13 @@ class DriverJobHandoffTests(unittest.TestCase):
                 invocation_id=1, run_id="007",
             )
             receipt = {
-                "run_id": "007",
-                "status": "driver_job",
+                "tuned_run_id": "007",
+                "tuned": False,
                 "ledger_updated": False,
-                "driver_job": {"kind": "warmstart", "run_id": "007", "k_eval": 2},
+                "driver_job": {"kind": "phase_c", "run_id": "007", "method": "bo", "trial_cap": 10},
             }
             self.assertEqual(
-                runner._problems(ROLES["tunable-contract-extractor"], ctx, receipt),
+                runner._problems(ROLES["tuner-orchestrator"], ctx, receipt),
                 [],
             )
 
@@ -377,16 +377,16 @@ class DriverJobHandoffTests(unittest.TestCase):
                 invocation_id=1, run_id="007",
             )
             receipt = {
-                "run_id": "007",
-                "status": "keep",
+                "tuned_run_id": "007",
+                "tuned": True,
                 "ledger_updated": True,
-                "driver_job": {"kind": "warmstart", "run_id": "007", "k_eval": 2},
+                "driver_job": {"kind": "phase_c", "run_id": "007", "method": "bo", "trial_cap": 10},
             }
             problems = runner._problems(
-                ROLES["tunable-contract-extractor"], ctx, receipt
+                ROLES["tuner-orchestrator"], ctx, receipt
             )
             self.assertEqual(len(problems), 1)
-            self.assertIn("status='driver_job'", problems[0])
+            self.assertIn("tuned=false", problems[0])
 
 
 class FakeSystemMessage:

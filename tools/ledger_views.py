@@ -128,8 +128,6 @@ def run_phase(
         refresh = experience_refresh_status(data)
         if not refresh["all_records_terminal"]:
             return "running", "budget_reached_pending_resolution"
-        if refresh["semantic_admission_blocked"]:
-            return "running", "final_experience_refresh_required"
         return "completed", (
             "evaluation_budget_reached" if evaluations_reached
             else "time_budget_reached"
@@ -244,6 +242,9 @@ def brief(data: dict, ledger_path: Path, *, budget_override: int | None = None) 
         "experience_dag_delta": refresh["experience_dag_delta"],
         "semantic_admission_blocked": refresh["semantic_admission_blocked"],
         "experience_refresh_required": refresh["experience_refresh_required"],
+        "experience_attempted_dag_revision": refresh["experience_attempted_dag_revision"],
+        "experience_update_status": refresh["experience_update_status"],
+        "experience_update_error": refresh["experience_update_error"],
         "direct_comparator_capability": data.get(
             DIRECT_COMPARATOR_CAPABILITY_KEY,
             DIRECT_COMPARATOR_CAPABILITY,

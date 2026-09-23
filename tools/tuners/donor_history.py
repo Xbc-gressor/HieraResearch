@@ -26,7 +26,7 @@ the base GP is fitted inside the box the acquisition will query. Each base
 task standardizes its own y (paper §4.2). Donors with fewer than
 ``min_points`` distinct projected points, or zero coverage, are not modelled.
 
-Annotations are the extractor-time ``{key: {"canonical": str,
+Annotations are the author-proposed ``{key: {"canonical": str,
 "couples_with": [str, ...]}}`` mapping per candidate; ``None`` means
 name-only alignment with no coupling constraints.
 

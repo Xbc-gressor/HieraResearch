@@ -22,8 +22,8 @@ DEEP segment until its lifetime `tuner.deep_tune_per_candidate_cap` is spent, it
 policy bout contract is complete, or a bout improves nothing. **One invocation = at most one
 bout** (often zero — a valid no-op).
 
-**Warm-start is already done** — step 0 (`tunable-contract-extractor`) proposed K
-configs and step 1 (eval-K) evaluated them, writing each candidate's `phase_a`
+**Warm-start is already done** — `candidate-writer` proposed K configs
+and the driver screened K_eval configs, writing each candidate's `phase_a`
 (warm trials + `best_warm_score`) into its `tune_report.json` and the ledger, and
 `BASE_PARAMS = best finite warm row`; an inherited config-0 control remains
 explicitly tagged for attribution and may be the operational incumbent. Its

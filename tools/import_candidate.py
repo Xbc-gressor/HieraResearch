@@ -210,6 +210,15 @@ def import_candidate(
         seed_path = target / "experience.seed.json"
         if not seed_path.exists():
             seed_path.write_text(json.dumps(experience, indent=2, ensure_ascii=False) + "\n")
+            by_id = {r["run_id"]: r for r in ledger.get("records", [])}
+            ancestry, pending = set(), [run_id]
+            while pending:
+                ident = pending.pop()
+                if ident not in ancestry:
+                    ancestry.add(ident)
+                    pending.extend(by_id.get(ident, {}).get("source_run_ids", []))
+            (target / "experience.seed.source.json").write_text(json.dumps({
+                "source": str(source), "run_ids": sorted(ancestry)}, ensure_ascii=False) + "\n")
 
     return {"candidate_dir": str(candidate_dst)}
 

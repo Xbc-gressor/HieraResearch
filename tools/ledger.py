@@ -1020,27 +1020,11 @@ def cmd_set_phase(args) -> int:
     data = _load_ledger(ledger_path, for_update=True)
     time_budget_configured = False
     if args.phase == "completed":
-        try:
-            refresh = _experience_refresh_status(data)
-        except ValueError as exc:
-            raise SystemExit(f"invalid experience refresh state: {exc}") from None
-        # Past deadline − final_reserve no session may start, so the final
-        # experience refresh cannot run: complete anyway. The delta stays
-        # visible through experience_refresh_status; pending records still
-        # have to be settled first.
+        _experience_refresh_status(data)
+        if any(r.get("status") == "pending" for r in data.get("records", [])):
+            raise SystemExit("cannot mark completed while a record is still pending")
         time_view = budget_status(ledger_path.parent).get("time") or {}
         at_deadline = time_view.get("time_reached") is True
-        if refresh["semantic_admission_blocked"] and not (
-                at_deadline and refresh["all_records_terminal"]):
-            detail = (
-                "pending records must be resolved before that refresh can run"
-                if not refresh["all_records_terminal"]
-                else "run the final experience refresh first"
-            )
-            raise SystemExit(
-                "cannot mark completed while a terminal DAG delta remains "
-                f"unprocessed; {detail}"
-            )
         budget = args.budget if args.budget is not None else _framework_budget(ledger_path)
         attempted = _evaluations_done(data, ledger_path)["evaluations_done"]
         # Any positive remainder is still spendable: got_select's admission
@@ -1107,6 +1091,8 @@ def _set_experience(
     experience: dict,
     *,
     validated_dag_revision: int,
+    update_state: dict | None = None,
+    space_state: dict | None = None,
 ) -> None:
     """Overwrite the derived experience snapshot and advance its DAG cursor.
 
@@ -1123,87 +1109,107 @@ def _set_experience(
     experience = dict(experience)
     experience["dag_revision"] = validated_dag_revision
     data["experience"] = experience
+    if update_state is not None:
+        data["experience_update"] = update_state
+    if space_state is not None:
+        data["search_space_state"] = space_state
     _save_ledger(ledger_path, data)
 
 
-def cmd_set_experience(args) -> int:
-    from background_contract import (
-        load_registry,
-        validate_background_markdown,
-        validate_experience,
-        validate_experience_replacement,
-        validate_registry,
-    )
-    from semantic_space import (
-        SemanticSpaceError,
-        resolve_dimension_catalog,
-        resolve_dimension_strategy,
-    )
-
-    ledger_path = Path(args.ledger)
-    background_path = Path(args.background)
-    data = _load_ledger(ledger_path)
-    try:
-        refresh = _experience_refresh_status(data)
-    except ValueError as exc:
-        raise SystemExit(f"invalid experience refresh state: {exc}") from None
-    if not refresh["experience_refresh_required"]:
-        reason = (
-            "a record is still pending"
-            if data.get("records") and not refresh["all_records_terminal"]
-            else "there is no unprocessed terminal DAG delta"
-        )
-        raise SystemExit(f"experience refresh rejected: {reason}")
-    validated_dag_revision = refresh["dag_revision"]
-    registry = load_registry(background_path)
-    try:
-        dimension_strategy = resolve_dimension_strategy(background_path)
-        catalog = resolve_dimension_catalog(
-            background_path,
-            explicit_path=Path(args.catalog) if args.catalog else None,
-        )
-    except SemanticSpaceError as exc:
-        raise SystemExit(f"invalid dimension catalog: {exc}") from exc
-    experience = json.loads(Path(args.from_json).read_text())
-    errors = validate_registry(
-        registry,
-        ledger=data,
-        catalog=catalog,
-        dimension_strategy=dimension_strategy,
-    )
-    errors.extend(validate_background_markdown(background_path, registry))
-    if not errors:
-        errors.extend(validate_experience(experience, registry, data))
-        errors.extend(validate_experience_replacement(experience, data))
+def _experience_registry(args, data):
+    from background_contract import load_registry, validate_registry, validate_experience
+    from semantic_space import resolve_dimension_catalog, resolve_dimension_strategy
+    background = Path(args.background)
+    registry = load_registry(background)
+    errors = validate_registry(registry, ledger=data,
+        catalog=resolve_dimension_catalog(background, explicit_path=(
+            Path(args.catalog) if getattr(args, "catalog", None) else None)),
+        dimension_strategy=resolve_dimension_strategy(background))
+    if data.get("experience"):
+        errors.extend(validate_experience(data["experience"], registry, data))
     if errors:
-        raise SystemExit("invalid P2 experience replacement: " + "; ".join(errors))
+        raise ValueError("invalid experience inputs: " + "; ".join(errors))
+    return registry
+
+
+def cmd_experience_context(args):
+    from experience_updates import build_context, publication_boundary, COLLECTIONS
+    from semantic_evidence import render_target_evidence
+    from semantic_space import dimension_map, hypothesis_map
+    path = Path(args.ledger)
+    data = _load_ledger(path)
+    registry = _experience_registry(args, data)
+    refresh = _experience_refresh_status(data)
+    if not refresh["experience_refresh_required"] or not publication_boundary(path.parent, data):
+        print(json.dumps({"ready": False, **refresh}))
+        return 0
+    context = build_context(data, registry)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Read-only lookup files let the role inspect referenced history by id,
+    # without re-reading the complete ledger or copying it into the input.
+    for field in COLLECTIONS:
+        for item in (data.get("experience") or {}).get(field, []):
+            dest = output.parent / "entries" / (item["id"] + ".json")
+            dest.parent.mkdir(exist_ok=True)
+            dest.write_text(json.dumps({"collection": field, **item}, ensure_ascii=False, indent=2))
+    for target in [*dimension_map(registry), *hypothesis_map(registry)]:
+        dest = output.parent / "targets" / (target + ".json")
+        dest.parent.mkdir(exist_ok=True)
+        dest.write_text(json.dumps(render_target_evidence(registry, data, target_ids=[target]), ensure_ascii=False, indent=2))
+    for record in data.get("records", []):
+        dest = output.parent / "runs" / (record["run_id"] + ".json")
+        dest.parent.mkdir(exist_ok=True)
+        dest.write_text(json.dumps({k: record.get(k) for k in (
+            "run_id", "source_run_ids", "semantic_point", "status", "final_best_score",
+            "evaluation_depth", "dag_revision", "semantic_edges", "idea", "change")}, ensure_ascii=False, indent=2))
+    context["lookup_directory"] = str(output.parent)
+    output.write_text(json.dumps(context, ensure_ascii=False, indent=2))
+    print(json.dumps({"ready": True, "context": str(output)}))
+    return 0
+
+
+@_mutation
+def cmd_experience_attempt(args):
+    from experience_updates import binding, publication_boundary
+    path = Path(args.ledger)
+    data = _load_ledger(path, for_update=True)
+    context = json.loads(Path(args.context).read_text())
+    if context["snapshot"] != binding(data) or not publication_boundary(path.parent, data):
+        raise ValueError("experience snapshot/publication boundary changed")
+    data["experience_update"] = {**data.get("experience_update", {}),
+        "attempted_dag_revision": data.get("dag_revision", 0),
+        "status": "failed" if args.error else "attempting", "error": args.error}
+    _save_ledger(path, data)
+    return 0
+
+
+def cmd_set_experience(args):
+    """Accept an explanation patch; publish it and overlay transitions together."""
+    from experience_updates import merge_patch, publication_boundary
+    path = Path(args.ledger)
+    data = _load_ledger(path)
+    registry = _experience_registry(args, data)
+    context = json.loads(Path(args.context).read_text())
+    if not publication_boundary(path.parent, data):
+        print(json.dumps({"error": "experience publication requires a quiescent boundary"}))
+        return 2
     try:
-        _set_experience(
-            ledger_path,
-            data,
-            experience,
-            validated_dag_revision=validated_dag_revision,
-        )
+        patch = json.loads(Path(args.from_json).read_text())
+        result = merge_patch(data, registry, context, patch)
+        decisions = append_experience_transitions(registry, result) if patch["updates"] else []
+        from search_space_state import validate_search_space_state
+        errors = validate_search_space_state(registry, result)
+        if errors:
+            raise ValueError("invalid state transition: " + "; ".join(errors))
     except ValueError as exc:
-        raise SystemExit(str(exc)) from None
-    keys = list(experience.keys()) if isinstance(experience, dict) else None
-    prior = data.get("experience")
-    metadata_fields = {"generation", "updated_at_run", "dag_revision"}
-    belief_changed = not isinstance(prior, dict) or {
-        key: value for key, value in prior.items() if key not in metadata_fields
-    } != {
-        key: value for key, value in experience.items() if key not in metadata_fields
-    }
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "experience_keys": keys,
-                "dag_revision": validated_dag_revision,
-                "belief_changed": belief_changed,
-            }
-        )
-    )
+        print(json.dumps({"error": str(exc)}))
+        return 2
+    _set_experience(path, data, result["experience"],
+        validated_dag_revision=data["dag_revision"],
+        update_state=result["experience_update"], space_state=result.get("search_space_state"))
+    print(json.dumps({"ok": True, "dag_revision": data["dag_revision"],
+                      "decision_ids": [d["decision_id"] for d in decisions]}))
     return 0
 
 
@@ -1367,9 +1373,19 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--background", required=True,
                      help="hierarchical background.md used to validate the ledger and belief view")
     exp.add_argument("--catalog", help="explicit dimension catalog override")
-    exp.add_argument("--from-json", required=True, type=Path,
-                     help="JSON file with the experience block to store (overwrites).")
+    exp.add_argument("--from-json", required=True, type=Path, help="Explanation patch JSON")
+    exp.add_argument("--context", required=True, type=Path, help="Driver-bound input snapshot")
     exp.set_defaults(func=cmd_set_experience)
+
+    exp_context = sub.add_parser("experience-context", parents=[common])
+    exp_context.add_argument("--background", required=True)
+    exp_context.add_argument("--catalog")
+    exp_context.add_argument("--output", required=True)
+    exp_context.set_defaults(func=cmd_experience_context)
+    exp_attempt = sub.add_parser("experience-attempt", parents=[common])
+    exp_attempt.add_argument("--context", required=True)
+    exp_attempt.add_argument("--error")
+    exp_attempt.set_defaults(func=cmd_experience_attempt)
 
     apply_state = sub.add_parser("apply-space-state", parents=[common])
     apply_state.add_argument("--background", required=True,

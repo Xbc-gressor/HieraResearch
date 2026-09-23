@@ -541,6 +541,9 @@ def _normalized_beliefs(
         for item in items:
             if not isinstance(item, dict):
                 continue
+            from experience_updates import item_is_current
+            if not item_is_current(item, ledger):
+                continue
             target_id = item.get("target_id")
             if not _nonempty(target_id):
                 continue
@@ -629,8 +632,8 @@ def _normalized_beliefs(
                         carriers["negative"] >= 3 and carriers["positive"] == 0
                     ),
                 ),
-                "experience_generation": generation,
-                "experience_dag_revision": dag_revision,
+                "experience_generation": item.get("judgment_generation", generation),
+                "experience_dag_revision": item.get("basis_dag_revision", dag_revision),
             }
     return beliefs
 

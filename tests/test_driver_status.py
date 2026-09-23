@@ -54,16 +54,15 @@ class DerivePhaseTests(unittest.TestCase):
         self.assertEqual(
             derive_phase(ledger, {"max_evaluations": 3}, 3), "running")
 
-    def test_completion_requires_fresh_experience(self) -> None:
-        # dag_revision ahead of the experience cursor -> running
-        # (_run_snapshot: final_experience_refresh_required).
+    def test_completion_allows_stale_experience(self) -> None:
+        # Experience lag is advisory once the budget and lifecycle are complete.
         ledger = {
             "records": [{"run_id": "001", "status": "keep"}],
             "dag_revision": 2,
             "experience": {"dag_revision": 1},
         }
         self.assertEqual(
-            derive_phase(ledger, {"max_evaluations": 3}, 3), "running")
+            derive_phase(ledger, {"max_evaluations": 3}, 3), "completed")
         ledger["experience"]["dag_revision"] = 2
         self.assertEqual(
             derive_phase(ledger, {"max_evaluations": 3}, 3), "completed")

@@ -228,8 +228,8 @@ the project root, or quoted absolute paths, without a leading `cd`.
   only the copy under `runs/<task-name>/<tag>/candidates/<run_id>/`. Most tasks
   omit a task-root `train.py`; `candidate-writer` generates each candidate's
   `train.py` under `runs/`. The task author does **not** need to provide
-  contract-compliant code — `tunable-contract-extractor` extracts the tuner
-  contract for every candidate, provided baselines included, at step 0+1.
+  parameterized code plus warm-config/search-space proposals; the driver
+  prepares, evaluates and settles candidates, including provided baselines.
 - A candidate entrypoint declared in `[seed].provided` is copied into run `000`
   and evaluated first at the all-baselines point; seedless tasks bootstrap with
   normal `fresh` candidates.
@@ -241,10 +241,10 @@ the project root, or quoted absolute paths, without a leading `cd`.
 - The outer loop searches semantic candidates; step 0+1 / step 2 tune numeric
   parameters inside one candidate. Keep those two search levels distinct in
   schemas, metrics, and experiments.
-- Keep context bounded. Experience refresh reads
-  `got_graph.py render --incremental` with fixed Top/Bottom anchors; never inject
-  the unbounded full ledger or global DAG. Retrieve a full record, source, or log
-  only when a compact view identifies a specific missing field or bottleneck.
+- Keep context bounded. Experience refresh reads the driver-provided DAG delta,
+  related entries and mechanically derived evidence; retrieve more by referenced
+  ID only when needed. Return an explanation patch through the receipt; the
+  driver owns atomic publication. Never inject the unbounded ledger or global DAG.
 - Use content hashes only for cross-artifact bindings, cache/version keys, and
   content-addressed ids. Do not store a hash beside the complete inline JSON it
   hashes unless another artifact uses that digest as its identity; never add a

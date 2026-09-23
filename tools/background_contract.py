@@ -1042,8 +1042,8 @@ def _validate_policy_receipt_v8(record: dict[str, Any], where: str) -> list[str]
             isinstance(generation, int)
             and not isinstance(generation, bool)
             and generation >= 0
-            and isinstance(updated_at_run, str)
-            and updated_at_run.isdigit()
+            and ((generation == 0 and updated_at_run is None)
+                 or (isinstance(updated_at_run, str) and updated_at_run.isdigit()))
             and isinstance(revision, str)
             and DIGEST_RE.fullmatch(revision) is not None
         )
@@ -1448,8 +1448,8 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
                 isinstance(generation, int)
                 and not isinstance(generation, bool)
                 and generation >= 0
-                and isinstance(updated_at_run, str)
-                and updated_at_run.isdigit()
+                and ((generation == 0 and updated_at_run is None)
+                     or (isinstance(updated_at_run, str) and updated_at_run.isdigit()))
                 and isinstance(revision, str)
                 and DIGEST_RE.fullmatch(revision) is not None
             )
@@ -2777,6 +2777,7 @@ def _validate_target_evidence(
     registry: dict[str, Any],
     ledger: dict[str, Any],
     limit: int,
+    enforce_judgments: bool = True,
 ) -> list[str]:
     """Validate one bounded two-level belief collection against cited receipts.
 
@@ -2955,6 +2956,8 @@ def _validate_target_evidence(
         if confidence not in EXPERIENCE_CONFIDENCE:
             errors.append(f"{target}.confidence must be low, med, or high")
 
+        if not enforce_judgments:
+            continue
         depth_bar = _contradiction_depth_bar(expected_coverage)
         mechanical_direction = mechanical_gain_direction(
             ledger,
@@ -3035,7 +3038,8 @@ def _validate_target_evidence(
     return errors
 
 
-def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
+def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[str, Any],
+                        *, enforce_judgments: bool = True) -> list[str]:
     """Validate the bounded schema-3 belief snapshot over the durable records.
 
     Generic collections stay bounded.  The two-level ``dimension_evidence``
@@ -3045,6 +3049,32 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
     """
     if not isinstance(experience, dict):
         return ["experience must be an object"]
+    if experience.get("schema_version") == 5:
+        from experience_updates import validation_snapshot, COLLECTIONS
+        ids = []
+        known_targets = set(dimension_map(registry)) | set(hypothesis_map(registry))
+        for field in COLLECTIONS:
+            if not isinstance(experience.get(field), list):
+                return [f"experience.{field} must be a list"]
+            for item in experience[field]:
+                if not isinstance(item, dict):
+                    return ["experience entries must be objects"]
+                ident = item.get("id")
+                if not isinstance(ident, str) or not re.fullmatch(r"experience-[1-9][0-9]*", ident) or ident in ids:
+                    return ["incremental experience needs unique stable entry ids"]
+                ids.append(ident)
+                for key, ceiling in (("basis_dag_revision", ledger.get("dag_revision", 0)),
+                                     ("judgment_generation", experience.get("generation", 0))):
+                    value = item.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= ceiling:
+                        return [f"invalid experience entry {key}"]
+                scope = item.get("target_ids")
+                if not isinstance(scope, list) or any(not isinstance(t, str) or t not in known_targets for t in scope):
+                    return ["experience entry scope must reference registered targets"]
+                if field.endswith("_evidence") and not isinstance(item.get("target_id"), str):
+                    return ["experience target entry needs target_id"]
+        return validate_experience(validation_snapshot({**ledger, "experience": experience}),
+                                   registry, ledger, enforce_judgments=False)
     errors: list[str] = []
     allowed_top = {
         "schema_version",
@@ -3084,7 +3114,8 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
     ]
     terminal_ids = {str(record.get("run_id")) for record in terminal_records}
     updated_at_run = experience.get("updated_at_run")
-    if not isinstance(updated_at_run, str) or updated_at_run not in terminal_ids:
+    empty_cursor = not enforce_judgments and generation == 0 and updated_at_run is None
+    if not empty_cursor and (not isinstance(updated_at_run, str) or updated_at_run not in terminal_ids):
         errors.append("experience.updated_at_run must reference a terminal ledger run")
 
     ledger_dag_revision = ledger.get("dag_revision", 0)
@@ -3199,6 +3230,7 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
             registry=registry,
             ledger=ledger,
             limit=MAX_DIMENSION_TARGETS,
+            enforce_judgments=enforce_judgments,
         )
     )
     errors.extend(
@@ -3209,52 +3241,9 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
             registry=registry,
             ledger=ledger,
             limit=MAX_HYPOTHESIS_TARGETS,
+            enforce_judgments=enforce_judgments,
         )
     )
-    return errors
-
-
-def validate_experience_replacement(experience: Any, ledger: dict[str, Any]) -> list[str]:
-    """Additional freshness checks for a snapshot about to replace the old one."""
-    if not isinstance(experience, dict):
-        return []
-    errors: list[str] = []
-    if "dag_revision" in experience:
-        errors.append("replacement experience must omit helper-owned dag_revision")
-    terminal_ids = [
-        str(record.get("run_id"))
-        for record in ledger.get("records", [])
-        if isinstance(record, dict) and record.get("status") in {"keep", "discard", "crash"}
-    ]
-    if terminal_ids and experience.get("updated_at_run") != terminal_ids[-1]:
-        errors.append("replacement experience.updated_at_run must be the latest terminal ledger run")
-    prior = ledger.get("experience")
-    prior_generation = prior.get("generation") if isinstance(prior, dict) and prior else None
-    metadata_fields = {"generation", "updated_at_run", "dag_revision"}
-    prior_payload = (
-        {
-            key: value
-            for key, value in prior.items()
-            if key not in metadata_fields
-        }
-        if isinstance(prior, dict) and prior
-        else None
-    )
-    replacement_payload = {
-        key: value
-        for key, value in experience.items()
-        if key not in metadata_fields
-    }
-    belief_changed = prior_payload is None or replacement_payload != prior_payload
-    expected_generation = (
-        prior_generation + (1 if belief_changed else 0)
-        if isinstance(prior_generation, int) and not isinstance(prior_generation, bool)
-        else 0
-    )
-    if experience.get("generation") != expected_generation:
-        errors.append(
-            f"replacement experience.generation must be {expected_generation}"
-        )
     return errors
 
 
@@ -3398,8 +3387,6 @@ def cmd_validate_experience(args: argparse.Namespace) -> int:
         experience = (ledger or {}).get("experience")
     if not errors:
         errors.extend(validate_experience(experience, registry, ledger or {}))
-        if args.experience:
-            errors.extend(validate_experience_replacement(experience, ledger or {}))
     print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
     return 0 if not errors else 1
 
