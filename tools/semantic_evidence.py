@@ -28,6 +28,7 @@ if __package__:
         selected_assignments,
         space_revision,
         validate_point,
+        validate_record_point,
     )
 else:
     from semantic_space import (
@@ -37,12 +38,13 @@ else:
         selected_assignments,
         space_revision,
         validate_point,
+        validate_record_point,
     )
 
 
 EDGE_SCHEMA_VERSION = 1
-CHANGE_CLASSES = {"same_point", "single_dimension", "multi_dimension"}
-OPERATIONS = {"hypothesis_changed", "dimension_activated", "dimension_deactivated"}
+CHANGE_CLASSES = {"same_point", "single_dimension", "multi_dimension", "space_extension"}
+OPERATIONS = {"hypothesis_changed", "dimension_activated", "dimension_deactivated", "dimension_declared"}
 EDGE_ID_RE = re.compile(r"^sedge-([0-9]+)-([0-9]+)$")
 
 EVALUATION_STATES = {"unevaluated", "failed", "observed", "comparator_covered"}
@@ -225,6 +227,8 @@ def acquisition_target_relations(
                 continue
             for change in changes:
                 if not isinstance(change, dict):
+                    continue
+                if change.get("operation") == "dimension_declared":
                     continue
                 dimension_id = change.get("dimension_id")
                 from_hypothesis_id = change.get("from_hypothesis_id")
@@ -654,6 +658,8 @@ def validate_conditioned_adjustment(
 
 
 def _change_class(changes: list[dict[str, Any]]) -> str:
+    if any(change.get("operation") == "dimension_declared" for change in changes):
+        return "space_extension"
     if not changes:
         return "same_point"
     return "single_dimension" if len(changes) == 1 else "multi_dimension"
@@ -688,12 +694,13 @@ def build_semantic_edges(
 
 
 def validate_semantic_edges(
-    prior_records: list[dict[str, Any]], child_record: dict[str, Any], registry: dict[str, Any]
+    prior_records: list[dict[str, Any]], child_record: dict[str, Any], registry: dict[str, Any], *,
+    registry_history: dict | None = None,
 ) -> list[str]:
     """Rebuild the expected receipts and require exact persisted equality."""
     errors: list[str] = []
     child_id = str(child_record.get("run_id"))
-    for error in validate_point(child_record.get("semantic_point"), registry):
+    for error in validate_record_point(child_record.get("semantic_point"), registry, registry_history):
         errors.append(f"record {child_id}: {error}")
     by_id = {
         str(record.get("run_id")): record
@@ -709,7 +716,7 @@ def validate_semantic_edges(
         if parent is None:
             errors.append(f"record {child_id} parent {parent_id} is not an earlier record")
             continue
-        for error in validate_point(parent.get("semantic_point"), registry):
+        for error in validate_record_point(parent.get("semantic_point"), registry, registry_history):
             errors.append(f"record {parent_id}: {error}")
     if errors:
         return errors

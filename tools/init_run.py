@@ -149,6 +149,7 @@ def initialize_run(
     max_evaluations: int | None = None,
     per_runtime_limit: float | None = None,
     no_eval_timeout: bool = False,
+    space_expansion: bool | None = None,
     time_budget_seconds: float | None = None,
     deadline: float | None = None,
     final_reserve_seconds: float | None = None,
@@ -346,6 +347,7 @@ def initialize_run(
         and max_evaluations is None
         and per_runtime_limit is None
         and not no_eval_timeout
+        and space_expansion is None
         and deadline is None
         and final_reserve_seconds is None
         and not round_options
@@ -726,6 +728,13 @@ def initialize_run(
         config["per_runtime_limit"] = normalized_limit
         updates.append(f"per_runtime_limit={normalized_limit}")
 
+    if space_expansion is not None:
+        config['space_expansion'] = {**config.get('space_expansion', {}), 'enabled': space_expansion}
+        updates.append(f"space_expansion.enabled={space_expansion}")
+    if config.get('space_expansion', {}).get('enabled'):
+        if config.get('deadline') is None or config.get('semantic_search', {}).get('policy') != 'judged_slate':
+            raise ValueError("space expansion requires a deadline and judged_slate")
+
     if updates:
         target.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
         print(
@@ -818,6 +827,8 @@ def main() -> int:
         ),
     )
     timeout_group = parser.add_mutually_exclusive_group()
+    parser.add_argument("--space-expansion", action=argparse.BooleanOptionalAction,
+                        default=None, help="review stalled semantic space and reserve one probe seat")
     timeout_group.add_argument("--no-eval-timeout", action="store_true",
                                help="no per-evaluation cap; requires a run deadline")
     timeout_group.add_argument(
@@ -887,6 +898,7 @@ def main() -> int:
             max_evaluations=args.max_evaluations,
             per_runtime_limit=args.per_runtime_limit,
             no_eval_timeout=args.no_eval_timeout,
+            space_expansion=args.space_expansion,
             time_budget_seconds=args.time_budget_seconds,
             deadline=args.deadline,
             final_reserve_seconds=args.final_reserve_seconds,

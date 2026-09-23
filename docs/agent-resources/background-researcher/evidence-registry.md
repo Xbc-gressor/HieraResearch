@@ -72,6 +72,15 @@ tests. Every `deprioritize` guidance item needs at least
 one out-of-scope probe hypothesis. The probe stays in the normal search space;
 the contract does not force an arbitrary bootstrap slot.
 
+Use `kind: synthesis_probe` for a testable agent inference without supporting
+literature. It requires `agent_synthesis` provenance and the usual rationale,
+scope, required comparisons and testable expectation; `probe_for` is absent.
+Without evidence links its literature credibility must be `unverified`. Any
+citations it does include still pass the normal source and receipt gates.
+Keep plausible deferred directions in registry `reserves` (up to 12): `id`,
+`mechanism`, `provenance`, `deferred_reason`, `open_questions`. These are inputs
+for later review, not hypotheses admitted to candidate generation.
+
 ## Relations
 
 Relation payloads are exact: `activates` has `when` plus

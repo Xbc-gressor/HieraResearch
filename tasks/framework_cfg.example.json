@@ -155,6 +155,14 @@
     "max_evaluations": "OPTIONAL strict global objective budget = max calls admitted into the task config->score fn. Every tuner atomically reserves one slot in evaluation_attempts.jsonl immediately before score_fn; once the cap is reached no further score call starts, even mid-round or mid-tuner. trials_attempted includes successful and failed admitted score calls; preflight attempts/rejections are reported separately and never consume objective slots. Legacy records without trials_attempted fall back to trials_completed and then warm_start_K.",
     "evaluation_timeout_mode": "fixed (task/CLI per-evaluation limit) or run_budget (no independent evaluation or preflight cap; only deadline minus final reserve may interrupt admitted work). Initialize with --no-eval-timeout; both runtime limits must be null and deadline present. Phase quota still gates new work.",
     "per_runtime_limit": "OPTIONAL per-evaluation wall-clock limit in SECONDS (one evaluate_config / one train.py run). A config/run exceeding it is hard-killed and recorded as a failed/crashed trial. Enforced by the eval callers, not prepare.py: framework tuners (warmstart_eval/bo/cmaes) run each eval in a timed subprocess; hillclimb uses timed_run.py. The template fallback is 60, but init_run seeds a new real task run from task.toml run.timeout_seconds unless --timeout explicitly overrides it. Use --no-eval-timeout at init for run_budget mode (requires deadline, stores null). Mode and cap are frozen per run. THIS VALUE IS TASK-SPECIFIC — set it after measuring the task's heaviest legitimate candidate.",
-    "preflight_runtime_limit": "OPTIONAL per-config no-score preflight timeout in seconds. Preflight may import/construct a candidate and execute the task-owned smoke hook, but it never calls score_fn or consumes max_evaluations. In fixed mode defaults to min(180, per_runtime_limit) when omitted. In run_budget mode null disables this independent cap."
+    "preflight_runtime_limit": "OPTIONAL per-config no-score preflight timeout in seconds. Preflight may import/construct a candidate and execute the task-owned smoke hook, but it never calls score_fn or consumes max_evaluations. In fixed mode defaults to min(180, per_runtime_limit) when omitted. In run_budget mode null disables this independent cap.",
+    "space_expansion": "Optional bounded review at completed-slate boundaries. --space-expansion enables; threshold is minimum scalar improvement, max_reviews caps reviews per run. targeted_retrieval independently allows one narrow adapter search per review. Requires a run deadline and judged_slate."
+  },
+  "space_expansion": {
+    "enabled": false,
+    "stall_slates": 2,
+    "improvement_threshold": 0.0,
+    "max_reviews": 2,
+    "targeted_retrieval": false
   }
 }

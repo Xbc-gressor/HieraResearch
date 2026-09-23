@@ -56,7 +56,7 @@ class RegistryTests(unittest.TestCase):
         "tuner-orchestrator",
         "experience-extractor", "crash-diagnosis", "hillclimb-editor",
         "rewrite-editor", "slate-judge", "slate-plan-writer",
-        "background-faithfulness-judge",
+        "background-faithfulness-judge", "space-reviewer",
     }
 
     def test_all_roles_registered(self) -> None:
@@ -103,6 +103,7 @@ class RegistryTests(unittest.TestCase):
             "slate-judge": (),
             "slate-plan-writer": ("Read",),
             "background-faithfulness-judge": (),
+            "space-reviewer": ("Read", "Write", "Bash"),
         }
         self.assertEqual(set(ROLES), set(expected))
         for name, tools in expected.items():

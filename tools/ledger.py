@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from evaluation_budget import budget_status
+from space_revisions import load_registry_history
 from ledger_core import (
     CRASH_SENTINEL,
     RECORD_FIELDS,
@@ -1124,7 +1125,8 @@ def _experience_registry(args, data):
     errors = validate_registry(registry, ledger=data,
         catalog=resolve_dimension_catalog(background, explicit_path=(
             Path(args.catalog) if getattr(args, "catalog", None) else None)),
-        dimension_strategy=resolve_dimension_strategy(background))
+        dimension_strategy=resolve_dimension_strategy(background),
+        registry_history=load_registry_history(background))
     if data.get("experience"):
         errors.extend(validate_experience(data["experience"], registry, data))
     if errors:
@@ -1252,8 +1254,10 @@ def cmd_apply_space_state(args) -> int:
         ledger=data,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
+        registry_history=load_registry_history(background_path),
     )
-    errors.extend(validate_background_markdown(background_path, registry))
+    from background_contract import load_initial_registry
+    errors.extend(validate_background_markdown(background_path, load_initial_registry(background_path)))
     experience = data.get("experience")
     if isinstance(experience, dict):
         errors.extend(validate_experience(experience, registry, data))
@@ -1268,6 +1272,7 @@ def cmd_apply_space_state(args) -> int:
         ledger=data,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
+        registry_history=load_registry_history(background_path),
     )
     if errors:
         raise SystemExit("invalid search-space transition: " + "; ".join(errors))
@@ -1284,6 +1289,37 @@ def cmd_apply_space_state(args) -> int:
             }
         )
     )
+    return 0
+
+
+@_mutation
+def sync_space_revision(ledger_path: Path, background: Path) -> dict:
+    """Complete a published same-run revision before any further admission."""
+    from background_contract import load_registry, validate_registry
+    from semantic_space import resolve_dimension_catalog, resolve_dimension_strategy, space_receipt
+    from space_revisions import load_revision_state
+    state = load_revision_state(background)
+    if state is None:
+        return {"synced": False}
+    data = _load_ledger(ledger_path, for_update=True)
+    if any(r.get("status") == "pending" for r in data["records"]):
+        # Idempotent recovery may observe already-admitted seats at this revision.
+        if data.get("search_space") != state["versions"][-1]["space"]:
+            raise ValueError("cannot change space with pending candidates")
+    registry = load_registry(background)
+    data["search_space"] = space_receipt(registry)
+    errors = validate_registry(registry, ledger=data,
+        catalog=resolve_dimension_catalog(background),
+        dimension_strategy=resolve_dimension_strategy(background),
+        registry_history=load_registry_history(background))
+    if errors:
+        raise ValueError("invalid published space/ledger: " + "; ".join(errors))
+    _save_ledger(ledger_path, data)
+    return {"synced": True, "space": data["search_space"]}
+
+
+def cmd_sync_space(args) -> int:
+    print(json.dumps(sync_space_revision(Path(args.ledger), Path(args.background))))
     return 0
 
 
@@ -1455,6 +1491,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     state = sub.add_parser("loop-state", parents=[common])
     state.set_defaults(func=cmd_loop_state)
+
+    sync = sub.add_parser("sync-space", parents=[common])
+    sync.add_argument("--background", required=True)
+    sync.set_defaults(func=cmd_sync_space)
 
     show = sub.add_parser("show", parents=[common])
     show.add_argument("--run-id")

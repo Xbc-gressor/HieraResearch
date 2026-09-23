@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
                                      "ignored on resume (run_metadata.json wins)")
     run.add_argument("--max-evaluations", type=int)
     timeout_group = run.add_mutually_exclusive_group()
+    run.add_argument("--space-expansion", action=argparse.BooleanOptionalAction,
+                        default=None, help="review stalled semantic space and reserve one probe seat")
     timeout_group.add_argument("--no-eval-timeout", action="store_true",
                                help="experiment: evaluate under the run deadline, without a single-evaluation cap")
     timeout_group.add_argument("--timeout", type=float,
@@ -167,6 +169,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "run":
+        if args.space_expansion is not None and args.loop != "experiment":
+            parser.error("--space-expansion is supported by --loop experiment")
         if args.no_eval_timeout and args.loop != "experiment":
             parser.error("--no-eval-timeout is supported by --loop experiment")
         if args.noise_margin is not None and args.noise_margin < 0:
@@ -258,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             proposer_arm=args.proposer_arm,
             time_budget=args.time_budget,
             no_eval_timeout=args.no_eval_timeout,
+            space_expansion=args.space_expansion,
             deadline=args.deadline,
             final_reserve=args.final_reserve,
             round_options={

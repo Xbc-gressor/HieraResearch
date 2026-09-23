@@ -40,6 +40,7 @@ class InvocationContext:
     # storage directory is a per-candidate sub-directory such as
     # candidates/<id>/_hebo_llm). Never rendered into the message.
     budget_run_dir: Path | None = None
+    deadline_epoch: float | None = None
 
     def user_message(self) -> str:
         """Paths and compact ids first; an inline payload follows a fixed delimiter."""
@@ -263,6 +264,12 @@ ROLES: dict[str, RoleDefinition] = {
         # the run deadline still bounds this entire invocation.
         wall_limit_seconds=10800.0,
         soft_rescue=True,
+    ),
+    "space-reviewer": RoleDefinition(
+        name="space-reviewer", prompt_file="space-reviewer.md",
+        tools=("Read", "Write", "Bash"), disallowed=_BASE_DISALLOWED,
+        receipt_schema={"review": "?str", "retrieval_request": "?str"},
+        corrective_attempts=0, max_turns=24,
     ),
     "idea-generator": RoleDefinition(
         name="idea-generator",

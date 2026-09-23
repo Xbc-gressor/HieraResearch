@@ -62,6 +62,7 @@ from ..roles import (
 from ..session import InvocationFailed, invocation_problem_class
 from ..status import budget_status, compact_status
 from . import background_audit
+from . import space_reviews
 from . import common
 from . import phase_c
 from . import rounds
@@ -164,7 +165,7 @@ def _scheduler_stopped(run_dir: Path) -> bool:
 
 def _invoke(runner, store, role_name, task, tag, run_dir, *,
             run_id=None, round_no=None, extra=None, resume_from=None,
-            inline_payload=None, writer_attempt_dir=None) -> dict:
+            inline_payload=None, writer_attempt_dir=None, deadline_epoch=None) -> dict:
     """Invoke one role and return its persisted receipt plus invocation id."""
     # Admission and attempt reservation are atomic with respect to a sibling
     # blocking the run. Never spend an attempt on a refused session, and never
@@ -181,7 +182,7 @@ def _invoke(runner, store, role_name, task, tag, run_dir, *,
     ctx = InvocationContext(task=task, tag=tag, run_dir=run_dir,
                             invocation_id=inv_id, run_id=run_id,
                             round_no=round_no, extra=extra or {},
-                            resume_session_id=resume,
+                            resume_session_id=resume, deadline_epoch=deadline_epoch,
                             inline_payload=inline_payload)
     try:
         runner.run(ROLES[role_name], ctx)
@@ -784,6 +785,7 @@ def _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events, *,
     events.emit("slate_generation_aborted", gen_no=manifest.get("gen_no"),
                 generation_id=manifest.get("generation_id"), reason=reason,
                 problems=problems[:5])
+    space_reviews.expansion.abort_probe_generation(run_dir, manifest)
     _note_seat_skip(run_dir, repo_root, cmd, events, role=role,
                     problems=problems)
 
@@ -1443,9 +1445,13 @@ def _implement_seats(runner, store, task, tag, run_dir, run_ids, repo_root,
         for run_id in run_ids:
             if budget_status(run_dir, repo_root, cmd).get("reached"):
                 break
+            started = time.monotonic()
+            events.emit("seat_started", run_id=run_id, session_wait_seconds=0.0)
             _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
             _implement_candidate(runner, store, task, tag, run_dir, run_id,
                                  repo_root, cmd, events, job_runner)
+            events.emit("seat_finished", run_id=run_id,
+                        seconds=round(time.monotonic()-started, 3))
         return
 
     batch_started = time.monotonic()
@@ -1510,15 +1516,25 @@ def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
         _or_block(run_dir, repo_root, cmd, events,
                   f"judged-slate generation {manifest['gen_no']} violates the "
                   f"atomic-admission contract: {detail}")
+    space_reviews.expansion.bind_probe(run_dir, manifest)
+    planning_started = time.monotonic()
     if not _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir,
                                manifest, round_no, repo_root, cmd, events):
         return []  # generation aborted: seats were never admitted
+    events.emit("slate_planning_finished", generation_id=manifest["generation_id"],
+                seconds=round(time.monotonic()-planning_started, 3))
+    if any(slot.get("seat_type") == "space_probe" for slot in manifest["slate"]):
+        if not space_reviews.activate_pending(run_dir, events=events):
+            _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events,
+                reason="probe reservation cancelled", role="space-reviewer", problems=["remaining budget"])
+            return []
     _admit_slate(run_dir, gen_dir, repo_root, cmd, events)
     events.emit("slate_admitted", gen_no=manifest["gen_no"],
                 generation_id=manifest["generation_id"],
                 run_ids=[slot["run_id"] for slot in manifest["slate"]])
     _evaluate_admitted_slate(runner, store, task, tag, run_dir, manifest,
                              repo_root, cmd, events, job_runner)
+    space_reviews.expansion.reconcile_probes(run_dir)
     return [{"run_id": slot["run_id"], "op": slot["carrier"]["op"]}
             for slot in manifest["slate"]]
 
@@ -2274,8 +2290,10 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
                     k_warm, k_eval, proposer_arm=None, time_budget=None,
                     deadline=None, final_reserve=None,
                     round_options=None, session_concurrency=None,
-                    rewrite_concurrency=None, no_eval_timeout=False) -> list[str]:
+                    rewrite_concurrency=None, no_eval_timeout=False, space_expansion=None) -> list[str]:
     extra = ["--no-eval-timeout"] if no_eval_timeout else []
+    if space_expansion is not None:
+        extra.append("--space-expansion" if space_expansion else "--no-space-expansion")
     if session_concurrency is not None:
         extra += ["--session-concurrency", str(session_concurrency)]
     if rewrite_concurrency is not None:
@@ -2317,7 +2335,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
            inner_policy, k_warm, k_eval, model, cli_path,
            proposer_arm=None, time_budget=None, deadline=None,
            final_reserve=None, round_options=None,
-           session_concurrency=None, rewrite_concurrency=None, no_eval_timeout=False) -> None:
+           session_concurrency=None, rewrite_concurrency=None, no_eval_timeout=False, space_expansion=None) -> None:
     extra = _init_run_extra(
         dimension_strategy,
         llm_intelligence_score,
@@ -2333,10 +2351,11 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         round_options=round_options,
         session_concurrency=session_concurrency,
         rewrite_concurrency=rewrite_concurrency,
-        no_eval_timeout=no_eval_timeout,
+        no_eval_timeout=no_eval_timeout, space_expansion=space_expansion,
     )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
+    space_reviews.expansion.initialize(run_dir)
     cmd(["uv", "--directory", common.task_project(task, task_toml), "sync"], repo_root)
     # the protocol gates this on "required assets absent"; the task
     # contract exposes no deterministic signal for that, so a declared
@@ -2754,6 +2773,13 @@ def _round_step(runner, store, task, tag, run_dir, round_no, task_toml,
     """
     view = (rounds.status(run_dir, repo_root, cmd) if ledger_exists
             else {"generate": True})
+    if space_reviews.expansion.pending_expansion(run_dir) is not None:
+        # The admitted slate precedes discretionary optimization. Clear a
+        # recovered phase boundary so its quota cannot gate promised screening.
+        from scheduler.round_policy import end_optimization
+        if view.get('state', {}).get('phase') == 'optimize':
+            end_optimization(run_dir, json.loads((run_dir/'ledger.json').read_text()))
+        view['generate'] = True
     if view["generate"]:
         actions = _evaluate_generation(
             runner, store, task, tag, run_dir, round_no,
@@ -2787,7 +2813,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    k_eval=None, proposer_arm=None, time_budget=None,
                    deadline=None, final_reserve=None, round_options=None,
                    session_concurrency=None, rewrite_concurrency=None,
-                   cli_path=None, finalization=None, no_eval_timeout=False,
+                   cli_path=None, finalization=None, no_eval_timeout=False, space_expansion=None,
                    cmd=common.run_cmd, job_runner=execute_driver_job) -> dict:
     """Set up or resume a run, then advance it until blocked or complete.
 
@@ -2826,7 +2852,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    round_options=round_options,
                    session_concurrency=session_concurrency,
                    rewrite_concurrency=rewrite_concurrency,
-                   no_eval_timeout=no_eval_timeout)
+                   no_eval_timeout=no_eval_timeout, space_expansion=space_expansion)
         else:
             # Explicit CLI overrides must never disappear merely because the
             # run directory already exists. init_run applies mutable limits,
@@ -2859,7 +2885,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 round_options=round_options,
                 session_concurrency=session_concurrency,
                 rewrite_concurrency=rewrite_concurrency,
-                no_eval_timeout=no_eval_timeout,
+                no_eval_timeout=no_eval_timeout, space_expansion=space_expansion,
             )
             if max_evaluations is not None or timeout is not None or extra:
                 common.init_run(
@@ -2871,6 +2897,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     timeout,
                     extra=extra,
                 )
+            space_reviews.recover(run_dir, cmd=cmd, repo_root=repo_root, events=events)
             _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd,
                           events, model, cli_path, task_toml=task_toml)
 
@@ -2900,6 +2927,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 # may have become terminal on the final available call.
                 unresolved = (_brief(run_dir, repo_root, cmd) or {}).get(
                     "pending_run_ids", [])
+                space_reviews.cancel_pending(run_dir, "run budget reached")
                 at_deadline = _time_reached(run_dir)
                 for pending_id in unresolved:
                     if at_deadline:
@@ -2922,6 +2950,13 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             if brief is not None and brief.get("experience_refresh_required"):
                 refreshed = _refresh(runner, store, task, tag, run_dir, repo_root,
                                      cmd, events)
+
+            # -----------------------------------------------------------------
+            # Optional review runs only after settled work and experience.
+            # The complete next slate is budgeted before publishing a revision.
+            # -----------------------------------------------------------------
+            space_reviews.review_boundary(runner, store, task, tag, run_dir,
+                repo_root, cmd, events, invoke=_invoke, job_runner=job_runner)
 
             # -----------------------------------------------------------------
             # Round steps 2+3 under round_v1: generate until the cycle's

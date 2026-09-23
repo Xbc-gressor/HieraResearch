@@ -40,6 +40,8 @@ ATTEMPT_KIND = "score_attempt"
 #: Never counted against any cap; only the per-candidate eval-time estimate
 #: the round scheduler prices bouts with reads it.
 COMPLETION_KIND = "score_completion"
+RESERVATION_KIND = "budget_reservation"
+RESERVATION_SETTLEMENT_KIND = "budget_reservation_settlement"
 #: Written by tools/scheduler/round_policy.py while an optimization phase is
 #: open; ``phase_deadline`` bounds every reservation inside that phase.
 ROUND_STATE_PATH = Path(".scheduler") / "round_state.json"
@@ -66,6 +68,15 @@ class EvaluationBudgetExhausted(RuntimeError):
             else f"{scope} evaluation budget exhausted before score_fn "
             f"(used={used}, budget={budget}, run_dir={run_dir})"
         )
+
+
+class BudgetReservationDenied(RuntimeError):
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason, self.detail = reason, detail
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+BudgetAdmissionDenied = BudgetReservationDenied
 
 
 def find_run_dir(ref_path: Any) -> Path | None:
@@ -289,7 +300,7 @@ def _read_rows(handle) -> list[dict]:
                 f"unsupported {ATTEMPT_LOG} schema on line {line_number}: "
                 f"{row.get('schema_version')!r}"
             )
-        if row.get("kind") not in (ATTEMPT_KIND, COMPLETION_KIND):
+        if row.get("kind") not in (ATTEMPT_KIND, COMPLETION_KIND, RESERVATION_KIND, RESERVATION_SETTLEMENT_KIND):
             raise ValueError(
                 f"unsupported {ATTEMPT_LOG} row kind on line {line_number}: "
                 f"{row.get('kind')!r}"
@@ -406,7 +417,9 @@ def reserve_evaluation(
     with _locked_log(run_dir) as handle:
         rows = _read_rows(handle)
         used, _ = _summarize_rows(rows)
-        if budget is not None and used >= budget:
+        holds = _reservation_outstanding(rows)
+        held_evals = sum(row['evaluations'] for row in holds.values())
+        if budget is not None and used + held_evals >= budget:
             raise EvaluationBudgetExhausted(
                 used=used,
                 budget=budget,
@@ -495,6 +508,207 @@ def _time_cutoffs(rows: list[dict]) -> dict[str, int]:
     return dict(counts)
 
 
+def _read_budget_rows(run_dir: Path) -> list[dict]:
+    path = Path(run_dir) / ATTEMPT_LOG
+    if not path.is_file():
+        return []
+    with path.open() as stream:
+        return _read_rows(stream)
+
+
+def _reservation_outstanding(rows: list[dict]) -> dict[str, dict]:
+    """Unstarted capacity, reduced by settlements and admitted attempts."""
+    outstanding: dict[str, dict] = {}
+    for row in rows:
+        reservation_id = row.get("reservation_id")
+        if row["kind"] in (RESERVATION_KIND,):
+            outstanding[reservation_id] = {
+                "reservation_id": reservation_id,
+                "label": row.get("label"),
+                "seconds": row["reserved_seconds"],
+                "evaluations": row["reserved_evaluations"],
+            }
+        elif reservation_id in outstanding:
+            entry = outstanding[reservation_id]
+            if row["kind"] == RESERVATION_SETTLEMENT_KIND and row["outcome"] in ("released", "activated"):
+                del outstanding[reservation_id]
+            elif row["kind"] in (RESERVATION_SETTLEMENT_KIND, ATTEMPT_KIND):
+                entry["seconds"] = max(0.0, entry["seconds"] - row.get("consumed_seconds", 0))
+                entry["evaluations"] = max(0, entry["evaluations"] - row.get("consumed_evaluations", 0))
+    return {key: value for key, value in outstanding.items()
+            if value["seconds"] > 0 or value["evaluations"] > 0}
+
+
+def outstanding_reservations(run_dir: Path) -> dict:
+    """Time/objective capacity currently promised to future work."""
+    entries = list(_reservation_outstanding(_read_budget_rows(run_dir)).values())
+    return {
+        "seconds": round(sum(entry["seconds"] for entry in entries), 3),
+        "evaluations": sum(entry["evaluations"] for entry in entries),
+        "rows": entries,
+    }
+
+
+def outstanding_reserved_seconds(run_dir: Path) -> float:
+    return float(outstanding_reservations(run_dir)["seconds"])
+
+
+def outstanding_reserved_evaluations(run_dir: Path) -> int:
+    return int(outstanding_reservations(run_dir)["evaluations"])
+
+
+def reserve_budget(
+    ref_path: Any,
+    *,
+    label: str,
+    seconds: float = 0.0,
+    evaluations: int = 0,
+    note: str = "",
+) -> dict:
+    """Promise capacity for future work (space review + probe slate).
+
+    Admission checks remaining run capacity: the promised seconds and
+    objective slots must fit what the run can still spend after existing
+    reservations, or the request is denied outright — a reservation never
+    overdraws the budget it is promising. ``settle_reservation`` drains it
+    as the protected work consumes time/slots.
+    """
+    run_dir = find_run_dir(ref_path)
+    if run_dir is None:
+        raise BudgetReservationDenied(
+            "outside_run", "no runs/<task>/<tag> encloses the reference path"
+        )
+    seconds = _finite_number(seconds)
+    if seconds is None or seconds < 0:
+        raise BudgetReservationDenied("invalid_request", "seconds must be finite and non-negative")
+    if (
+        not isinstance(evaluations, int)
+        or isinstance(evaluations, bool)
+        or evaluations < 0
+    ):
+        raise BudgetReservationDenied("invalid_request", "evaluations must be a non-negative integer")
+    if seconds <= 0 and evaluations <= 0:
+        raise BudgetReservationDenied("invalid_request", "reservation is empty")
+    with _locked_log(run_dir) as handle:
+        rows = _read_rows(handle)
+        outstanding = _reservation_outstanding(rows)
+        # Use the raw clock while holding the common budget lock.
+        clock = time_budget(run_dir)
+        reserved_seconds = sum(entry["seconds"] for entry in outstanding.values())
+        reserved_evals = sum(entry["evaluations"] for entry in outstanding.values())
+        if clock["usable_seconds"] is not None and (
+            seconds + reserved_seconds > clock["usable_seconds"]
+        ):
+            raise BudgetReservationDenied(
+                "insufficient_time",
+                f"requested {seconds:g}s; usable {clock['usable_seconds']:g}s "
+                f"with {reserved_seconds:g}s already reserved",
+            )
+        budget = _framework_budget(run_dir)
+        if budget is not None:
+            used, _ = _summarize_rows(rows)
+            if budget - used - reserved_evals - evaluations < 0:
+                raise BudgetReservationDenied(
+                    "insufficient_evaluations",
+                    f"used={used}, reserved={reserved_evals}, "
+                    f"requested={evaluations}, budget={budget}",
+                )
+        reservation = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": RESERVATION_KIND,
+            "reservation_id": f"resv-{sum(1 for r in rows if r.get('kind') == RESERVATION_KIND) + 1:04d}",
+            "run_id": Path(ref_path).resolve().parent.name,
+            "label": str(label)[:200],
+            "reserved_seconds": round(seconds, 3),
+            "reserved_evaluations": evaluations,
+            "note": str(note)[:500],
+            "created_at_epoch": time.time(),
+        }
+        _append_row(handle, reservation)
+        return reservation
+
+
+def settle_reservation(
+    ref_path: Any,
+    reservation_id: str,
+    *,
+    consumed_seconds: float = 0.0,
+    consumed_evaluations: int = 0,
+    outcome: str = "consumed",
+    reason: str = "",
+) -> dict | None:
+    """Drain one reservation by the capacity the protected work consumed.
+
+    Partial settlements are append-only and accumulate; ``outcome``
+    distinguishes normal consumption from an explicit release
+    (cancelled/unevaluated promised work). Over-settling is a no-op beyond
+    zero (the outstanding computation floors at zero). A release clears
+    all remaining capacity; repeated releases are no-ops."""
+    run_dir = find_run_dir(ref_path)
+    if run_dir is None:
+        return None
+    seconds = _finite_number(consumed_seconds) or 0.0
+    if seconds < 0:
+        seconds = 0.0
+    if not isinstance(consumed_evaluations, int) or isinstance(consumed_evaluations, bool):
+        consumed_evaluations = 0
+    row = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": RESERVATION_SETTLEMENT_KIND,
+        "reservation_id": str(reservation_id),
+        "consumed_seconds": round(seconds, 3),
+        "consumed_evaluations": max(0, consumed_evaluations),
+        "outcome": str(outcome),
+        "reason": str(reason)[:500],
+        "created_at_epoch": time.time(),
+    }
+    with _locked_log(run_dir) as handle:
+        if reservation_id not in _reservation_outstanding(_read_rows(handle)):
+            return None
+        _append_row(handle, row)
+        return row
+
+
+def activate_reservation(ref_path: Any, reservation_id: str) -> dict:
+    """Transfer a whole slate's pending promise to the driver's active work.
+
+    The caller starts the protected slate immediately and closes its publication
+    afterwards. Objective calls then charge the ordinary run budget.
+    """
+    run_dir = find_run_dir(ref_path)
+    if run_dir is None:
+        raise BudgetReservationDenied("outside_run")
+    with _locked_log(run_dir) as handle:
+        rows = _read_rows(handle)
+        outstanding = _reservation_outstanding(rows)
+        own = outstanding.pop(reservation_id, None)
+        if own is None:
+            activated = next((row for row in reversed(rows)
+                              if row["kind"] == RESERVATION_SETTLEMENT_KIND
+                              and row.get("reservation_id") == reservation_id
+                              and row.get("outcome") == "activated"), None)
+            if activated is not None:
+                return activated
+            raise BudgetReservationDenied("reservation_unavailable", reservation_id)
+        available = time_budget(run_dir)["usable_seconds"]
+        if available is not None:
+            available -= sum(row["seconds"] for row in outstanding.values())
+            if available < own["seconds"]:
+                raise BudgetReservationDenied("insufficient_time", "reserved work no longer fits")
+        receipt = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": RESERVATION_SETTLEMENT_KIND,
+            "reservation_id": reservation_id,
+            "outcome": "activated",
+            "label": own["label"],
+            "activated_seconds": own["seconds"],
+            "activated_evaluations": own["evaluations"],
+            "created_at_epoch": time.time(),
+        }
+        _append_row(handle, receipt)
+        return receipt
+
+
 def budget_status(run_dir: Path, *, create: bool = False) -> dict:
     """Return the strict objective usage view without mutating by default."""
     run_dir = Path(run_dir)
@@ -550,6 +764,7 @@ def budget_status(run_dir: Path, *, create: bool = False) -> dict:
                 for run_id, value in sorted(deep_per_candidate.items())
             ],
         },
+        "reservations": outstanding_reservations(run_dir),
         "attempt_log": str(path),
     }
 

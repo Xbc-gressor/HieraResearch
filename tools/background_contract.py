@@ -90,7 +90,10 @@ from semantic_space import (
     space_receipt,
     space_revision,
     validate_point,
+    validate_record_point,
+    registry_for_point,
     validate_space_core,
+    _validate_provenance,
 )
 
 
@@ -217,7 +220,16 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def load_registry(path: Path) -> dict[str, Any]:
-    """Extract the canonical semantic-search-space registry from Markdown."""
+    """Resolve the current published registry, or the initial Markdown registry."""
+    from space_revisions import load_revision_state
+    state = load_revision_state(path)
+    if state is not None:
+        return state["versions"][-1]["registry"]
+    return load_initial_registry(path)
+
+
+def load_initial_registry(path: Path) -> dict[str, Any]:
+    """Read the unchanged research-time registry for source/Markdown auditing."""
     text = path.read_text(errors="replace")
     marker = re.search(r"^## Search space registry\s*$", text, flags=re.MULTILINE)
     if marker is None:
@@ -509,7 +521,8 @@ def _validate_hypotheses(
                 continue
             where = f"dimensions[{dimension_index}].hypotheses[{hypothesis_index}]"
             errors.extend(_validate_scope(hypothesis.get("scope"), f"{where}.scope"))
-            allow_empty = hypothesis.get("kind") == "baseline"
+            synthesis = hypothesis.get("kind") == "synthesis_probe"
+            allow_empty = hypothesis.get("kind") == "baseline" or synthesis
             link_errors, links = _evidence_link_errors(
                 hypothesis.get("evidence"),
                 f"{where}.evidence",
@@ -518,6 +531,45 @@ def _validate_hypotheses(
             )
             errors.extend(link_errors)
             errors.extend(_credibility_errors(hypothesis, links, source_by_id, where))
+            if synthesis:
+                if not any(p.get("kind") == "agent_synthesis"
+                           for p in hypothesis.get("provenance", []) if isinstance(p, dict)):
+                    errors.append(f"{where} synthesis_probe requires agent_synthesis provenance")
+                if not links and hypothesis.get("literature_credibility") != "unverified":
+                    errors.append(f"{where} unsourced synthesis must have unverified literature credibility")
+    return errors
+
+
+def validate_reserves(registry: dict[str, Any]) -> list[str]:
+    """Lightweight retained directions; these are not registered hypotheses."""
+    reserves = registry.get("reserves", [])
+    if not isinstance(reserves, list) or len(reserves) > 12:
+        return ["reserves must be a list of at most 12 directions"]
+    errors: list[str] = []
+    seen: set[str] = set()
+    sources = {s.get("id") for s in registry.get("sources", []) if isinstance(s, dict)}
+    for index, lead in enumerate(reserves):
+        where = f"reserves[{index}]"
+        fields = {"id", "mechanism", "provenance", "deferred_reason", "open_questions"}
+        if not isinstance(lead, dict) or set(lead) != fields:
+            errors.append(f"{where} must contain {sorted(fields)}")
+            continue
+        for field in ("id", "mechanism", "deferred_reason"):
+            if not _nonempty(lead.get(field)):
+                errors.append(f"{where}.{field} must be non-empty")
+        lead_id = lead.get("id")
+        if isinstance(lead_id, str):
+            if lead_id in seen:
+                errors.append(f"{where} duplicate reserve id {lead_id}")
+            seen.add(lead_id)
+        questions = lead.get("open_questions")
+        if not isinstance(questions, list) or not questions or any(not _nonempty(q) for q in questions):
+            errors.append(f"{where}.open_questions must be a non-empty string list")
+        provenance = lead.get("provenance")
+        errors.extend(_validate_provenance(provenance, f"{where}.provenance"))
+        for receipt in provenance if isinstance(provenance, list) else []:
+            if isinstance(receipt, dict) and receipt.get("kind") == "literature" and receipt.get("ref") not in sources:
+                errors.append(f"{where} references unknown source {receipt.get('ref')!r}")
     return errors
 
 
@@ -1750,7 +1802,8 @@ def _validate_policy_receipt(record: dict[str, Any], where: str) -> list[str]:
     return errors
 
 
-def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
+def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any], *,
+                    registry_history: dict | None = None) -> list[str]:
     errors: list[str] = []
     errors.extend(validate_lineage_snapshots(ledger))
     errors.extend(validate_attempt_observations(ledger))
@@ -1877,8 +1930,10 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
             errors.append(
                 f"{where} {op} requires {expected_parent_count} distinct numeric parents"
             )
-        point_errors = validate_point(record.get("semantic_point"), registry)
+        point_errors = validate_record_point(record.get("semantic_point"), registry, registry_history)
         errors.extend(f"{where}: {error}" for error in point_errors)
+        record_registry = registry if point_errors else registry_for_point(
+            record["semantic_point"], registry, registry_history)
         errors.extend(_validate_policy_receipt(record, where))
         # Replay the overlay at the record's historical selection revision, so
         # later pruning never invalidates an earlier admitted record.
@@ -1886,7 +1941,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
         if (
             isinstance(receipt, dict)
             and receipt.get("schema_version") == 8
-            and receipt.get("space") != expected_receipt
+            and receipt.get("space") != space_receipt(record_registry)
         ):
             errors.append(
                 f"{where}.policy_receipt.space must equal the frozen space receipt"
@@ -1935,10 +1990,10 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                     f"[0, {state_revision}]"
                 )
             else:
-                runtime = replay_search_space_state(registry, state, revision=record_revision)
-                effective = compose_effective_selection(registry, guidance, runtime)
+                runtime = replay_search_space_state(record_registry, state, revision=record_revision)
+                effective = compose_effective_selection(record_registry, derive_hypothesis_selection(record_registry), runtime)
                 eligibility = validate_point_eligibility(
-                    record.get("semantic_point"), registry, effective
+                    record.get("semantic_point"), record_registry, effective
                 )
                 errors.extend(f"{where}: {error}" for error in eligibility)
                 if isinstance(receipt, dict) and receipt.get("schema_version") in {6, 7, 8}:
@@ -2009,7 +2064,7 @@ def validate_ledger(registry: dict[str, Any], ledger: dict[str, Any]) -> list[st
                                     f"{where}.policy_receipt.experience evidence "
                                     f"must reference earlier edges {unknown_edges}"
                                 )
-        errors.extend(validate_semantic_edges(records[:index], record, registry))
+        errors.extend(validate_semantic_edges(records[:index], record, registry, registry_history=registry_history))
         errors.extend(
             f"{where}: {error}"
             for error in validate_parameter_transfer_binding(ledger, record)
@@ -2073,6 +2128,7 @@ def validate_registry(
     dimension_strategy: str = DEFAULT_DIMENSION_STRATEGY,
     baseline_mechanisms: dict[str, Any] | None = None,
     number_gate: bool = False,
+    registry_history: dict | None = None,
 ) -> list[str]:
     errors = validate_space_core(
         registry, catalog=catalog, dimension_strategy=dimension_strategy
@@ -2082,6 +2138,7 @@ def validate_registry(
     )
     errors.extend(source_errors)
     errors.extend(_validate_hypotheses(registry, source_by_id))
+    errors.extend(validate_reserves(registry))
     errors.extend(
         _validate_baseline_mechanism_disjointness(registry, baseline_mechanisms)
     )
@@ -2113,7 +2170,7 @@ def validate_registry(
                 "the frozen registry has no valid explicit-baseline point under its relations"
             )
     if ledger is not None:
-        errors.extend(validate_ledger(registry, ledger))
+        errors.extend(validate_ledger(registry, ledger, registry_history=registry_history))
     return errors
 
 
@@ -2406,6 +2463,12 @@ def _number_presence_gate_errors(
         if isinstance(item, dict):
             items.append(("guidance", item))
     for item_kind, item in items:
+        # Source-free synthesis states a proposed mechanism or runtime
+        # observation, not a number attributed to literature. Its provenance
+        # and unverified credibility remain subject to _validate_hypotheses.
+        # A synthesis with any citation still owes the full evidence contract.
+        if item_kind == "hypothesis" and item.get("kind") == "synthesis_probe" and not item.get("evidence"):
+            continue
         result = item_number_presence(item, registry, manifest, manifest_dir)
         candidates = list(
             dict.fromkeys(
@@ -2647,8 +2710,9 @@ def render_space(
     *,
     max_hypotheses: int,
     retrieval_manifest: dict[str, Any] | None = None,
+    registry_history: dict | None = None,
 ) -> dict[str, Any]:
-    coverage = coverage_from_records(registry, (ledger or {}).get("records", []))
+    coverage = coverage_from_records(registry, (ledger or {}).get("records", []), registry_history=registry_history)
     counts = {
         item["hypothesis_id"]: item["count"]
         for dimension in coverage["dimensions"]
@@ -3248,6 +3312,7 @@ def validate_experience(experience: Any, registry: dict[str, Any], ledger: dict[
 
 
 def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any] | None, list[str]]:
+    from space_revisions import load_registry_history
     registry = load_registry(args.background)
     dimension_strategy = resolve_dimension_strategy(args.background)
     catalog = resolve_dimension_catalog(
@@ -3272,6 +3337,7 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         dimension_strategy=dimension_strategy,
         baseline_mechanisms=baseline_mechanisms,
         number_gate=getattr(args, "number_gate", False),
+        registry_history=load_registry_history(args.background),
     )
     # The product-side scan also applies when only --background is passed in a
     # run dir: resolve the profile from the sibling retrieval manifest path.
@@ -3281,7 +3347,7 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         else args.background.parent / "background_retrieval.json"
     )
     errors.extend(
-        validate_background_markdown(args.background, registry, policy_profile=policy_profile)
+        validate_background_markdown(args.background, load_initial_registry(args.background), policy_profile=policy_profile)
     )
     return registry, ledger, errors
 
@@ -3312,6 +3378,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_render(args: argparse.Namespace) -> int:
+    from space_revisions import load_registry_history
     if not 1 <= args.max_hypotheses <= 32:
         print(
             json.dumps(
@@ -3335,6 +3402,7 @@ def cmd_render(args: argparse.Namespace) -> int:
                 ledger,
                 max_hypotheses=args.max_hypotheses,
                 retrieval_manifest=manifest,
+                registry_history=load_registry_history(args.background),
             ),
             separators=(",", ":"),
         )
@@ -3362,6 +3430,7 @@ def cmd_validate_point(args: argparse.Namespace) -> int:
 
 
 def cmd_lineage(args: argparse.Namespace) -> int:
+    from space_revisions import load_registry_history
     if args.compact and not 1 <= args.limit <= 64:
         print(
             json.dumps(
@@ -3374,7 +3443,8 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     if errors:
         print(json.dumps({"ok": False, "errors": errors}, separators=(",", ":")))
         return 1
-    value = derive_semantic_lineage(registry, ledger or {}, limit=args.limit if args.compact else None)
+    value = derive_semantic_lineage(registry, ledger or {}, limit=args.limit if args.compact else None,
+                                    registry_history=load_registry_history(args.background))
     print(json.dumps(value, separators=(",", ":") if args.compact else None, indent=None if args.compact else 2))
     return 0
 

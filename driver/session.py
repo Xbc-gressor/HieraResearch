@@ -409,7 +409,13 @@ def budget_run_dir(ctx: InvocationContext) -> Path:
 
 
 def session_time_budget(ctx: InvocationContext) -> dict:
-    return time_budget(budget_run_dir(ctx))
+    view = time_budget(budget_run_dir(ctx))
+    if ctx.deadline_epoch is not None:
+        remaining = ctx.deadline_epoch-time.time()
+        usable = view.get("usable_seconds")
+        view["usable_seconds"] = remaining if usable is None else min(usable, remaining)
+        view["time_reached"] = view["usable_seconds"] <= 0
+    return view
 
 
 def admit_session(role: RoleDefinition, ctx: InvocationContext,

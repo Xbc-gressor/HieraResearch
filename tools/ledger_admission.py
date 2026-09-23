@@ -15,6 +15,7 @@ from pathlib import Path
 from background_contract import (
     ATTEMPT_POLICY_NAMES,
     load_registry,
+    load_initial_registry,
     validate_background_markdown,
     validate_registry,
 )
@@ -27,6 +28,7 @@ from ledger_core import (
     search_space_state_revision,
 )
 from run_cfg import load_run_cfg
+from space_revisions import load_registry_history
 from search_space_state import empty_search_space_state
 from semantic_attempts import (
     DEFAULT_ATTEMPT_CONFIG,
@@ -58,7 +60,7 @@ from semantic_space import (
     resolve_dimension_strategy,
     space_receipt,
 )
-from slate import replay_aggregation, verify_manifest
+from slate import replay_aggregation, verify_manifest, validate_approved_probe_binding
 
 
 class AdmissionError(ValueError):
@@ -101,8 +103,9 @@ def _resolve_space(
         ledger=data,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
+        registry_history=load_registry_history(request.background_path),
     )
-    errors.extend(validate_background_markdown(request.background_path, registry))
+    errors.extend(validate_background_markdown(request.background_path, load_initial_registry(request.background_path)))
     if errors:
         raise AdmissionError("invalid P2 background/ledger: " + "; ".join(errors))
     return registry, catalog, dimension_strategy
@@ -385,6 +388,7 @@ def admit_record(data: dict, request: AdmissionRequest) -> dict:
         ledger=data,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
+        registry_history=load_registry_history(request.background_path),
     )
     if errors:
         data["records"].pop()
@@ -539,7 +543,18 @@ def _validate_judge_binding(
             raise AdmissionError(f"slate slot {index} must carry the full point")
         if slot.get("point_id") != point_id(slot["point"]):
             raise AdmissionError(f"slate slot {index} point_id does not match its point")
-        if carrier.get("proposal_set_revision") != revisions.get(carrier.get("lane_id")):
+        if slot.get("seat_type") == "space_probe":
+            binding = slot.get("space_probe_binding")
+            if binding != carrier.get("space_probe_binding"):
+                raise AdmissionError("probe carrier does not match its publication")
+            approved = {**binding, "probe": binding["review"]["probe"]}
+            errors = validate_approved_probe_binding(Path(request.run_dir), approved)
+            if errors:
+                raise AdmissionError("invalid approved probe: " + "; ".join(errors))
+            if carrier.get("proposal_set_revision") != digest(approved):
+                raise AdmissionError("probe proposal revision does not match publication")
+        elif (carrier.get("lane_id") not in revisions or
+              carrier.get("proposal_set_revision") != revisions.get(carrier.get("lane_id"))):
             raise AdmissionError(
                 f"slate slot {index} carrier proposal revision is not one of the "
                 "manifest's recorded proposal sets"
@@ -722,6 +737,7 @@ def admit_slate_atomic(data: dict, request: SlateAdmissionRequest) -> list[dict]
         ledger=data,
         catalog=catalog,
         dimension_strategy=dimension_strategy,
+        registry_history=load_registry_history(request.background_path),
     )
     if errors:
         del records[pre_count:]

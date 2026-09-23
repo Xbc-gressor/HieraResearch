@@ -532,6 +532,18 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
             raise RunConfigError(f"{path}: round must be an object")
         _validate_round_config(round_section, path)
 
+    expansion = config.get("space_expansion", {})
+    if not isinstance(expansion, dict):
+        raise RunConfigError(f"{path}: space_expansion must be an object")
+    for key in ("enabled", "targeted_retrieval"):
+        if key in expansion and not isinstance(expansion[key], bool):
+            raise RunConfigError(f"{path}: space_expansion.{key} must be boolean")
+    for key in ("stall_slates", "max_reviews"):
+        _validate_optional_positive_int(expansion, key, path)
+    threshold = expansion.get("improvement_threshold", 0)
+    if not _is_finite_number(threshold) or threshold < 0:
+        raise RunConfigError(f"{path}: space_expansion.improvement_threshold must be finite and nonnegative")
+
     judged_slate = config.get("judged_slate")
     if judged_slate is not None:
         if not isinstance(judged_slate, dict):

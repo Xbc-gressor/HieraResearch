@@ -65,6 +65,13 @@ uv run python -m driver run tabular-model-search <tag> \
 初始化生成 `runs/<task>/<tag>/task_contract/{TASK.md,task.toml,budget.json}`，向所有角色
 呈现有效预算；原任务代码、环境和评分合同不变。该目录是角色上下文约定，不是文件系统隔离。
 
+`--loop experiment --space-expansion` 启用运行期语义空间审视（需设置 run 时间预算，使用 `judged_slate`）。
+默认连续两个完整 slate 没有有效改善时申请审视，rewrite/tune 的改善也会重置计数；每 run 最多两次。
+审视消费留存 research、储备路线和运行经验，通过预算准入后给下一份两席 slate 预留一个新路线 probe。
+该开关与 `--no-eval-timeout` 独立；`--no-space-expansion` 关闭新审视，已发布的 probe 仍按原承诺结算。
+`framework_cfg.json.space_expansion` 记录触发阈值与开关；`targeted_retrieval` 默认关闭，可独立开启一次有界定向检索。
+空间快照、审视材料和 probe 状态位于 `.semantic/`，容量预约与实际评估共用 `evaluation_attempts.jsonl`，实际耗时仍受全局截止约束。
+
 `--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--loop baseline-tune` 是强调优基线：task 提供的 baseline（需要 `[seed].provided`）在 step 0+1 之后，由 driver 确定性地用 ONE 个 HEBO MACE bout 花完整个 `--max-evaluations` 预算（相当于把 INITIAL BOUT 拉长到整个 run；无 ideation、无 scheduler、无 tuner-orchestrator 会话），冻结 `inner_policy=baseline-hebo-full-v1` + `scheduler_policy=legacy`。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations`、`--timeout`、`--semantic-policy`、`--scheduler-policy` 与 `--inner-tuner-policy` 经 `tools/init_run.py` 持久化到 `framework_cfg.json`；`--timeout` 是单次评估时限的别名，不是会话看门狗。`anchor_challenger_v1`、`anchor_transfer_challenger_v1` 和 `v3_2` 都需要有限的 `max_evaluations`；新 run 模板默认提供 200。
 
 对于并行实验，使用不同的 `tag` 值启动多个进程。

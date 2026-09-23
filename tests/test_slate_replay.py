@@ -79,6 +79,7 @@ def build_admitted_generation(
     extra_records: tuple = (),
     reserved_run_ids: str = "005,006",
     donor: str | None = None,
+    prepare_run=None,
 ) -> dict:
     """One full judged generation, admitted into the on-disk ledger.
 
@@ -96,6 +97,8 @@ def build_admitted_generation(
         (run_dir / "framework_cfg.json").write_text(json.dumps(framework_cfg))
     data = _ledger_data(registry)
     data["records"].extend(extra_records)
+    if prepare_run is not None:
+        prepare_run(run_dir, data)
     (run_dir / "ledger.json").write_text(json.dumps(data, indent=2) + "\n")
 
     gen = run_dir / ".semantic" / "gen-0001"

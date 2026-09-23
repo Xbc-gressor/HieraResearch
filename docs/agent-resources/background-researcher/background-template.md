@@ -61,7 +61,7 @@ include backend failures and coverage limitations>
           "id": "hyp-<globally-unique-stable-slug>",
           "title": "<short choice name>",
           "claim": "<specific attribution hypothesis, not a universal truth>",
-          "kind": "baseline | evidence_prior | scope_probe",
+          "kind": "baseline | evidence_prior | scope_probe | synthesis_probe",
           "status": "active",
           "provenance": [
             {"kind": "task_contract | literature | agent_synthesis", "ref": "<path or source id>"}
@@ -85,6 +85,7 @@ include backend failures and coverage limitations>
       ]
     }
   ],
+  "reserves": [],
   "relations": [
     {
       "id": "rel-<stable-slug>",

@@ -38,7 +38,7 @@ RELATION_RE = re.compile(r"^rel-[a-z0-9][a-z0-9-]*$")
 
 DIMENSION_MODES = {"searchable", "baseline_only"}
 ELEMENT_STATUSES = {"active"}
-HYPOTHESIS_KINDS = {"baseline", "evidence_prior", "scope_probe"}
+HYPOTHESIS_KINDS = {"baseline", "evidence_prior", "scope_probe", "synthesis_probe"}
 RELATION_TYPES = {"activates", "requires", "excludes"}
 PROVENANCE_KINDS = {"catalog", "task_contract", "literature", "agent_synthesis"}
 
@@ -76,6 +76,11 @@ def resolve_dimension_catalog(
     """Resolve the catalog for one run, with an explicit CLI path taking priority."""
     if explicit_path is not None:
         return load_catalog(Path(explicit_path))
+
+    from space_revisions import load_revision_state
+    state = load_revision_state(background_path)
+    if state is not None:
+        return state["versions"][-1]["catalog"]
 
     strategy = resolve_dimension_strategy(background_path)
     if strategy == DEFAULT_DIMENSION_STRATEGY:
@@ -580,7 +585,7 @@ def validate_space_core(
     # explicit inactive point entries when their activation is false.
     unknown_top = sorted(
         set(registry)
-        - {"schema_version", "kind", "space_id", "catalog", "dimensions", "relations", "guidance", "sources"}
+        - {"schema_version", "kind", "space_id", "catalog", "dimensions", "relations", "guidance", "sources", "reserves"}
     )
     if unknown_top:
         errors.append(f"search-space registry has unknown fields {unknown_top}")
@@ -850,10 +855,12 @@ def point_diff(parent: dict[str, Any], child: dict[str, Any]) -> list[dict[str, 
         previous = parent_by_dim.get(current["dimension_id"], {})
         before = previous.get("hypothesis_id") if previous.get("state") == "selected" else None
         after = current.get("hypothesis_id") if current.get("state") == "selected" else None
-        if before == after:
+        undeclared = current["dimension_id"] not in parent_by_dim
+        if before == after and not undeclared:
             continue
         operation = (
-            "dimension_activated" if before is None
+            "dimension_declared" if undeclared
+            else "dimension_activated" if before is None
             else "dimension_deactivated" if after is None
             else "hypothesis_changed"
         )
@@ -866,14 +873,34 @@ def point_diff(parent: dict[str, Any], child: dict[str, Any]) -> list[dict[str, 
     return changes
 
 
-def coverage_from_records(registry: dict[str, Any], records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def registry_for_point(point: Any, registry: dict, registry_history: dict | None = None) -> dict:
+    """Resolve a historical point without ever repairing or backfilling it."""
+    revision = point.get("space_revision") if isinstance(point, dict) else None
+    if revision == space_revision(registry):
+        return registry
+    historical = (registry_history or {}).get(revision)
+    if historical is None or space_revision(historical) != revision or historical.get("space_id") != registry.get("space_id"):
+        raise SemanticSpaceError(f"unknown or inconsistent historical space revision {revision}")
+    return historical
+
+
+def validate_record_point(point: Any, registry: dict, registry_history: dict | None = None) -> list[str]:
+    try:
+        original = registry_for_point(point, registry, registry_history)
+    except SemanticSpaceError as exc:
+        return [str(exc)]
+    return validate_point(point, original)
+
+
+def coverage_from_records(registry: dict[str, Any], records: Iterable[dict[str, Any]], *,
+                          registry_history: dict | None = None) -> dict[str, Any]:
     hypothesis_counts = {hypothesis_id: 0 for hypothesis_id in hypothesis_map(registry)}
     point_counts: dict[str, int] = {}
     invalid_records: list[dict[str, Any]] = []
     for record in records:
         run_id = str(record.get("run_id"))
         point = record.get("semantic_point")
-        point_errors = validate_point(point, registry)
+        point_errors = validate_record_point(point, registry, registry_history)
         if point_errors:
             invalid_records.append({"run_id": run_id, "errors": point_errors})
             continue
@@ -909,7 +936,8 @@ def coverage_from_records(registry: dict[str, Any], records: Iterable[dict[str, 
 
 
 def derive_semantic_lineage(
-    registry: dict[str, Any], ledger: dict[str, Any], *, limit: int | None = None
+    registry: dict[str, Any], ledger: dict[str, Any], *, limit: int | None = None,
+    registry_history: dict | None = None,
 ) -> dict[str, Any]:
     records = {
         str(record.get("run_id")): record
@@ -923,7 +951,7 @@ def derive_semantic_lineage(
     }
     for run_id, record in records.items():
         point = record.get("semantic_point")
-        point_errors = validate_point(point, registry)
+        point_errors = validate_record_point(point, registry, registry_history)
         if point_errors:
             warnings.append(f"run {run_id} has invalid semantic_point: {'; '.join(point_errors)}")
             continue
@@ -956,7 +984,7 @@ def derive_semantic_lineage(
             hypothesis_id: ([] if limit == 0 else run_ids[-limit:])
             for hypothesis_id, run_ids in hypothesis_runs.items()
         }
-    coverage = coverage_from_records(registry, records.values())
+    coverage = coverage_from_records(registry, records.values(), registry_history=registry_history)
     if limit is not None and limit >= 0:
         recent_point_ids = list(
             dict.fromkeys(

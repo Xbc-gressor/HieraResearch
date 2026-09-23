@@ -534,6 +534,7 @@ def build_proposal_set(
     op: str,
     parents: list[str],
     max_points: int = 128,
+    registry_history: dict | None = None,
 ) -> dict[str, Any]:
     if (
         not isinstance(max_points, int)
@@ -543,6 +544,11 @@ def build_proposal_set(
         raise ContractError(f"max_points must be an integer in [1, {MAX_PROPOSALS}]")
     _validate_action(op, parents)
     parent_records = _parent_records(ledger, parents)
+    from semantic_space import validate_record_point
+    for record in parent_records:
+        errors = validate_record_point(record.get("semantic_point"), registry, registry_history)
+        if errors:
+            raise ContractError("invalid parent point: " + "; ".join(errors))
     eligible, effective, state_revision = _eligible_hypotheses(registry, ledger)
     if any(not choices for choices in eligible.values()):
         empty = [dimension_id for dimension_id, choices in eligible.items() if not choices]
@@ -557,7 +563,7 @@ def build_proposal_set(
         )
     if not points:
         raise ContractError(f"no valid semantic points can satisfy action {op}")
-    coverage = coverage_from_records(registry, ledger.get("records", []))
+    coverage = coverage_from_records(registry, ledger.get("records", []), registry_history=registry_history)
     proposals: list[dict[str, Any]] = []
     for point in points:
         selected = selected_assignments(point)
@@ -1529,6 +1535,7 @@ def _framework_policy_config(
 
 
 def cmd_propose(args: argparse.Namespace) -> int:
+    from space_revisions import load_registry_history
     # Setup validates and freezes background/catalog/source evidence.  Proposal
     # generation is a high-frequency runtime projection and validates the
     # changing action, ancestry, point eligibility, and state it consumes.
@@ -1546,6 +1553,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
             op=args.op,
             parents=parents,
             max_points=args.max_points,
+            registry_history=load_registry_history(args.background),
         )
     _write_object(args.output, value)
     print(

@@ -508,7 +508,7 @@ class JudgedSlateTests(unittest.TestCase):
         self.assertEqual(
             [k for k in self._events() if k.startswith("slate_")],
             ["slate_pool_built", "slate_judge_completed",
-             "slate_manifested", "slate_admitted"],
+             "slate_manifested", "slate_planning_finished", "slate_admitted"],
         )
         self.assertEqual(cmd._ledger().get("run_state", {}).get("phase"), "completed")
         from experience_updates import publication_boundary

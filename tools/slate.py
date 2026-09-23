@@ -50,8 +50,10 @@ from semantic_space import (
     digest,
     dimension_map,
     hypothesis_map,
+    point_diff,
     selected_assignments,
     space_receipt,
+    validate_point,
 )
 
 
@@ -135,6 +137,9 @@ def build_pool(
     proposal_sets: dict,
     registry: dict,
     pool_size: int,
+    *,
+    approved_probe: dict | None = None,
+    records: list | None = None,
 ) -> dict:
     """Seat one generation's candidate pool from per-lane proposal sets.
 
@@ -221,6 +226,40 @@ def build_pool(
                 ),
             }
         )
+    if approved_probe is not None:
+        probe = approved_probe["probe"]
+        errors = validate_point(probe.get("point"), registry)
+        if approved_probe.get("space") != space_receipt(registry):
+            errors.append("approved probe belongs to another registry")
+        if errors:
+            raise ContractError("invalid approved probe: " + "; ".join(errors))
+        by_id = {str(record["run_id"]): record for record in records or []}
+        parents = probe["parents"]
+        if any(parent not in by_id for parent in parents):
+            raise ContractError("approved probe parent missing from ledger prefix")
+        binding = {key: approved_probe[key] for key in ("space", "review", "admission")}
+        carrier = {
+            "lane_id": "space-probe", "op": probe["op"], "parents": parents,
+            "parent_diffs": [{"parent_run_id": parent,
+                              "changes": point_diff(by_id[parent]["semantic_point"], probe["point"])}
+                             for parent in parents],
+            "lane_value": None, "proposal_set_revision": digest(approved_probe),
+            "space_probe_binding": binding,
+        }
+        entry = next((entry for entry in pool if entry["point_id"] == probe["point"]["point_id"]), None)
+        if entry is None:
+            if len(pool) == pool_size:
+                pool.pop()
+            entry = {"point_id": probe["point"]["point_id"], "point": probe["point"],
+                     "coverage": 0.0, "deprioritized_hypotheses": [],
+                     "carrier_alternatives": []}
+            pool.append(entry)
+        else:
+            entry["carrier_alternatives"].insert(0, entry["carrier"])
+        entry.update(carrier=carrier, seat_type="space_probe", space_probe_binding=binding)
+        entry["summary"] = bare_point_summary(entry["point"], carrier, entry["deprioritized_hypotheses"], registry)
+        for rank, entry in enumerate(pool, start=1):
+            entry.update(label=f"C{rank}", coverage_rank=rank)
     return {
         "pool": pool,
         "lanes_without_proposals": lanes_without_proposals,
@@ -538,6 +577,24 @@ def _check_stage_artifact(
 
 
 def decide_aggregation(pool: dict, stages: dict, context_digest: str) -> tuple[dict, bool]:
+    """Apply the frozen probe commitment to the ordinary deterministic ranking."""
+    probe = None
+    if pool.get("approved_probe") is not None:
+        cap = (pool.get("budget") or {}).get("admission_cap")
+        if (cap is not None and cap < SLATE_SIZE) or len(pool["pool"]) < SLATE_SIZE:
+            raise ContractError("approved probe requires the complete two-seat slate")
+        probes = [entry for entry in pool["pool"] if entry.get("seat_type") == "space_probe"]
+        if len(probes) != 1:
+            raise ContractError("approved probe requires exactly one bound pool entry")
+        probe = probes[0]
+    decision, called = _decide_ordinary_aggregation(pool, stages, context_digest)
+    if probe is not None and decision["status"] != "boundary_required":
+        ordinary = next(label for label in decision["slate"] if label != probe["label"])
+        decision = {**decision, "slate": [probe["label"], ordinary]}
+    return decision, called
+
+
+def _decide_ordinary_aggregation(pool: dict, stages: dict, context_digest: str) -> tuple[dict, bool]:
     """The aggregation decision tree over already-parsed stage artifacts.
 
     Degraded paths (empty pool, zero cap, or a slate the pool cannot fill
@@ -686,6 +743,8 @@ def build_manifest(
                 "carrier_alternatives": entry["carrier_alternatives"],
             }
         )
+        if entry.get("seat_type") == "space_probe":
+            slate[-1].update(seat_type="space_probe", space_probe_binding=entry["space_probe_binding"])
     core = {
         "schema_version": SCHEMA_VERSION,
         "gen_no": pool["gen_no"],
@@ -857,9 +916,35 @@ def verify_manifest(manifest: dict, pool: dict, context: dict, judge: dict) -> l
         errors.append("judge.json pool_digest does not match pool.json")
     if judge.get("context_digest") != context_digest:
         errors.append("judge.json context_digest does not match context.json")
+    if [slot.get("label") for slot in manifest.get("slate", [])] != judge.get("aggregation", {}).get("slate"):
+        errors.append("manifest slate does not match the frozen aggregation")
+    by_label = {entry["label"]: entry for entry in pool.get("pool", [])}
+    approved = pool.get("approved_probe")
+    probe_slots = [slot for slot in manifest.get("slate", []) if slot.get("seat_type") == "space_probe"]
+    if approved is not None:
+        if approved.get("probe") != approved.get("review", {}).get("probe"):
+            errors.append("approved pool probe differs from the reviewed route")
+        if len(manifest.get("slate", [])) != SLATE_SIZE or len(probe_slots) != 1:
+            errors.append("approved probe requires exactly one seat in a two-seat manifest")
+        else:
+            slot = probe_slots[0]
+            probe = approved["probe"]
+            binding = {key: approved[key] for key in ("space", "review", "admission")}
+            if (slot.get("point") != probe["point"]
+                    or slot.get("carrier", {}).get("op") != probe["op"]
+                    or slot.get("carrier", {}).get("parents") != probe["parents"]
+                    or slot.get("space_probe_binding") != binding):
+                errors.append("manifest probe does not match the approved route")
+    elif probe_slots:
+        errors.append("manifest probe has no approved pool snapshot")
     for slot in manifest.get("slate", []):
         if slot.get("candidate_id") != recompute_candidate_id(slot):
             errors.append(f"slot {slot.get('slot')} candidate_id does not recompute")
+        entry = by_label.get(slot.get("label"), {})
+        for key in ("point_id", "point", "carrier", "carrier_alternatives",
+                    "seat_type", "space_probe_binding"):
+            if slot.get(key) != entry.get(key):
+                errors.append(f"slot {slot.get('slot')} {key} differs from the pool")
     return errors
 
 
@@ -1046,7 +1131,23 @@ def _load_proposal_sets(lanes_doc: dict, proposals_dir: Path, space: dict) -> di
     return proposal_sets
 
 
+def validate_approved_probe_binding(run_dir: Path, approved_probe: dict) -> list:
+    """Bind a frozen probe to its immutable publication, including after settlement."""
+    from space_revisions import load_revision_state
+
+    state = load_revision_state(Path(run_dir) / "background.md")
+    for version in (state or {}).get("versions", []):
+        if version.get("space") == approved_probe.get("space"):
+            expected = {"space": version["space"], "review": version.get("review"),
+                        "admission": version.get("admission"),
+                        "probe": (version.get("review") or {}).get("probe")}
+            return [] if approved_probe == expected else ["approved probe differs from immutable publication"]
+    return ["approved probe has no immutable publication"]
+
+
 def cmd_construct(args: argparse.Namespace) -> int:
+    if (Path(args.pool_output).parent / "generation.json").exists():
+        raise ContractError("cannot reconstruct a frozen generation")
     lanes_doc = _load_object(args.lanes)
     _check_lanes_document(lanes_doc)
     ledger_path = Path(args.ledger)
@@ -1061,7 +1162,19 @@ def cmd_construct(args: argparse.Namespace) -> int:
     if pool_size is None:
         pool_size = load_judged_slate_config(ledger_path)["pool_size"]
     snapshot = lanes_doc["ledger_snapshot"]
-    core = build_pool(lanes_doc["lanes"], proposal_sets, registry, pool_size)
+    from space_expansion import pending_expansion
+
+    approved_probe = pending_expansion(ledger_path.parent)
+    if approved_probe is not None:
+        errors = validate_approved_probe_binding(ledger_path.parent, approved_probe)
+        if errors:
+            raise ContractError("; ".join(errors))
+    core = build_pool(lanes_doc["lanes"], proposal_sets, registry, pool_size,
+                      approved_probe=approved_probe, records=records)
+    if approved_probe is not None:
+        cap = lanes_doc["budget"].get("admission_cap")
+        if (cap is not None and cap < SLATE_SIZE) or len(core["pool"]) < SLATE_SIZE:
+            raise ContractError("approved probe requires the complete two-seat slate")
     payload = {
         "schema_version": SCHEMA_VERSION,
         "gen_no": lanes_doc["gen_no"],
@@ -1076,6 +1189,8 @@ def cmd_construct(args: argparse.Namespace) -> int:
         "lanes_without_proposals": core["lanes_without_proposals"],
         "pool": core["pool"],
     }
+    if approved_probe is not None:
+        payload["approved_probe"] = approved_probe
     pool_digest = digest(payload)
     generation_seed = digest(
         {
@@ -1436,7 +1551,8 @@ def _coverage_order_subset(pool_doc: dict, labels: list) -> list:
 
 
 def _replay_pool_errors(
-    pool_doc: dict, lanes_doc: dict, proposal_sets: dict, registry: dict
+    pool_doc: dict, lanes_doc: dict, proposal_sets: dict, registry: dict,
+    records: list | None = None,
 ) -> list:
     """Seating, coverage order, carriers, and the lane/proposal bindings."""
     errors = []
@@ -1444,7 +1560,8 @@ def _replay_pool_errors(
         errors.append("pool lanes_digest does not match lanes.json")
     try:
         core = build_pool(
-            lanes_doc["lanes"], proposal_sets, registry, pool_doc["pool_size"]
+            lanes_doc["lanes"], proposal_sets, registry, pool_doc["pool_size"],
+            approved_probe=pool_doc.get("approved_probe"), records=records,
         )
     except (ContractError, KeyError, TypeError) as exc:
         return errors + [f"pool does not rebuild from lanes + proposals: {exc}"]
@@ -1970,15 +2087,27 @@ def replay_generation(gen_dir: Path, ledger: dict, registry: dict | None) -> dic
     context_doc = _load_object(context_path)
 
     def check_pool():
-        if registry is None:
+        from space_revisions import load_registry_history
+
+        run_dir = gen_dir.parent.parent
+        history = load_registry_history(run_dir / "background.md")
+        original_registry = history.get((pool_doc.get("space") or {}).get("space_revision"), registry)
+        if original_registry is None:
             return ["background registry unavailable; the pool cannot be rebuilt"]
+        if space_receipt(original_registry) != pool_doc.get("space"):
+            return ["pool registry revision unavailable in history"]
         try:
             proposal_sets = _load_proposal_sets(
                 lanes_doc, gen_dir / "proposals", pool_doc.get("space")
             )
         except ContractError as exc:
             return [f"proposals: {exc}"]
-        return _replay_pool_errors(pool_doc, lanes_doc, proposal_sets, registry)
+        errors = []
+        if pool_doc.get("approved_probe") is not None:
+            errors += validate_approved_probe_binding(run_dir, pool_doc["approved_probe"])
+        count = (pool_doc.get("ledger_snapshot") or {}).get("record_count", 0)
+        return errors + _replay_pool_errors(pool_doc, lanes_doc, proposal_sets, original_registry,
+                                           ledger.get("records", [])[:count])
 
     run_check("pool", check_pool)
 

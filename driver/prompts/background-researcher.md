@@ -377,3 +377,14 @@ return, it will send you a corrective message listing exactly what failed —
 fix it with your tools and submit again. The driver may also invoke you again
 with `validation_errors` or `faithfulness_findings` in the context; that is
 the Step 5 feedback loop — repair the artifacts in place and submit again.
+
+
+## Retained directions
+
+Include a `reserves` list in the search-space registry (at most 12 entries).
+Each entry has a stable `id`, `mechanism`, `provenance`, `deferred_reason`, and
+nonempty `open_questions` list. Prefer diverse mechanisms. Provenance may cite a
+registered literature source or explicitly use `agent_synthesis`; no fabricated
+source is needed. Preserve plausible directions that lack direct task-scale
+results without claiming they work. Exclude known prohibited routes. These
+entries are review material, not yet selectable hypotheses.
