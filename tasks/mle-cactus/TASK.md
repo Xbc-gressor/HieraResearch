@@ -42,5 +42,10 @@ labels, private answers, prior runs or submissions.
 
 Images are decoded once and cached in each evaluator process. Fit any learned
 preprocessing on training images only. Set random states for stochastic models.
+
+<!-- runtime-budget:start -->
 The per-evaluation limit is 300 seconds; the cell's total runtime also includes
-agent calls, setup and final refitting. Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed; `train.py` is the candidate implementation.
+agent calls, setup and final refitting.
+<!-- runtime-budget:end -->
+
+Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed; `train.py` is the candidate implementation.

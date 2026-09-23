@@ -34,6 +34,7 @@ from .roles import (
     driver_job_handoff_problem,
 )
 from tools.evaluation_budget import find_run_dir, time_budget
+from tools.task_contract import contract_context
 
 RECEIPT_TOOL = "mcp__receipts__submit_receipt"
 
@@ -423,12 +424,11 @@ def admit_session(role: RoleDefinition, ctx: InvocationContext,
                         invocation_id=ctx.invocation_id, reason="time_reached")
         raise InvocationFailed(role.name, [TIME_REACHED_PROBLEM],
                                invocation_id=ctx.invocation_id)
+    extra = {**ctx.extra, **contract_context(budget_run_dir(ctx))}
     usable = budget.get("usable_seconds")
-    if usable is None:
-        return ctx
-    return dataclasses.replace(
-        ctx, extra={**ctx.extra,
-                    "time_budget_remaining_seconds": int(max(0.0, usable))})
+    if usable is not None:
+        extra["time_budget_remaining_seconds"] = int(max(0.0, usable))
+    return dataclasses.replace(ctx, extra=extra)
 
 
 def _has_tool_use(msg) -> bool:
@@ -671,6 +671,12 @@ class SDKSessionRunner:
         # runner is testable before the prompt files exist.
         body = (prompt_path.read_text(encoding="utf-8")
                 if prompt_path.exists() else "")
+        if ctx.extra.get("task_contract_dir"):
+            body += ("\n\nRead TASK.md and task.toml from task_contract_dir supplied below. "
+                     "These are the effective task contract for this run, including its evaluation budget. "
+                     "References to TASK.md/task.toml in task paths or task packets refer to these copies. "
+                     "Continue using the original task directory for prepare.py, code, data and the uv environment. "
+                     "Keep the staged contract read-only.")
         return (
             body
             + "\n\n---\n\n## Invocation context\n\n"
@@ -1036,18 +1042,23 @@ class SDKSessionRunner:
             raise _TransportFailure(
                 [f"session ended with error result: {result['subtype']}"],
                 api_error_status=result.get("api_error_status"))
-        if result and result.get("wall_limited") and receipt is None:
-            receipt = await self._soft_rescue(client, role, ctx, store,
-                                              accepted, breaker, transcript,
-                                              started)
-            return receipt, self._problems(role, ctx, receipt)
-        problems = self._problems(role, ctx, receipt)
-        if breaker["tripped"] is not None:
-            problems.append(
-                f"repetition breaker tripped: {breaker['tripped']}")
         attempts = 0
-        while (problems and attempts < role.corrective_attempts
-               and breaker["tripped"] is None):
+        while True:
+            # Every drain shares the same wall-limit exit, including the
+            # last corrective turn. Rescue returns immediately, so it can
+            # run at most once per invocation.
+            if result and result.get("wall_limited") and receipt is None:
+                receipt = await self._soft_rescue(client, role, ctx, store,
+                                                  accepted, breaker, transcript,
+                                                  started)
+                return receipt, self._problems(role, ctx, receipt)
+            problems = self._problems(role, ctx, receipt)
+            if breaker["tripped"] is not None:
+                problems.append(
+                    f"repetition breaker tripped: {breaker['tripped']}")
+            if (not problems or attempts >= role.corrective_attempts
+                    or breaker["tripped"] is not None):
+                return receipt, problems
             if result and result["is_error"]:
                 # The session ended on an error result (e.g.
                 # error_max_turns from a role's max_turns cap): the CLI
@@ -1074,7 +1085,6 @@ class SDKSessionRunner:
             result = await self._drain(client, role, ctx, store, accepted,
                                        breaker, transcript, started)
             receipt = self._latest_receipt(store, role, ctx, accepted)
-            problems = self._problems(role, ctx, receipt)
         return receipt, problems
 
     async def _soft_rescue(self, client, role, ctx, store, accepted, breaker,

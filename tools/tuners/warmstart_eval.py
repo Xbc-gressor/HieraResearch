@@ -1178,6 +1178,8 @@ def _preflight_config(
             run.candidate_path,
             expected_execution_revision=run.candidate_code_revision,
         )
+    except EvaluationBudgetExhausted:
+        raise
     except Exception as exc:
         tb = traceback.format_exc()
         sys.stderr.write(tb)
@@ -1518,12 +1520,15 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
             write_tune_report(run.report_path, run.report)
             continue
 
-        preflight = _preflight_config(
-            run,
-            params=params,
-            proposed_index=proposed_index,
-            trial_receipt=trial_receipt,
-        )
+        try:
+            preflight = _preflight_config(
+                run,
+                params=params,
+                proposed_index=proposed_index,
+                trial_receipt=trial_receipt,
+            )
+        except EvaluationBudgetExhausted as exc:
+            return _finish_budget_exhausted(run, current_position=position, error=exc)
         if preflight == "skip":
             consecutive_infeasible = 0
             continue

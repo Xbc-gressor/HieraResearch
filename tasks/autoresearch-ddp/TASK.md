@@ -133,9 +133,15 @@ Rules:
 Evaluation cost: one config eval is one full budgeted training run (~75 s of
 training plus startup/compilation and the sharded final eval) across all
 ranks. Startup grows with world size (each rank pays its own torch.compile
-and kernel load, largely in parallel); this task's 600 s
+and kernel load, largely in parallel).
+
+<!-- runtime-budget:start -->
+This task's 600 s
 `run.timeout_seconds` becomes the per-config `per_runtime_limit`.
-`init_run.py --timeout` may override it. Consider lowering `tuner.K` /
+`init_run.py --timeout` may override it.
+<!-- runtime-budget:end -->
+
+Consider lowering `tuner.K` /
 `tuner.K_eval` in `framework_cfg.json` — the defaults cost 3 full training
 runs per candidate at step 0+1.
 

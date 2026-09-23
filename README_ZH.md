@@ -50,12 +50,20 @@ uv sync --frozen
 
 ```bash
 uv run python -m driver run tabular-model-search <tag> \
-  --loop experiment --model <model-id> [--max-evaluations N] [--timeout SECONDS] \
+  --loop experiment --model <model-id> [--max-evaluations N] [--timeout SECONDS | --no-eval-timeout] \
   [--semantic-policy POLICY] [--scheduler-policy POLICY]
   [--inner-tuner-policy POLICY]
 ```
 
 新 experiment run 默认启用 `judged_slate` 语义策略、scheduler `anchor_transfer_challenger_v1` 和 inner-tuner `hebo24-transfer10-hebo10`（global-donor 转移对），即每个入选候选的 24+10+10 三段合约；bout 内的 proposer arm 由 `tuner.proposer_arm` 单独指定（默认 `explicit_e3u2`，`--proposer-arm pool_hebo_mace` 切回单调用 proposer），与 inner policy 正交。无需预建目录或手改 JSON。对照臂可通过 `--scheduler-policy` 和 `--inner-tuner-policy` 显式选择；其余 24+20 inner policy 都必须与 `anchor_challenger_v1` 配对。解析后的选择会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
+
+`--loop experiment --no-eval-timeout` 启用无单次评估上限模式，需同时设置
+`--time-budget SECONDS` 或 `--deadline EPOCH`，与 `--timeout` 互斥。
+省略开关时仍使用任务默认上限。模式及单次上限在 run 内固定，切换需使用新 tag。
+已准入的评估和训练型预检只受 `deadline - final_reserve_seconds` 约束；phase quota
+控制下一项工作的准入。GPU 租约、LLM 空闲保护和网络请求超时保持原有作用范围。
+初始化生成 `runs/<task>/<tag>/task_contract/{TASK.md,task.toml,budget.json}`，向所有角色
+呈现有效预算；原任务代码、环境和评分合同不变。该目录是角色上下文约定，不是文件系统隔离。
 
 `--loop hillclimb` 是 edit→run→keep/revert 对照基线，启动方式相同。`--loop baseline-tune` 是强调优基线：task 提供的 baseline（需要 `[seed].provided`）在 step 0+1 之后，由 driver 确定性地用 ONE 个 HEBO MACE bout 花完整个 `--max-evaluations` 预算（相当于把 INITIAL BOUT 拉长到整个 run；无 ideation、无 scheduler、无 tuner-orchestrator 会话），冻结 `inner_policy=baseline-hebo-full-v1` + `scheduler_policy=legacy`。`--model` 仅新运行必需；恢复运行时以 `run_metadata.json` 为准。`--max-evaluations`、`--timeout`、`--semantic-policy`、`--scheduler-policy` 与 `--inner-tuner-policy` 经 `tools/init_run.py` 持久化到 `framework_cfg.json`；`--timeout` 是单次评估时限的别名，不是会话看门狗。`anchor_challenger_v1`、`anchor_transfer_challenger_v1` 和 `v3_2` 都需要有限的 `max_evaluations`；新 run 模板默认提供 200。
 
@@ -517,7 +525,7 @@ runs/<task>/<tag>/framework_cfg.json
 - 任务特定的预算约束（例如，最大评估次数、单次评估时间限制）
 - 调整探索与利用的权衡
 
-**使用方法**：正常情况下直接用 `driver run` 的 CLI 标志，不需要手改该文件。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --llm-intelligence-score 61 --semantic-policy judged_slate --scheduler-policy anchor_challenger_v1 --inner-tuner-policy hebo24-hebo20 --max-evaluations 200 --timeout 60` 单独初始化；恢复已有运行时可更新预算和超时，但策略、维度来源和 intelligence score 在相关产物生成后被冻结。配置文件仍可用于没有 CLI 暴露的研究参数。
+**使用方法**：正常情况下直接用 `driver run` 的 CLI 标志，不需要手改该文件。新运行也可用 `python tools/init_run.py <task> <tag> --dimension-strategy llm_induced --llm-intelligence-score 61 --semantic-policy judged_slate --scheduler-policy anchor_challenger_v1 --inner-tuner-policy hebo24-hebo20 --max-evaluations 200 --timeout 60` 单独初始化；恢复已有运行时可更新评估次数；评估模式和单次上限在初始化后固定，但策略、维度来源和 intelligence score 在相关产物生成后被冻结。配置文件仍可用于没有 CLI 暴露的研究参数。
 
 主要配置包括：
 - **`got.*`**：外层 S-GoT 图搜索参数（bootstrap 大小、PUCB 批次大小、停滞阈值、渐进加宽等）

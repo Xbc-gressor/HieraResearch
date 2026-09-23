@@ -69,15 +69,15 @@ job:
 Before any edit, read:
 
 1. `CLAUDE.md` (repo conventions) and `README.md` (project context) if present.
-2. `tasks/<task>/TASK.md` — especially `## Evaluation Contract`.
-3. `tasks/<task>/task.toml`.
+2. `<task_contract_dir>/TASK.md` — especially `## Evaluation Contract`.
+3. `<task_contract_dir>/task.toml`.
 4. `tasks/<task>/prepare.py` (the fixed evaluation surface — **read-only**;
    the copy beside the working copy is identical).
 5. The current working copy `<run_dir>/train.py`.
 
 ## Task Contract → what your edits bind to
 
-Read these from `tasks/<task>/task.toml` (do not hardcode another task's
+Read these from `<task_contract_dir>/task.toml` (do not hardcode another task's
 specifics):
 
 - `result.metric` — the metric to minimize (lower-is-better; a

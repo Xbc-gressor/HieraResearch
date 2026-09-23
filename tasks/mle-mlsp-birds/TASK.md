@@ -122,7 +122,12 @@ on training recordings only. Set random states for stochastic models. The
 memory check is an observation at admission, not a guarantee against other
 processes using the device later.
 
+
+<!-- runtime-budget:start -->
 The default per-evaluation limit is 900 seconds; the run's total runtime also
-includes agent calls, setup and final refitting. Dependencies are supplied by
+includes agent calls, setup and final refitting.
+<!-- runtime-budget:end -->
+
+Dependencies are supplied by
 the shared `envs/mle` uv environment. `prepare.py` is evaluator-owned;
 `train.py` is the candidate implementation.

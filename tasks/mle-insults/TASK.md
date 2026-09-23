@@ -33,5 +33,10 @@ dependency needs for installation into this shared environment before execution.
 prepared public `train.csv`, `test.csv`, and `sample_submission_null.csv`.
 The test has `Date,Comment`; the sample has `Insult,Date,Comment`. Do not
 look for private test labels, raw competition archives, or prior submissions.
-This task has a 300 second per-evaluation limit. Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed and read-only; `train.py` is the
+
+<!-- runtime-budget:start -->
+This task has a 300 second per-evaluation limit.
+<!-- runtime-budget:end -->
+
+Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed and read-only; `train.py` is the
 candidate implementation.

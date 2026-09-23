@@ -45,7 +45,13 @@ dependency needs for installation into this shared environment before execution.
 public `train.csv`, `test.csv`, `sample_submission.csv`, and the
 `{train,test}/<id>/geometry.xyz` structure files. Training and test IDs are
 the per-split IDs created by the official MLE-bench preparation, so the same
-integer appears in both splits and is only a submission key. This task has a
-300 second per-evaluation limit. Dependencies are supplied by the shared
+integer appears in both splits and is only a submission key.
+
+<!-- runtime-budget:start -->
+This task has a
+300 second per-evaluation limit.
+<!-- runtime-budget:end -->
+
+Dependencies are supplied by the shared
 `envs/mle` uv environment; `prepare.py` is fixed and read-only and `train.py`
 is the candidate file.

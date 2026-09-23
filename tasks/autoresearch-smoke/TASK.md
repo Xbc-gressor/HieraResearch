@@ -19,7 +19,9 @@ Everything not listed here is identical to the baseline task.
   (`~/.cache/autoresearch`, shared with the baseline task).
 - `train.py`: `DEFAULT_PARAMS` uses `depth = 4`, `device_batch_size = 48`
   (was 8 / 128) so the default config peaks well under 24 GB VRAM.
+<!-- runtime-budget:start -->
 - `task.toml`: `timeout_seconds = 600` per config (was 900).
+<!-- runtime-budget:end -->
 
 ## Evaluation Contract
 

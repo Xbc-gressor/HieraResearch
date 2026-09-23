@@ -271,6 +271,12 @@ def main() -> int:
                         "candidate_execution_revision"
                     ],
                 )
+            except EvaluationBudgetExhausted as exc:
+                budget_exhausted = True
+                budget_exhausted_scope = exc.scope
+                early_stopped = True
+                early_stop_reason = "evaluation_budget"
+                break
             except Exception as exc:
                 failure = record_failure(
                     report_path=args.tune_report_json,

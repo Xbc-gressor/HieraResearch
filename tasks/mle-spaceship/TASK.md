@@ -40,5 +40,10 @@ Do not access original Kaggle labels, private answers, prior runs or submissions
 
 Feature columns contain missing values; fit imputers and any learned
 preprocessing on training rows only. Set random states for stochastic models.
+
+<!-- runtime-budget:start -->
 The per-evaluation limit is 300 seconds; the cell's total runtime also includes
-agent calls, setup and final refitting. Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed; `train.py` is the candidate implementation.
+agent calls, setup and final refitting.
+<!-- runtime-budget:end -->
+
+Dependencies are supplied by the shared `envs/mle` uv environment. `prepare.py` is fixed; `train.py` is the candidate implementation.

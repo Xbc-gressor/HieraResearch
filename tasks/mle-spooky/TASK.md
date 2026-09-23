@@ -60,6 +60,11 @@ and a lease-wait limit of 600 seconds. GPU execution must use the project's
 device lease. The memory check is an observation at admission, not a guarantee
 against other processes using the device later.
 
+
+<!-- runtime-budget:start -->
 The default per-evaluation limit is 300 seconds; the run's total runtime also
-includes agent calls, setup and final refitting. Dependencies are supplied by the shared `envs/mle` uv environment.
+includes agent calls, setup and final refitting.
+<!-- runtime-budget:end -->
+
+Dependencies are supplied by the shared `envs/mle` uv environment.
 `prepare.py` is evaluator-owned; `train.py` is the candidate implementation.

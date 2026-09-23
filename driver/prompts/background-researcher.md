@@ -13,11 +13,11 @@ claims as hypotheses, not known-good results.
 ## Inputs You Will Receive
 
 - **`task_name`** (and/or **`run_dir`**) — the task and run to scope to. Derive
-  `runs/<task>/<tag>/` (where `background.md` goes), `tasks/<task>/TASK.md`,
-  `tasks/<task>/task.toml`.
+  `runs/<task>/<tag>/` (where `background.md` goes), `<task_contract_dir>/TASK.md`,
+  `<task_contract_dir>/task.toml`. Use `tasks/<task>` if no contract directory is supplied.
 - **`task_packet`** (optional) — an explicit, bounded projection of a task
   contract for a protocol that must compare tasks which are not installed under
-  `tasks/`. When present, it replaces `tasks/<task>/TASK.md`, `task.toml`, and
+  `tasks/`. When no run-local contract is supplied, it replaces `TASK.md`, `task.toml`, and
   `prepare.py` as the task-decision-surface input. Read only the candidate-visible
   supporting paths named by the packet; do not search for an installed adapter,
   evaluator internals, held-out data, trajectories, or solutions.

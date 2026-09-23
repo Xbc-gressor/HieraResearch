@@ -476,7 +476,7 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                             repo_root, "toy", f"bad-k-warm-{index}", k_warm=value
                         )
 
-    def test_run_limits_can_change_when_resuming(self) -> None:
+    def test_evaluation_count_can_change_but_timeout_is_frozen(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._repo(repo_root)
@@ -488,12 +488,12 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
                 "toy",
                 "resume-limits",
                 max_evaluations=400,
-                per_runtime_limit=90,
             )
 
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["max_evaluations"], 400)
-            self.assertEqual(config["per_runtime_limit"], 90)
+            with self.assertRaisesRegex(ValueError, "cannot change.*timeout"):
+                initialize_run(repo_root, "toy", "resume-limits", per_runtime_limit=90)
 
     def test_existing_deadline_is_frozen_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

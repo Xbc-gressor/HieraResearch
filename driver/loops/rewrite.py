@@ -226,7 +226,10 @@ def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
                     repo_root / "tools" / "preflight_candidate.py",
                     "--candidate-path", candidate / "train.py"],
                    repo_root, check=False, env=_leased_env(lease))
-    if proc.returncode == 0:
+    if proc.returncode in (0, 4):
+        # A budget cutoff supplies no feasibility evidence. Let rewrite_eval's
+        # admission gate return its existing budget exit, which reverts the edit
+        # without a repair session or a crash journal entry.
         return None
     return ("candidate preflight failed. stderr tail:\n"
             + (proc.stderr or "")[-3000:]

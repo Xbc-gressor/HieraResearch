@@ -322,6 +322,26 @@ class SlateAdmissionTests(unittest.TestCase):
         # The batch revalidates cleanly, schema-6 prefix and schema-8 seats alike.
         self.assertEqual(validate_ledger(self.registry, self.data), [])
 
+    def test_inactive_route_arm_ignores_present_provenance_shell(self) -> None:
+        plans = self.gen / "plans"
+        plan = json.loads((plans / "slot-0.json").read_text())
+        plan["route_provenance"] = {
+            "schema_version": 1,
+            "point_id": "point-shell",
+            "op": "fresh",
+            "memory_rows": [],
+            "sketches": [],
+            "preference_order": [],
+            "chosen_sketch_id": None,
+            "chosen_route": None,
+            "n_route_sketches": 0,
+            "route_memory": False,
+        }
+        (plans / "slot-0.json").write_text(json.dumps(plan))
+        admitted = admit_slate_atomic(self.data, self._request())
+        self.assertIsNone(admitted[0]["route_provenance"])
+        self.assertEqual(validate_ledger(self.registry, self.data), [])
+
     def test_both_seats_share_the_pre_admission_snapshot(self) -> None:
         pre = copy.deepcopy(self.data)
         seen = []

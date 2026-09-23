@@ -313,6 +313,8 @@ def main() -> int:
                         "candidate_execution_revision"
                     ],
                 )
+            except EvaluationBudgetExhausted:
+                raise
             except Exception as exc:
                 failure = record_failure(
                     report_path=args.tune_report_json,

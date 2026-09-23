@@ -28,9 +28,14 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from run_cfg import load_run_cfg
-from semantic_attempts import classify_attempts
-from semantic_space import point_id as _point_id, selected_assignments
+if __package__:
+    from .run_cfg import load_run_cfg
+    from .semantic_attempts import classify_attempts
+    from .semantic_space import point_id as _point_id, selected_assignments
+else:
+    from run_cfg import load_run_cfg
+    from semantic_attempts import classify_attempts
+    from semantic_space import point_id as _point_id, selected_assignments
 
 
 ROUTE_MEMORY_SCHEMA_VERSION = 1
@@ -252,6 +257,7 @@ def validate_route_provenance(
             "route sketch"
         ]
     ids: list[str] = []
+    routes: dict[str, Any] = {}
     for index, sketch in enumerate(sketches):
         where = f"route_provenance.sketches[{index}]"
         if not isinstance(sketch, dict) or set(sketch) != {"sketch_id", "route"}:
@@ -265,6 +271,7 @@ def validate_route_provenance(
         if not isinstance(route, str) or not route.strip():
             errors.append(f"{where}.route must be a concrete non-empty route")
         ids.append(sketch_id)
+        routes[sketch_id] = route
     if len(set(ids)) != len(ids):
         errors.append("route_provenance.sketches must use distinct sketch ids")
     order = provenance.get("preference_order")
@@ -276,7 +283,7 @@ def validate_route_provenance(
     if chosen not in ids:
         errors.append("route_provenance.chosen_sketch_id must name one sketch")
     else:
-        route = next(s["route"] for s in sketches if s["sketch_id"] == chosen)
+        route = routes[chosen]
         if provenance.get("chosen_route") != route:
             errors.append(
                 "route_provenance.chosen_route must repeat the chosen sketch's "

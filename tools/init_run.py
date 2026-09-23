@@ -20,7 +20,7 @@ Usage:
       [--round-new-candidates N] [--round-rewrite-bouts r]
       [--round-tune-bouts t] [--round-seconds Q] [--round-noise-margin E]
       [--round-rewrite-top-k K]
-      [--timeout <seconds>]
+      [--timeout <seconds> | --no-eval-timeout]
 
 Example:
     python tools/init_run.py tabular-model-search exp-20260630 \
@@ -148,6 +148,7 @@ def initialize_run(
     k_eval: int | None = None,
     max_evaluations: int | None = None,
     per_runtime_limit: float | None = None,
+    no_eval_timeout: bool = False,
     time_budget_seconds: float | None = None,
     deadline: float | None = None,
     final_reserve_seconds: float | None = None,
@@ -155,6 +156,8 @@ def initialize_run(
     session_concurrency: int | None = None,
     rewrite_concurrency: int | None = None,
 ) -> Path:
+    if no_eval_timeout and per_runtime_limit is not None:
+        raise ValueError("--no-eval-timeout and --timeout are mutually exclusive")
     repo_root = Path(repo_root).resolve()
     round_options = {
         key: value for key, value in (round_options or {}).items()
@@ -209,7 +212,7 @@ def initialize_run(
     # New runs inherit a task-appropriate limit instead of blindly retaining
     # the generic template's 60 seconds. Existing run-local choices remain
     # untouched, and an explicit --timeout still wins.
-    if per_runtime_limit is None and not target_existed:
+    if per_runtime_limit is None and not target_existed and not no_eval_timeout:
         per_runtime_limit = _task_runtime_limit(repo_root, task_name)
 
     if (
@@ -342,14 +345,31 @@ def initialize_run(
         and k_eval is None
         and max_evaluations is None
         and per_runtime_limit is None
+        and not no_eval_timeout
         and deadline is None
         and final_reserve_seconds is None
         and not round_options
     ):
+        from task_contract import stage_task_contract
+        stage_task_contract(repo_root, run_dir, task_name)
         return run_dir
 
     config = _read_framework_config(target) if target.exists() else {}
     updates: list[str] = []
+    current_mode = config.get("evaluation_timeout_mode", "fixed")
+    requested_mode = "run_budget" if no_eval_timeout else ("fixed" if per_runtime_limit is not None else current_mode)
+    if target_existed and "evaluation_timeout_mode" in config and (
+        requested_mode != current_mode or
+        (per_runtime_limit is not None and per_runtime_limit != config.get("per_runtime_limit"))
+    ):
+        raise ValueError("cannot change evaluation timeout policy on resume; start a new run")
+    if requested_mode == "run_budget":
+        if deadline is None and config.get("deadline") is None:
+            raise ValueError("--no-eval-timeout requires --time-budget or --deadline")
+        config["per_runtime_limit"] = None
+        config["preflight_runtime_limit"] = None
+    config["evaluation_timeout_mode"] = requested_mode
+    updates.append(f"evaluation_timeout_mode={requested_mode}")
 
     effective_tuner = config.get("tuner", {})
     effective_tuner = effective_tuner if isinstance(effective_tuner, dict) else {}
@@ -712,6 +732,8 @@ def initialize_run(
             f"Set {', '.join(updates)} in "
             f"{target.relative_to(repo_root)}"
         )
+    from task_contract import stage_task_contract
+    stage_task_contract(repo_root, run_dir, task_name)
     return run_dir
 
 
@@ -795,7 +817,10 @@ def main() -> int:
             "artifacts exist"
         ),
     )
-    parser.add_argument(
+    timeout_group = parser.add_mutually_exclusive_group()
+    timeout_group.add_argument("--no-eval-timeout", action="store_true",
+                               help="no per-evaluation cap; requires a run deadline")
+    timeout_group.add_argument(
         "--timeout",
         "--per-runtime-limit",
         dest="per_runtime_limit",
@@ -861,6 +886,7 @@ def main() -> int:
             k_eval=args.k_eval,
             max_evaluations=args.max_evaluations,
             per_runtime_limit=args.per_runtime_limit,
+            no_eval_timeout=args.no_eval_timeout,
             time_budget_seconds=args.time_budget_seconds,
             deadline=args.deadline,
             final_reserve_seconds=args.final_reserve_seconds,

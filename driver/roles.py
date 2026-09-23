@@ -283,9 +283,11 @@ ROLES: dict[str, RoleDefinition] = {
         },
         postconditions=(background_artifacts_exist,),
         bash_adapter_only=True,
-        # Runs once per run; healthy cells observed 1066-1259s, degraded
-        # retrieval pushed one session past 2164s (2026-09-19 calibration).
-        wall_limit_seconds=3600.0,
+        # Research includes retrieval, synthesis and contract correction.
+        # A successful Quest invocation took ~3680s; Statoil exhausted 3600s
+        # during correction (2026-09-23). Leave >2x observed headroom;
+        # the run deadline still bounds this entire invocation.
+        wall_limit_seconds=10800.0,
         soft_rescue=True,
     ),
     "idea-generator": RoleDefinition(

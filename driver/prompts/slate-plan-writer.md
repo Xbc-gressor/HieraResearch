@@ -16,7 +16,7 @@ carrier (`op`/`parents`), the candidate summary exactly as the judges saw it
 (hypothesis diffs vs each carrier parent, non-baseline hypothesis titles and
 claims, deprioritized marks), and the bounded measured-history table.
 
-You may additionally `Read` the task contract (`tasks/<task>/TASK.md`) and
+You may additionally `Read` the task contract (`<task_contract_dir>/TASK.md`) and
 files your context explicitly names (e.g. a route-memory JSON). When the
 payload opens with an objective block, its `aspirational_target_score` is the
 task's declared ambition bar: plan mechanisms that genuinely threaten it —

@@ -81,6 +81,7 @@ from tools.scheduler.contract import (
     ResourceContract,
 )
 from tools.scheduler.donor import build_donor_snapshot, donors_dir
+from tools.semantic_routes import is_not_applicable, validate_route_provenance
 
 TRANSFER_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
 # Mirrors tune_tools.GLOBAL_DONOR_TRANSFER_FILENAME; the tuners package is a
@@ -912,7 +913,8 @@ def _invoke_slate_judge(runner, store, task, tag, run_dir, gen_dir, stage, *,
             "--output", input_path]
     if labels:
         args += ["--labels", ",".join(labels)]
-    task_brief = repo_root / "tasks" / task / "TASK.md"
+    from tools.task_contract import task_brief_path
+    task_brief = task_brief_path(repo_root, run_dir, task)
     if task_brief.is_file():
         args += ["--task-brief", task_brief]
     objective_path = run_dir / "objective_brief.json"
@@ -1051,8 +1053,8 @@ def _commit_slate_manifest(run_dir, gen_dir, slate_size, repo_root, cmd,
     return manifest
 
 
-def _slate_plan_problems(plan, slot: dict, route_arm: int) -> list[str]:
-    """Driver-side receipt/plan checks: non-empty fields and slot binding."""
+def _slate_plan_problems(plan, slot: dict, route_memory: dict | None) -> list[str]:
+    """Validate the writer-owned fields before leaving its repair loop."""
     if not isinstance(plan, dict):
         return ["plan is not a JSON object"]
     problems = []
@@ -1063,9 +1065,14 @@ def _slate_plan_problems(plan, slot: dict, route_arm: int) -> list[str]:
         if not isinstance(plan.get(field_name), str) \
                 or not plan[field_name].strip():
             problems.append(f"plan needs a non-empty {field_name}")
-    if route_arm and not isinstance(plan.get("route_provenance"), dict):
-        problems.append(
-            "route arm is active: plan needs a route_provenance object")
+    if route_memory is not None:
+        provenance = plan.get("route_provenance")
+        if is_not_applicable(provenance):
+            problems.append(
+                "a judged-slate candidate is never the task-provided baseline; "
+                "route provenance cannot be not_applicable")
+        else:
+            problems.extend(validate_route_provenance(provenance, memory=route_memory))
     return problems
 
 
@@ -1258,25 +1265,8 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
     objective_text = _objective_block(run_dir)
     for slot in manifest["slate"]:
         plan_path = plans_dir / f"slot-{slot['slot']}.json"
-        if plan_path.exists():
-            try:
-                existing = json.loads(plan_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = None
-            if existing is not None and not _slate_plan_problems(
-                    existing, slot, route_arm):
-                continue
-        if _slate_writer_attempts_used(plans_dir, slot["slot"]) \
-                >= _SLATE_WRITER_ATTEMPTS:
-            reason = (f"slate-plan-writer attempt budget exhausted for slot "
-                      f"{slot['slot']} ({_SLATE_WRITER_ATTEMPTS} attempts, "
-                      f"no valid plan)")
-            _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events,
-                                    reason=reason,
-                                    role="slate-plan-writer",
-                                    problems=[reason])
-            return False
         route_memory_path = None
+        route_memory = None
         if route_arm:
             point_path = plans_dir / f"slot-{slot['slot']}.point.json"
             point_path.write_text(
@@ -1288,6 +1278,25 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
                         "--point", point_path,
                         "--op", slot["carrier"]["op"],
                         "--output", route_memory_path], "route memory")
+            route_memory = json.loads(route_memory_path.read_text(encoding="utf-8"))
+        if plan_path.exists():
+            try:
+                existing = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if existing is not None and not _slate_plan_problems(
+                    existing, slot, route_memory):
+                continue
+        if _slate_writer_attempts_used(plans_dir, slot["slot"]) \
+                >= _SLATE_WRITER_ATTEMPTS:
+            reason = (f"slate-plan-writer attempt budget exhausted for slot "
+                      f"{slot['slot']} ({_SLATE_WRITER_ATTEMPTS} attempts, "
+                      f"no valid plan)")
+            _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events,
+                                    reason=reason,
+                                    role="slate-plan-writer",
+                                    problems=[reason])
+            return False
         extra = {"slot": slot["slot"], "candidate_id": slot["candidate_id"],
                  "gen_dir": str(gen_dir)}
         if route_arm:
@@ -1306,7 +1315,7 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
             except InvocationFailed as exc:
                 problems = [str(p) for p in exc.problems]
             else:
-                problems = _slate_plan_problems(receipt, slot, route_arm)
+                problems = _slate_plan_problems(receipt, slot, route_memory)
                 if not problems:
                     break  # a valid plan for this seat
             if attempt >= _SLATE_WRITER_ATTEMPTS:
@@ -2318,8 +2327,8 @@ def _init_run_extra(dimension_strategy, llm_intelligence_score,
                     k_warm, k_eval, proposer_arm=None, time_budget=None,
                     deadline=None, final_reserve=None,
                     round_options=None, session_concurrency=None,
-                    rewrite_concurrency=None) -> list[str]:
-    extra = []
+                    rewrite_concurrency=None, no_eval_timeout=False) -> list[str]:
+    extra = ["--no-eval-timeout"] if no_eval_timeout else []
     if session_concurrency is not None:
         extra += ["--session-concurrency", str(session_concurrency)]
     if rewrite_concurrency is not None:
@@ -2361,7 +2370,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
            inner_policy, k_warm, k_eval, model, cli_path,
            proposer_arm=None, time_budget=None, deadline=None,
            final_reserve=None, round_options=None,
-           session_concurrency=None, rewrite_concurrency=None) -> None:
+           session_concurrency=None, rewrite_concurrency=None, no_eval_timeout=False) -> None:
     extra = _init_run_extra(
         dimension_strategy,
         llm_intelligence_score,
@@ -2377,6 +2386,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         round_options=round_options,
         session_concurrency=session_concurrency,
         rewrite_concurrency=rewrite_concurrency,
+        no_eval_timeout=no_eval_timeout,
     )
     common.init_run(task, tag, repo_root, cmd, max_evaluations, timeout,
                     extra=extra)
@@ -2888,7 +2898,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    k_eval=None, proposer_arm=None, time_budget=None,
                    deadline=None, final_reserve=None, round_options=None,
                    session_concurrency=None, rewrite_concurrency=None,
-                   cli_path=None, finalization=None,
+                   cli_path=None, finalization=None, no_eval_timeout=False,
                    cmd=common.run_cmd, job_runner=execute_driver_job) -> dict:
     """Set up or resume a run, then advance it until blocked or complete.
 
@@ -2926,7 +2936,8 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                    deadline=deadline, final_reserve=final_reserve,
                    round_options=round_options,
                    session_concurrency=session_concurrency,
-                   rewrite_concurrency=rewrite_concurrency)
+                   rewrite_concurrency=rewrite_concurrency,
+                   no_eval_timeout=no_eval_timeout)
         else:
             # Explicit CLI overrides must never disappear merely because the
             # run directory already exists. init_run applies mutable limits,
@@ -2959,6 +2970,7 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                 round_options=round_options,
                 session_concurrency=session_concurrency,
                 rewrite_concurrency=rewrite_concurrency,
+                no_eval_timeout=no_eval_timeout,
             )
             if max_evaluations is not None or timeout is not None or extra:
                 common.init_run(

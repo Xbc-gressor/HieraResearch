@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import got_select  # noqa: E402
 import ledger as ledger_cli  # noqa: E402
 import semantic_search  # noqa: E402
+import semantic_routes  # noqa: E402
 import slate  # noqa: E402
 from semantic_space import complete_point, digest, space_receipt  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
@@ -159,6 +160,9 @@ class JudgedCmd(ExperimentCmd):
             handler = lambda: self._propose(args)
         elif script == "tools/slate.py":
             handler = lambda: self._slate(args)
+        elif script == "tools/semantic_routes.py":
+            parsed = semantic_routes.build_parser().parse_args(args[2:])
+            handler = lambda: parsed.func(parsed)
         elif script == "tools/ledger.py" and "admit-slate" in args:
             handler = lambda: self._admit_slate(args)
         if handler is None:
@@ -330,7 +334,7 @@ def judge_entry(*, invalid: bool = False):
     return entry
 
 
-def plan_entry():
+def plan_entry(*, route_error=None):
     """A per-seat plan receipt, compliant with the carrier's op."""
     entry: dict = {}
 
@@ -352,6 +356,28 @@ def plan_entry():
             "change": change,
             "candidate_name": f"seat_{slot['run_id']}",
         }
+        if ctx.extra.get("route_memory"):
+            memory = json.loads(Path(ctx.extra["route_memory"]).read_text())
+            sketches = [{"sketch_id": f"r{i + 1}", "route": f"Build route {i + 1}"}
+                        for i in range(memory["n_route_sketches"])]
+            provenance = {
+                "schema_version": 1,
+                **{key: memory[key] for key in
+                   ("point_id", "op", "n_route_sketches", "route_memory")},
+                "memory_rows": memory["rows"],
+                "sketches": sketches,
+                "preference_order": [s["sketch_id"] for s in sketches],
+                "chosen_sketch_id": sketches[-1]["sketch_id"],
+                "chosen_route": sketches[-1]["route"],
+            }
+            if route_error == "missing_chosen_route":
+                provenance["chosen_route"] = None
+            elif route_error == "not_applicable":
+                provenance = {"schema_version": 1, "status": "not_applicable",
+                              "reason": "no planning needed"}
+            elif route_error == "malformed_sketch":
+                provenance["sketches"][0] = {}
+            entry["receipt"]["route_provenance"] = provenance
 
     entry["side_effects"] = effect
     return entry
@@ -647,6 +673,55 @@ class JudgedSlateTests(unittest.TestCase):
         self.assertIn("identical file Read", retry.inline_payload)
         self.assertIn("Prior attempt note", retry.inline_payload)
         self.assertNotIn("Prior attempt note", first.inline_payload)
+
+    def _enable_route_planning(self, sketches=1):
+        path = self._gen_dir().parents[1] / "framework_cfg.json"
+        cfg = json.loads(path.read_text())
+        cfg["semantic_search"].update(n_route_sketches=sketches, route_memory=False)
+        path.write_text(json.dumps(cfg))
+
+    def test_invalid_route_is_corrected_before_admission(self) -> None:
+        self._assert_route_repaired("missing_chosen_route", "chosen_route")
+
+    def test_malformed_nested_sketch_is_corrected_before_admission(self) -> None:
+        self._assert_route_repaired("malformed_sketch", "sketches[0]", sketches=2)
+
+    def _assert_route_repaired(self, error, diagnostic, *, sketches=1):
+        self._seed_run()
+        self._enable_route_planning(sketches)
+        cmd = JudgedCmd(self.repo)
+        cmd.reached = [False, False, False, False, True]
+        runner = self._run(cmd, [
+            judge_entry(), judge_entry(),
+            plan_entry(route_error=error),
+            plan_entry(), plan_entry(),
+            writer_entry(), extractor_entry(cmd),
+            writer_entry(), extractor_entry(cmd), tuner_entry(),
+        ])
+        self.assertEqual(runner.status["phase"], "completed")
+        plans = [ctx for name, ctx in runner.calls if name == "slate-plan-writer"]
+        self.assertEqual(len(plans), 3)
+        self.assertIn(diagnostic, plans[1].inline_payload)
+        self.assertEqual(len(self._new_records(cmd)), 2)
+        self.assertNotIn("blocked", self._events())
+
+    def test_invalid_route_exhaustion_aborts_only_generation(self) -> None:
+        self._seed_run()
+        self._enable_route_planning()
+        cmd = JudgedCmd(self.repo)
+        cmd.reached = [False, True, True]
+        runner = self._run(cmd, [
+            judge_entry(), judge_entry(),
+            plan_entry(route_error="not_applicable"),
+            plan_entry(route_error="not_applicable"),
+            plan_entry(route_error="not_applicable"),
+        ])
+        self.assertEqual(runner.status["phase"], "completed")
+        self.assertEqual(len([ctx for name, ctx in runner.calls
+                              if name == "slate-plan-writer"]), 3)
+        self.assertEqual(self._new_records(cmd), [])
+        self.assertTrue((self._gen_dir() / "generation.aborted.json").exists())
+        self.assertNotIn("blocked", self._events())
 
     def test_plan_budget_exhausted_aborts_generation_and_resume_skips_it(self) -> None:
         self._seed_run()

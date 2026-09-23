@@ -604,13 +604,16 @@ def _slate_route_provenance(
 ) -> dict | None:
     """Validate one seat's planned route provenance against the shared prefix."""
     provenance = plan.get("route_provenance")
-    if provenance is None:
-        if route_active:
-            raise AdmissionError(
-                "the configured route arm requires route_provenance in each "
-                "slate plan"
-            )
+    if not route_active:
+        # The field is out of scope when the route arm is off: a present but
+        # empty shell (a writer that fills the schema instead of omitting the
+        # key) is treated as the contractual null rather than a hard error.
         return None
+    if provenance is None:
+        raise AdmissionError(
+            "the configured route arm requires route_provenance in each "
+            "slate plan"
+        )
     if is_not_applicable(provenance):
         raise AdmissionError(
             "a judged-slate candidate is never the task-provided baseline; "

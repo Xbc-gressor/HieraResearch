@@ -597,16 +597,31 @@ def main() -> int:
         )
         return 0
 
-    frozen = _build_checkpoint(
-        candidate_path=args.candidate_path,
-        report=report,
-        incumbent=incumbent,
-        contract=contract,
-        remaining=remaining,
-        policy_id=policy_id,
-        bout_index=bout_index,
-        initialization_mode=initialization_mode,
-    )
+    try:
+        frozen = _build_checkpoint(
+            candidate_path=args.candidate_path,
+            report=report,
+            incumbent=incumbent,
+            contract=contract,
+            remaining=remaining,
+            policy_id=policy_id,
+            bout_index=bout_index,
+            initialization_mode=initialization_mode,
+        )
+    except EvaluationBudgetExhausted as exc:
+        elapsed = deep_tune_stage_elapsed(time_budget)
+        set_stage_meta(
+            args.tune_report_json, METHOD, bout_index=bout_index,
+            status="budget_exhausted", elapsed_seconds=elapsed,
+            budget_exhausted_scope=exc.scope,
+        )
+        write_json({
+            "method": METHOD, "status": "budget_exhausted",
+            "reason": "run budget exhausted before checkpoint construction",
+            "budget_exhausted_scope": exc.scope, "trials_attempted": 0,
+            "trials_completed": 0, "elapsed_seconds": round(elapsed, 1),
+        })
+        return 0
     codec = codec_mod.Codec(contract)
     history_trials = [
         state_mod.Trial(
@@ -716,6 +731,8 @@ def main() -> int:
                     ],
                     python_cmd=python_cmd,
                 )
+            except EvaluationBudgetExhausted:
+                raise
             except Exception as exc:
                 failure = record_failure(
                     report_path=args.tune_report_json,

@@ -31,7 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model", help="resolved model id; required for a new run, "
                                      "ignored on resume (run_metadata.json wins)")
     run.add_argument("--max-evaluations", type=int)
-    run.add_argument("--timeout", type=float,
+    timeout_group = run.add_mutually_exclusive_group()
+    timeout_group.add_argument("--no-eval-timeout", action="store_true",
+                               help="experiment: evaluate under the run deadline, without a single-evaluation cap")
+    timeout_group.add_argument("--timeout", type=float,
                      help="per-evaluation limit in seconds; pass-through alias for "
                           "init_run.py --per-runtime-limit, NOT a session watchdog")
     run.add_argument("--dimension-strategy", choices=["catalog_subset", "llm_induced"])
@@ -164,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "run":
+        if args.no_eval_timeout and args.loop != "experiment":
+            parser.error("--no-eval-timeout is supported by --loop experiment")
         if args.noise_margin is not None and args.noise_margin < 0:
             parser.error("--noise-margin must be >= 0")
         finalization = (args.submission_command, args.grader_command, args.data_dir)
@@ -184,6 +189,11 @@ def main(argv: list[str] | None = None) -> int:
         from driver.events import EventsLog
 
         run_dir = REPO_ROOT / "runs" / args.task / args.tag
+        config_path = run_dir / "framework_cfg.json"
+        if args.loop != "experiment" and config_path.is_file():
+            from tools.run_cfg import read_framework_cfg
+            if read_framework_cfg(config_path).get("evaluation_timeout_mode") == "run_budget":
+                parser.error("run_budget evaluation mode is supported by --loop experiment")
         model, warning = resolve_model(args.model, run_dir)
         if warning:
             print(f"warning: {warning}", file=sys.stderr)
@@ -247,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             k_eval=args.k_eval,
             proposer_arm=args.proposer_arm,
             time_budget=args.time_budget,
+            no_eval_timeout=args.no_eval_timeout,
             deadline=args.deadline,
             final_reserve=args.final_reserve,
             round_options={

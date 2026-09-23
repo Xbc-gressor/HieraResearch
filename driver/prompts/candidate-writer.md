@@ -35,7 +35,8 @@ Derive everything else from `candidate_dir` (do not ask the caller):
 | the file you write | `<candidate_dir>/train.py` |
 | implementation brief | `<candidate_dir>/_candidate_brief.json` |
 | `prepare.py` (readonly) | `<candidate_dir>/prepare.py` — read for its API surface, never edit |
-| `task_dir` | `tasks/<task>`, where `<task>` is the `runs/<task>/` segment of the path |
+| `task_dir` | `tasks/<task>`; source code and baseline files, where `<task>` is the `runs/<task>/` segment |
+| `task_contract_dir` | supplied in the invocation; effective `TASK.md` and `task.toml` for this run |
 
 Then read **`_candidate_brief.json`**. `new_candidate.py` generated this compact,
 immutable view from the record that `idea-generator` persisted before you were
@@ -86,8 +87,8 @@ nonnumeric, or the
 candidate dir or `prepare.py` does not resolve, stop and report the invalid or
 missing input. Do not invent paths.
 
-The task contract you must honor lives in `TASK.md`'s `## Evaluation Contract`
-and `task.toml` `[evaluation]`/`[constraints]` — read them (step 1 below); they
+The task contract you must honor lives in `<task_contract_dir>/TASK.md`'s `## Evaluation Contract`
+and `<task_contract_dir>/task.toml` `[evaluation]`/`[constraints]` — read them (step 1 below); they
 are authoritative.
 
 ## Write Mode Resolution
@@ -110,7 +111,7 @@ Decide what to do from the file system, in this order:
 3. **No parents → inspect baseline as reference, then write from scratch.**
    This is a `fresh` candidate: there is still no parent and no parent-relative
    delta. Before writing, look for a task-provided baseline implementation.
-   Read `task.toml` `[seed]`; if `provided` names the candidate entrypoint
+   Read `<task_contract_dir>/task.toml` `[seed]`; if `provided` names the candidate entrypoint
    (usually `train.py`) and that file exists under `task_dir`, read it. Treat
    it strictly as a reference for the evaluation surface, file conventions, and
    how a working candidate talks to `prepare.py`. It is not a parent, not a
@@ -130,8 +131,8 @@ Those contents are already in your context; repeated reads of unchanged content
 will be refused by the driver. Complete the checks required by the current
 write mode, then immediately carry out that mode and submit the receipt.
 
-1. Read your candidate brief (above), then `TASK.md` (its `## Evaluation
-   Contract`) and `task.toml` `[constraints]`, then resolve the write mode. Read
+1. Read your candidate brief (above), then `<task_contract_dir>/TASK.md` (its `## Evaluation
+   Contract`) and `<task_contract_dir>/task.toml` `[constraints]`, then resolve the write mode. Read
    the candidate dir's `prepare.py` for context only. In write-mode 3, also
    read any provided baseline as reference only (see above) before writing.
 2. Write the candidate dir's `train.py` per the resolved mode. Keep the
@@ -147,7 +148,7 @@ write mode, then immediately carry out that mode and submit the receipt.
    - The file imports only symbols that exist in `prepare.py` or in
      already-imported libraries (do not silently add new dependencies).
    - The file does not edit, copy from, or shadow the readonly `prepare.py`.
-   - The file follows the task's Evaluation Contract (in `TASK.md`) exactly: it
+   - The file follows the task's Evaluation Contract (in `<task_contract_dir>/TASK.md`) exactly: it
      trains, produces the official score, and reports through the Contract's
      declared surfaces, and violates none of its rules. Do not bypass the
      scoring surface or fabricate scores.
@@ -199,7 +200,7 @@ text and stop. The driver treats the invocation as failed and escalates.
 - **Do not write `_candidate_brief.json`, `ledger.json`, or `loop_state.md`.**
   They are inputs owned by the orchestrator/ledger path.
 - **No new dependencies unless explicitly allowed.** If
-  `constraints.allow_dependencies` in `task.toml` is false (or unspecified), use
+  `constraints.allow_dependencies` in `<task_contract_dir>/task.toml` is false (or unspecified), use
   only packages already imported in the parents or `prepare.py`. If the idea
   genuinely requires a new package, do not import it silently — treat it as a
   blocked input: explain the conflict in plain text and stop without submitting

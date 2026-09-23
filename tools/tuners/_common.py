@@ -65,6 +65,7 @@ from evaluation_budget import (  # noqa: E402
     find_run_dir,
     record_evaluation_completion,
     time_remaining,
+    time_budget,
     EvaluationBudgetExhausted,
     reserve_evaluation,
 )
@@ -757,14 +758,21 @@ def deep_tune_stage_elapsed(time_budget: dict) -> float:
 
 def read_runtime_limit(ref_path: Any) -> float | None:
     """Top-level `per_runtime_limit` (seconds) from `<run_dir>/framework_cfg.json`
-    (walking up from ref_path), clamped to the time the run has left. Returns
+    (walking up from ref_path). In run_budget mode only the run search
+    deadline bounds admitted work; fixed mode also clamps to the phase. Returns
     a positive float, else None (no limit). A cfg file that exists but cannot
     be parsed raises RunConfigError: silently dropping the limit would let an
     evaluation run unbounded."""
     cfg = find_framework_cfg(ref_path)
     if cfg is None:
         return None
-    v = read_framework_cfg(cfg).get("per_runtime_limit")
+    data = read_framework_cfg(cfg)
+    if data.get("evaluation_timeout_mode") == "run_budget":
+        left = time_budget(cfg.parent)["usable_seconds"]
+        if left <= 0:
+            raise EvaluationBudgetExhausted(used=0, budget=None, run_dir=cfg.parent, scope="time_cutoff")
+        return left
+    v = data.get("per_runtime_limit")
     try:
         v = float(v)
         limit = v if v > 0 else None
@@ -788,6 +796,8 @@ def _time_clamped(ref_path: Any, limit: float | None) -> bool:
     cfg = find_framework_cfg(ref_path)
     if cfg is None:
         return False
+    if read_framework_cfg(cfg).get("evaluation_timeout_mode") == "run_budget":
+        return True
     left = time_remaining(cfg.parent)
     if left is None:
         return False
@@ -808,12 +818,15 @@ def read_preflight_limit(ref_path: Any) -> float:
     """Return the bounded no-score preflight timeout for one config.
 
     Clamped to the time the run has left, mirroring :func:`read_runtime_limit`
-    (with the same 1s floor): a probe may not outlive the run deadline.
+    (fixed mode retains its 1s floor). Run-budget mode has no separate cap
+    or floor and uses only the run search deadline.
     """
     cfg = find_framework_cfg(ref_path)
     if cfg is None:
         return DEFAULT_PREFLIGHT_LIMIT
     data = read_framework_cfg(cfg)
+    if data.get("evaluation_timeout_mode") == "run_budget":
+        return read_runtime_limit(ref_path)
     limit = None
     value = data.get("preflight_runtime_limit")
     if value is not None:
@@ -1140,19 +1153,34 @@ def timed_preflight(
     )
     if configured is None:
         return None
-    preflight_one = str(Path(__file__).resolve().parent / "_preflight_one.py")
-    out, err, returncode = _communicate_with_limit(
-        [
-            *(python_cmd or [sys.executable]),
-            preflight_one,
-            str(candidate_path),
-            json.dumps(params),
-            json.dumps(expected_execution_revision),
-            probe_mode,
-        ],
-        limit=read_preflight_limit(candidate_path),
-        label="preflight exceeded preflight_runtime_limit",
-    )
+    cfg = find_framework_cfg(candidate_path)
+    run_budget_mode = cfg is not None and read_framework_cfg(cfg).get("evaluation_timeout_mode") == "run_budget"
+    if run_budget_mode:
+        # Preflights spend time but no objective slot. A phase gates new probes,
+        # while an admitted probe is bounded only by the global search deadline.
+        left = time_remaining(cfg.parent)
+        if left is not None and left <= 0:
+            scope = "time_cutoff" if time_budget(cfg.parent)["usable_seconds"] <= 0 else "round_quota"
+            raise EvaluationBudgetExhausted(used=0, budget=None, run_dir=cfg.parent, scope=scope)
+    limit = read_preflight_limit(candidate_path)
+    try:
+        preflight_one = str(Path(__file__).resolve().parent / "_preflight_one.py")
+        out, err, returncode = _communicate_with_limit(
+            [
+                *(python_cmd or [sys.executable]),
+                preflight_one,
+                str(candidate_path),
+                json.dumps(params),
+                json.dumps(expected_execution_revision),
+                probe_mode,
+            ],
+            limit=limit,
+            label="preflight exceeded preflight_runtime_limit",
+        )
+    except TimeoutError as exc:
+        if run_budget_mode:
+            raise EvaluationBudgetExhausted(used=0, budget=None, run_dir=cfg.parent, scope="time_cutoff") from exc
+        raise
     result_lines = [line for line in out.splitlines()
                     if line.startswith("PREFLIGHT:")]
     if result_lines:
@@ -1911,6 +1939,8 @@ def clamp_search_space_to_preflight(
                 probe_mode=probe_mode,
                 expected_execution_revision=expected_execution_revision,
             )
+        except EvaluationBudgetExhausted:
+            raise
         except Exception as exc:
             append_preflight_attempt(
                 report_path,
@@ -2067,6 +2097,9 @@ def clamp_search_space_to_preflight(
                         collapse(clampable)
                         corner_feasible = True
                     outcome = "collapsed_to_base"
+    except EvaluationBudgetExhausted:
+        # Leave the space unchanged; the next admission observes exhaustion.
+        return search_space
     except _ClampProbeBudgetExceeded:
         # Probe governance: stop exploring and fall back to the box whose
         # corner is the base point — feasible by direct evidence, when the

@@ -44,7 +44,8 @@ Derive (do not ask the caller):
 |---|---|
 | `<run_dir>/ledger.json` | the run's ledger (written only via `tools/ledger.py` — never hand-edit) |
 | `repo_root` | the path before `/runs/` in `run_dir` |
-| `<env.project>` (uv `--directory`) | `env.project` in the task's `task.toml` |
+| `<env.project>` (uv `--directory`) | `env.project` in `<task_contract_dir>/task.toml`; use the value unchanged |
+| `task_contract_dir` | supplied in the invocation; effective task contract for this run |
 
 The tuner scripts and `ledger.py` infer the **task** from these paths themselves
 (via `task.toml`), so you never pass a task name. Scores are **always
@@ -220,7 +221,7 @@ There is **no Phase B** here — the percentile gate moved into
 ### Phase 0 — Context (chosen candidate)
 
 Read **`<candidate_path>`** in full — confirm `SEARCH_SPACE`, `make_model`,
-`BASE_PARAMS` are present (all from step 0/1). Read **`tasks/<task>/task.toml`**
+`BASE_PARAMS` are present (all from step 0/1). Read **`<task_contract_dir>/task.toml`**
 only for `env.project` (the uv dir) and `constraints` as a sanity reference. Do
 NOT read `TASK.md` or `prepare.py`; the search scripts open `prepare.py`
 themselves via `load_candidate_modules`. (Step 1 already recorded this

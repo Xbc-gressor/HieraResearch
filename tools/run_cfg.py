@@ -510,6 +510,13 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
     """Validate the hard-limit fields shared by deterministic consumers."""
     _validate_optional_positive_int(config, "max_evaluations", path)
     _validate_optional_positive_number(config, "per_runtime_limit", path)
+    mode = config.get("evaluation_timeout_mode", "fixed")
+    if mode not in ("fixed", "run_budget"):
+        raise RunConfigError(f"{path}: invalid evaluation_timeout_mode {mode!r}")
+    if mode == "run_budget" and (config.get("per_runtime_limit") is not None
+                                 or config.get("preflight_runtime_limit") is not None
+                                 or config.get("deadline") is None):
+        raise RunConfigError(f"{path}: run_budget requires a deadline and null evaluation/preflight limits")
     _validate_optional_positive_number(config, "preflight_runtime_limit", path)
     _validate_optional_positive_number(config, "deadline", path)
     if config.get("final_reserve_seconds") is not None:

@@ -18,6 +18,7 @@ TUNER_DIR = Path(__file__).resolve().parent / "tuners"
 sys.path.insert(0, str(TUNER_DIR))
 
 from _common import (  # noqa: E402
+    EvaluationBudgetExhausted,
     _configured_preflight_name,
     load_candidate_modules,
     timed_preflight,
@@ -61,6 +62,9 @@ def main() -> int:
     try:
         params_name, params = read_standalone_params(candidate_path)
         result = timed_preflight(params, candidate_path)
+    except EvaluationBudgetExhausted as exc:
+        print(json.dumps({"status": "budget_exhausted", "scope": exc.scope, "objective_calls": 0}))
+        return 4
     except Exception as exc:
         print(
             json.dumps(

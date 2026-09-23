@@ -510,6 +510,8 @@ def main() -> int:
                     "candidate_execution_revision"
                 ],
             )
+        except EvaluationBudgetExhausted:
+            raise
         except Exception as exc:
             failure = record_failure(
                 report_path=args.tune_report_json,
@@ -567,7 +569,14 @@ def main() -> int:
             # remaining proposals are dropped (deferred extras still run).
             continue
         params = cast_params_to_search_space(dict(d_params), search_space)
-        preflight_ok = preflight_passes(params)
+        try:
+            preflight_ok = preflight_passes(params)
+        except EvaluationBudgetExhausted as exc:
+            budget_exhausted = True
+            budget_exhausted_scope = exc.scope
+            early_stopped = True
+            early_stop_reason = "evaluation_budget"
+            break
         if not preflight_ok:
             # No budget charge, for either kind: preflight reserves no slot in
             # evaluation_attempts.jsonl and never reaches score_fn, so a
@@ -675,7 +684,15 @@ def main() -> int:
                     stop_now = True
                     break
                 continue
-            preflight_ok = preflight_passes(params)
+            try:
+                preflight_ok = preflight_passes(params)
+            except EvaluationBudgetExhausted as exc:
+                budget_exhausted = True
+                budget_exhausted_scope = exc.scope
+                early_stopped = True
+                early_stop_reason = "evaluation_budget"
+                stop_now = True
+                break
             if not preflight_ok:
                 results.append((x, None))
                 evals += 1

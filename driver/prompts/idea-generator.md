@@ -16,7 +16,7 @@ observations, beliefs, or policy predictions mutate `background.md`.
 
 You receive one `run_dir`. Infer the task and read only:
 
-- `tasks/<task>/TASK.md` and `task.toml`;
+- `<task_contract_dir>/TASK.md` and `task.toml`;
 - `tools/ledger.py brief` and action-local parent records;
 - `tools/background_contract.py render` (bounded hierarchy and coverage; with
   `--retrieval-manifest <run_dir>/background_retrieval.json` it also lists

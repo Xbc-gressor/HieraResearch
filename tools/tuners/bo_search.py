@@ -638,6 +638,13 @@ def main() -> int:
                         "candidate_execution_revision"
                     ],
                 )
+            except EvaluationBudgetExhausted as exc:
+                counters["budget_exhausted"] = True
+                counters["budget_exhausted_scope"] = exc.scope
+                early_stopped["flag"] = True
+                early_stopped["reason"] = "evaluation_budget"
+                study.stop()
+                raise
             except Exception as exc:
                 _set_feasibility(trial, feasible=False)
                 failure = record_failure(

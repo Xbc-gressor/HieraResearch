@@ -43,9 +43,11 @@ Derive the rest from `train_py` (do not ask the caller):
 | `run_dir` | the `runs/<task>/<tag>/` ancestor (holds `ledger.json`) |
 | implementation source | `candidate_dir/_candidate_brief.json` → `implementation_source` |
 | `prepare.py` (readonly) | `<candidate_dir>/prepare.py` — read for the task's problem interface (what `make_model` receives and must return), never edit |
-| `task_dir` / `env.project` | `tasks/<task>` (`<task>` = the `runs/<task>/` segment); the uv dir for segment ③ is `task.toml`'s `env.project` (usually `tasks/<task>`) |
+| `task_dir` | `tasks/<task>` (`<task>` = the `runs/<task>/` segment); source code and task environment |
+| `task_contract_dir` | supplied in the invocation; effective `TASK.md` and `task.toml` for this run |
+| `env.project` | read from `<task_contract_dir>/task.toml`; use that value as the uv dir for segment ③ (usually `tasks/<task>`) |
 
-Read the task contract — `TASK.md`'s `## Evaluation Contract` + `task.toml`
+Read the task contract — `<task_contract_dir>/TASK.md`'s `## Evaluation Contract` + `<task_contract_dir>/task.toml`
 `[evaluation]`/`[constraints]` — before editing. These are authoritative. If a
 required path does not resolve, stop and report. **Scores are lower-is-better**;
 everything you propose aims *low*.

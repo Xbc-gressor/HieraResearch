@@ -221,7 +221,12 @@ class SessionBudgetTests(unittest.TestCase):
             self.assertEqual(len(_events(run_dir, "idle_timeout")), 1)
             self.assertEqual(_events(run_dir, "transport_retry"), [])
 
-    def _wall_limit_runner(self, run_dir, store, *, rescue_accepts):
+    def _wall_limit_runner(self, run_dir, store, *, rescue_accepts,
+                           during_correction=False):
+        async def missing_receipt():
+            yield _Init()
+            yield _Result()
+
         async def slow_turn():
             yield _Init()
             await asyncio.sleep(0.15)
@@ -237,7 +242,10 @@ class SessionBudgetTests(unittest.TestCase):
                                       {"edited": True, "summary": "partial"})
             yield _Result(num_turns=1)
 
-        client = _Client([slow_turn, rescue_turn])
+        turns = [slow_turn, rescue_turn]
+        if during_correction:
+            turns.insert(0, missing_receipt)
+        client = _Client(turns)
         runner = SDKSessionRunner(model="m", events=EventsLog(run_dir),
                                   client_factory=lambda options: client)
         return runner, client
@@ -271,6 +279,29 @@ class SessionBudgetTests(unittest.TestCase):
             self.assertIn("wall-clock limit", cm.exception.problems[0])
             self.assertEqual(len(client.queries), 1)
             self.assertFalse(_events(run_dir, "session_wall_limit")[0]["rescued"])
+
+    def test_wall_limit_during_last_correction_gets_one_rescue(self) -> None:
+        for accepts in (True, False):
+            with self.subTest(rescue_accepts=accepts), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                runner, client = self._wall_limit_runner(
+                    run_dir, ReceiptStore(run_dir), rescue_accepts=accepts,
+                    during_correction=True)
+                role = _role(wall_limit_seconds=0.05, soft_rescue=True,
+                             corrective_attempts=1)
+                ctx = InvocationContext(task="toy", tag="r1", run_dir=run_dir,
+                                        invocation_id=1)
+                if accepts:
+                    self.assertEqual(runner.run(role, ctx)["summary"], "partial")
+                else:
+                    with self.assertRaises(InvocationFailed) as cm:
+                        runner.run(role, ctx)
+                    self.assertIn("rescue turn produced no receipt", str(cm.exception))
+                self.assertEqual(len(client.queries), 3)
+                self.assertEqual(client.queries[-1], SOFT_RESCUE_MESSAGE)
+                limits = _events(run_dir, "session_wall_limit")
+                self.assertEqual(len(limits), 1)
+                self.assertEqual(limits[0]["rescued"], accepts)
 
     def test_transport_failure_retries_with_the_same_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
