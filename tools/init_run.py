@@ -209,10 +209,11 @@ def initialize_run(
             )
         if proposer_arm is None:
             proposer_arm = DEFAULT_PROPOSER_ARM
+        if per_runtime_limit is None and (time_budget_seconds is not None or deadline is not None):
+            no_eval_timeout = True
 
-    # New runs inherit a task-appropriate limit instead of blindly retaining
-    # the generic template's 60 seconds. Existing run-local choices remain
-    # untouched, and an explicit --timeout still wins.
+    # Without a run deadline, retain the task's fixed evaluation limit.
+    # An explicit --timeout overrides the budgeted-run default.
     if per_runtime_limit is None and not target_existed and not no_eval_timeout:
         per_runtime_limit = _task_runtime_limit(repo_root, task_name)
 
@@ -728,6 +729,11 @@ def initialize_run(
         config["per_runtime_limit"] = normalized_limit
         updates.append(f"per_runtime_limit={normalized_limit}")
 
+    if not target_existed and space_expansion is None:
+        space_expansion = (
+            config.get('deadline') is not None
+            and config.get('semantic_search', {}).get('policy') == 'judged_slate'
+        )
     if space_expansion is not None:
         config['space_expansion'] = {**config.get('space_expansion', {}), 'enabled': space_expansion}
         updates.append(f"space_expansion.enabled={space_expansion}")
@@ -828,9 +834,9 @@ def main() -> int:
     )
     timeout_group = parser.add_mutually_exclusive_group()
     parser.add_argument("--space-expansion", action=argparse.BooleanOptionalAction,
-                        default=None, help="review stalled semantic space and reserve one probe seat")
+                        default=None, help="review stalled semantic space (default with a run deadline and judged_slate)")
     timeout_group.add_argument("--no-eval-timeout", action="store_true",
-                               help="no per-evaluation cap; requires a run deadline")
+                               help="no per-evaluation cap (default with a run deadline; --timeout opts out)")
     timeout_group.add_argument(
         "--timeout",
         "--per-runtime-limit",

@@ -53,8 +53,8 @@ research selects a task-relevant subset. With `llm_induced`, the run-local
 catalog is already the final task-specific dimension set, so the registry must
 use every catalog dimension exactly once and in catalog order. Under either
 strategy, every serialized run dimension must come from the resolved catalog
-and repeat its stable id, definition, ownership boundary, and provenance
-exactly, then add a task-specific selection reason, evidence receipts, mode,
+by stable id (`background_contract.py normalize` fills its definition,
+ownership boundary, and provenance from the catalog), then add a task-specific selection reason, evidence receipts, mode,
 status, baseline, and hypotheses. A gap in the resolved catalog is recorded
 explicitly rather than routed into a catch-all dimension.
 
@@ -119,7 +119,7 @@ space decomposition. Its scalar defaults remain inner-HPO settings.
 That attribution is enforced through `<run_dir>/baseline_mechanisms.json`, a
 schema-1 `baseline_mechanism_inventory` written alongside `background.md`: per
 resolved dimension, the mechanism tags the entrypoint actually applies plus
-`<file>:<line>` citations, and the entrypoint's sha256. Two checks then run in
+`<file>:<line>` citations. Two checks then run in
 `background_contract.py`:
 
 - **Baseline completeness** (inventory supplied): a dimension's baseline
@@ -142,7 +142,7 @@ Each hypothesis preserves:
 - stable id, title, claim, `status: active`, and provenance receipts;
 - `kind: baseline`, `evidence_prior`, or `scope_probe`;
 - claim boundary and exact five-facet scope;
-- required local comparisons and reopening condition;
+- reopening condition;
 - literature credibility and rationale;
 - testable lower-is-better expectation;
 - typed source evidence links.
@@ -566,6 +566,9 @@ python tools/search_backends.py validate \
 
 python tools/background_contract.py catalog \
   --path <run_dir>/dimension_catalog.json  # llm_induced only
+
+python tools/background_contract.py normalize \
+  --background <run_dir>/background.md
 
 python tools/background_contract.py validate \
   --background <run_dir>/background.md \

@@ -292,6 +292,36 @@ def _cycle(edges: list[tuple[str, str]]) -> list[str] | None:
     return None
 
 
+DIMENSION_FIELDS = {
+    "id",
+    "definition",
+    "boundary",
+    "catalog_provenance",
+    "selection_reason",
+    "evidence",
+    "mode",
+    "status",
+    "baseline_hypothesis_id",
+    "hypotheses",
+}
+HYPOTHESIS_FIELDS = {
+    "id",
+    "title",
+    "claim",
+    "kind",
+    "status",
+    "provenance",
+    "claim_scope",
+    "scope",
+    "reopen_when",
+    "literature_credibility",
+    "credibility_rationale",
+    "testable_expectation",
+    "evidence",
+    "probe_for",
+}
+
+
 def validate_space_core(
     registry: dict[str, Any],
     catalog: dict[str, Any] | None = None,
@@ -348,35 +378,6 @@ def validate_space_core(
     baseline_by_dimension: dict[str, str] = {}
     dimension_mode: dict[str, str] = {}
 
-    allowed_dimension_fields = {
-        "id",
-        "definition",
-        "boundary",
-        "catalog_provenance",
-        "selection_reason",
-        "evidence",
-        "mode",
-        "status",
-        "baseline_hypothesis_id",
-        "hypotheses",
-    }
-    allowed_hypothesis_fields = {
-        "id",
-        "title",
-        "claim",
-        "kind",
-        "status",
-        "provenance",
-        "claim_scope",
-        "scope",
-        "required_comparisons",
-        "reopen_when",
-        "literature_credibility",
-        "credibility_rationale",
-        "testable_expectation",
-        "evidence",
-        "probe_for",
-    }
     for index, dimension in enumerate(dimensions):
         where = f"dimensions[{index}]"
         if not isinstance(dimension, dict):
@@ -469,13 +470,6 @@ def validate_space_core(
                 errors.append(
                     f"{hyp_where}.provenance must trace the task-specific baseline"
                 )
-            comparisons = hypothesis.get("required_comparisons")
-            if (
-                not isinstance(comparisons, list)
-                or not comparisons
-                or any(not _nonempty(item) for item in comparisons)
-            ):
-                errors.append(f"{hyp_where}.required_comparisons must be a non-empty string list")
             evidence = hypothesis.get("evidence")
             if not isinstance(evidence, list):
                 errors.append(f"{hyp_where}.evidence must be a list")
@@ -487,7 +481,7 @@ def validate_space_core(
                     errors.append(f"{hyp_where}.probe_for must be a non-empty guidance-id list")
             elif hypothesis.get("probe_for"):
                 errors.append(f"{hyp_where}.probe_for is only valid for a scope_probe")
-            unknown_hypothesis_fields = sorted(set(hypothesis) - allowed_hypothesis_fields)
+            unknown_hypothesis_fields = sorted(set(hypothesis) - HYPOTHESIS_FIELDS)
             if unknown_hypothesis_fields:
                 errors.append(f"{hyp_where} has unknown fields {unknown_hypothesis_fields}")
         if isinstance(dimension_id, str):
@@ -505,7 +499,7 @@ def validate_space_core(
                 errors.append(f"{where} baseline hypothesis must have kind='baseline'")
         if mode == "baseline_only" and len(hypotheses) != 1:
             errors.append(f"{where} baseline_only dimension must contain exactly its baseline")
-        unknown_dimension_fields = sorted(set(dimension) - allowed_dimension_fields)
+        unknown_dimension_fields = sorted(set(dimension) - DIMENSION_FIELDS)
         if unknown_dimension_fields:
             errors.append(f"{where} has unknown fields {unknown_dimension_fields}")
 

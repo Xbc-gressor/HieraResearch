@@ -32,9 +32,21 @@ service dependency.
 - `metadata_mismatch` — resume-time provenance drift (model, SDK/CLI
   version, or prompt hashes differ from `run_metadata.json`); record and
   warn, never refuse (`warning`).
-- `blocked` — the loop hit a hard stop condition (`reason`).
+- `blocked` — the loop hit a hard stop condition (`reason`, `cls`: one of
+  compliance, ledger_integrity, evaluation_surface, deadline,
+  empty_frontier).
 - `blocked_secondary` — another seat hit a stop condition while the run was
-  already blocked (`reason`); only the first block persists the phase.
+  already blocked (`reason`, `cls`); only the first block persists the phase.
+- `unit_failed` — a work unit (generation, rewrite climb, tune bout,
+  refresh) failed at its boundary (`action`, `target`, `signature`,
+  `error`, `traceback`).
+- `recovery_choice` — a failure point picked its next action (`layer`,
+  `signature`, `frontier`, `choice`, `chooser`: default | triage).
+- `guard_denied` / `guard_degraded` — a session tool guard refused a call,
+  or let it through rewritten or with a hint (`guard`: a
+  `driver/session.py` `GUARDS` id, `role`, `tool`).
+- `failure_summary` — run-end totals; per-guard, per-signature and
+  per-choice counts are in `<run_dir>/failure_summary.json`.
 - `seat_started` / `seat_finished` / `seat_skipped` — one admitted seat's
   implementation on the session channel (`run_id`; `session_wait_seconds`
   is the time it waited for a session slot, `seconds` its wall clock).

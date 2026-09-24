@@ -64,12 +64,10 @@ If your invocation context declares the route arm active
 (`n_route_sketches >= 1`), read the named route-memory file first, plan that
 many genuinely distinct implementation routes to the seat's point, rank them,
 and add a `route_provenance` object to your receipt:
-`{"schema_version": 1, "point_id": ..., "op": ..., "n_route_sketches": N,
-"route_memory": true, "memory_rows": <the rows array copied verbatim>,
-"sketches": [{"sketch_id": "r1", "route": ...}, ...],
-"preference_order": [...], "chosen_sketch_id": ..., "chosen_route":
-<verbatim copy of the chosen sketch's route>}`. It records what you planned
-before any code exists. When the route arm is inactive, omit the field.
+`{"sketches": [{"sketch_id": "r1", "route": ...}, ...],
+"preference_order": [...], "chosen_sketch_id": ...}`. It records what you
+planned before any code exists; the driver fills in the memory view and the
+chosen route. When the route arm is inactive, omit the field.
 
 ## Output contract (driver-mediated)
 

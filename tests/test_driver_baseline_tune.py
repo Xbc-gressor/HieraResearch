@@ -41,6 +41,7 @@ class BaselineTuneTest(unittest.TestCase):
                 mock.ANY,
                 mock.sentinel.events,
                 "baseline bout: phase-c-action failed: broken action",
+                cls=mock.ANY,
             )
 
 

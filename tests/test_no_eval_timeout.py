@@ -65,6 +65,32 @@ def test_cli_timeout_switches_are_exclusive():
         parser.parse_args(['run', 'unit', 'tag', '--loop', 'experiment', '--no-eval-timeout', '--timeout', '10'])
 
 
+@pytest.mark.parametrize('budget', [{'time_budget_seconds': 120}, {'deadline': 2000000000}])
+def test_new_budgeted_run_defaults_to_uncapped_evaluation_and_space_expansion(tmp_path, budget):
+    repo = repo_fixture(tmp_path)
+    (repo / 'tasks/framework_cfg.example.json').write_bytes(
+        (ROOT / 'tasks/framework_cfg.example.json').read_bytes())
+    run = initialize_run(repo, 'unit', 'defaults', **budget)
+    cfg = json.loads((run / 'framework_cfg.json').read_text())
+    assert cfg['evaluation_timeout_mode'] == 'run_budget'
+    assert cfg['per_runtime_limit'] is None
+    assert cfg['preflight_runtime_limit'] is None
+    assert cfg['space_expansion']['enabled'] is True
+    assert 'timeout_seconds' not in tomllib.loads((run / 'task_contract/task.toml').read_text())['run']
+
+
+def test_budgeted_run_can_explicitly_disable_new_defaults(tmp_path):
+    repo = repo_fixture(tmp_path)
+    run = initialize_run(repo, 'unit', 'fixed', time_budget_seconds=120,
+                         per_runtime_limit=2, space_expansion=False)
+    cfg = json.loads((run / 'framework_cfg.json').read_text())
+    assert cfg['evaluation_timeout_mode'] == 'fixed'
+    assert cfg['per_runtime_limit'] == 2
+    assert cfg['space_expansion']['enabled'] is False
+    initialize_run(repo, 'unit', 'fixed')
+    assert json.loads((run / 'framework_cfg.json').read_text()) == cfg
+
+
 def runtime_fixture(tmp_path, *, mode='run_budget', remaining=20):
     repo = repo_fixture(tmp_path)
     candidate = repo / 'runs/mle-statoil-iceberg/tag/candidates/001/train.py'

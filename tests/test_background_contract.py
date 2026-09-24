@@ -15,10 +15,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 from background_contract import (  # noqa: E402
     _validated_inputs,
     audit_text,
+    cmd_quarantine,
     derive_hypothesis_selection,
     extract_result_numbers,
     item_number_presence,
     mapping_number_presence,
+    normalize_registry,
     result_number_matches,
     validate_experience,
     validate_registry,
@@ -136,6 +138,39 @@ class CatalogInjectionTests(unittest.TestCase):
             [],
         )
         self.assertTrue(validate_registry(registry))
+
+    def test_normalize_fills_catalog_fields_and_strips_unknown(self) -> None:
+        catalog, registry = _custom_catalog_registry()
+        dimension = registry["dimensions"][0]
+        for field in ("definition", "boundary", "catalog_provenance"):
+            dimension.pop(field)
+        dimension["notes"] = "free text"
+        dimension["hypotheses"][0]["required_comparisons"] = ["x"]
+        registry["catalog"] = {}
+
+        warnings = normalize_registry(registry, catalog)
+
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(validate_registry(registry, catalog=catalog), [])
+
+    def test_quarantine_drops_invalid_units_until_the_space_validates(self) -> None:
+        registry = fixture_registry()
+        _hypothesis(registry, "hyp-model-multibranch")["scope"] = "broken"
+        with tempfile.TemporaryDirectory() as tmp:
+            background = Path(tmp) / "background.md"
+            background.write_text(background_text(registry))
+            args = argparse.Namespace(
+                background=background, catalog=None, ledger=None,
+                retrieval_manifest=None, baseline_mechanisms=None,
+                number_gate=False, drop=None)
+
+            self.assertEqual(cmd_quarantine(args), 0)
+
+            _, _, errors = _validated_inputs(args)
+            self.assertEqual(errors, [])
+            text = background.read_text()
+            self.assertNotIn("`hyp-model-multibranch`", text)
+            self.assertIn("hyp-model-linear", text)
 
     def test_catalog_resolver_uses_configured_dimension_strategy(self) -> None:
         custom_catalog, _ = _custom_catalog_registry()
@@ -299,7 +334,7 @@ class BaselineMechanismTests(unittest.TestCase):
         inventory = {
             "schema_version": 1,
             "kind": "baseline_mechanism_inventory",
-            "entrypoint": {"path": "tasks/toy/train.py", "sha256": "sha256:" + "a" * 64},
+            "entrypoint": {"path": "tasks/toy/train.py"},
             "dimensions": dimensions,
         }
         inventory.update(overrides)
@@ -375,13 +410,6 @@ class BaselineMechanismTests(unittest.TestCase):
             ("unknown dimensions ['dim-not-real']", unknown),
             ("schema_version must be 1", self._inventory(registry, schema_version=2)),
             ("kind must be", self._inventory(registry, kind="something_else")),
-            (
-                "entrypoint.sha256 must be a sha256 digest",
-                self._inventory(
-                    registry,
-                    entrypoint={"path": "tasks/toy/train.py", "sha256": "nope"},
-                ),
-            ),
         ]
         for needle, inventory in cases:
             with self.subTest(needle=needle):

@@ -181,12 +181,12 @@ _PUNCTUATION_CHARS = "|&;()<>"
 _ADAPTER_ALLOWLIST = {
     "tools/search_backends.py": ("search", "status", "results", "visit",
                                  "read", "validate"),
-    "tools/background_contract.py": ("catalog", "validate"),
+    "tools/background_contract.py": ("catalog", "normalize", "validate"),
 }
 _ADAPTER_USAGE = ("run a single adapter command: `python "
                   "tools/search_backends.py search|status|results|visit|read|"
                   "validate ...` or `python tools/background_contract.py "
-                  "catalog|validate ...`")
+                  "catalog|normalize|validate ...`")
 
 
 def _adapter_tokens(command: str) -> list[str] | None:
@@ -236,22 +236,19 @@ def adapter_command_verdict(command: str, run_dir: Path) -> str | None:
     if len(tokens) < 3 or tokens[0] not in ("python", "python3") \
             or tokens[2] not in _ADAPTER_ALLOWLIST.get(tokens[1], ()):
         return f"off the adapter allowlist; {_ADAPTER_USAGE}"
-    manifest = None
     for index, token in enumerate(tokens):
-        if token == "--manifest":
+        flag, _, value = token.partition("=")
+        if flag not in ("--manifest", "--background"):
+            continue
+        if not value:
             if index + 1 >= len(tokens):
-                return "--manifest requires a value"
-            manifest = tokens[index + 1]
-            break
-        if token.startswith("--manifest="):
-            manifest = token.split("=", 1)[1]
-            break
-    if manifest is not None:
-        candidate = Path(manifest)
+                return f"{flag} requires a value"
+            value = tokens[index + 1]
+        candidate = Path(value)
         if not candidate.is_absolute():
             candidate = Path(run_dir) / candidate
         if not candidate.resolve().is_relative_to(Path(run_dir).resolve()):
-            return ("--manifest must stay inside this run's directory "
+            return (f"{flag} must stay inside this run's directory "
                     f"({run_dir}); {_ADAPTER_USAGE}")
     return None
 
@@ -262,40 +259,88 @@ _DUMP_MAX_BYTES = 256 * 1024
 
 _REPEAT_HISTORY_LIMIT = 10
 _WINDOW_REPEAT_LIMIT = 4
-_CORRECTION_TRIP_LIMIT = 3
+# Consecutive tool calls that only revisit earlier (tool, input, revision)
+# fingerprints of this invocation. Liveness is judged by novelty: a new
+# input, a Read of a changed file, or any Edit/Write is progress.
+_STALL_LIMIT = 8
+# The same trip over a window, so sparse novel calls cannot reset it:
+# _STALL_WINDOW_REVISITS revisits among the last _STALL_WINDOW calls.
+_STALL_WINDOW = 20
+_STALL_WINDOW_REVISITS = 16
+# Reads of one unchanged file beyond this count are revisits whatever their
+# offset/limit, so paging through the same content is not novelty.
+_READ_REVISIT_AFTER = 8
+# Every PreToolUse guard: the invariant it protects, who consumes that
+# invariant, its consequence class (hard | repairable | advisory; see the
+# design's guard discipline) and the legal exit it offers. guard_denied /
+# guard_degraded events carry the id; a guard that blocks a run is the
+# first suspect.
+GUARDS = {
+    "capability": ("role tool set", "role isolation", "hard",
+                   "the role's available tools"),
+    "ledger_write": ("only tools/ledger.py mutates ledger.json",
+                     "ledger integrity", "hard", "tools/ledger.py"),
+    "bash_patterns": ("role Bash prefix allowlist", "role scope",
+                      "repairable", "allowed prefixes; file tools"),
+    "driver_job": ("long objective work is driver-owned",
+                   "GPU lease and evaluation accounting", "repairable",
+                   "a driver_job receipt"),
+    "bash_adapter": ("retrieval goes through the adapter",
+                     "retrieval compliance", "hard",
+                     "adapter commands (benign shell forms rewritten); "
+                     "file tools"),
+    "repetition_breaker": ("the session makes progress", "liveness",
+                           "repairable", "fresh session with a handoff"),
+    "repetition_hint": ("the session makes progress", "liveness",
+                        "advisory", "the call proceeds with a hint"),
+}
+COMPACTION_HINT = (
+    "Your context was just compacted and its summary may be inaccurate. "
+    "Re-read a file before editing it; the invocation context in your "
+    "system prompt (paths, ids) is authoritative.")
 
 
-def _read_repetition_state(breaker: dict, name: str,
-                           tool_input: dict | None,
-                           available_tools: set[str]) -> tuple[tuple | None, str | None]:
-    """Return the Read's file revision and its unchanged-content correction."""
+def _read_revision(name: str, tool_input: dict | None) -> tuple | None:
+    """The (path, mtime) a Read observes, so a Read after an edit is new."""
     if name != "Read" or not isinstance(tool_input, dict):
-        return None, None
+        return None
     raw_path = tool_input.get("file_path")
     if not raw_path:
-        return None, None
+        return None
     path = str(Path(str(raw_path)).expanduser().resolve(strict=False))
     try:
         mtime = Path(path).stat().st_mtime_ns
     except OSError:
         mtime = None
-    mtimes = breaker["read_mtimes"]
-    counts = breaker["read_counts"]
-    if path not in mtimes or mtimes[path] != mtime:
-        mtimes[path] = mtime
-        counts[path] = 0
-    counts[path] += 1
-    revision = (path, mtime)
-    if counts[path] < 8:
-        return revision, None
-    if {"Write", "Edit"} & available_tools:
-        next_step = "continue writing or editing and submit your receipt"
-    elif "Grep" in available_tools or "Bash" in available_tools:
-        next_step = "continue the remaining checks and submit your receipt"
-    else:
-        next_step = "use the context already obtained and submit your receipt"
-    return revision, (f"Read of {path} denied: its content is unchanged and already "
-                      f"in your context after {counts[path]} reads; {next_step}.")
+    return (path, mtime)
+
+
+def _strip_benign_shell(command: str, run_dir: Path) -> str | None:
+    """An equivalent adapter command without trailing benign shell forms
+    (``2>&1``, ``2>/dev/null``, ``| head/tail [-n N]``), or None when the
+    command is not one allowlisted adapter call once they are removed."""
+    tokens = _adapter_tokens(command)
+    if not tokens:
+        return None
+    stripped = list(tokens)
+    while True:
+        if stripped[-3:] == ["2", ">&", "1"] or stripped[-3:] == ["2", ">", "/dev/null"]:
+            del stripped[-3:]
+            continue
+        pipe = max((i for i, t in enumerate(stripped) if t == "|"), default=-1)
+        tail = stripped[pipe + 1:] if pipe >= 0 else []
+        if tail and tail[0] in ("head", "tail") and (
+                tail[1:] == []
+                or (len(tail) == 2 and tail[1].startswith("-")
+                    and tail[1].lstrip("-n").isdigit())
+                or (len(tail) == 3 and tail[1] == "-n" and tail[2].isdigit())):
+            del stripped[pipe:]
+            continue
+        break
+    if stripped == tokens:
+        return None
+    rewritten = shlex.join(stripped)
+    return rewritten if adapter_command_verdict(rewritten, run_dir) is None else None
 
 
 def new_breaker() -> dict:
@@ -307,10 +352,12 @@ def new_breaker() -> dict:
         # the invocation breaker so a model cannot evade the window by
         # repeating a call that was refused.
         "history": [],
-        "correction_count": 0,
-        "continuous_corrected_fps": set(),
-        "read_counts": {},
-        "read_mtimes": {},
+        "seen": set(),
+        "stall": 0,
+        "revisits": [],
+        "reads": Counter(),
+        # Set by the PreCompact hook; the next tool call carries the hint.
+        "compacted": False,
     }
 
 
@@ -472,9 +519,34 @@ class SDKSessionRunner:
     def run(self, role: RoleDefinition, ctx: InvocationContext) -> dict:
         ctx = admit_session(role, ctx, self.events)
         attempt = 0
+        restarted = False
         while True:
             try:
                 return anyio.run(self._run_async, role, ctx)
+            except InvocationFailed as exc:
+                # A tripped session's context is degenerate; one fresh
+                # session with a driver-built handoff is the role-level
+                # recovery. On-disk work persists across the restart.
+                trip = next((p for p in exc.problems
+                             if p.startswith("repetition breaker tripped")), None)
+                if trip is None or restarted \
+                        or session_time_budget(ctx)["time_reached"]:
+                    raise
+                restarted = True
+                self.events.emit("recovery_choice", layer="role", role=role.name,
+                                 invocation_id=ctx.invocation_id,
+                                 signature="repetition_breaker",
+                                 frontier=["fresh_session", "abandon"],
+                                 choice="fresh_session", chooser="default")
+                ctx = admit_session(role, dataclasses.replace(
+                    ctx, resume_session_id=None, extra={
+                        **ctx.extra,
+                        "restart_handoff": (
+                            f"a previous session of this invocation was stopped "
+                            f"({'; '.join(exc.problems)}). Files it wrote persist; "
+                            "inspect the current on-disk state once, then finish "
+                            "the task without repeating earlier tool calls."),
+                    }), self.events)
             except _TransportFailure as exc:
                 if (exc.api_error_status in KEY_ROTATION_STATUSES
                         and self._token_pool.rotate()):
@@ -516,19 +588,36 @@ class SDKSessionRunner:
         bypassPermissions and never reached; hooks still run). When the role
         declares bash_patterns, Bash commands must also start with one of
         those prefixes; bash_adapter_only instead confines Bash to the
-        retrieval-adapter allowlist (adapter_command_verdict), emitting a
-        policy_bash_denied event per refusal. The same hook hosts layered
-        repetition protection: the strict consecutive breaker remains the
-        hard fallback, while a bounded call window and unchanged-file Read
-        cap issue corrective denies. Ignoring three corrective denies trips
-        the invocation breaker and interrupts the drain.
+        retrieval-adapter allowlist (adapter_command_verdict): benign trailing
+        shell forms are rewritten away via updatedInput, other refusals name
+        the tools that do the job. Every deny names a legal alternative and
+        emits guard_denied with its GUARDS id.
+
+        Repetition: the strict consecutive breaker and the novelty stall
+        (``_STALL_LIMIT`` consecutive, or ``_STALL_WINDOW_REVISITS`` of the
+        last ``_STALL_WINDOW`` calls that only revisit earlier fingerprints)
+        trip the invocation; early-repeat and window repeats only attach a
+        hint (additionalContext) and the call proceeds.
         """
         if breaker is None:
             breaker = new_breaker()
         allowed = set(role.tools) | {RECEIPT_TOOL}
         adapter_run_dir = Path(run_dir or ".")
+        alternatives = "; ".join(
+            text for tool, text in (
+                ("Glob", "list files with Glob"),
+                ("Read", "read files with Read"),
+                ("Edit", "modify files with Edit"),
+                ("Write", "write files with Write"),
+            ) if tool in allowed)
 
-        def deny(reason: str) -> dict:
+        def deny(guard: str, reason: str, name: str, context,
+                 **fields) -> dict:
+            self.events.emit("guard_denied", guard=guard,
+                             cls=GUARDS[guard][2], role=role.name,
+                             invocation_id=context.get("invocation_id")
+                             if isinstance(context, dict) else None,
+                             tool=name, reason=reason, **fields)
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -537,16 +626,38 @@ class SDKSessionRunner:
                 }
             }
 
+        def allow(hints: list[str], updated_input: dict | None = None) -> dict:
+            if not hints and updated_input is None:
+                return {}
+            output = {"hookEventName": "PreToolUse"}
+            if updated_input is not None:
+                output["permissionDecision"] = "allow"
+                output["updatedInput"] = updated_input
+            if hints:
+                output["additionalContext"] = "\n".join(hints)
+            return {"hookSpecificOutput": output}
+
+        def emit_trip(name: str, context) -> dict:
+            reason = f"repetition breaker tripped: {breaker['tripped']}"
+            return deny("repetition_breaker", reason, name, context)
+
         async def hook(input_data, tool_use_id, context):
             name = input_data.get("tool_name", "")
-            revision, read_problem = (_read_repetition_state(
-                breaker, name, input_data.get("tool_input"), allowed)
-                if name in allowed else (None, None))
+            tool_input = input_data.get("tool_input")
+            hints: list[str] = []
+            if breaker["compacted"]:
+                # Re-reading after compaction is legitimate, not a loop.
+                breaker["compacted"] = False
+                breaker["history"].clear()
+                breaker["seen"].clear()
+                breaker["stall"] = 0
+                breaker["revisits"].clear()
+                breaker["reads"].clear()
+                hints.append(COMPACTION_HINT)
             # All repetition layers see the same content revision: a Read
             # after a real edit is not a repetition of the earlier result.
-            fp = (name,
-                  json.dumps(input_data.get("tool_input"), sort_keys=True,
-                             default=str), revision)
+            fp = (name, json.dumps(tool_input, sort_keys=True, default=str),
+                  _read_revision(name, tool_input))
             if fp == breaker["fp"]:
                 breaker["count"] += 1
             else:
@@ -559,114 +670,119 @@ class SDKSessionRunner:
 
             # Adapter status/results are intentionally poll-like: the same
             # command can be issued after a round changes without changing
-            # its input. Keep the call in history and retain the strict
-            # consecutive breaker, but do not apply the window correction.
+            # its input. Keep the strict consecutive breaker, but neither
+            # the window hint nor the novelty stall applies.
             adapter_poll = (
                 name == "Bash" and role.bash_adapter_only
-                and _adapter_poll_command(
-                    (input_data.get("tool_input") or {}).get("command", ""),
-                    adapter_run_dir,
-                )
+                and _adapter_poll_command((tool_input or {}).get("command", ""),
+                                          adapter_run_dir)
             )
+            if not adapter_poll:
+                revisit = fp in breaker["seen"]
+                breaker["seen"].add(fp)
+                if fp[2] is not None:
+                    breaker["reads"][fp[2]] += 1
+                    revisit = revisit or breaker["reads"][fp[2]] > _READ_REVISIT_AFTER
+                breaker["stall"] = breaker["stall"] + 1 if revisit else 0
+                breaker["revisits"].append(revisit)
+                del breaker["revisits"][:-_STALL_WINDOW]
 
             if breaker["tripped"] is None and breaker["count"] >= REPETITION_LIMIT:
                 breaker["tripped"] = (f"{fp[0]} invoked {breaker['count']}x "
                                       "with identical input")
+            if breaker["tripped"] is None and breaker["stall"] >= _STALL_LIMIT:
+                breaker["tripped"] = (f"no progress: {breaker['stall']} "
+                                      "consecutive calls repeated earlier calls")
+            if breaker["tripped"] is None \
+                    and sum(breaker["revisits"]) >= _STALL_WINDOW_REVISITS:
+                breaker["tripped"] = (f"no progress: {sum(breaker['revisits'])} "
+                                      f"of the last {_STALL_WINDOW} calls "
+                                      "repeated earlier calls")
             if breaker["tripped"] is not None:
-                reason = f"repetition breaker tripped: {breaker['tripped']}"
-                self.events.emit("policy_repetition_denied",
-                                 role=role.name,
-                                 invocation_id=context.get("invocation_id")
-                                 if isinstance(context, dict) else None,
-                                 tool=name, reason=reason, tripped=True)
-                return deny(reason)
+                return emit_trip(name, context)
 
-            correction = None
+            repeat_hint = None
             if role.early_repeat_correct and breaker["count"] >= 2:
-                correction = (
+                repeat_hint = (
                     f"repeated identical call #{breaker['count']} to {fp[0]} "
                     "with the same input; the earlier result is already in "
-                    "your context — do not re-read; proceed to produce your "
-                    "receipt/output.")
-            elif (not adapter_poll
-                  # Once this fingerprint has received the role-specific
-                  # continuous correction, let that path own its escalation
-                  # rather than issuing a second correction for the same
-                  # underlying repeat pattern.
-                  and fp not in breaker["continuous_corrected_fps"]
-                  and window_count >= _WINDOW_REPEAT_LIMIT):
-                correction = (
+                    "your context — proceed to produce your receipt/output.")
+            elif not adapter_poll and window_count >= _WINDOW_REPEAT_LIMIT:
+                repeat_hint = (
                     f"repeated call to {fp[0]} appears {window_count} times "
                     f"in the last {_REPEAT_HISTORY_LIMIT} tool calls; use the "
                     "context already obtained and proceed to produce your "
                     "receipt/output.")
-
-            # The path-based cap also catches loops diluted by offsets or
-            # enough other calls to stay below the window threshold.
-            if correction is None and read_problem is not None:
-                correction = read_problem
-
-            if correction is not None:
-                if role.early_repeat_correct and breaker["count"] >= 2:
-                    breaker["continuous_corrected_fps"].add(fp)
-                breaker["correction_count"] += 1
-                if breaker["correction_count"] >= _CORRECTION_TRIP_LIMIT:
-                    breaker["tripped"] = (
-                        f"corrective deny ignored {breaker['correction_count']}x "
-                        f"(latest: {correction})")
-                    reason = f"repetition breaker tripped: {breaker['tripped']}"
-                    self.events.emit("policy_repetition_denied",
-                                     role=role.name,
-                                     invocation_id=context.get("invocation_id")
-                                     if isinstance(context, dict) else None,
-                                     tool=name, reason=reason, tripped=True,
-                                     correction_count=breaker["correction_count"])
-                    return deny(reason)
-                self.events.emit("policy_repetition_denied",
+            if repeat_hint is not None:
+                hints.append(repeat_hint)
+                self.events.emit("guard_degraded", guard="repetition_hint",
                                  role=role.name,
                                  invocation_id=context.get("invocation_id")
                                  if isinstance(context, dict) else None,
-                                 tool=name, reason=correction, tripped=False,
-                                 correction_count=breaker["correction_count"])
-                return deny(correction)
+                                 tool=name, hint=repeat_hint)
+
             if name not in allowed:
-                return deny(f"role {role.name} may not use tool {name}")
-            ledger_problem = _ledger_write_problem(
-                name, input_data.get("tool_input"))
+                return deny("capability",
+                            f"role {role.name} may not use tool {name}; "
+                            f"available tools: {', '.join(sorted(allowed))}",
+                            name, context)
+            ledger_problem = _ledger_write_problem(name, tool_input)
             if ledger_problem:
-                return deny(ledger_problem)
+                return deny("ledger_write", ledger_problem, name, context)
             if name == "Bash" and role.bash_patterns:
                 # Coarse prefix matching — compound commands (&&, ;, |) can
                 # evade it. This is minimal containment, not a sandbox.
-                command = (input_data.get("tool_input") or {}).get("command", "")
+                command = (tool_input or {}).get("command", "")
                 if not any(command.startswith(p) for p in role.bash_patterns):
                     return deny(
+                        "bash_patterns",
                         f"role {role.name} may only run Bash commands starting "
-                        f"with: {', '.join(role.bash_patterns)}")
+                        f"with: {', '.join(role.bash_patterns)}; {alternatives}",
+                        name, context)
             if name == "Bash" and role.forbidden_bash_substrings:
-                command = (input_data.get("tool_input") or {}).get("command", "")
+                command = (tool_input or {}).get("command", "")
                 forbidden = next(
                     (part for part in role.forbidden_bash_substrings if part in command),
                     None,
                 )
                 if forbidden is not None:
                     return deny(
+                        "driver_job",
                         f"role {role.name} may not launch long objective work via "
-                        f"Bash ({forbidden!r}); submit a driver_job receipt"
-                    )
+                        f"Bash ({forbidden!r}); submit a driver_job receipt",
+                        name, context)
             if name == "Bash" and role.bash_adapter_only:
-                command = (input_data.get("tool_input") or {}).get("command", "")
+                command = (tool_input or {}).get("command", "")
                 reason = adapter_command_verdict(command, adapter_run_dir)
                 if reason is not None:
-                    # Deny-and-explain: a habitual curl gets a retryable
-                    # refusal; verbatim retries trip the repetition breaker.
-                    self.events.emit("policy_bash_denied",
-                                     command_head=command[:120], reason=reason)
-                    return deny(reason)
-            # A corrective deny was obeyed once the model reaches a genuinely
-            # allowed tool call. Policy-denied detours return above and do not
-            # masquerade as progress.
-            breaker["correction_count"] = 0
+                    rewritten = _strip_benign_shell(command, adapter_run_dir)
+                    if rewritten is not None:
+                        self.events.emit("guard_degraded", guard="bash_adapter",
+                                         role=role.name,
+                                         command_head=command[:120],
+                                         rewritten_head=rewritten[:120])
+                        hints.append(
+                            f"the driver ran `{rewritten}` (trailing shell "
+                            "redirects/pipes are removed; adapter output is "
+                            "already bounded)")
+                        return allow(hints, {**tool_input, "command": rewritten})
+                    return deny("bash_adapter",
+                                f"{reason}; for anything else, {alternatives}",
+                                name, context, command_head=command[:120])
+            return allow(hints)
+
+        return hook
+
+    def _compaction_hook(self, role: RoleDefinition, breaker: dict,
+                         invocation_id: int):
+        """PreCompact: flag the breaker so the next tool call carries the
+        re-read hint (the Python SDK has no PostCompact/SessionStart hook)."""
+
+        async def hook(input_data, tool_use_id, context):
+            breaker["compacted"] = True
+            self.events.emit("session_compacted", role=role.name,
+                             invocation_id=invocation_id,
+                             trigger=input_data.get("trigger"))
             return {}
 
         return hook
@@ -736,10 +852,13 @@ class SDKSessionRunner:
             setting_sources=[],
             disallowed_tools=list(role.disallowed),
             mcp_servers={"receipts": server},
-            hooks={"PreToolUse": [HookMatcher(matcher=None,
-                                              hooks=[self._capability_hook(
-                                                  role, breaker,
-                                                  run_dir=Path(ctx.run_dir))])]},
+            hooks={
+                "PreToolUse": [HookMatcher(matcher=None, hooks=[
+                    self._capability_hook(role, breaker,
+                                          run_dir=Path(ctx.run_dir))])],
+                "PreCompact": [HookMatcher(matcher=None, hooks=[
+                    self._compaction_hook(role, breaker, ctx.invocation_id)])],
+            },
             **kwargs,
         )
 

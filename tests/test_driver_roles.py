@@ -56,7 +56,7 @@ class RegistryTests(unittest.TestCase):
         "tuner-orchestrator",
         "experience-extractor", "crash-diagnosis", "hillclimb-editor",
         "rewrite-editor", "slate-judge", "slate-plan-writer",
-        "background-faithfulness-judge", "space-reviewer",
+        "background-faithfulness-judge", "space-reviewer", "failure-triage",
     }
 
     def test_all_roles_registered(self) -> None:
@@ -92,7 +92,7 @@ class RegistryTests(unittest.TestCase):
         retired agent; their entries pin the new contract instead.
         """
         expected = {
-            "background-researcher": ("Read", "Write", "Bash", "Glob"),
+            "background-researcher": ("Read", "Write", "Edit", "Bash", "Glob"),
             "idea-generator": ("Read", "Write", "Bash", "Glob"),
             "candidate-writer": ("Read", "Write", "Edit", "Glob"),
             "tuner-orchestrator": ("Read", "Write", "Edit", "Bash", "Glob"),
@@ -104,6 +104,7 @@ class RegistryTests(unittest.TestCase):
             "slate-plan-writer": ("Read",),
             "background-faithfulness-judge": (),
             "space-reviewer": ("Read", "Write", "Bash"),
+            "failure-triage": (),
         }
         self.assertEqual(set(ROLES), set(expected))
         for name, tools in expected.items():

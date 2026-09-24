@@ -671,6 +671,56 @@ def make_model""",
 
             evaluate.assert_not_called()
 
+    def test_failed_inherited_control_fails_the_screen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, child, configs_path = self._fixture(Path(tmp))
+            child.write_text(
+                _child_source().replace(
+                    "\ndef make_model",
+                    """
+SEARCH_SPACE = {
+    "same": ("int", 1, 10),
+    "category": ("categorical", ["a", "c"]),
+    "changed_kind": ("int", 1, 5),
+    "new_key": ("float", 0.1, 0.5),
+}
+
+def make_model""",
+                )
+            )
+            (child.parent / "prepare.py").write_text(
+                "def evaluate_config(make_model, params):\n"
+                "    return float(params['same'])\n"
+            )
+            receipt = materialize_parameter_transfer(child, configs_path)
+            report_path = child.parent / "tune_report.json"
+            argv = [
+                "warmstart_eval.py",
+                "--candidate-path", str(child),
+                "--configs-json", str(configs_path),
+                "--tune-report-json", str(report_path),
+                "--k-eval", "2",
+            ]
+
+            def evaluate(_evaluate, _make_model, params, *args, **kwargs):
+                if params == receipt["projection"]["params"]:
+                    raise TimeoutError("control exceeded the runtime limit")
+                return -1.0
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(warmstart_eval, "timed_eval",
+                                  side_effect=evaluate),
+                mock.patch("sys.stdout", new=io.StringIO()),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                self.assertNotEqual(warmstart_eval.main(), 0)
+
+            phase_a = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(phase_a["status"], "crashed")
+            self.assertEqual([row["score"] for row in phase_a["warm_start_configs"]],
+                             [None, -1.0])
+
 
 if __name__ == "__main__":
     unittest.main()

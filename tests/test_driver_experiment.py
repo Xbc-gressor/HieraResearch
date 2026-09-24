@@ -17,7 +17,7 @@ from driver.loops import experiment
 from driver.receipts import ReceiptStore
 from driver.events import EventsLog  # noqa: E402
 from driver.loops.background_audit import audit_completed  # noqa: E402
-from driver.loops.common import RunBlocked  # noqa: E402
+from driver.loops.common import BlockClass, RunBlocked  # noqa: E402
 from driver.loops.experiment import (  # noqa: E402
     _note_seat_progress,
     _note_seat_skip,
@@ -1059,7 +1059,8 @@ class CandidateRecoveryTests(unittest.TestCase):
         def sibling_blocks(ctx):
             with self.assertRaises(RunBlocked):
                 experiment._or_block(
-                    self.run, self.repo, self.cmd, self.events, "sibling blocked")
+                    self.run, self.repo, self.cmd, self.events, "sibling blocked",
+                    cls=BlockClass.EMPTY_FRONTIER)
 
         first = FakeSessionRunner([
             {"fail": ["no accepted receipt"], "side_effects": sibling_blocks},
@@ -1230,6 +1231,24 @@ class DegradedDeliveryTests(unittest.TestCase):
                     if row["kind"] == "degraded_submit"][-1]
         self.assertEqual(delivery["status"], "success")
 
+    def test_block_with_grader_grades_and_writes_manifest(self) -> None:
+        grader = (
+            "python -c \"open('grade-sample.log', 'w').write('ok')\""
+        )
+        status = self._block({"submission_command": self.SUBMISSION,
+                              "grader_command": grader,
+                              "data_dir": str(self.repo / "data")})
+        self.assertIn("degraded_submit", status["stop_condition"])
+        self.assertTrue((self.run_dir / "grade-sample.log").is_file())
+        manifest = json.loads(
+            (self.run_dir / "finalization-manifest.json").read_text())
+        self.assertTrue(manifest["degraded"])
+        self.assertEqual(manifest["submission"]["status"], "success")
+        self.assertEqual(manifest["grader"]["status"], "success")
+        rows = self._events()
+        grade = [row for row in rows if row["kind"] == "degraded_grade"][-1]
+        self.assertEqual(grade["status"], "success")
+
     def test_annotation_failure_keeps_the_original_block_durable(self) -> None:
         class AnnotationFailCmd(ExperimentCmd):
             def __init__(self, repo: Path) -> None:
@@ -1276,17 +1295,39 @@ class DegradedDeliveryTests(unittest.TestCase):
         self.assertTrue((self.run_dir / "submission.csv").is_file())
         self.assertEqual(experiment._seat_skip_count(self.run_dir), 0)
 
-    def test_settlement_exception_keeps_the_original_block_durable(self) -> None:
+    def test_settlement_exception_still_delivers_the_settled_records(self) -> None:
         with mock.patch.object(experiment, "_settle_for_delivery",
                                side_effect=RuntimeError("settlement unavailable")):
             status = self._block(
                 {"submission_command": self.SUBMISSION, "data_dir": "x"})
         self.assertEqual(status["phase"], "blocked")
         self.assertIn("JSONDecodeError", status["stop_condition"])
+        self.assertIn("degraded_submit", status["stop_condition"])
         failures = [r for r in self._events()
-                    if r["kind"] == "degraded_submit" and r["status"] == "failed"]
-        self.assertEqual(len(failures), 1)
-        self.assertIn("settlement unavailable", failures[0]["error"])
+                    if r["kind"] == "candidate_settlement_failed"]
+        self.assertEqual([r["run_id"] for r in failures], ["001"])
+        self.assertIn("settlement unavailable", failures[0]["detail"])
+
+    def test_seat_whose_settlement_raises_is_closed_as_a_crash(self) -> None:
+        self._ledger_with({"000": "keep", "001": "pending"})
+        (self.run_dir / "candidates/001").mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "candidates/001/tune_report.json").write_text(
+            '{"phase_a": {"status": "ok", "best_warm_score": 0.1}}')
+        cmd = ExperimentCmd(self.repo)
+        events = EventsLog(self.run_dir)
+        refused = subprocess.CalledProcessError(
+            1, ["python", "tools/ledger.py", "record-run"], stderr="refused")
+        with mock.patch.object(experiment, "_materialize_candidate"), \
+                mock.patch.object(experiment, "_implement_candidate",
+                                  side_effect=refused), \
+                mock.patch.object(experiment.candidate_evaluation, "settle",
+                                  side_effect=refused):
+            experiment._run_seat(None, None, "fake-task", "t1", self.run_dir,
+                                 "001", self.repo, cmd, events, None)
+        self.assertEqual([r["status"] for r in cmd._ledger()["records"]],
+                         ["keep", "crash"])
+        kinds = [row["kind"] for row in self._events()]
+        self.assertIn("unit_failed", kinds)
 
     def test_delivery_waits_for_inflight_evaluation_before_settling(self) -> None:
         self._ledger_with({"000": "keep", "001": "pending", "002": "pending"})
@@ -1312,7 +1353,8 @@ class DegradedDeliveryTests(unittest.TestCase):
                 self.assertTrue(started.wait(5))
                 try:
                     experiment._or_block(run, self.repo, cmd, events,
-                                         "another channel blocked")
+                                         "another channel blocked",
+                                         cls=BlockClass.EMPTY_FRONTIER)
                 finally:
                     blocker_returned.set()
             else:

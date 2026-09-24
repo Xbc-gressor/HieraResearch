@@ -70,9 +70,11 @@ they freeze only when the final validation passes.
 ### Step 1 — Scope from the task (read, do not guess)
 
 Read `TASK.md`'s `## Evaluation Contract`, `task.toml`, and the
-candidate-visible interfaces in `prepare.py`; or, when `task_packet` is present,
-read that packet and only the candidate-visible supporting paths it explicitly
-names. Pin down:
+candidate-visible interfaces in `prepare.py`. When a run-local contract
+directory is supplied, `TASK.md` and `task.toml` live there, but `prepare.py`
+is **not** staged into it — read it at `tasks/<task>/prepare.py`. Or, when
+`task_packet` is present, read that packet and only the candidate-visible
+supporting paths it explicitly names. Pin down:
 
 - **What is optimized** and the metric — note it is **lower-is-better**
   (framework-wide); frame every recommendation as "drives the metric *down*".
@@ -103,7 +105,7 @@ Read `<run_dir>/framework_cfg.json`. Resolve
 or file is absent.
 
 - **`catalog_subset`:** run `python tools/background_contract.py catalog` and
-  use only those ids, definitions, boundaries, and catalog provenance. Select a
+  use only those dimension ids. Select a
   dimension when the task has a legal material choice there, or when a task
   constraint fixes a material choice that must stay visible
   (`mode: baseline_only`). Do not invent a run-local or miscellaneous dimension.
@@ -128,7 +130,8 @@ candidate space.
 
 Every registry dimension needs:
 
-- the catalog definition/boundary/provenance copied exactly;
+- its catalog id (`normalize` fills the catalog definition, boundary, and
+  provenance);
 - a task-specific selection reason, non-empty evidence receipts, and
   `status: active`;
 - one explicit `kind: baseline` hypothesis (an identity/no-intervention
@@ -155,7 +158,7 @@ inventory the contract checks the registry against:
 {
   "schema_version": 1,
   "kind": "baseline_mechanism_inventory",
-  "entrypoint": {"path": "tasks/<task>/train.py", "sha256": "sha256:<digest>"},
+  "entrypoint": {"path": "tasks/<task>/train.py"},
   "dimensions": {
     "dim-model-architecture": {
       "interventions": ["<mechanism tag>", "<another mechanism tag>"],
@@ -167,7 +170,7 @@ inventory the contract checks the registry against:
 
 Every resolved dimension needs an entry, each `interventions` tag must be a
 mechanism the entrypoint actually applies, and each citation is a
-`<file>:<line>` receipt you verified. The digest is the entrypoint's sha256.
+`<file>:<line>` receipt you verified.
 
 Two rules follow, and the contract enforces both:
 
@@ -290,6 +293,8 @@ python tools/background_contract.py catalog \
   --path <run_dir>/dimension_catalog.json
 python tools/search_backends.py validate \
   --manifest <run_dir>/background_retrieval.json
+python tools/background_contract.py normalize \
+  --background <run_dir>/background.md
 python tools/background_contract.py validate \
   --background <run_dir>/background.md \
   --retrieval-manifest <run_dir>/background_retrieval.json \

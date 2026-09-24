@@ -114,7 +114,8 @@ class AdapterHookTests(unittest.TestCase):
             rows = [json.loads(line)
                     for line in (run_dir / "driver_events.jsonl")
                     .read_text().splitlines()]
-            denied = [r for r in rows if r.get("kind") == "policy_bash_denied"]
+            denied = [r for r in rows if r.get("kind") == "guard_denied"
+                      and r.get("guard") == "bash_adapter"]
             self.assertEqual(len(denied), 1)
             self.assertEqual(denied[0]["command_head"],
                              "curl https://kaggle.com/c/x")
@@ -133,6 +134,27 @@ class AdapterHookTests(unittest.TestCase):
                                 f"--manifest {run_dir}/background_retrieval.json"}},
                 None, {}))
             self.assertEqual(verdict, {})
+
+    def test_benign_trailing_forms_are_rewritten_not_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = SDKSessionRunner(model="m", events=EventsLog(run_dir))
+            hook = runner._capability_hook(ROLES["background-researcher"],
+                                           run_dir=run_dir)
+            base = ("python tools/background_contract.py validate "
+                    "--background background.md")
+            output = asyncio.run(hook(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": f"{base} 2>&1 | head -50"}},
+                None, {}))["hookSpecificOutput"]
+            self.assertEqual(output["permissionDecision"], "allow")
+            self.assertEqual(output["updatedInput"]["command"], base)
+            denied = asyncio.run(hook(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": f"{base} > out.txt"}},
+                None, {}))["hookSpecificOutput"]
+            self.assertEqual(denied["permissionDecision"], "deny")
+            self.assertIn("Edit", denied["permissionDecisionReason"])
 
     def test_other_roles_bash_unaffected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

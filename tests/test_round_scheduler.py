@@ -624,8 +624,8 @@ class RewriteClimbTests(unittest.TestCase):
             self.assertIn("dec-r1", record)
             self.assertEqual(record[record.index("--consumed") + 1], "4")
             self.assertEqual(record[record.index("--status") + 1], "valid")
-            self.assertAlmostEqual(
-                float(record[record.index("--gain") + 1]), 0.1)
+            gain = next(a for a in record if a.startswith("--gain="))
+            self.assertAlmostEqual(float(gain.split("=", 1)[1]), 0.1)
             # the editor session persisted and resumed across steps
             calls = [ctx for name, ctx in runner.calls
                      if name == "rewrite-editor"]
@@ -674,6 +674,120 @@ class RewriteClimbTests(unittest.TestCase):
                          if e.get("kind") == "rewrite_climb")
             self.assertEqual((climb["steps"], climb["stop"]),
                              (0, "round_quota"))
+
+
+    def test_failed_climbs_are_closed_then_rewrite_is_disabled(self) -> None:
+        import subprocess
+        from driver.events import EventsLog
+        from driver.loops import recovery, rounds
+        from driver.receipts import ReceiptStore
+
+        class BrokenRecordCmd(ClimbCmd):
+            def __call__(self, args, repo_root, check=True, capture=True, **kw):
+                args = [str(a) for a in args]
+                joined = " ".join(args)
+                if "scheduler/cli.py" in joined and "select" in joined \
+                        and "rewrite" in joined:
+                    self.calls.append(args)
+                    exclude = (args[args.index("--exclude") + 1].split(",")
+                               if "--exclude" in args else [])
+                    free = [r for r in ("000", "001") if r not in exclude]
+                    view = ({"action": "REWRITE", "run_id": free[0],
+                             "reason": "scripted", "decision_id": f"dec-{free[0]}",
+                             "reference": 1.0,
+                             "evidence_mode": {"overhead_seconds": 10.0}}
+                            if free else {"action": "STOP", "run_id": None,
+                                          "reason": "none", "decision_id": "dec-s"})
+                    return subprocess.CompletedProcess(args, 0, json.dumps(view), "")
+                if " record " in f"{joined} " and any(
+                        a.startswith("--gain") for a in args):
+                    self.calls.append(args)
+                    raise subprocess.CalledProcessError(2, args, "", "bad --gain")
+                return super().__call__(args, repo_root, check, capture, **kw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _ = self._setup_run(Path(tmp))
+            (run_dir / "ledger.json").write_text(json.dumps({
+                "records": [_record("000", 1.0), _record("001", 1.0)]}))
+            candidate = run_dir / "candidates" / "001"
+            candidate.mkdir(parents=True)
+            (candidate / "train.py").write_text(ClimbCmd.V[0])
+            (candidate / "tune_report.json").write_text(json.dumps({
+                "phase_a": {"best_warm_score": 1.0}, "phase_c": {"stages": []}}))
+            cmd = BrokenRecordCmd(Path(tmp), run_dir, eval_script=[0.9] * 4)
+
+            def edit(ctx):
+                (Path(ctx.extra["candidate_dir"]) / "train.py").write_text(
+                    ClimbCmd.V[1])
+
+            runner = FakeSessionRunner([
+                {"receipt": {"edited": True, "summary": "a", "basis": "h"},
+                 "side_effects": edit},
+                {"receipt": {"edited": True, "summary": "b", "basis": "h"},
+                 "side_effects": edit},
+            ])
+            config = {**round_policy.DEFAULTS, "rewrite_bouts": 3,
+                      "rewrite_max_bouts": 1, "tune_bouts": 1,
+                      "noise_margin": 0.0}
+            recovery.reset(run_dir)
+            open_rows = [{"decision_id": "dec-000"}, {"decision_id": "dec-001"}]
+            with mock.patch.object(recovery.SchedulerStore, "unbound_decisions",
+                                   return_value=open_rows):
+                rounds.optimization_phase(
+                    runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir,
+                    1, {"result": {"metric": "neg_acc"}}, Path(tmp), cmd,
+                    EventsLog(run_dir), tune=lambda no, sel: {"tuned": False},
+                    config=config)
+
+            closed = [c[c.index("--decision-id") + 1] for c in cmd.calls
+                      if "record" in c and "infra_failure" in c]
+            self.assertEqual(closed, ["dec-000", "dec-001"])
+            choices = [e["choice"] for e in self._events(run_dir)
+                       if e.get("kind") == "recovery_choice"]
+            self.assertEqual(choices, ["exclude_target", "disable_action"])
+            self.assertTrue(recovery.disabled(run_dir, recovery.REWRITE))
+            tune_select = next(c for c in cmd.calls if "select" in c
+                               and "tune" in c and "--peek" not in c)
+            self.assertEqual(tune_select[tune_select.index("--exclude") + 1],
+                             "000,001")
+
+    def test_triage_picks_scope_once_per_signature_and_falls_back(self):
+        from driver.events import EventsLog
+        from driver.loops import recovery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            events = EventsLog(run_dir)
+            picks = iter([{"scope": "retry_once", "rationale": "relay"},
+                          {"scope": "finish_everything", "rationale": "?"}])
+            asked = []
+
+            def triage(payload):
+                asked.append(payload["signature"])
+                return next(picks)
+
+            def fail(error):
+                try:
+                    raise error
+                except Exception as exc:  # noqa: BLE001
+                    return exc
+
+            recovery.reset(run_dir)
+            recovery.set_triage(run_dir, triage)
+            first = recovery.unit_failed(run_dir, events, recovery.TUNE, "001",
+                                         fail(ValueError("x")))
+            again = recovery.unit_failed(run_dir, events, recovery.TUNE, "002",
+                                         fail(ValueError("x")))
+            invalid = recovery.unit_failed(run_dir, events, recovery.REWRITE,
+                                           "001", fail(KeyError("y")))
+            self.assertEqual(len(asked), 2)  # the recurrence is not re-asked
+            self.assertEqual((first, again, invalid),
+                             ("retry_once", "disable_action", "exclude_target"))
+            self.assertTrue(recovery.disabled(run_dir, recovery.TUNE))
+            self.assertEqual(recovery.excluded(run_dir, recovery.TUNE), {"002"})
+            choosers = [e["chooser"] for e in self._events(run_dir)
+                        if e.get("kind") == "recovery_choice"]
+            self.assertEqual(choosers, ["triage", "default", "default"])
 
 
 class ConcurrentClimbTests(unittest.TestCase):

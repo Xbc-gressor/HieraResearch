@@ -65,8 +65,9 @@ from . import background_audit
 from . import space_reviews
 from . import common
 from . import phase_c
+from . import recovery
 from . import rounds
-from .common import RunBlocked
+from .common import BlockClass, RunBlocked
 from tools import competition_policy, mlebench_finalize
 from tools.evaluation_budget import budget_status as objective_budget_status
 from tools.evaluation_budget import phase_c_attempts
@@ -83,7 +84,11 @@ from tools.scheduler.contract import (
     ResourceContract,
 )
 from tools.scheduler.donor import build_donor_snapshot, donors_dir
-from tools.semantic_routes import is_not_applicable, validate_route_provenance
+from tools.semantic_routes import (
+    is_not_applicable,
+    normalize_route_provenance,
+    validate_route_provenance,
+)
 
 TRANSFER_SCHEDULER_POLICY = "anchor_transfer_challenger_v1"
 # Mirrors tune_tools.GLOBAL_DONOR_TRANSFER_FILENAME; the tuners package is a
@@ -301,12 +306,14 @@ def _invoke_with_driver_jobs(
 # valid), and run_experiment unwinds once the channels have joined.
 _block_lock = threading.Lock()
 _block_reason: dict[str, str] = {}  # run_dir -> first block reason
+_block_class: dict[str, BlockClass] = {}
 _block_persisted: set[str] = set()
 
 
 def _reset_block_state(run_dir) -> None:
     with _block_lock:
         _block_reason.pop(str(run_dir), None)
+        _block_class.pop(str(run_dir), None)
         _block_persisted.discard(str(run_dir))
 
 
@@ -317,9 +324,12 @@ def _refuse_if_blocked(run_dir) -> None:
         raise RunBlocked(reason)
 
 
-def _or_block(run_dir, repo_root, cmd, events, reason: str):
+def _or_block(run_dir, repo_root, cmd, events, reason: str, *,
+              cls: BlockClass):
     """Stop new work and persist the first blocker before unwinding.
 
+    ``cls`` names the hard class that licenses the block (see BlockClass);
+    a failure that fits none belongs in a recovery frontier instead.
     Delivery belongs to the joined run boundary, never a seat's stack:
     another channel may still be producing objective evidence. A failed
     persistence is not a persisted block; the boundary may retry it.
@@ -327,11 +337,13 @@ def _or_block(run_dir, repo_root, cmd, events, reason: str):
     key = str(run_dir)
     with _block_lock:
         original = _block_reason.setdefault(key, reason)
+        original_cls = _block_class.setdefault(key, cls)
         if key not in _block_persisted:
-            common.block(run_dir, repo_root, cmd, events, original)
+            common.block(run_dir, repo_root, cmd, events, original,
+                         cls=original_cls)
             _block_persisted.add(key)
         else:
-            events.emit("blocked_secondary", reason=reason)
+            events.emit("blocked_secondary", reason=reason, cls=str(cls))
     raise RunBlocked(original)
 
 
@@ -340,6 +352,7 @@ def _finish_blocked_run(run_dir, repo_root, cmd, events) -> None:
     key = str(run_dir)
     with _block_lock:
         reason = _block_reason.get(key)
+        cls = _block_class.get(key)
         persisted = key in _block_persisted
     if reason is None:
         return
@@ -347,7 +360,7 @@ def _finish_blocked_run(run_dir, repo_root, cmd, events) -> None:
         # A worker's persistence failure can accompany another worker's
         # RunBlocked. Do not let the latter mask a non-durable stop.
         try:
-            _or_block(run_dir, repo_root, cmd, events, reason)
+            _or_block(run_dir, repo_root, cmd, events, reason, cls=cls)
         except RunBlocked:
             pass
     try:
@@ -374,7 +387,8 @@ def _finish_blocked_run(run_dir, repo_root, cmd, events) -> None:
 # (ledger `aborted`: terminal, no observation, no DAG bump) and the run
 # continues. Only a STREAK of consecutive skips with isomorphic failure
 # signatures (same role + same frozen problem class, see
-# session.problem_class) is systemic degradation and blocks the run. A seat
+# session.problem_class) is systemic degradation: under round_v1 it disables
+# the role's action (recovery.disable), elsewhere it blocks the run. A seat
 # that completes normally resets the streak.
 
 _SEAT_SKIP_TRIP_LIMIT = 2
@@ -386,7 +400,7 @@ _delivery_cfg: dict[str, dict] = {}
 
 
 def _seat_skip_trip_limit(run_dir: Path) -> int:
-    """Consecutive isomorphic skips that block the run
+    """Consecutive isomorphic skips that trip the breaker
     (framework_cfg ``pipeline.seat_skip_trip_limit``; default 2)."""
     try:
         section = json.loads((run_dir / "framework_cfg.json").read_text(
@@ -438,12 +452,20 @@ def _note_seat_skip(run_dir, repo_root, cmd, events, *, role, problems,
             state["streak"] = 1
         streak = state["streak"]
     if streak >= _seat_skip_trip_limit(run_dir):
-        _or_block(
-            run_dir, repo_root, cmd, events,
-            f"consecutive seat failures ({streak}x) with isomorphic "
-            f"signature (role={signature[0]}, "
-            f"problem_class={signature[1]}): systemic degradation, "
-            "not an isolated failure")
+        reason = (f"consecutive seat failures ({streak}x) with isomorphic "
+                  f"signature (role={signature[0]}, "
+                  f"problem_class={signature[1]}): systemic degradation, "
+                  "not an isolated failure")
+        if _scheduler_policy(run_dir) != rounds.POLICY_ID:
+            _or_block(run_dir, repo_root, cmd, events, reason,
+                      cls=BlockClass.EMPTY_FRONTIER)
+        # round_v1: the failing action leaves the frontier; the run goes on
+        # with what remains and finishes degraded when nothing does
+        action = (recovery.TUNE if role == "tuner-orchestrator"
+                  else recovery.GENERATION)
+        recovery.disable(run_dir, events, action,
+                         f"{action}:{signature[0]}/{signature[1]}", reason)
+        _note_seat_progress(run_dir)
 
 
 def _skip_candidate(run_dir, repo_root, cmd, events, run_id, *, role,
@@ -472,7 +494,8 @@ def _skip_candidate(run_dir, repo_root, cmd, events, run_id, *, role,
             except subprocess.CalledProcessError as exc:
                 _or_block(run_dir, repo_root, cmd, events,
                           f"resolve-aborted refused for {run_id}: "
-                          f"{(exc.stderr or str(exc)).strip()[-1500:]}")
+                          f"{(exc.stderr or str(exc)).strip()[-1500:]}",
+                          cls=BlockClass.LEDGER_INTEGRITY)
     events.emit("candidate_skipped", run_id=str(run_id), role=str(role),
                 problem_class=invocation_problem_class(
                     problems or ["postcondition"]),
@@ -519,8 +542,14 @@ def _attempt_degraded_delivery(run_dir, repo_root, cmd, events) -> str | None:
         return None
     for record in records:
         if str(record.get("status") or "pending") == "pending":
-            _settle_for_delivery(run_dir, str(record.get("run_id")),
-                                 repo_root, cmd, events)
+            # One unsettleable record must not cost the settled ones.
+            try:
+                _settle_for_delivery(run_dir, str(record.get("run_id")),
+                                     repo_root, cmd, events)
+            except Exception as exc:  # noqa: BLE001 - RunBlocked included
+                events.emit("candidate_settlement_failed",
+                            run_id=str(record.get("run_id")),
+                            detail=f"{type(exc).__name__}: {exc}"[-2000:])
     records = _ledger_records(run_dir)
     settled = [r for r in records
                if r.get("status") in ("keep", "discard")]
@@ -550,6 +579,29 @@ def _attempt_degraded_delivery(run_dir, repo_root, cmd, events) -> str | None:
         started_at_unix=result.get("started_at_unix"),
         ended_at_unix=result.get("ended_at_unix"),
     )
+    grade = None
+    if status == "success" and delivery.get("grader_command"):
+        try:
+            _, grade = mlebench_finalize.run_grader(
+                task=delivery["task"], run_dir=run_dir,
+                data_dir=delivery["data_dir"],
+                grader_command=delivery["grader_command"])
+        except Exception as exc:  # grading must not lose the delivery
+            grade = {"status": "failed", "error": repr(exc)}
+        events.emit("degraded_grade", status=grade.get("status"),
+                    returncode=grade.get("returncode"),
+                    elapsed_seconds=grade.get("elapsed_seconds"),
+                    error=grade.get("error"))
+    if status == "success":
+        manifest = {"task": delivery["task"], "run_dir": str(run_dir),
+                    "deadline_unix": deadline, "degraded": True,
+                    "submission": result, "grader": grade or {}}
+        try:
+            (run_dir / "finalization-manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            events.emit("degraded_submit", status="manifest_failed",
+                        error=str(exc))
     return "degraded_submit" if status == "success" else None
 
 
@@ -586,7 +638,8 @@ def _complete_run(run_dir, repo_root, cmd, events, terminal_leftover=False,
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or str(exc)).strip()
         _or_block(run_dir, repo_root, cmd, events,
-                  f"set-phase completed refused: {detail}")
+                  f"set-phase completed refused: {detail}",
+                  cls=BlockClass.LEDGER_INTEGRITY)
 
 
 def _time_reached(run_dir) -> bool:
@@ -742,13 +795,13 @@ def _slate_route_arm(run_dir: Path) -> int:
 
 
 def _slate_cmd(run_dir, repo_root, cmd, events, args, what: str):
-    """A tools/ subprocess whose failure blocks the run (fail closed)."""
+    """A judged-slate tools/ subprocess. A failure fails the generation
+    unit; the round boundary closes it and picks the next action."""
     try:
         return cmd(args, repo_root)
     except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or str(exc)).strip()
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"judged-slate {what} failed: {detail}")
+        exc.add_note(f"judged-slate {what} failed")
+        raise
 
 
 def _generation_abort_path(gen_dir: Path) -> Path:
@@ -761,7 +814,7 @@ def _generation_aborted(gen_dir: Path) -> bool:
 
 def _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events, *,
                             reason: str, role: str,
-                            problems: list[str]) -> None:
+                            problems: list[str], count_failure=True) -> None:
     """Abort one generation whose plan phase cannot complete within its
     attempt budget, instead of blocking the run on a permanent re-block loop.
 
@@ -786,8 +839,9 @@ def _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events, *,
                 generation_id=manifest.get("generation_id"), reason=reason,
                 problems=problems[:5])
     space_reviews.expansion.abort_probe_generation(run_dir, manifest)
-    _note_seat_skip(run_dir, repo_root, cmd, events, role=role,
-                    problems=problems)
+    if count_failure:
+        _note_seat_skip(run_dir, repo_root, cmd, events, role=role,
+                        problems=problems)
 
 
 def _find_open_slate_generation(run_dir: Path) -> tuple[Path, int, dict | None]:
@@ -892,8 +946,8 @@ def _validate_judge_stage(run_dir, gen_dir, stage, receipt_path, session_id,
         args += ["--model", model]
     cmd(args, repo_root, check=False)
     if not out_path.exists():
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"validate-judge produced no stage artifact for {stage}")
+        raise RuntimeError(
+            f"validate-judge produced no stage artifact for {stage}")
     return json.loads(out_path.read_text(encoding="utf-8"))
 
 
@@ -1028,7 +1082,8 @@ def _generation_donor_args(run_dir, repo_root, cmd, events) -> list[str]:
         result = build_donor_snapshot(run_dir)
     except (ValueError, OSError) as exc:
         _or_block(run_dir, repo_root, cmd, events,
-                  f"donor snapshot construction failed: {exc}")
+                  f"donor snapshot construction failed: {exc}",
+                  cls=BlockClass.LEDGER_INTEGRITY)
     if result["status"] == "no_donor":
         return ["--no-donor"]
     return ["--donor-snapshot", result["path"]]
@@ -1057,6 +1112,17 @@ def _commit_slate_manifest(run_dir, gen_dir, slate_size, repo_root, cmd,
                 reserved_run_ids=reserved,
                 aggregation=manifest["aggregation"].get("path"))
     return manifest
+
+
+def _normalized_plan(plan: dict, route_memory: dict | None) -> dict:
+    """Derive the route fields the framework can compute; drop them when the
+    route arm is off (they have no reader)."""
+    plan = dict(plan)
+    provenance = normalize_route_provenance(plan.pop("route_provenance", None),
+                                            route_memory)
+    if provenance is not None:
+        plan["route_provenance"] = provenance
+    return plan
 
 
 def _slate_plan_problems(plan, slot: dict, route_memory: dict | None) -> list[str]:
@@ -1313,7 +1379,9 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
             slot, pool_doc, context_doc, route_memory_path,
             objective_text=objective_text)
         from tools.experience_updates import related_view
-        ledger_data = json.loads((run_dir / "ledger.json").read_text())
+        ledger_path = run_dir / "ledger.json"
+        ledger_data = (json.loads(ledger_path.read_text())
+                       if ledger_path.is_file() else {})
         experience = related_view(ledger_data, slot["point"], slot["carrier"].get("parents", []))
         if experience:
             payload += "\nRelevant experience (basis revisions are historical; facts are current):\n" + json.dumps(experience, ensure_ascii=False) + "\n"
@@ -1327,6 +1395,8 @@ def _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir, manifest,
             except InvocationFailed as exc:
                 problems = [str(p) for p in exc.problems]
             else:
+                if isinstance(receipt, dict):
+                    receipt = _normalized_plan(receipt, route_memory)
                 problems = _slate_plan_problems(receipt, slot, route_memory)
                 if not problems:
                     break  # a valid plan for this seat
@@ -1414,6 +1484,46 @@ def _session_concurrency(run_dir: Path) -> int:
     return value
 
 
+def _failure_triage(runner, store, task, tag, run_dir, events):
+    """The recovery policy's LLM chooser; None defers to the default."""
+    def choose(payload: dict) -> dict | None:
+        if _time_reached(run_dir):
+            return None
+        try:
+            receipt, _ = _invoke(runner, store, "failure-triage", task, tag,
+                                 run_dir, inline_payload=json.dumps(
+                                     payload, indent=2))
+        except Exception as exc:  # noqa: BLE001 - triage is advisory
+            events.emit("failure_triage_failed", signature=payload["signature"],
+                        error=str(getattr(exc, "problems", exc))[-500:])
+            return None
+        return receipt
+    return choose
+
+
+def _run_seat(runner, store, task, tag, run_dir, run_id, repo_root, cmd,
+              events, job_runner) -> None:
+    """Materialize + implement one seat inside its unit boundary: an
+    unexpected failure ends this seat (and feeds the recovery policy), not
+    the run. ``RunBlocked`` still propagates."""
+    if recovery.disabled(run_dir, recovery.GENERATION):
+        _skip_candidate(run_dir, repo_root, cmd, events, run_id,
+                        role="driver", count_failure=False,
+                        problems=["generation disabled by recovery policy"])
+        return
+    try:
+        _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
+        _implement_candidate(runner, store, task, tag, run_dir, run_id,
+                             repo_root, cmd, events, job_runner)
+    except RunBlocked:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the seat's unit boundary
+        _skip_candidate(run_dir, repo_root, cmd, events, run_id,
+                        role="driver", count_failure=False,
+                        problems=[f"unit failure: {type(exc).__name__}: {exc}"])
+        recovery.unit_failed(run_dir, events, recovery.GENERATION, run_id, exc)
+
+
 def _implement_seats(runner, store, task, tag, run_dir, run_ids, repo_root,
                      cmd, events, job_runner) -> None:
     """Materialize + implement each admitted seat, up to
@@ -1435,9 +1545,8 @@ def _implement_seats(runner, store, task, tag, run_dir, run_ids, repo_root,
             return
         events.emit("seat_started", run_id=run_id,
                     session_wait_seconds=round(started - ready, 3))
-        _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
-        _implement_candidate(runner, store, task, tag, run_dir, run_id,
-                             repo_root, cmd, events, job_runner)
+        _run_seat(runner, store, task, tag, run_dir, run_id, repo_root, cmd,
+                  events, job_runner)
         events.emit("seat_finished", run_id=run_id,
                     seconds=round(time.monotonic() - started, 3))
 
@@ -1447,9 +1556,8 @@ def _implement_seats(runner, store, task, tag, run_dir, run_ids, repo_root,
                 break
             started = time.monotonic()
             events.emit("seat_started", run_id=run_id, session_wait_seconds=0.0)
-            _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
-            _implement_candidate(runner, store, task, tag, run_dir, run_id,
-                                 repo_root, cmd, events, job_runner)
+            _run_seat(runner, store, task, tag, run_dir, run_id, repo_root,
+                      cmd, events, job_runner)
             events.emit("seat_finished", run_id=run_id,
                         seconds=round(time.monotonic()-started, 3))
         return
@@ -1515,7 +1623,8 @@ def _evaluate_judged_generation(runner, store, task, tag, run_dir, round_no,
         detail = "; ".join(problems) if problems else "partial admission"
         _or_block(run_dir, repo_root, cmd, events,
                   f"judged-slate generation {manifest['gen_no']} violates the "
-                  f"atomic-admission contract: {detail}")
+                  f"atomic-admission contract: {detail}",
+                  cls=BlockClass.LEDGER_INTEGRITY)
     space_reviews.expansion.bind_probe(run_dir, manifest)
     planning_started = time.monotonic()
     if not _ensure_slate_plans(runner, store, task, tag, run_dir, gen_dir,
@@ -1604,7 +1713,16 @@ def _settle_at_deadline(run_dir, run_id, repo_root, cmd, events) -> None:
         # Refused (e.g. the record already carries a score): a record left
         # pending would block set-phase completed at the cutoff, so fall
         # through to the crash settlement like a refused set-tuning.
-    if candidate_evaluation.settle(run_dir, run_id, repo_root, cmd, events):
+    try:
+        settled = candidate_evaluation.settle(run_dir, run_id, repo_root, cmd,
+                                              events)
+    except Exception as exc:  # noqa: BLE001 - the crash close is the fallback
+        # This is also the seat boundary's cleanup: re-raising the failure
+        # that brought us here would carry it past that boundary.
+        events.emit("candidate_settlement_failed", run_id=run_id,
+                    detail=f"{type(exc).__name__}: {exc}"[-2000:])
+        settled = False
+    if settled:
         return
     _record_crash(run_dir, run_id, repo_root, cmd)
     events.emit("candidate_settled_at_deadline", run_id=run_id,
@@ -1669,13 +1787,14 @@ def _manifest_donor_binding(run_dir, run_id, repo_root, cmd, events):
     if not manifest_path.is_file():
         _or_block(run_dir, repo_root, cmd, events,
                   f"seat {run_id}'s generation manifest {manifest_rel} is "
-                  "missing")
+                  "missing", cls=BlockClass.LEDGER_INTEGRITY)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     binding = manifest.get("donor_snapshot")
     if not isinstance(binding, dict):
         _or_block(run_dir, repo_root, cmd, events,
                   f"seat {run_id}'s generation manifest lacks the donor "
-                  "binding the transfer scheduler policy requires")
+                  "binding the transfer scheduler policy requires",
+                  cls=BlockClass.LEDGER_INTEGRITY)
     return binding
 
 
@@ -1693,13 +1812,14 @@ def _candidate_donor_binding(run_dir, run_id, repo_root, cmd, events) -> dict:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             _or_block(run_dir, repo_root, cmd, events,
-                      f"candidate {run_id} donor receipt is unreadable: {exc}")
+                      f"candidate {run_id} donor receipt is unreadable: {exc}",
+                      cls=BlockClass.LEDGER_INTEGRITY)
         donor = receipt.get("donor") if isinstance(receipt, dict) else None
         snapshot_id = donor.get("snapshot_id") if isinstance(donor, dict) else None
         if not isinstance(snapshot_id, str) or not snapshot_id:
             _or_block(run_dir, repo_root, cmd, events,
                       f"candidate {run_id} donor receipt lacks "
-                      "donor.snapshot_id")
+                      "donor.snapshot_id", cls=BlockClass.LEDGER_INTEGRITY)
         return {
             "status": "bound",
             "snapshot_id": snapshot_id,
@@ -1711,7 +1831,8 @@ def _candidate_donor_binding(run_dir, run_id, repo_root, cmd, events) -> dict:
         result = build_donor_snapshot(run_dir)
     except (ValueError, OSError) as exc:
         _or_block(run_dir, repo_root, cmd, events,
-                  f"donor snapshot construction failed: {exc}")
+                  f"donor snapshot construction failed: {exc}",
+                  cls=BlockClass.LEDGER_INTEGRITY)
     if result["status"] == "no_donor":
         return {"status": "no_donor", "snapshot_id": None, "path": None}
     return {
@@ -1743,7 +1864,7 @@ def _resolve_donor_extra(run_dir, run_id, repo_root, cmd, events) -> dict:
     if snapshot_path is None or not snapshot_path.is_file():
         _or_block(run_dir, repo_root, cmd, events,
                   f"candidate {run_id} is bound to donor snapshot {path!r} "
-                  "but the artifact is missing")
+                  "but the artifact is missing", cls=BlockClass.LEDGER_INTEGRITY)
     return {"donor_binding": "bound", "donor_snapshot": str(snapshot_path)}
 
 
@@ -1802,7 +1923,8 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                         count_failure=not abandoned and not provided)
         if provided:
             _or_block(run_dir, repo_root, cmd, events,
-                      "provided baseline could not be evaluated: " + "; ".join(detail))
+                      "provided baseline could not be evaluated: " + "; ".join(detail),
+                      cls=BlockClass.EVALUATION_SURFACE)
         if abandoned:
             _note_seat_progress(run_dir)
 
@@ -1815,7 +1937,8 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
             if provided and record_status(run_dir, run_id) not in ("keep", "discard"):
                 _or_block(run_dir, repo_root, cmd, events,
-                          "provided baseline lacks a valid control evaluation")
+                          "provided baseline lacks a valid control evaluation",
+                          cls=BlockClass.DEADLINE)
             return
         if need_writer:
             if failed_sessions >= _CANDIDATE_WRITER_ATTEMPTS:
@@ -1847,7 +1970,8 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                                    or receipt.get("wrote")
                                    or _candidate_artifacts(candidate_dir)[0] != before[0]):
                 _or_block(run_dir, repo_root, cmd, events,
-                          "provided-baseline writer violates existing/false no-op")
+                          "provided-baseline writer violates existing/false no-op",
+                          cls=BlockClass.EVALUATION_SURFACE)
             failed_sessions = 0
             _record_candidate_writer_success(candidate_dir, writer_inv)
             state = _candidate_writer_attempts(candidate_dir)
@@ -1874,11 +1998,13 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
             except ResourceUnavailable as exc:
                 if not budget_status(run_dir, repo_root, cmd).get("reached"):
                     _or_block(run_dir, repo_root, cmd, events,
-                              f"candidate {run_id} resource unavailable: {exc}")
+                              f"candidate {run_id} resource unavailable: {exc}",
+                              cls=BlockClass.EMPTY_FRONTIER)
                 _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
                 if provided and record_status(run_dir, run_id) not in ("keep", "discard"):
                     _or_block(run_dir, repo_root, cmd, events,
-                              "provided baseline lacks a valid control evaluation")
+                              "provided baseline lacks a valid control evaluation",
+                              cls=BlockClass.DEADLINE)
                 return
             except (DriverJobError, OSError, subprocess.SubprocessError) as exc:
                 result = {"kind": "warmstart", "accepted": False, "error": str(exc)}
@@ -1889,7 +2015,8 @@ def _implement_candidate(runner, store, task, tag, run_dir, run_id, repo_root,
                 _settle_at_deadline(run_dir, run_id, repo_root, cmd, events)
                 if provided and record_status(run_dir, run_id) not in ("keep", "discard"):
                     _or_block(run_dir, repo_root, cmd, events,
-                              "provided baseline lacks a valid control evaluation")
+                              "provided baseline lacks a valid control evaluation",
+                              cls=BlockClass.DEADLINE)
                 return
             problems = ["warm screening did not produce a valid applied result: "
                         + json.dumps(result, ensure_ascii=False)]
@@ -2196,7 +2323,7 @@ def _settle_pinned_tune(runner, store, task, tag, run_dir, round_no, repo_root,
                            phase_c_before=before["phase_c_attempts"])
         _or_block(run_dir, repo_root, cmd, events,
                   "authoritative artifacts still contradict after tuner "
-                  "reconciliation")
+                  "reconciliation", cls=BlockClass.LEDGER_INTEGRITY)
     return reconciled
 
 
@@ -2222,9 +2349,11 @@ def _tune_session(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
         except (InvocationFailed, DriverJobError) as exc:
             problems = [str(p) for p in
                         getattr(exc, "problems", [str(exc)])]
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"tuner session failed: {first_problems}; "
-                      f"reconciliation failed: {problems}")
+            # an auxiliary failure: this round skips tuning, the run goes on
+            events.emit("tune_infra_failure", first_failure=first_problems,
+                        problems=problems)
+            return {"tuned_run_id": "none", "tuned": False,
+                    "ledger_updated": False}
     tuned_id = receipt.get("tuned_run_id", "none")
     # The receipt is only a handoff.  If it names a candidate, consult the
     # deterministic phase-C action even when tuned=false; an exhausted bout
@@ -2263,12 +2392,12 @@ def _tune_session(runner, store, task, tag, run_dir, round_no, repo_root, cmd,
                 problems = getattr(exc, "problems", [str(exc)])
                 _or_block(run_dir, repo_root, cmd, events,
                       f"tuner receipt/ledger contradiction unresolved: "
-                          f"{problems}")
+                          f"{problems}", cls=BlockClass.LEDGER_INTEGRITY)
         if corrected.get("tuned") and \
                 not _tune_flag(run_dir, corrected.get("tuned_run_id", "none")):
             _or_block(run_dir, repo_root, cmd, events,
                       "authoritative artifacts still contradict after "
-                      "tuner reconciliation")
+                      "tuner reconciliation", cls=BlockClass.LEDGER_INTEGRITY)
         return corrected
     return receipt
 
@@ -2364,7 +2493,8 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     try:
         common.run_prepare(task, task_toml, repo_root, cmd)
     except RuntimeError as exc:
-        _or_block(run_dir, repo_root, cmd, events, str(exc))
+        _or_block(run_dir, repo_root, cmd, events, str(exc),
+                  cls=BlockClass.EVALUATION_SURFACE)
     common.preflight_env(task, run_dir, repo_root, cmd)
     competition_id = (task_toml.get("mlebench") or {}).get("competition_id")
     write_metadata(run_dir, model, cli_path, competition_id=competition_id)
@@ -2379,8 +2509,8 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
     # background-researcher runs ONCE, never in the loop. A run dir pre-seeded
     # with a frozen background (background.md + retrieval manifest) skips
     # generation entirely; the same deterministic validators gate it, and a
-    # failure blocks rather than letting the researcher rewrite the frozen
-    # artifacts.
+    # failure blocks: neither the researcher nor quarantine may alter a space
+    # that runs share for comparison, and the block lands at launch.
     strategy = _dimension_strategy(run_dir)
     objective = _objective_line(task_toml)
     preseeded = (
@@ -2388,11 +2518,7 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
         and (run_dir / "background_retrieval.json").exists()
     )
     if preseeded:
-        errors = _background_validation_errors(run_dir, repo_root, cmd,
-                                               strategy)
-        if errors:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"pre-seeded background validation failed: {errors}")
+        _gate_preseeded_background(run_dir, repo_root, cmd, events, strategy)
         _background_faithfulness_gate(
             runner, store, task, tag, run_dir, repo_root, cmd, events,
             strategy,
@@ -2402,14 +2528,24 @@ def _setup(runner, store, task, tag, run_dir, task_toml, repo_root, cmd,
             _invoke(runner, store, "background-researcher", task, tag, run_dir,
                     extra={"objective": objective})
         except InvocationFailed as exc:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"background-researcher failed: {exc.problems}")
+            _researcher_failed(run_dir, repo_root, cmd, events, exc)
         _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
                              events, strategy, number_gate=True)
         _background_faithfulness_gate(
             runner, store, task, tag, run_dir, repo_root, cmd, events,
             strategy,
             repairable=_background_researcher_invoked(run_dir))
+
+
+def _researcher_failed(run_dir, repo_root, cmd, events, exc) -> None:
+    """A researcher that left both artifacts behind goes on to validation
+    (repair, then quarantine); without them there is no space to continue."""
+    events.emit("background_researcher_failed", problems=exc.problems)
+    if not ((run_dir / "background.md").exists()
+            and (run_dir / "background_retrieval.json").exists()):
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"background-researcher failed: {exc.problems}",
+                  cls=BlockClass.EMPTY_FRONTIER)
 
 
 def _ensure_identity_profile(run_dir, task, competition_id) -> None:
@@ -2495,6 +2631,9 @@ def _background_validation_errors(run_dir, repo_root, cmd,
     ]
     if number_gate:
         contract_validate.append("--number-gate")
+    # derivable fields are filled before validation, never rejected
+    cmd(["python", "tools/background_contract.py", "normalize",
+         "--background", run_dir / "background.md"], repo_root, check=False)
     checks.extend([
         ["python", "tools/search_backends.py", "validate",
          "--manifest", run_dir / "background_retrieval.json"],
@@ -2509,9 +2648,19 @@ def _background_validation_errors(run_dir, repo_root, cmd,
     return errors
 
 
+def _gate_preseeded_background(run_dir, repo_root, cmd, events,
+                               strategy) -> None:
+    errors = _background_validation_errors(run_dir, repo_root, cmd, strategy)
+    if errors:
+        _or_block(run_dir, repo_root, cmd, events,
+                  f"pre-seeded background validation failed: {errors}",
+                  cls=BlockClass.EMPTY_FRONTIER)
+
+
 def _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
                          events, strategy, *, number_gate=False) -> None:
-    """Validate background artifacts and allow one in-session repair."""
+    """Validate background artifacts and allow one in-session repair; what
+    still fails after it is quarantined (degraded space) rather than blocking."""
     errors = _background_validation_errors(run_dir, repo_root, cmd, strategy,
                                            number_gate=number_gate)
     if not errors:
@@ -2521,13 +2670,47 @@ def _validate_background(runner, store, task, tag, run_dir, repo_root, cmd,
         _invoke(runner, store, "background-researcher", task, tag, run_dir,
                 extra={"validation_errors": "\n".join(errors)})
     except InvocationFailed as exc:
-        _or_block(run_dir, repo_root, cmd, events,
-                  f"background validation repair failed: {exc.problems}")
+        events.emit("background_researcher_failed", problems=exc.problems)
     errors = _background_validation_errors(run_dir, repo_root, cmd, strategy,
                                            number_gate=number_gate)
     if errors:
+        _quarantine_background(run_dir, repo_root, cmd, events, strategy,
+                               errors, number_gate=number_gate)
+
+
+def _quarantine_background(run_dir, repo_root, cmd, events, strategy, errors,
+                           *, number_gate=False, drop=()) -> None:
+    """Continue with the validated subset of the space; block only when no
+    valid space remains (empty frontier)."""
+    args = ["python", "tools/background_contract.py", "quarantine",
+            "--background", run_dir / "background.md",
+            "--retrieval-manifest", run_dir / "background_retrieval.json"]
+    if number_gate:
+        args.append("--number-gate")
+    for unit_id in drop:
+        args += ["--drop", unit_id]
+    result = cmd(args, repo_root, check=False)
+    try:
+        outcome = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        outcome = {}
+    if outcome.get("ok"):
+        remaining = _background_validation_errors(run_dir, repo_root, cmd,
+                                                  strategy, number_gate=number_gate)
+    else:
+        remaining = outcome.get("errors") or errors or [
+            (result.stderr or "").strip()[-2000:] or "quarantine failed"]
+    choice = "quarantine" if not remaining else "block"
+    events.emit("recovery_choice", layer="role", signature="background_invalid",
+                frontier=["quarantine", "block"], choice=choice,
+                chooser="default", action="background-researcher",
+                target=outcome.get("quarantined"))
+    if remaining:
         _or_block(run_dir, repo_root, cmd, events,
-                  f"background validation failed: {errors}")
+                  f"background validation failed: {remaining}",
+                  cls=BlockClass.EMPTY_FRONTIER)
+    events.emit("background_degraded", quarantined=outcome.get("quarantined"),
+                errors=errors)
 
 
 def _background_faithfulness_gate(runner, store, task, tag, run_dir,
@@ -2540,7 +2723,7 @@ def _background_faithfulness_gate(runner, store, task, tag, run_dir,
     pre-seeded frozen background cannot be rewritten, so its unfaithful
     findings are recorded as a terminal warning instead of blocking.
     """
-    repair = None
+    repair = quarantine = None
     if repairable:
         def repair(findings_text: str) -> None:
             try:
@@ -2548,19 +2731,25 @@ def _background_faithfulness_gate(runner, store, task, tag, run_dir,
                         run_dir,
                         extra={"faithfulness_findings": findings_text})
             except InvocationFailed as exc:
-                _or_block(run_dir, repo_root, cmd, events,
-                          f"background faithfulness repair failed: {exc.problems}")
+                events.emit("background_researcher_failed", problems=exc.problems)
             _validate_background(
                 runner, store, task, tag, run_dir, repo_root, cmd, events,
                 strategy,
                 number_gate=_background_researcher_invoked(run_dir))
 
+        def quarantine(item_ids: list[str]) -> None:
+            _quarantine_background(
+                run_dir, repo_root, cmd, events, strategy, [],
+                number_gate=_background_researcher_invoked(run_dir),
+                drop=item_ids)
+
     background_audit.run_faithfulness_gate(
         runner, store, task, tag, run_dir, events,
         invoke=_invoke,
         or_block=lambda reason: _or_block(run_dir, repo_root, cmd, events,
-                                          reason),
+                                          reason, cls=BlockClass.EMPTY_FRONTIER),
         repair=repair,
+        quarantine=quarantine,
     )
 
 
@@ -2596,7 +2785,8 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
             try:
                 common.run_prepare(task, task_toml, repo_root, cmd)
             except RuntimeError as exc:
-                _or_block(run_dir, repo_root, cmd, events, str(exc))
+                _or_block(run_dir, repo_root, cmd, events, str(exc),
+                          cls=BlockClass.EVALUATION_SURFACE)
 
     common.preflight_env(task, run_dir, repo_root, cmd)
 
@@ -2620,19 +2810,21 @@ def _resume_setup(runner, store, task, tag, run_dir, repo_root, cmd, events,
             _invoke(runner, store, "background-researcher", task, tag, run_dir,
                     extra={"objective": _objective_line(task_toml)})
         except InvocationFailed as exc:
-            _or_block(run_dir, repo_root, cmd, events,
-                      f"background-researcher failed: {exc.problems}")
+            _researcher_failed(run_dir, repo_root, cmd, events, exc)
 
     # A resume may follow a kill after the researcher wrote its files but
     # before setup validated them.  Establish the frozen-space invariant once
     # at this process boundary; rounds trust it.  The number gate applies iff
     # this run ever invoked the researcher (a receipt or an init-time session
-    # file proves it); a pre-seeded frozen background stays gate-off.
-    _validate_background(
-        runner, store, task, tag, run_dir, repo_root, cmd, events,
-        _dimension_strategy(run_dir),
-        number_gate=_background_researcher_invoked(run_dir),
-    )
+    # file proves it); a pre-seeded frozen background stays gate-off and is
+    # never repaired or quarantined.
+    if _background_researcher_invoked(run_dir):
+        _validate_background(
+            runner, store, task, tag, run_dir, repo_root, cmd, events,
+            _dimension_strategy(run_dir), number_gate=True)
+    else:
+        _gate_preseeded_background(run_dir, repo_root, cmd, events,
+                                   _dimension_strategy(run_dir))
 
     # The same kill window covers the faithfulness audit.  Re-run the gate
     # unless a prior audit reached a terminal-ok outcome on these artifacts;
@@ -2717,6 +2909,7 @@ def _ensure_provided_baseline(runner, store, task, tag, run_dir, task_toml,
             "seed.provided baseline missing: the ledger has records but no "
             "000; the protocol forbids retrofitting the control after "
             "ideation",
+            cls=BlockClass.LEDGER_INTEGRITY,
         )
 
 
@@ -2737,9 +2930,8 @@ def _resume_pending_candidates(runner, store, task, tag, run_dir, brief,
     for pending_id in pending_ids:
         if budget_status(run_dir, repo_root, cmd).get("reached"):
             break
-        _materialize_candidate(task, tag, run_dir, pending_id, repo_root, cmd)
-        _implement_candidate(runner, store, task, tag, run_dir, pending_id,
-                             repo_root, cmd, events, job_runner)
+        _run_seat(runner, store, task, tag, run_dir, pending_id, repo_root,
+                  cmd, events, job_runner)
 
     return _brief(run_dir, repo_root, cmd), pending_ids
 
@@ -2761,6 +2953,23 @@ def _evaluate_generation(runner, store, task, tag, run_dir, round_no,
     return actions
 
 
+def _close_failed_generation(run_dir, repo_root, cmd, events, exc) -> None:
+    """A judged-slate generation that failed before admission is closed, so
+    the next generation starts fresh instead of resuming into the same
+    failure. Admitted seats are left to the pending-seat resume path."""
+    if _semantic_policy(run_dir) != "judged_slate":
+        return
+    gen_dir, _, manifest = _find_open_slate_generation(run_dir)
+    if manifest is None \
+            or any(seat is not None
+                   for seat in _slate_seat_records(run_dir, manifest)):
+        return
+    _abort_slate_generation(run_dir, gen_dir, repo_root, cmd, events,
+                            reason="unit_failure", role="driver",
+                            problems=[f"{type(exc).__name__}: {exc}"],
+                            count_failure=False)
+
+
 def _round_step(runner, store, task, tag, run_dir, round_no, task_toml,
                 repo_root, cmd, events, job_runner, model, *,
                 ledger_exists) -> tuple[list[dict], bool]:
@@ -2780,12 +2989,20 @@ def _round_step(runner, store, task, tag, run_dir, round_no, task_toml,
         if view.get('state', {}).get('phase') == 'optimize':
             end_optimization(run_dir, json.loads((run_dir/'ledger.json').read_text()))
         view['generate'] = True
-    if view["generate"]:
-        actions = _evaluate_generation(
-            runner, store, task, tag, run_dir, round_no,
-            repo_root, cmd, events, job_runner, model=model,
-            task_toml=task_toml,
-        )
+    if view["generate"] and not recovery.disabled(run_dir, recovery.GENERATION):
+        try:
+            actions = _evaluate_generation(
+                runner, store, task, tag, run_dir, round_no,
+                repo_root, cmd, events, job_runner, model=model,
+                task_toml=task_toml,
+            )
+        except RunBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the generation's unit boundary
+            _close_failed_generation(run_dir, repo_root, cmd, events, exc)
+            recovery.unit_failed(run_dir, events, recovery.GENERATION,
+                                 str(round_no), exc)
+            return [], False
         return actions, False
     events.emit("round_optimize", round_no=round_no,
                 produced=view.get("produced"), threshold=view.get("threshold"),
@@ -2833,11 +3050,15 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
     _reset_block_state(run_dir)
     _reset_seat_skip_state(run_dir)
     rounds.reset_tune_backoff(run_dir)
+    recovery.reset(run_dir)
+    recovery.set_triage(run_dir, _failure_triage(runner, store, task, tag,
+                                                 run_dir, events))
     if finalization and finalization.get("submission_command"):
         _delivery_cfg[str(run_dir)] = {
             "task": task,
             "submission_command": finalization["submission_command"],
             "data_dir": str(finalization.get("data_dir") or ""),
+            "grader_command": finalization.get("grader_command"),
         }
     _arm_exit_hooks()  # main thread: SIGTERM must reach leased child groups
 
@@ -2947,9 +3168,21 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # Round step 1: refresh experience at a revision boundary.
             # -----------------------------------------------------------------
             refreshed = False
-            if brief is not None and brief.get("experience_refresh_required"):
-                refreshed = _refresh(runner, store, task, tag, run_dir, repo_root,
-                                     cmd, events)
+            if brief is not None and brief.get("experience_refresh_required") \
+                    and not recovery.disabled(run_dir, recovery.REFRESH) \
+                    and str(brief.get("dag_revision")) not in recovery.excluded(
+                        run_dir, recovery.REFRESH):
+                try:
+                    refreshed = _refresh(runner, store, task, tag, run_dir,
+                                         repo_root, cmd, events)
+                except RunBlocked:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - refresh unit boundary
+                    events.emit("experience_update_failed",
+                                error=f"{type(exc).__name__}: {exc}")
+                    recovery.unit_failed(
+                        run_dir, events, recovery.REFRESH,
+                        str(brief.get("dag_revision")), exc)
 
             # -----------------------------------------------------------------
             # Optional review runs only after settled work and experience.
@@ -2964,12 +3197,24 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # candidates), then one optimization phase over the full pool.
             # -----------------------------------------------------------------
             if _scheduler_policy(run_dir) == rounds.POLICY_ID:
+                if all(recovery.disabled(run_dir, action) for action in
+                       (recovery.GENERATION, recovery.REWRITE, recovery.TUNE)):
+                    events.emit("recovery_choice", layer="run",
+                                signature="empty_frontier",
+                                frontier=["finish_degraded"],
+                                choice="finish_degraded", chooser="default")
+                    _complete_run(run_dir, repo_root, cmd, events,
+                                  stop_condition="degraded_empty_frontier")
+                    break
+                recovery_version = recovery.version(run_dir)
                 actions, tuner_progressed = _round_step(
                     runner, store, task, tag, run_dir, round_no, task_toml,
                     repo_root, cmd, events, job_runner, model,
                     ledger_exists=ledger_exists)
+                # a unit failure shrank the frontier: the next round differs
                 progressed = (bool(actions) or tuner_progressed or refreshed
-                              or bool(pending_ids))
+                              or bool(pending_ids)
+                              or recovery.version(run_dir) != recovery_version)
                 zero_progress_rounds = 0 if progressed else zero_progress_rounds + 1
                 if zero_progress_rounds >= 2:
                     events.emit("quiescent", round_no=round_no,
@@ -3060,9 +3305,11 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     traceback=traceback.format_exc()[-4000:])
         try:
             _or_block(run_dir, repo_root, cmd, events,
-                      f"unhandled {type(exc).__name__}: {exc}")
+                      f"unhandled {type(exc).__name__}: {exc}",
+                      cls=BlockClass.EMPTY_FRONTIER)
         except RunBlocked:
             pass
 
     _finish_blocked_run(run_dir, repo_root, cmd, events)
+    recovery.summarize(run_dir, events)
     return compact_status(task, tag, run_dir, repo_root=repo_root, cmd=cmd)

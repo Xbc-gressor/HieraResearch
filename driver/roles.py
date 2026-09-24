@@ -91,10 +91,9 @@ class RoleDefinition:
     # invocation per call, no shell operators, and --manifest confined to the
     # run's own directory.
     bash_adapter_only: bool = False
-    # Early corrective denies for consecutive identical (tool, input) calls
+    # Early corrective hints for consecutive identical (tool, input) calls
     # BEFORE the hard repetition trip. Roles with an observed read-loop
-    # attractor opt in; the session hook also applies its bounded window and
-    # corrective-escalation rules.
+    # attractor opt in; the session hook also applies its bounded window hint.
     early_repeat_correct: bool = False
     # Long objective commands are driver-owned. These substrings keep an agent
     # from bypassing the typed job handoff and orphaning a GPU process.
@@ -249,7 +248,7 @@ ROLES: dict[str, RoleDefinition] = {
     "background-researcher": RoleDefinition(
         name="background-researcher",
         prompt_file="background-researcher.md",
-        tools=("Read", "Write", "Bash", "Glob"),
+        tools=("Read", "Write", "Edit", "Bash", "Glob"),
         disallowed=_BASE_DISALLOWED,
         receipt_schema={
             "status": ("enum", "ok"),
@@ -278,6 +277,7 @@ ROLES: dict[str, RoleDefinition] = {
         disallowed=_BASE_DISALLOWED,
         receipt_schema={"actions": "list"},
         postconditions=(actions_admitted,),
+        wall_limit_seconds=1800.0,
     ),
     "candidate-writer": RoleDefinition(
         name="candidate-writer",
@@ -292,6 +292,7 @@ ROLES: dict[str, RoleDefinition] = {
         },
         postconditions=(candidate_submission_ready,),
         early_repeat_correct=True,
+        wall_limit_seconds=3600.0,
         soft_rescue=True,
     ),
     "tuner-orchestrator": RoleDefinition(
@@ -397,6 +398,19 @@ ROLES: dict[str, RoleDefinition] = {
         corrective_attempts=0,
         max_turns=8,
         wall_limit_seconds=600.0,
+    ),
+    # round-level recovery: a tool-free chooser consulted once per unseen
+    # failure signature. The driver checks its scope against the menu and
+    # falls back to the default policy on any failure, so no repair loop.
+    "failure-triage": RoleDefinition(
+        name="failure-triage",
+        prompt_file="failure-triage.md",
+        tools=(),
+        disallowed=_BASE_DISALLOWED,
+        receipt_schema={"scope": "str", "rationale": "str"},
+        corrective_attempts=0,
+        max_turns=4,
+        wall_limit_seconds=180.0,
     ),
     # judged_slate arm: writes the PLAN for exactly one frozen slate seat.
     # Read-only: the driver persists the receipt as plans/slot-N.json; the

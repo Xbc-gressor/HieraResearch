@@ -165,7 +165,8 @@ def test_audit_completed_fails_closed(tmp_path) -> None:
             True,
         ),
         ({"version": version, "rounds": [{"outcome": "unfaithful"}]}, False),
-        ({"version": version, "rounds": [{"outcome": "judge_failed"}]}, False),
+        ({"version": version, "rounds": [{"outcome": "audit_unavailable"}]}, False),
+        ({"version": version, "rounds": [{"outcome": "quarantined"}]}, True),
     ):
         artifact.write_text(json.dumps(doc))
         assert background_audit.audit_completed(tmp_path) is expected
@@ -703,6 +704,26 @@ def test_gate_attempt2_unfaithful_blocks_with_identity_message(tmp_path) -> None
     assert not background_audit.audit_completed(run_dir)  # fail closed
 
 
+def test_gate_failed_quarantine_is_not_terminal(tmp_path) -> None:
+    run_dir = _run_dir(tmp_path)
+
+    def quarantine(item_ids: list[str]) -> None:
+        _or_block(f"quarantine failed: {item_ids}")
+
+    with pytest.raises(_Blocked):
+        background_audit.run_faithfulness_gate(
+            None, None, "toy", "tag", run_dir, _Events(),
+            invoke=_invoke_stub([{"hyp-data-filtered": "unfaithful"}] * 2),
+            or_block=_or_block,
+            repair=lambda findings_text: None,
+            quarantine=quarantine,
+        )
+
+    artifact = json.loads((run_dir / background_audit.ARTIFACT_NAME).read_text())
+    assert artifact["rounds"][-1]["outcome"] == "unfaithful"
+    assert not background_audit.audit_completed(run_dir)
+
+
 def test_gate_judge_retries_twice_then_passes(tmp_path) -> None:
     run_dir = _run_dir(tmp_path)
     events = _Events()
@@ -725,7 +746,7 @@ def test_gate_judge_retries_twice_then_passes(tmp_path) -> None:
     assert background_audit.audit_completed(run_dir)
 
 
-def test_gate_judge_failed_block_names_batch_sources(tmp_path) -> None:
+def test_gate_judge_unavailable_records_and_proceeds(tmp_path) -> None:
     run_dir = _run_dir(tmp_path)
     events = _Events()
     state = {"calls": 0}
@@ -734,38 +755,12 @@ def test_gate_judge_failed_block_names_batch_sources(tmp_path) -> None:
         state["calls"] += 1
         raise InvocationFailed(role, ["judge produced no receipt"])
 
-    with pytest.raises(_Blocked) as blocked:
-        background_audit.run_faithfulness_gate(
-            None, None, "toy", "tag", run_dir, events,
-            invoke=invoke, or_block=_or_block,
-            repair=lambda findings: None,
-        )
-
-    assert state["calls"] == 3  # retries exhausted per batch before blocking
-    message = str(blocked.value)
-    assert "batch 1/1" in message
-    assert canonical_key(TOY_SOURCE["url"]) in message
-    artifact = json.loads((run_dir / background_audit.ARTIFACT_NAME).read_text())
-    assert artifact["rounds"][-1]["outcome"] == "judge_failed"
-    assert artifact["rounds"][-1]["batches"][-1]["error"] == ["judge produced no receipt"]
-    assert not background_audit.audit_completed(run_dir)  # fail closed
-
-
-def test_gate_judge_unavailable_preseeded_records_and_proceeds(tmp_path) -> None:
-    run_dir = _run_dir(tmp_path)
-    events = _Events()
-    state = {"calls": 0}
-
-    def invoke(runner, store, role, task, tag, gate_run_dir, inline_payload):
-        state["calls"] += 1
-        raise InvocationFailed(role, ["judge produced no receipt"])
-
-    # A pre-seeded frozen background (repair=None): an unavailable judge is
-    # recorded as audit_unavailable and the run proceeds; a later resume
-    # retries the audit (not terminal-ok).
+    # An unavailable judge is recorded as audit_unavailable and the run
+    # proceeds; a later resume retries the audit (not terminal-ok).
     background_audit.run_faithfulness_gate(
         None, None, "toy", "tag", run_dir, events,
         invoke=invoke, or_block=_or_block,
+        repair=lambda findings: None,
     )
 
     assert state["calls"] == 3

@@ -29,7 +29,7 @@ from ..roles import REPO_ROOT
 from ..status import budget_status, compact_status
 from . import common
 from . import phase_c
-from .common import RunBlocked
+from .common import BlockClass, RunBlocked
 from .experiment import (
     _brief,
     _complete_run,
@@ -107,7 +107,8 @@ def _tune_full_budget(task, tag, run_dir, repo_root, cmd, events,
         # seat to skip; the open stage stays resumable for a later launch).
         events.emit("baseline_bout_budget_exhausted", detail=str(exc))
     except phase_c.PhaseCBoutFailure as exc:
-        _or_block(run_dir, repo_root, cmd, events, f"baseline bout: {exc}")
+        _or_block(run_dir, repo_root, cmd, events, f"baseline bout: {exc}",
+                  cls=BlockClass.EMPTY_FRONTIER)
 
 
 def run_baseline_tune(task, tag, *, runner, model, repo_root=REPO_ROOT,
@@ -165,7 +166,8 @@ def run_baseline_tune(task, tag, *, runner, model, repo_root=REPO_ROOT,
                     traceback=traceback.format_exc()[-4000:])
         try:
             _or_block(run_dir, repo_root, cmd, events,
-                      f"unhandled {type(exc).__name__}: {exc}")
+                      f"unhandled {type(exc).__name__}: {exc}",
+                      cls=BlockClass.EMPTY_FRONTIER)
         except RunBlocked:
             pass
 

@@ -1394,6 +1394,31 @@ def _record_objective_failure(
 def _finish_phase_a(run: WarmstartRun) -> int:
     """Apply the best finite row and persist the successful Phase A."""
     selectable = finite_warm_incumbent_rows(run.warm_rows)
+    control = next((row for row in run.warm_rows
+                    if row.get("proposed_index") == 0), None)
+    if selectable and run.parameter_transfer is not None and (
+            control is None or control not in selectable):
+        # A non-fresh candidate is scored only against its inherited
+        # control; the ledger refuses a result without it, so Phase A fails
+        # here, where the control's own failure is still at hand.
+        run.phase_a["warm_start_configs"] = run.warm_rows
+        run.phase_a["status"] = "crashed"
+        _stamp_donor_facts(run)
+        write_tune_report(run.report_path, run.report)
+        write_json(
+            {
+                "phase": "a",
+                "status": "crashed",
+                "reason": "inherited control (warm config 0, the parent's "
+                          "parameters projected onto this candidate) has no "
+                          "finite score; the candidate must run it",
+                "control_status": (control or {}).get("status"),
+                "control_error": (control or {}).get("error"),
+                "k_evaluated": len(run.warm_rows),
+                "trials_attempted": run.trials_attempted,
+            }
+        )
+        return CRASHED
     if not selectable:
         # Every selected row failed non-fatally (smoke rejections,
         # config-infeasible rows, or the donor-only treatment path); the

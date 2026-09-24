@@ -217,6 +217,36 @@ def validate_not_applicable(provenance: Any) -> list[str]:
     return errors
 
 
+def normalize_route_provenance(provenance: Any,
+                               memory: dict[str, Any] | None) -> Any:
+    """Fill what the framework can derive, so validation only sees choices.
+
+    Arm off (``memory is None``): the field has no reader and is dropped.
+    Otherwise the memory-view fields are recomputed, unknown fields stripped,
+    and ``chosen_route`` derived from ``chosen_sketch_id``.
+    """
+    if memory is None:
+        return None
+    if not isinstance(provenance, dict) or is_not_applicable(provenance):
+        return provenance
+    value = {key: provenance[key] for key in PROVENANCE_FIELDS
+             if key in provenance}
+    value.update(schema_version=PROVENANCE_SCHEMA_VERSION,
+                 point_id=memory["point_id"], op=memory["op"],
+                 n_route_sketches=memory["n_route_sketches"],
+                 route_memory=memory["route_memory"],
+                 memory_rows=memory["rows"])
+    sketches = value.get("sketches")
+    if isinstance(sketches, list):
+        routes = {sketch.get("sketch_id"): sketch.get("route")
+                  for sketch in sketches if isinstance(sketch, dict)}
+        if value.get("chosen_sketch_id") in routes:
+            value["chosen_route"] = routes[value["chosen_sketch_id"]]
+        if len(routes) == 1 and "preference_order" not in value:
+            value["preference_order"] = list(routes)
+    return value
+
+
 def validate_route_provenance(
     provenance: Any,
     *,

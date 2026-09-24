@@ -38,7 +38,8 @@ import os
 from ..resources import ResourceUnavailable
 from ..session import InvocationFailed
 from ..status import budget_status
-from . import rewrite
+from . import recovery, rewrite
+from .common import RunBlocked
 from tools.evaluation_budget import time_remaining
 
 POLICY_ID = "round_v1"
@@ -64,7 +65,7 @@ def _record(run_dir, repo_root, cmd, decision_id, run_id, *, action, consumed,
             "--run-id", run_id, "--consumed", str(consumed),
             "--status", status]
     if gain is not None:
-        args += ["--gain", str(gain)]
+        args += [f"--gain={gain}"]
     cmd(args, repo_root)
 
 
@@ -587,13 +588,16 @@ def _rewrite_channel(channel, coord, runner, store, task, tag, run_dir,
     while True:
         with coord.cond:
             while True:
-                if coord.halt or coord.remaining <= 0:
+                if coord.halt or coord.remaining <= 0 \
+                        or recovery.disabled(run_dir, recovery.REWRITE):
                     return
                 if budget_status(run_dir, repo_root, cmd).get("reached"):
                     coord.halt = True
                     coord.cond.notify_all()
                     return
-                exclude = sorted(coord.in_flight)
+                in_flight = sorted(coord.in_flight)
+                exclude = sorted(set(in_flight)
+                                 | recovery.excluded(run_dir, recovery.REWRITE))
                 args = ["select", "--kind", "rewrite"]
                 if exclude:
                     args += ["--exclude", ",".join(exclude)]
@@ -613,15 +617,26 @@ def _rewrite_channel(channel, coord, runner, store, task, tag, run_dir,
                             enabled=int(config["tune_bouts"]) > 0)
                     tune_reserve = coord.tune_reserve
                     break
-                if not exclude:
+                if not in_flight:
                     return
                 coord.cond.wait()
+        evals_before, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
         try:
             result = _rewrite_climb(
                 runner, store, task, tag, run_dir, selection, task_toml,
                 config, repo_root, cmd, events, tune_reserve=tune_reserve,
                 coord=coord, channel=channel, exclude_run_ids=exclude,
                 concurrency=concurrency)
+        except RunBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the climb's unit boundary
+            evals_after, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
+            with coord.cond:
+                recovery.close_decision(run_dir, repo_root, cmd, selection,
+                                        recovery.REWRITE,
+                                        max(0, evals_after - evals_before))
+            recovery.unit_failed(run_dir, events, recovery.REWRITE, run_id, exc)
+            result = {"status": "failed", "steps": 0}
         finally:
             with coord.cond:
                 coord.in_flight.discard(run_id)
@@ -686,9 +701,14 @@ def optimization_phase(runner, store, task, tag, run_dir, round_no, task_toml,
         progressed = _rewrite_phase(runner, store, task, tag, run_dir,
                                     task_toml, config, repo_root, cmd, events)
         for _ in range(int(config["tune_bouts"])):
-            if budget_status(run_dir, repo_root, cmd).get("reached"):
+            if budget_status(run_dir, repo_root, cmd).get("reached") \
+                    or recovery.disabled(run_dir, recovery.TUNE):
                 break
-            excluded = tune_excluded(run_dir)
+            # a candidate whose rewrite climb failed mid-step is in an
+            # unjournaled state; tuning it would measure that drift
+            excluded = sorted(set(tune_excluded(run_dir))
+                              | recovery.excluded(run_dir, recovery.TUNE)
+                              | recovery.excluded(run_dir, recovery.REWRITE))
             select_args = ["select", "--kind", "tune"]
             if excluded:
                 select_args += ["--exclude", ",".join(excluded)]
@@ -709,13 +729,23 @@ def optimization_phase(runner, store, task, tag, run_dir, round_no, task_toml,
             reference_before = _ledger_score(run_dir, run_id)
             started = time.monotonic()
             evals_before, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
-            receipt = tune(round_no, selection)
-            progressed = progressed or bool(receipt.get("tuned"))
-            _overhead(run_dir, repo_root, cmd, "tune", run_id, started,
-                      evals_before)
-            close_tune_outcome(run_dir, repo_root, cmd, events, selection,
-                               receipt, evals_before=evals_before,
-                               reference_before=reference_before)
+            try:
+                receipt = tune(round_no, selection)
+                progressed = progressed or bool(receipt.get("tuned"))
+                _overhead(run_dir, repo_root, cmd, "tune", run_id, started,
+                          evals_before)
+                close_tune_outcome(run_dir, repo_root, cmd, events, selection,
+                                   receipt, evals_before=evals_before,
+                                   reference_before=reference_before)
+            except RunBlocked:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the bout's unit boundary
+                evals_after, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
+                recovery.close_decision(run_dir, repo_root, cmd, selection,
+                                        recovery.TUNE,
+                                        max(0, evals_after - evals_before))
+                _note_tune_outcome(run_dir, events, run_id, "infra_failure")
+                recovery.unit_failed(run_dir, events, recovery.TUNE, run_id, exc)
     finally:
         args = ["end"]
         stage = os.environ.get("EVALUATION_STAGE")

@@ -100,6 +100,32 @@ def run_submission(*, task: str, run_dir: Path, data_dir: Path | str,
     return effective_rc, result
 
 
+def run_grader(*, task: str, run_dir: Path, data_dir: Path | str,
+               grader_command: str, grader_timeout: float = 3600
+               ) -> tuple[int, dict]:
+    """Run the out-of-budget grader command against run_dir/submission.csv."""
+    grader = _command(grader_command, task=task, run_dir=run_dir,
+                      data_dir=data_dir)
+    started = time.time()
+    try:
+        rc = _run(grader, run_dir, grader_timeout)
+        return rc, {"status": "success" if rc == 0 else "failed",
+                    "returncode": rc, "started_at_unix": started,
+                    "ended_at_unix": time.time(),
+                    "elapsed_seconds": time.time() - started,
+                    "command": grader,
+                    "counts_toward_submission_budget": False}
+    except subprocess.TimeoutExpired:
+        return 124, {"status": "timeout", "started_at_unix": started,
+                     "ended_at_unix": time.time(), "command": grader,
+                     "counts_toward_submission_budget": False}
+    except OSError as exc:
+        return 1, {"status": "failed", "returncode": 1,
+                   "started_at_unix": started, "ended_at_unix": time.time(),
+                   "command": grader, "error": str(exc),
+                   "counts_toward_submission_budget": False}
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--task", required=True)
@@ -126,26 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         deadline=a.deadline,
     )
     if rc == 0:
-        grader = _command(a.grader_command, task=a.task, run_dir=run_dir, data_dir=data_dir)
-        gs = time.time()
-        try:
-            rc = _run(grader, run_dir, a.grader_timeout)
-            manifest["grader"] = {"status": "success" if rc == 0 else "failed",
-                                   "returncode": rc, "started_at_unix": gs,
-                                   "ended_at_unix": time.time(),
-                                   "elapsed_seconds": time.time() - gs, "command": grader,
-                                   "counts_toward_submission_budget": False}
-        except subprocess.TimeoutExpired:
-            rc = 124
-            manifest["grader"] = {"status": "timeout", "started_at_unix": gs,
-                                   "ended_at_unix": time.time(), "command": grader,
-                                   "counts_toward_submission_budget": False}
-        except OSError as exc:
-            rc = 1
-            manifest["grader"] = {"status": "failed", "returncode": rc,
-                                   "started_at_unix": gs, "ended_at_unix": time.time(),
-                                   "command": grader, "error": str(exc),
-                                   "counts_toward_submission_budget": False}
+        rc, manifest["grader"] = run_grader(
+            task=a.task, run_dir=run_dir, data_dir=data_dir,
+            grader_command=a.grader_command, grader_timeout=a.grader_timeout)
     out = a.manifest or (run_dir / "finalization-manifest.json")
     out.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return rc

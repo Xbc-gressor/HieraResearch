@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import tomllib
+from enum import StrEnum
 from pathlib import Path
 
 from ..events import EventsLog
@@ -21,6 +22,18 @@ class RunBlocked(Exception):
     persistence before returning status. Helpers report fatal conditions as
     ordinary exceptions, never as a bare RunBlocked with no stop recorded.
     """
+
+
+class BlockClass(StrEnum):
+    """The only failures allowed to block a run. Anything else enters a
+    recovery frontier (``recovery.py``); EMPTY_FRONTIER is the block for a
+    failure point that has no legal next action left."""
+
+    COMPLIANCE = "compliance"
+    LEDGER_INTEGRITY = "ledger_integrity"
+    EVALUATION_SURFACE = "evaluation_surface"
+    DEADLINE = "deadline"
+    EMPTY_FRONTIER = "empty_frontier"
 
 
 def run_cmd(args, repo_root, check=True, capture=True, cwd=None, **kw) -> subprocess.CompletedProcess:
@@ -109,8 +122,9 @@ def set_phase(run_dir, repo_root, cmd, phase, stop_condition=None,
     cmd(args, repo_root)
 
 
-def block(run_dir, repo_root, cmd, events: EventsLog, reason: str) -> None:
-    events.emit("blocked", reason=reason)
+def block(run_dir, repo_root, cmd, events: EventsLog, reason: str, *,
+          cls: BlockClass) -> None:
+    events.emit("blocked", reason=reason, cls=str(cls))
     set_phase(run_dir, repo_root, cmd, "blocked", stop_condition=reason)
 
 

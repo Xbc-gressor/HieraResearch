@@ -33,9 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-evaluations", type=int)
     timeout_group = run.add_mutually_exclusive_group()
     run.add_argument("--space-expansion", action=argparse.BooleanOptionalAction,
-                        default=None, help="review stalled semantic space and reserve one probe seat")
+                        default=None, help="review stalled semantic space (default with a run deadline and judged_slate)")
     timeout_group.add_argument("--no-eval-timeout", action="store_true",
-                               help="experiment: evaluate under the run deadline, without a single-evaluation cap")
+                               help="experiment: no single-evaluation cap (default with a run deadline; --timeout opts out)")
     timeout_group.add_argument("--timeout", type=float,
                      help="per-evaluation limit in seconds; pass-through alias for "
                           "init_run.py --per-runtime-limit, NOT a session watchdog")
@@ -278,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             cli_path=args.cli_path,
             finalization=(
                 {"submission_command": args.submission_command,
+                 "grader_command": args.grader_command,
                  "data_dir": args.data_dir}
                 if args.submission_command else None),
         )

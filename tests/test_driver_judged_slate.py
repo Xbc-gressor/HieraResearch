@@ -370,8 +370,9 @@ def plan_entry(*, route_error=None):
                 "chosen_sketch_id": sketches[-1]["sketch_id"],
                 "chosen_route": sketches[-1]["route"],
             }
-            if route_error == "missing_chosen_route":
-                provenance["chosen_route"] = None
+            if route_error == "choices_only":
+                provenance = {key: provenance[key] for key in
+                              ("sketches", "preference_order", "chosen_sketch_id")}
             elif route_error == "not_applicable":
                 provenance = {"schema_version": 1, "status": "not_applicable",
                               "reason": "no planning needed"}
@@ -669,8 +670,20 @@ class JudgedSlateTests(unittest.TestCase):
         cfg["semantic_search"].update(n_route_sketches=sketches, route_memory=False)
         path.write_text(json.dumps(cfg))
 
-    def test_invalid_route_is_corrected_before_admission(self) -> None:
-        self._assert_route_repaired("missing_chosen_route", "chosen_route")
+    def test_derivable_route_fields_are_filled_not_repaired(self) -> None:
+        self._seed_run()
+        self._enable_route_planning(1)
+        cmd = JudgedCmd(self.repo)
+        cmd.reached = [False, False, False, False, True]
+        runner = self._run(cmd, [
+            judge_entry(), judge_entry(),
+            plan_entry(route_error="choices_only"), plan_entry(),
+            writer_entry(), writer_entry(), tuner_entry(),
+        ])
+        self.assertEqual(runner.status["phase"], "completed")
+        self.assertEqual(len([ctx for name, ctx in runner.calls
+                              if name == "slate-plan-writer"]), 2)
+        self.assertEqual(len(self._new_records(cmd)), 2)
 
     def test_malformed_nested_sketch_is_corrected_before_admission(self) -> None:
         self._assert_route_repaired("malformed_sketch", "sketches[0]", sketches=2)

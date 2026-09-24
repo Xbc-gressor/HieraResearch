@@ -57,15 +57,16 @@ uv run python -m driver run tabular-model-search <tag> \
 
 新 experiment run 默认启用 `judged_slate` 语义策略、scheduler `anchor_transfer_challenger_v1` 和 inner-tuner `hebo24-transfer10-hebo10`（global-donor 转移对），即每个入选候选的 24+10+10 三段合约；bout 内的 proposer arm 由 `tuner.proposer_arm` 单独指定（默认 `explicit_e3u2`，`--proposer-arm pool_hebo_mace` 切回单调用 proposer），与 inner policy 正交。无需预建目录或手改 JSON。对照臂可通过 `--scheduler-policy` 和 `--inner-tuner-policy` 显式选择；其余 24+20 inner policy 都必须与 `anchor_challenger_v1` 配对。解析后的选择会持久化到 run-local `framework_cfg.json`，恢复已有 run 时不改写已冻结策略。
 
-`--loop experiment --no-eval-timeout` 启用无单次评估上限模式，需同时设置
-`--time-budget SECONDS` 或 `--deadline EPOCH`，与 `--timeout` 互斥。
-省略开关时仍使用任务默认上限。模式及单次上限在 run 内固定，切换需使用新 tag。
+新建 `--loop experiment` 时，设置 `--time-budget SECONDS` 或 `--deadline EPOCH`
+即默认启用无单次评估上限模式；`--timeout SECONDS` 显式切回固定上限。
+`--no-eval-timeout` 保留为显式启用参数，与 `--timeout` 互斥；没有总 deadline 时使用任务默认上限。
+模式及单次上限在 run 内固定，切换需使用新 tag。
 已准入的评估和训练型预检只受 `deadline - final_reserve_seconds` 约束；phase quota
 控制下一项工作的准入。GPU 租约、LLM 空闲保护和网络请求超时保持原有作用范围。
 初始化生成 `runs/<task>/<tag>/task_contract/{TASK.md,task.toml,budget.json}`，向所有角色
 呈现有效预算；原任务代码、环境和评分合同不变。该目录是角色上下文约定，不是文件系统隔离。
 
-`--loop experiment --space-expansion` 启用运行期语义空间审视（需设置 run 时间预算，使用 `judged_slate`）。
+新建 `--loop experiment` 时，设置 run 时间预算且使用 `judged_slate` 即默认启用运行期语义空间审视。
 默认连续两个完整 slate 没有有效改善时申请审视，rewrite/tune 的改善也会重置计数；每 run 最多两次。
 审视消费留存 research、储备路线和运行经验，通过预算准入后给下一份两席 slate 预留一个新路线 probe。
 该开关与 `--no-eval-timeout` 独立；`--no-space-expansion` 关闭新审视，已发布的 probe 仍按原承诺结算。

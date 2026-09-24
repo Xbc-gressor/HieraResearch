@@ -48,9 +48,6 @@ include backend failures and coverage limitations>
   "dimensions": [
     {
       "id": "dim-...",
-      "definition": "<copy catalog definition exactly>",
-      "boundary": "<copy catalog boundary exactly>",
-      "catalog_provenance": "<copy catalog provenance exactly>",
       "selection_reason": "<task-specific reason>",
       "evidence": [{"kind": "task_contract | literature | agent_synthesis", "ref": "<receipt>"}],
       "mode": "searchable | baseline_only",
@@ -75,7 +72,6 @@ include backend failures and coverage limitations>
             "interventions": ["<lowercase_tag>"],
             "evaluation_protocols": ["<lowercase_tag>"]
           },
-          "required_comparisons": ["<matched local comparison>"],
           "reopen_when": "<new scope, implementation, or evidence>",
           "literature_credibility": "unverified | preliminary | corroborated | replicated | contested",
           "credibility_rationale": "<why>",

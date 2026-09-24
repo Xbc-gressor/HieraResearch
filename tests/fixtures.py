@@ -80,9 +80,6 @@ def hypothesis(
         ],
         "claim_scope": f"Toy scope for {title}.",
         "scope": scope(intervention),
-        "required_comparisons": [
-            "Matched budget and split against the dimension baseline."
-        ],
         "reopen_when": "A materially different mechanism or task regime is tested.",
         "literature_credibility": "unverified" if baseline else "preliminary",
         "credibility_rationale": (

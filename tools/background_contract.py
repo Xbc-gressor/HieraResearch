@@ -75,6 +75,8 @@ from semantic_evidence import (
 )
 from semantic_space import (
     DEFAULT_DIMENSION_STRATEGY,
+    DIMENSION_FIELDS,
+    HYPOTHESIS_FIELDS,
     SemanticSpaceError,
     catalog_receipt,
     complete_point,
@@ -666,10 +668,6 @@ def _validate_baseline_inventory(
     entrypoint = inventory.get("entrypoint")
     if not isinstance(entrypoint, dict) or not _nonempty(entrypoint.get("path")):
         errors.append("baseline mechanism inventory requires entrypoint.path")
-    elif DIGEST_RE.fullmatch(str(entrypoint.get("sha256", ""))) is None:
-        errors.append(
-            "baseline mechanism inventory entrypoint.sha256 must be a sha256 digest"
-        )
     dimensions = inventory.get("dimensions")
     if not isinstance(dimensions, dict) or not dimensions:
         return errors + ["baseline mechanism inventory requires a non-empty dimensions map"]
@@ -3352,6 +3350,197 @@ def _validated_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
     return registry, ledger, errors
 
 
+def normalize_registry(registry: dict[str, Any], catalog: dict[str, Any]) -> list[str]:
+    """Fill the catalog-derived fields and strip unknown fields in place.
+
+    Returns one warning per stripped field. Validation then only reports what
+    the author has to decide.
+    """
+    registry["catalog"] = catalog_receipt(catalog)
+    by_id = {item["id"]: item for item in catalog.get("dimensions", [])}
+    warnings: list[str] = []
+
+    def strip(item: dict[str, Any], allowed: set[str], where: str) -> None:
+        for key in sorted(set(item) - allowed):
+            del item[key]
+            warnings.append(f"{where}: stripped unknown field {key!r}")
+
+    for dimension in registry.get("dimensions") or []:
+        if not isinstance(dimension, dict):
+            continue
+        entry = by_id.get(dimension.get("id"))
+        if entry is not None:
+            dimension["definition"] = entry["definition"]
+            dimension["boundary"] = entry["boundary"]
+            dimension["catalog_provenance"] = catalog["provenance"]
+        strip(dimension, DIMENSION_FIELDS, f"dimension {dimension.get('id')}")
+        for hypothesis in dimension.get("hypotheses") or []:
+            if isinstance(hypothesis, dict):
+                strip(hypothesis, HYPOTHESIS_FIELDS,
+                      f"hypothesis {hypothesis.get('id')}")
+    return warnings
+
+
+def _with_registry(text: str, registry: dict[str, Any]) -> str:
+    marker = re.search(r"^## Search space registry\s*$", text, flags=re.MULTILINE)
+    fence = re.search(r"```json\s*(\{.*?\})\s*```", text[marker.end():], flags=re.DOTALL)
+    start, end = marker.end() + fence.start(1), marker.end() + fence.end(1)
+    return text[:start] + json.dumps(registry, indent=2, ensure_ascii=False) + text[end:]
+
+
+def cmd_normalize(args: argparse.Namespace) -> int:
+    from space_revisions import load_revision_state
+    if load_revision_state(args.background) is not None:
+        print(json.dumps({"changed": False, "reason": "the space is already published"}))
+        return 0
+    text = args.background.read_text()
+    registry = load_initial_registry(args.background)
+    catalog = resolve_dimension_catalog(args.background, explicit_path=args.catalog)
+    before = json.dumps(registry, sort_keys=True)
+    warnings = normalize_registry(registry, catalog)
+    changed = json.dumps(registry, sort_keys=True) != before
+    if changed:
+        args.background.write_text(_with_registry(text, registry))
+    print(json.dumps({"changed": changed, "warnings": warnings}, indent=2))
+    return 0
+
+
+_UNIT_PATH_RE = re.compile(
+    r"(?<![\w.])(?:dimensions\[(\d+)\](?:\.hypotheses\[(\d+)\])?"
+    r"|relations\[(\d+)\]|(guidance)\[(\d+)\]|sources\[\d+\])"
+)
+_UNIT_ID_RE = re.compile(r"\b(?:rel|hyp|dim)-[a-z0-9-]*[a-z0-9]")
+
+
+def _error_subject(message: str, registry: dict[str, Any]) -> tuple[str, Any] | None:
+    """The one registry unit an error names, or None when it names none that
+    can be quarantined. A structural path wins over ids; among ids the most
+    specific kind wins (relation, then hypothesis, then dimension)."""
+    dimensions = registry.get("dimensions") or []
+    match = _UNIT_PATH_RE.search(message)
+    if match:
+        dim, hyp, rel, guidance, guidance_index = match.groups()
+        try:
+            if rel is not None:
+                return "relation", registry["relations"][int(rel)]["id"]
+            if guidance is not None:
+                return "guidance", int(guidance_index)
+            if dim is not None:
+                dimension = dimensions[int(dim)]
+                if hyp is not None:
+                    return "hypothesis", dimension["hypotheses"][int(hyp)]["id"]
+                return "dimension", dimension["id"]
+        except (IndexError, KeyError, TypeError):
+            return None
+        return None
+    known = {
+        "rel": {r.get("id") for r in registry.get("relations") or [] if isinstance(r, dict)},
+        "hyp": set(hypothesis_map(registry)),
+        "dim": {d.get("id") for d in dimensions if isinstance(d, dict)},
+    }
+    found = [token for token in _UNIT_ID_RE.findall(message) if token in known[token[:3]]]
+    for prefix, kind in (("rel", "relation"), ("hyp", "hypothesis"), ("dim", "dimension")):
+        for token in found:
+            if token.startswith(prefix):
+                return kind, token
+    return None
+
+
+def _quarantine_unit(registry: dict[str, Any], kind: str, target: Any) -> str | None:
+    """Drop (or, for binding guidance, downgrade) one unit in place; returns the
+    quarantined id, or None when the unit cannot be quarantined."""
+    if kind == "guidance":
+        item = (registry.get("guidance") or [])[target]
+        if not isinstance(item, dict) or item.get("effect") != "deprioritize":
+            return None
+        item["effect"] = "caution"
+        return str(item.get("id"))
+    key = "relations" if kind == "relation" else "dimensions"
+    items = registry.get(key) or []
+    if kind in ("relation", "dimension"):
+        kept = [i for i in items if not (isinstance(i, dict) and i.get("id") == target)]
+        registry[key] = kept
+        return target if len(kept) != len(items) else None
+    for dimension in items:  # a hypothesis; its baseline takes the dimension along
+        if not isinstance(dimension, dict):
+            continue
+        if dimension.get("baseline_hypothesis_id") == target:
+            return _quarantine_unit(registry, "dimension", dimension.get("id"))
+        hypotheses = dimension.get("hypotheses") or []
+        kept = [h for h in hypotheses if not (isinstance(h, dict) and h.get("id") == target)]
+        if len(kept) != len(hypotheses):
+            dimension["hypotheses"] = kept
+            return target
+    return None
+
+
+def _unmark(text: str, unit_id: str) -> str:
+    """Keep the human view readable while it stops referencing a dropped unit."""
+    marker = re.search(r"^## Search space registry\s*$", text, flags=re.MULTILINE)
+    human, rest = (text[:marker.start()], text[marker.start():]) if marker else (text, "")
+    human = re.sub(rf"^(###\s+)`{re.escape(unit_id)}`\s*$",
+                   rf"\1{unit_id} (quarantined)", human, flags=re.MULTILINE)
+    return human.replace(f"`{unit_id}`", unit_id) + rest
+
+
+def cmd_quarantine(args: argparse.Namespace) -> int:
+    """Degraded fallback after repair: drop the units that validation errors (or
+    ``--drop``) name until the space validates, then publish it only if it does."""
+    from space_revisions import load_revision_state
+    if load_revision_state(args.background) is not None:
+        print(json.dumps({"ok": False, "errors": ["the space is already published"]}))
+        return 1
+    text = args.background.read_text()
+    registry = load_initial_registry(args.background)
+    scratch = args.background.with_name(".quarantine-" + args.background.name)
+    quarantined: list[str] = []
+
+    def apply(kind: str, target: Any) -> bool:
+        nonlocal text
+        unit_id = _quarantine_unit(registry, kind, target)
+        if unit_id is None:
+            return False
+        quarantined.append(unit_id)
+        if kind != "guidance":
+            text = _unmark(text, unit_id)
+        return True
+
+    for unit_id in args.drop or []:
+        kind = {"rel": "relation", "hyp": "hypothesis", "dim": "dimension"}.get(unit_id[:3])
+        if kind is not None:
+            apply(kind, unit_id)
+    try:
+        while True:
+            text = _with_registry(text, registry)
+            scratch.write_text(text)
+            _, _, errors = _validated_inputs(
+                argparse.Namespace(**{**vars(args), "background": scratch}))
+            if not errors:
+                break
+            before = text
+            # resolve every subject before dropping anything: paths are indices
+            subjects = [(_error_subject(message, registry), message) for message in errors]
+            known = set(hypothesis_map(registry)) | {
+                item.get("id") for key in ("dimensions", "relations")
+                for item in registry.get(key) or [] if isinstance(item, dict)}
+            for subject, message in subjects:
+                if subject is not None:
+                    apply(*subject)
+                    continue
+                # a human-view reference to a unit the registry no longer has
+                for token in set(_UNIT_ID_RE.findall(message)) - known:
+                    text = _unmark(text, token)
+            if _with_registry(text, registry) == before:
+                break
+    finally:
+        scratch.unlink(missing_ok=True)
+    ok = not errors and bool(registry.get("dimensions"))
+    if ok and quarantined:
+        args.background.write_text(text)
+    print(json.dumps({"ok": ok, "quarantined": quarantined, "errors": errors}, indent=2))
+    return 0 if ok else 1
+
+
 def cmd_catalog(args: argparse.Namespace) -> int:
     path = getattr(args, "path", None)
     catalog = load_catalog(path) if path else load_catalog()
@@ -3491,25 +3680,41 @@ def build_parser() -> argparse.ArgumentParser:
     catalog.add_argument("--compact", action="store_true")
     catalog.set_defaults(func=cmd_catalog)
 
+    normalize = sub.add_parser(
+        "normalize",
+        help="fill catalog-derived fields and strip unknown fields in background.md",
+    )
+    normalize.add_argument("--background", type=Path, required=True)
+    normalize.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
+    normalize.set_defaults(func=cmd_normalize)
+
     validate = sub.add_parser("validate", help="validate a hierarchical background")
-    validate.add_argument("--background", type=Path, required=True)
-    validate.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
-    validate.add_argument("--ledger", type=Path)
-    validate.add_argument("--retrieval-manifest", type=Path)
-    validate.add_argument(
-        "--baseline-mechanisms",
-        type=Path,
-        help="baseline mechanism inventory for a task with a provided entrypoint; "
-        "required whenever [seed].provided resolves",
+    quarantine = sub.add_parser(
+        "quarantine",
+        help="drop the units validation errors name until the space validates",
     )
-    validate.add_argument(
-        "--number-gate",
-        action="store_true",
-        help="generation-path item-level number gate: every result-type number "
-        "in an item's audit text must appear in a tier≥preview cited source's "
-        "retained content",
-    )
+    for command in (validate, quarantine):
+        command.add_argument("--background", type=Path, required=True)
+        command.add_argument("--catalog", type=Path, help="explicit dimension catalog override")
+        command.add_argument("--ledger", type=Path)
+        command.add_argument("--retrieval-manifest", type=Path)
+        command.add_argument(
+            "--baseline-mechanisms",
+            type=Path,
+            help="baseline mechanism inventory for a task with a provided entrypoint; "
+            "required whenever [seed].provided resolves",
+        )
+        command.add_argument(
+            "--number-gate",
+            action="store_true",
+            help="generation-path item-level number gate: every result-type number "
+            "in an item's audit text must appear in a tier≥preview cited source's "
+            "retained content",
+        )
     validate.set_defaults(func=cmd_validate)
+    quarantine.add_argument("--drop", action="append",
+                            help="a hypothesis/dimension/relation id to drop first")
+    quarantine.set_defaults(func=cmd_quarantine)
 
     render = sub.add_parser("render", help="bounded dimension/hypothesis/coverage view")
     render.add_argument("--background", type=Path, required=True)

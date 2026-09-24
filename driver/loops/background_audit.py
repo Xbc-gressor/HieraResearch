@@ -62,7 +62,8 @@ BATCH_MAX_MAPPINGS = 12  # per-batch mapping cap
 FINDINGS_CHARS = 20480  # ~20KB cap on the repair payload handed to the researcher
 
 VERDICTS = ("faithful", "unfaithful", "unverifiable")
-TERMINAL_OK_OUTCOMES = ("passed", "no_mappings", "unfaithful_irreparable_warning")
+TERMINAL_OK_OUTCOMES = ("passed", "no_mappings", "unfaithful_irreparable_warning",
+                        "quarantined")
 # Audit content collection ranks a visit's view by the verification tier it
 # raises; the abstract view counts as preview-tier content.
 _VIEW_RANK = {
@@ -580,8 +581,8 @@ def audit_completed(run_dir: Path) -> bool:
     """True when a prior audit reached a terminal-ok outcome on the current artifacts.
 
     Only an artifact at the current ``ARTIFACT_VERSION`` counts: anything
-    older, unreadable, or ended on ``unfaithful``/``judge_failed`` re-runs the
-    audit (fail closed).  ``unfaithful_irreparable_warning`` is terminal-ok:
+    older, unreadable, or ended on ``unfaithful``/``audit_unavailable`` re-runs
+    the audit (fail closed).  ``unfaithful_irreparable_warning`` is terminal-ok:
     the pre-seeded background it flags is frozen, so re-auditing would just
     re-record the same warning.
     """
@@ -717,8 +718,9 @@ def run_faithfulness_gate(
     invoke,
     or_block,
     repair=None,
+    quarantine=None,
 ) -> None:
-    """Audit a validated background before freeze; block on any failure.
+    """Audit a validated background before freeze.
 
     ``invoke``/``or_block`` are the driver loop's own helpers (injected to
     keep this module import-light).  ``repair`` is the one researcher repair
@@ -728,8 +730,10 @@ def run_faithfulness_gate(
     ``repair=None`` marks the pre-seeded path: the frozen background cannot be
     rewritten, so unfaithful findings are recorded into the artifact and
     events as ``unfaithful_irreparable_warning`` — a terminal-ok outcome —
-    instead of blocking.  ``or_block`` and a failing ``repair`` never return
-    (they raise RunBlocked).
+    instead of blocking.  An unavailable judge is recorded as
+    ``audit_unavailable`` and the run proceeds.  Findings that survive the
+    repair go to ``quarantine`` (their items leave the space) when given;
+    otherwise they block.  ``or_block`` never returns (it raises RunBlocked).
     """
     rounds: list[dict] = []
     prior_windows: dict[str, str] = {}
@@ -808,14 +812,10 @@ def run_faithfulness_gate(
             batch, exc = failed
             error = [str(p) for p in exc.problems]
             judged.append(_batch_record(batch, None, None, error=error))
-            # A pre-seeded frozen background cannot be rewritten, so an
-            # unavailable judge is recorded as audit_unavailable and the run
-            # proceeds (the unfaithful_irreparable_warning precedent); the
-            # generation path stays fail-closed. audit_unavailable is not
-            # terminal-ok: a later resume retries the audit with a healthy
-            # judge.
-            outcome = "judge_failed" if repair is not None \
-                else "audit_unavailable"
+            # The judge is an auxiliary role: its unavailability is recorded
+            # and the run proceeds. audit_unavailable is not terminal-ok: a
+            # later resume retries the audit with a healthy judge.
+            outcome = "audit_unavailable"
             rounds.append(
                 {
                     "attempt": attempt,
@@ -833,21 +833,28 @@ def run_faithfulness_gate(
                 batch=judged[-1]["labels"],
                 sources=sources,
             )
-            if repair is None:
-                return
-            or_block(
-                f"background faithfulness judge failed on batch"
-                f" {len(judged)}/{len(batches)}"
-                f" (sources: {', '.join(sources) or 'unknown'}): {exc.problems}"
-            )
+            return
 
         outcome = "passed"
         if unfaithful:
             outcome = (
-                "unfaithful"
-                if repair is not None
-                else "unfaithful_irreparable_warning"
+                "unfaithful_irreparable_warning" if repair is None
+                else "quarantined" if attempt == 2 and quarantine is not None
+                else "unfaithful"
             )
+        if outcome == "quarantined":
+            # guidance is advisory and keeps its gapless ids: its findings
+            # stay recorded below; hypotheses and relations leave the space.
+            # Quarantine first: a failed one blocks before this round is
+            # recorded as terminal, so a resume re-audits.
+            dropped = sorted({
+                str(item_id)
+                for finding in unfaithful
+                if finding["entry"]["item_kind"] != "guidance"
+                for item_id in finding["entry"]["item_ids"]
+            })
+            if dropped:
+                quarantine(dropped)
         rounds.append(
             {
                 "attempt": attempt,
@@ -871,7 +878,7 @@ def run_faithfulness_gate(
             "unfaithful": len(unfaithful),
             "unverifiable": len(unverifiable),
         }
-        if outcome == "unfaithful_irreparable_warning":
+        if outcome in ("unfaithful_irreparable_warning", "quarantined"):
             event["findings"] = rounds[-1]["unfaithful"]
         events.emit("background_faithfulness_audit", **event)
         if not unfaithful:
@@ -887,4 +894,5 @@ def run_faithfulness_gate(
             prior_unfaithful = {_identity_key(f["entry"]) for f in unfaithful}
             repair(_format_findings(unfaithful))
             continue  # re-validate already happened inside repair; narrowed recheck
-        or_block(_block_message(unfaithful, prior_unfaithful))
+        if quarantine is None:
+            or_block(_block_message(unfaithful, prior_unfaithful))

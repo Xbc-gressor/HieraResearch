@@ -75,9 +75,13 @@ def settle(run_dir: Path, run_id: str, repo_root: Path, cmd, events) -> bool:
         events.emit('candidate_settlement_failed', run_id=run_id,
                     detail=(result.stderr or result.stdout).strip()[-2000:])
         return False
-    cmd(['python', 'tools/ledger.py', 'record-run',
-         '--ledger', run_dir / 'ledger.json', '--run-id', run_id,
-         '--final-best-score', str(score)], repo_root)
+    result = cmd(['python', 'tools/ledger.py', 'record-run',
+                  '--ledger', run_dir / 'ledger.json', '--run-id', run_id,
+                  '--final-best-score', str(score)], repo_root, check=False)
+    if result.returncode:
+        events.emit('candidate_settlement_failed', run_id=run_id,
+                    detail=(result.stderr or result.stdout).strip()[-2000:])
+        return False
     events.emit('candidate_settled', run_id=run_id,
                 outcome=record_status(run_dir, run_id), best_warm_score=score)
     return True

@@ -40,6 +40,8 @@ class InitRunDimensionStrategyTests(unittest.TestCase):
             self.assertEqual(self._strategy(run_dir), "catalog_subset")
             config = json.loads((run_dir / "framework_cfg.json").read_text())
             self.assertEqual(config["per_runtime_limit"], 60)
+            self.assertEqual(config["evaluation_timeout_mode"], "fixed")
+            self.assertFalse(config["space_expansion"]["enabled"])
             self.assertEqual(
                 config["semantic_search"]["policy"],
                 "judged_slate",
