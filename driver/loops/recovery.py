@@ -6,9 +6,10 @@ run. The default policy keys the failure by signature (exception type + the
 failing tool subcommand or innermost repo frame): the first occurrence
 excludes the failed target from the action for the rest of this process;
 the same signature on a different target disables the whole action. The
-scheduler then picks from what remains; when nothing remains the run
-completes degraded (export the incumbent). ``RunBlocked`` is never caught
-here — only the hard classes block.
+scheduler then picks from what remains. GENERATION is never disabled for
+the run: disabling it only pauses it until the next optimization round has
+changed the pool (``lift``), so semantic search always resumes.
+``RunBlocked`` is never caught here — only the hard classes block.
 
 A signature this run has not seen yet may first go to a registered triage
 chooser (the ``failure-triage`` role), which picks the scope from the same
@@ -117,7 +118,7 @@ def unit_failed(run_dir, events, action: str, target: str | None,
             state["disabled"].add(action)
         state["version"] = state.get("version", 0) + 1
     events.emit("recovery_choice", layer="round", signature=sig,
-                frontier=frontier + ["finish_degraded"], choice=choice,
+                frontier=frontier, choice=choice,
                 chooser=chooser, action=action, target=target,
                 rationale=rationale)
     return choice
@@ -131,9 +132,20 @@ def disable(run_dir, events, action: str, sig: str, reason: str) -> None:
         state["disabled"].add(action)
         state["version"] = state.get("version", 0) + 1
     events.emit("recovery_choice", layer="round", signature=sig,
-                frontier=["disable_action", "finish_degraded"],
+                frontier=["disable_action"],
                 choice="disable_action", chooser="default", action=action,
                 reason=reason)
+
+
+def lift(run_dir, events, action: str) -> None:
+    """End a pause (the GENERATION contract: optimization has run since)."""
+    state = _run_state(run_dir)
+    with _lock:
+        if action not in state["disabled"]:
+            return
+        state["disabled"].discard(action)
+        state["version"] = state.get("version", 0) + 1
+    events.emit("recovery_lifted", layer="round", action=action)
 
 
 def excluded(run_dir, action: str) -> set[str]:

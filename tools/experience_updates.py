@@ -87,7 +87,7 @@ def item_is_current(item, data):
     for edge_id in item.get('evidence_edge_ids', []):
         edge = index.get(edge_id, {})
         cited.update((edge.get('parent_run_id'), edge.get('child_run_id')))
-    changed = [r for r in data.get('records', []) if r.get('dag_revision', 0) > basis]
+    changed = [r for r in data.get('records', []) if (r.get('dag_revision') or 0) > basis]
     return not (any(r['run_id'] in cited for r in changed)
                 or bool(affected_targets(data, changed) & watched))
 
@@ -124,7 +124,7 @@ def build_context(data, registry, *, target_ids=None, entry_ids=None):
     experience = data.get('experience') or {}
     cursor = experience.get('dag_revision', 0)
     changed = [r for r in data.get('records', [])
-               if r.get('dag_revision', 0) > cursor]
+               if (r.get('dag_revision') or 0) > cursor]
     wanted = set(target_ids or [])
     wanted.update(affected_targets(data, changed))
     runs = {r['run_id'] for r in changed}

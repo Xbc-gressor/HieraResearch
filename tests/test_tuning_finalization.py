@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import finalize_tuning  # noqa: E402
 import ledger  # noqa: E402
+import tune_tools  # noqa: E402
 from search_space_state import empty_search_space_state  # noqa: E402
 from semantic_evidence import _json_sha256  # noqa: E402
 from tune_tools import _candidate_execution_revision  # noqa: E402
@@ -316,6 +317,13 @@ class TuningFinalizationTests(unittest.TestCase):
                 }
             )
             report_path.write_text(json.dumps(report, indent=2))
+            # The deterministic bout loop must reach this close by itself:
+            # the first bout's closing fields bind only its own stage.
+            (Path(tmp) / "run" / "framework_cfg.json").write_text(
+                json.dumps({"tuner": {"inner_policy": "legacy"}}))
+            action = tune_tools.phase_c_action(report, candidate_path)
+            self.assertEqual(action["action"], "finalize")
+            self.assertEqual(action["best_score"], 0.7)
             result = finalize_tuning.finalize(
                 candidate_path=candidate_path,
                 report_path=report_path,

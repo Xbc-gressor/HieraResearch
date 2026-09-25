@@ -150,6 +150,10 @@ def test_review_material_includes_unregistered_research_failures_and_live_experi
     assert packet["search"]["status_counts"] == {"keep": 15, "crash": 15}
     assert len(packet["search"]["recent"]) == 4
     assert packet["coverage"]["n_valid_records"] == 30
+    # Baseline assignments are tried (30 attempts, 15 scored); the rest are listed untried.
+    assert {(row["attempts"], row["scored"]) for row in packet["coverage"]["tried"]} == {(30, 15)}
+    searchable = sum(len(d["hypotheses"]) for d in registry["dimensions"] if d["mode"] == "searchable")
+    assert len(packet["coverage"]["tried"]) + len(packet["coverage"]["untried"]) == searchable
     assert packet["experience"]["lessons"][0]["evidence"] == ["1"]
     assert packet["execution"]["completed_eval_seconds"] == 12.5
     assert validate_retrieval_request({"knowledge_gap": "Need adaptation cost",

@@ -42,6 +42,8 @@ service dependency.
   `error`, `traceback`).
 - `recovery_choice` — a failure point picked its next action (`layer`,
   `signature`, `frontier`, `choice`, `chooser`: default | triage).
+- `recovery_lifted` — a paused action is available again (`action`; only
+  GENERATION, after an optimization round).
 - `guard_denied` / `guard_degraded` — a session tool guard refused a call,
   or let it through rewritten or with a hint (`guard`: a
   `driver/session.py` `GUARDS` id, `role`, `tool`).

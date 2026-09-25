@@ -150,8 +150,9 @@ def review_boundary(runner,store,task,tag,run,repo_root,cmd,events,*,invoke,job_
             remaining_seconds=expansion.time_budget(run)['usable_seconds'])
         material['admitted_review_seconds']=admission['review']['budget_seconds']
         expansion.write_json(folder/'material.json',material)
-        extra={'material':str(folder/'material.json'),'review_output':str(output),
-               'retrieval_request_output':str(folder/'retrieval-request.json')}
+        extra={'material':str(folder/'material.json'),'review_output':str(output)}
+        if cfg['targeted_retrieval']:
+            extra['retrieval_request_output']=str(folder/'retrieval-request.json')
         retrieved=False
         for attempt in range(2):
             try:

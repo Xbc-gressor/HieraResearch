@@ -44,6 +44,41 @@ def test_completed_slate_progress_includes_optimization_and_separates_domains(tm
     assert observe_boundary(run, ledger)['stalled_slates'] == 2
 
 
+def test_stall_counts_after_first_optimization_and_doubles_after_expansion(tmp_path):
+    from space_expansion import observe_boundary, load_state, write_json, STATE
+    from scheduler.round_policy import load_round_state, save_round_state
+    run = run_fixture(tmp_path, tuner={'scheduler_policy': 'round_v1'})
+    ledger = {'records': []}
+    def complete(n):
+        ledger['records'].append({'run_id':f'{n:03d}', 'op':'fresh', 'status':'keep',
+            'policy_receipt':{'generation_id':f'g{n}'}, 'final_best_score':.5})
+        return observe_boundary(run, ledger)
+    complete(0)
+    assert complete(1)['stalled_slates'] == 0
+    state = load_round_state(run, for_update=True)
+    state['cycle'] = 1
+    save_round_state(run, state)
+    complete(2)
+    assert complete(3)['review_due']
+    state = load_state(run)
+    state.update(reviews=[{'status':'expanded'}], stalled_slates=0)
+    write_json(run/STATE, state)
+    assert not any(complete(n)['review_due'] for n in (4, 5, 6))
+    assert complete(7)['review_due']
+    assert [(row['run_id'], row['source']) for row in load_state(run)['best_history']] == [('000', 'fresh')]
+
+
+def test_review_share_charges_actual_wall_clock(tmp_path):
+    from space_expansion import reserve_review, finish_review, cancel_expansion, load_state
+    run = run_fixture(tmp_path, space_expansion={'enabled': True, 'review_seconds': 300})
+    first = reserve_review(run)
+    assert first['review']['budget_seconds'] == 300
+    cancel_expansion(run, first['slate']['reservation_id'], 'continue')
+    finish_review(run, 1, 'continue')
+    assert load_state(run)['reviews'][0]['elapsed_seconds'] < 300
+    assert reserve_review(run)['review']['budget_seconds'] == 300
+
+
 def test_review_reserves_complete_slate_without_eval_timeout(tmp_path):
     from space_expansion import reserve_review, cancel_expansion
     from evaluation_budget import outstanding_reservations, BudgetReservationDenied

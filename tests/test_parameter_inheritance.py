@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -13,8 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 import sys
 
 sys.path.insert(0, str(ROOT / "tools" / "tuners"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 import warmstart_eval  # noqa: E402
+from ledger_tuning import transfer_binding_from_receipt  # noqa: E402
+from rewrite_rebase import rebase  # noqa: E402
+from search_space_state import empty_search_space_state  # noqa: E402
+import finalize_tuning  # noqa: E402
 from tune_tools import (  # noqa: E402
     _candidate_execution_revision,
     _read_literal_mapping,
@@ -443,6 +449,20 @@ class ParameterInheritanceTests(unittest.TestCase):
             for path, content in before.items():
                 self.assertEqual(path.read_bytes(), content)
 
+    def test_schema_repair_keeping_keys_reuses_original_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, child, configs_path = self._fixture(Path(tmp))
+            first = materialize_parameter_transfer(child, configs_path)
+            child.write_text(child.read_text().replace(
+                '"new_key": "float"', '"new_key": ("float", "log")'))
+
+            receipt = materialize_parameter_transfer(child, configs_path)
+
+            self.assertEqual(receipt["candidate"]["defaults"],
+                             first["candidate"]["defaults"])
+            self.assertEqual(json.loads(configs_path.read_text())[0],
+                             receipt["projection"]["params"])
+
     def test_tuning_record_preserves_control_receipts_and_observation(self) -> None:
         receipt = {
             "schema_version": 1,
@@ -720,6 +740,329 @@ def make_model""",
             self.assertEqual(phase_a["status"], "crashed")
             self.assertEqual([row["score"] for row in phase_a["warm_start_configs"]],
                              [None, -1.0])
+
+
+TASK = "autoresearch-baseline"
+
+
+def _one_param_source(params: dict) -> str:
+    return (
+        'PARAM_SCHEMA = {"x": "float"}\n'
+        'SEARCH_SPACE = {"x": ("float", 0.0, 2.0)}\n'
+        f"BASE_PARAMS = {params!r}\n"
+        "def make_model(params):\n    return params\n"
+    )
+
+
+class TransferBindingBackfillTests(unittest.TestCase):
+    """Ledger boundaries rebuild a missing transfer field from the candidate-dir
+    receipt; a truly absent or inconsistent receipt stays fail-closed."""
+
+    def _run_fixture(self, root: Path) -> dict:
+        """Fresh parent 001 settled; improve child 002 pending with a
+        materialized inheritance receipt (the production judged-slate shape)."""
+        run_dir = root / "run"
+        parent = run_dir / "candidates" / "001"
+        child = run_dir / "candidates" / "002"
+        parent.mkdir(parents=True)
+        child.mkdir(parents=True)
+        (parent / "train.py").write_text(_one_param_source({"x": 1.0}))
+        (parent / "prepare.py").write_text(
+            "def evaluate_config(make_model, params):\n    return 0.0\n")
+        parent_params = {"x": 1.0}
+        (parent / "tune_report.json").write_text(json.dumps({
+            "phase_a": {
+                "status": "ok",
+                "best_warm_params": parent_params,
+                "best_warm_score": 0.5,
+                "warm_start_configs": [
+                    {"params": parent_params, "score": 0.5, "proposed_index": 0},
+                ],
+                "search_space": {"x": ["float", 0.0, 2.0]},
+                "trials_attempted": 1,
+                "candidate_code_revision": _candidate_execution_revision(
+                    parent / "train.py"),
+            },
+            "phase_c": {"stages": []},
+        }))
+        (child / "train.py").write_text(_one_param_source({"x": 0.5}))
+        (child / "prepare.py").write_text(
+            "def evaluate_config(make_model, params):\n    return 0.0\n")
+        (child / "_candidate_brief.json").write_text(json.dumps({
+            "schema_version": 4,
+            "run_id": "002",
+            "op": "improve",
+            "source_run_ids": ["001"],
+            "primary_parent": {
+                "schema_version": 1,
+                "run_id": "001",
+                "path": str(parent / "train.py"),
+                "sha256": _sha256(parent / "train.py"),
+            },
+            "implementation_source": {
+                "kind": "primary_parent_snapshot",
+                "parent_run_id": "001",
+                "path": str(parent / "train.py"),
+                "sha256": _sha256(parent / "train.py"),
+            },
+        }))
+        configs = child / "_warm_configs.json"
+        configs.write_text(json.dumps([{"x": 0.5}, {"x": 1.5}]))
+        ledger_path = run_dir / "ledger.json"
+        ledger_path.write_text(json.dumps({
+            "task": TASK,
+            "tag": "backfill",
+            "metric": "val_bpb",
+            "dag_revision": 1,
+            "search_space_state": empty_search_space_state(),
+            "records": [
+                {
+                    "run_id": "001",
+                    "op": "fresh",
+                    "source_run_ids": [],
+                    "semantic_point": {},
+                    "policy_receipt": {},
+                    "status": "keep",
+                    "final_best_score": 0.5,
+                    "best_warm_score": 0.5,
+                    "tune": True,
+                    "evaluation_depth": "screening",
+                    "dag_revision": 1,
+                    "applied_incumbent": {
+                        "schema_version": 1,
+                        "source": "applied_phase_a",
+                        "score": 0.5,
+                        "params": parent_params,
+                        "param_schema": {"x": "float"},
+                        "entrypoint_sha256": _sha256(parent / "train.py"),
+                        "tune_report_sha256": _sha256(
+                            parent / "tune_report.json"),
+                    },
+                },
+                {
+                    "run_id": "002",
+                    "op": "improve",
+                    "source_run_ids": ["001"],
+                    "semantic_point": {},
+                    "policy_receipt": {},
+                    "status": "pending",
+                    "tune": False,
+                    "tuning_bouts": 0,
+                    "dag_revision": 1,
+                },
+            ],
+        }))
+        receipt = materialize_parameter_transfer(child / "train.py", configs)
+        # warmstart applies the best warm row to BASE_PARAMS before settling.
+        (child / "train.py").write_text(
+            _one_param_source(receipt["projection"]["params"]))
+        return {
+            "run_dir": run_dir,
+            "ledger_path": ledger_path,
+            "child": child,
+            "receipt": receipt,
+        }
+
+    def _report(self, child: Path, receipt: dict, *, stamped: bool) -> dict:
+        projected = receipt["projection"]["params"]
+        phase_a = {
+            "status": "ok",
+            "warm_start_configs": [
+                {"params": projected, "score": 0.4, "proposed_index": 0,
+                 "role": "inherited_control"},
+                {"params": {"x": 1.5}, "score": 0.45, "proposed_index": 1},
+            ],
+            "best_warm_params": projected,
+            "best_warm_score": 0.4,
+            "search_space": {"x": ["float", 0.0, 2.0]},
+            "trials_attempted": 2,
+            "elapsed_seconds": 1.0,
+            "candidate_code_revision": _candidate_execution_revision(
+                child / "train.py"),
+        }
+        if stamped:
+            phase_a["parameter_transfer"] = receipt
+            phase_a["inherited_control"] = {
+                "warm_config_index": 0,
+                "selected": True,
+                "primary_parent_run_id": receipt["primary_parent"]["run_id"],
+                "parent_incumbent_score": receipt["primary_parent"][
+                    "incumbent_score"],
+            }
+        return {"phase_a": phase_a, "phase_c": {"stages": []}}
+
+    def _ledger_cli(self, fx: dict, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "ledger.py"), *args,
+             "--ledger", str(fx["ledger_path"]), "--task", TASK,
+             "--run-id", "002"],
+            capture_output=True, text=True, cwd=ROOT)
+
+    def _settle(self, fx: dict, *, stamped: bool) -> tuple:
+        report = self._report(fx["child"], fx["receipt"], stamped=stamped)
+        report_path = fx["child"] / "tune_report.json"
+        report_path.write_text(json.dumps(report))
+        set_tuning = self._ledger_cli(
+            fx, "set-tuning", "--from-report", str(report_path))
+        record_run = self._ledger_cli(
+            fx, "record-run", "--final-best-score", "0.4")
+        record = json.loads(fx["ledger_path"].read_text())["records"][1]
+        return set_tuning, record_run, record
+
+    def test_unstamped_report_settles_via_receipt_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._run_fixture(Path(tmp))
+            set_tuning, record_run, record = self._settle(fx, stamped=False)
+            self.assertEqual(set_tuning.returncode, 0, set_tuning.stderr)
+            self.assertEqual(record_run.returncode, 0, record_run.stderr)
+            self.assertEqual(record["status"], "keep")
+            self.assertEqual(
+                record["parameter_transfer"],
+                {
+                    "receipt": fx["receipt"],
+                    "inherited_control": {
+                        "warm_config_index": 0,
+                        "selected": True,
+                        "primary_parent_run_id": "001",
+                        "parent_incumbent_score": 0.5,
+                    },
+                    "warm_start_observations": [
+                        {
+                            "params": fx["receipt"]["projection"]["params"],
+                            "score": 0.4,
+                            "proposed_index": 0,
+                            "role": "inherited_control",
+                        }
+                    ],
+                },
+            )
+
+    def test_settlement_stays_fail_closed_without_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._run_fixture(Path(tmp))
+            (fx["child"] / "_parameter_transfer.json").unlink()
+            set_tuning, record_run, record = self._settle(fx, stamped=False)
+            self.assertEqual(set_tuning.returncode, 0, set_tuning.stderr)
+            self.assertEqual(record_run.returncode, 1)
+            self.assertIn(
+                "record 002.parameter_transfer is required for a non-fresh "
+                "scored candidate",
+                record_run.stderr,
+            )
+            self.assertEqual(record["status"], "pending")
+
+    def test_finalize_after_kept_rewrite_rebinds_from_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._run_fixture(Path(tmp))
+            set_tuning, record_run, record = self._settle(fx, stamped=True)
+            self.assertEqual(record_run.returncode, 0, record_run.stderr)
+            child = fx["child"]
+            train = child / "train.py"
+            train.write_text(train.read_text() + "\nREWRITTEN = True\n")
+            rebase(child, bout=1, score=0.39, attempts=1)
+            rewrite = self._ledger_cli(
+                fx, "record-rewrite", "--score", "0.39",
+                "--tune-report", str(child / "tune_report.json"))
+            self.assertEqual(rewrite.returncode, 0, rewrite.stderr)
+
+            report_path = child / "tune_report.json"
+            report = json.loads(report_path.read_text())
+            self.assertNotIn("parameter_transfer", report["phase_a"])
+            report["phase_c"] = {
+                "stages": [
+                    {
+                        "method": "bo",
+                        "status": "ok",
+                        "trials": [{"params": {"x": 0.9}, "score": 0.3}],
+                        "elapsed_seconds": 2.0,
+                        "bout_index": 0,
+                    }
+                ]
+            }
+            report_path.write_text(json.dumps(report))
+
+            result = finalize_tuning.finalize(
+                candidate_path=train,
+                report_path=report_path,
+                ledger_path=fx["ledger_path"],
+                run_id="002",
+                task_name=TASK,
+            )
+            self.assertEqual(result["final_best_score"], 0.3)
+            record = json.loads(fx["ledger_path"].read_text())["records"][1]
+            self.assertTrue(record["tune"])
+            self.assertEqual(record["status"], "keep")
+            self.assertEqual(
+                record["parameter_transfer"]["receipt"], fx["receipt"])
+            self.assertEqual(
+                record["parameter_transfer"]["warm_start_observations"],
+                [
+                    {
+                        "params": fx["receipt"]["projection"]["params"],
+                        "score": 0.4,
+                        "proposed_index": 0,
+                        "role": "inherited_control",
+                    }
+                ],
+            )
+
+    def test_backfill_helper_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._run_fixture(Path(tmp))
+            child = fx["child"]
+            record = {
+                "run_id": "002",
+                "op": "improve",
+                "source_run_ids": ["001"],
+            }
+            report = self._report(child, fx["receipt"], stamped=False)
+            rebuilt = transfer_binding_from_receipt(record, child, report=report)
+            self.assertIsNotNone(rebuilt)
+            self.assertEqual(rebuilt["receipt"], fx["receipt"])
+
+            self.assertIsNone(transfer_binding_from_receipt(
+                {**record, "op": "fresh", "source_run_ids": []},
+                child,
+                report=report,
+            ))
+            # No control row in the report and nothing durable on the record:
+            # no honest observation exists.
+            report["phase_a"]["warm_start_configs"] = [
+                {"params": {"x": 1.5}, "score": 0.45, "proposed_index": 1}
+            ]
+            self.assertIsNone(transfer_binding_from_receipt(
+                record, child, report=report))
+            # A binding already durable on the record supplies the observation.
+            durable = {
+                "receipt": fx["receipt"],
+                "inherited_control": {
+                    "warm_config_index": 0,
+                    "selected": True,
+                    "primary_parent_run_id": "001",
+                    "parent_incumbent_score": 0.5,
+                },
+                "warm_start_observations": [
+                    {
+                        "params": fx["receipt"]["projection"]["params"],
+                        "score": 0.4,
+                        "proposed_index": 0,
+                        "role": "inherited_control",
+                    }
+                ],
+            }
+            rebuilt = transfer_binding_from_receipt(
+                {**record, "parameter_transfer": durable}, child, report=report)
+            self.assertEqual(rebuilt, durable)
+
+            receipt_path = child / "_parameter_transfer.json"
+            foreign = json.loads(receipt_path.read_text())
+            foreign["candidate"]["run_id"] = "999"
+            receipt_path.write_text(json.dumps(foreign))
+            self.assertIsNone(transfer_binding_from_receipt(
+                record, child, report=report))
+            receipt_path.unlink()
+            self.assertIsNone(transfer_binding_from_receipt(
+                record, child, report=report))
 
 
 if __name__ == "__main__":

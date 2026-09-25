@@ -308,7 +308,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    argv = sys.argv[1:]
+    # argparse reads a bare negative float in scientific notation
+    # ("--gain -2.317e-06") as an option flag and exits 2; join the pair.
+    for i, tok in enumerate(argv[:-1]):
+        if tok == "--gain" and argv[i + 1].startswith("-"):
+            argv[i:i + 2] = [f"--gain={argv[i + 1]}"]
+            break
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 

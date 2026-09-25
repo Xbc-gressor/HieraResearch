@@ -28,8 +28,8 @@ from _common import write_tune_report  # noqa: E402
 from tune_tools import (  # noqa: E402
     finalizable_tuning_result,
     has_applied_close,
-    has_validated_applied_close,
     validate_phase_a_candidate_state,
+    without_stale_close,
 )
 
 
@@ -187,24 +187,10 @@ def finalize(
     if not isinstance(report, dict):
         raise ValueError("tune report must be a JSON object")
     applied_close = has_applied_close(report)
-    if applied_close and not has_validated_applied_close(report):
-        # A continuation bout extended the stage list after an earlier close.
-        # That close is proven for the stages it covered (has_applied_close
-        # above), so the BASE_PARAMS rewrite it performed is legitimate and the
-        # warm-base requirement stays off — but its closing fields bind only
-        # that covered prefix, not the extended report, and would falsely fail
-        # the global-best consistency check. They are recomputed below against
-        # every stage.
-        report = {
-            key: value
-            for key, value in report.items()
-            if key
-            not in {
-                "final_best_params",
-                "final_best_score",
-                "applied_to_base_params",
-            }
-        }
+    # A continuation bout's stale close fields are recomputed below against
+    # every stage; the BASE_PARAMS rewrite that close performed stays
+    # legitimate, so the warm-base requirement stays off.
+    report = without_stale_close(report)
     # Binds phase_a to the candidate on disk, including the SEARCH_SPACE
     # literal and execution revision.
     validate_phase_a_candidate_state(

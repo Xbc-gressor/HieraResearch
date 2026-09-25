@@ -538,8 +538,8 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
     for key in ("enabled", "targeted_retrieval"):
         if key in expansion and not isinstance(expansion[key], bool):
             raise RunConfigError(f"{path}: space_expansion.{key} must be boolean")
-    for key in ("stall_slates", "max_reviews"):
-        _validate_optional_positive_int(expansion, key, path)
+    _validate_optional_positive_int(expansion, "stall_slates", path)
+    _validate_optional_positive_number(expansion, "review_seconds", path)
     threshold = expansion.get("improvement_threshold", 0)
     if not _is_finite_number(threshold) or threshold < 0:
         raise RunConfigError(f"{path}: space_expansion.improvement_threshold must be finite and nonnegative")

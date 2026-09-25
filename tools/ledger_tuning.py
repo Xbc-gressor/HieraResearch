@@ -190,6 +190,101 @@ def applied_incumbent_from_report(
     return snapshot
 
 
+def transfer_binding_from_receipt(
+    record: dict,
+    candidate_dir: Path,
+    *,
+    report: dict | None = None,
+) -> dict | None:
+    """Rebuild the durable transfer binding from the candidate-dir receipt.
+
+    The report's ``phase_a.parameter_transfer`` stamp is only a copy of the
+    receipt written at inheritance time; report writers that legitimately
+    rebuild phase_a (a kept rewrite's rebase, or any pre-stamping evaluator)
+    drop the copy, never the binding.  The candidate-local receipt remains the
+    deterministic authority, so a ledger boundary whose report projection
+    carries no transfer may rebuild the field here instead of rejecting the
+    candidate.  The control observation is taken from the report's warm rows
+    when they prove it, else from the binding already durable on the record;
+    with neither there is no honest evidence and the caller stays fail-closed.
+    """
+    if record.get("op") not in {"improve", "crossover"}:
+        return None
+    parents = record.get("source_run_ids")
+    if not isinstance(parents, list) or not parents:
+        return None
+    tune_tools = _load_tune_tools()
+    receipt_path = (
+        Path(candidate_dir) / tune_tools.PARAMETER_TRANSFER_FILENAME
+    )
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("kind") != "primary_parent_parameter_transfer"
+    ):
+        return None
+    candidate = receipt.get("candidate")
+    primary = receipt.get("primary_parent")
+    projection = receipt.get("projection")
+    projected = (
+        projection.get("params") if isinstance(projection, dict) else None
+    )
+    if (
+        not isinstance(candidate, dict)
+        or not isinstance(primary, dict)
+        or not isinstance(projected, dict)
+        or candidate.get("run_id") != str(record.get("run_id"))
+        or primary.get("run_id") != parents[0]
+    ):
+        return None
+    if report is None:
+        try:
+            loaded = json.loads(
+                (Path(candidate_dir) / "tune_report.json").read_text()
+            )
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        report = loaded if isinstance(loaded, dict) else None
+    phase_a = report.get("phase_a") if isinstance(report, dict) else None
+    rows = (
+        phase_a.get("warm_start_configs") if isinstance(phase_a, dict) else None
+    )
+    observations = []
+    if isinstance(rows, list):
+        for row in rows:
+            if (
+                isinstance(row, dict)
+                and row.get("proposed_index") == 0
+                and row.get("params") == projected
+                and tune_tools._is_finite_score(row.get("score"))
+            ):
+                observations.append({**row, "role": "inherited_control"})
+                break
+    if not observations:
+        existing = record.get("parameter_transfer")
+        if (
+            isinstance(existing, dict)
+            and existing.get("receipt") == receipt
+            and isinstance(existing.get("warm_start_observations"), list)
+        ):
+            observations = existing["warm_start_observations"]
+    if not observations:
+        return None
+    return {
+        "receipt": receipt,
+        "inherited_control": {
+            "warm_config_index": 0,
+            "selected": True,
+            "primary_parent_run_id": primary.get("run_id"),
+            "parent_incumbent_score": primary.get("incumbent_score"),
+        },
+        "warm_start_observations": observations,
+    }
+
+
 def validate_tuning_report_ownership(
     ledger_path: Path,
     run_id: str,
@@ -304,6 +399,7 @@ def prospective_finalized_record(
     *,
     strict_attempts: int,
     validate_revision: bool = True,
+    candidate_dir: Path | None = None,
 ) -> dict:
     """Build and validate the exact record a tuning close would persist."""
     finalized = finalized_tuning_record_from_report(
@@ -315,6 +411,16 @@ def prospective_finalized_record(
         int(updates.get("trials_attempted") or 0),
         int(strict_attempts),
     )
+    if updates.get("parameter_transfer") is None:
+        rebuilt = transfer_binding_from_receipt(
+            record,
+            Path(candidate_dir)
+            if candidate_dir is not None
+            else Path(report_path).resolve().parent,
+            report=json.loads(Path(report_path).read_text()),
+        )
+        if rebuilt is not None:
+            updates["parameter_transfer"] = rebuilt
     score = float(finalized["final_best_score"])
     already_closed = (
         record.get("tune") is True

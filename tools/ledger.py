@@ -67,6 +67,7 @@ from ledger_tuning import (
     capture_transfer_parent_snapshot as _capture_transfer_parent_snapshot,
     preserve_descendant_bindings as _preserve_descendant_bindings,
     prospective_finalized_record as _prospective_finalized_record,
+    transfer_binding_from_receipt as _transfer_binding_from_receipt,
     tuning_record_from_report as _tuning_record_from_report,
     validate_tuning_report_ownership as _validate_tuning_report_ownership,
 )
@@ -382,6 +383,7 @@ def validate_tuning_finalization(
         prospective_report_path,
         strict_attempts=int(strict_attempts),
         validate_revision=False,
+        candidate_dir=ledger_path.parent / "candidates" / str(run_id),
     )
     _capture_transfer_parent_snapshot(data, prospective)
     return prospective
@@ -437,6 +439,7 @@ def finalize_tuning(
         record,
         report_path,
         strict_attempts=int(strict_attempts),
+        candidate_dir=ledger_path.parent / "candidates" / str(run_id),
     )
 
     before_graph_value = (record.get("status"), record.get("final_best_score"))
@@ -487,6 +490,15 @@ def cmd_set_tuning(args) -> int:
             updates = _tuning_record_from_report(Path(args.from_report))
         except ValueError as exc:
             raise SystemExit(str(exc)) from None
+        if updates.get("parameter_transfer") is None:
+            # The report's stamp is only a copy of the candidate-local receipt;
+            # when a projection carries no transfer, rebuild the durable field
+            # from that receipt instead of clearing it.
+            rebuilt = _transfer_binding_from_receipt(
+                record, Path(args.from_report).resolve().parent
+            )
+            if rebuilt is not None:
+                updates["parameter_transfer"] = rebuilt
     else:
         receipt = record.get("policy_receipt")
         if (
@@ -517,7 +529,10 @@ def cmd_set_tuning(args) -> int:
         # A report is the complete authority for the tuning projection.  Its
         # explicit nulls clear metadata left by an earlier partial/manual
         # update; preserving any old value would make the ledger disagree with
-        # the report that was just admitted.
+        # the report that was just admitted.  The one exception is
+        # parameter_transfer, already rebuilt from the candidate-local receipt
+        # above when the report carries no stamp: the receipt, not its report
+        # copy, is the durable authority for that binding.
         for key in TUNING_FIELDS:
             record[key] = updates.get(key)
     else:
@@ -589,6 +604,12 @@ def record_run(
         record["candidate_name"] = candidate_name
     if description:
         record["description"] = description
+    if record.get("parameter_transfer") is None and status in ("keep", "discard"):
+        rebuilt = _transfer_binding_from_receipt(
+            record, ledger_path.parent / "candidates" / str(run_id)
+        )
+        if rebuilt is not None:
+            record["parameter_transfer"] = rebuilt
     transfer_errors = validate_parameter_transfer_binding(data, record)
     if transfer_errors:
         raise ValueError("; ".join(transfer_errors))

@@ -1410,15 +1410,13 @@ def last_finalized_stage_index(report: dict) -> int | None:
     return value
 
 
-def has_applied_close(report: dict) -> bool:
-    """Whether a finalize close (any bout) applied its incumbent to BASE_PARAMS.
+def applied_close_result(report: dict) -> dict:
+    """The incumbent the last finalize close applied to BASE_PARAMS.
 
     The closing fields must prove consistent with the stages they cover —
     i.e. the stage prefix up to ``last_finalized_stage_index`` (legacy closes
     without the field covered every stage, which is all a one-shot report can
-    have)."""
-    if not isinstance(report, dict) or report.get("applied_to_base_params") is not True:
-        return False
+    have). Rows a later bout appended are not applied yet and are ignored."""
     stages = report.get("phase_c", {}).get("stages", [])
     last = last_finalized_stage_index(report)
     if last is None:
@@ -1428,7 +1426,14 @@ def has_applied_close(report: dict) -> bool:
         **report,
         "phase_c": {**phase_c, "stages": stages[: last + 1]},
     }
-    finalizable_tuning_result(prefix_report, require_applied=True)
+    return finalizable_tuning_result(prefix_report, require_applied=True)
+
+
+def has_applied_close(report: dict) -> bool:
+    """Whether a finalize close (any bout) applied its incumbent to BASE_PARAMS."""
+    if not isinstance(report, dict) or report.get("applied_to_base_params") is not True:
+        return False
+    applied_close_result(report)
     return True
 
 
@@ -1439,6 +1444,20 @@ def has_validated_applied_close(report: dict) -> bool:
     stages = report.get("phase_c", {}).get("stages", [])
     last = last_finalized_stage_index(report)
     return last is None or last == len(stages) - 1
+
+
+def without_stale_close(report: dict) -> dict:
+    """Drop closing fields that bind only a prefix of the stages.
+
+    A continuation bout extends the stage list after an earlier close. That
+    close stays proven for the stages it covered (``has_applied_close``), but
+    its fields would falsely fail the global-best check against the extended
+    report; the next finalize recomputes them over every stage."""
+    if has_applied_close(report) and not has_validated_applied_close(report):
+        return {key: value for key, value in report.items()
+                if key not in {"final_best_params", "final_best_score",
+                               "applied_to_base_params"}}
+    return report
 
 
 def _unresumable_budget_scope(candidate_path: Path) -> tuple[str | None, str]:
@@ -1695,7 +1714,7 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
             }
         if applied_close:
             return start_new_bout(bout_index + 1)
-        result = finalizable_tuning_result(report)
+        result = finalizable_tuning_result(without_stale_close(report))
         return {
             **common,
             "action": "finalize",
@@ -1708,7 +1727,7 @@ def phase_c_action(report: dict, candidate_path: Path) -> dict:
         }
     if applied_close:
         return start_new_bout(bout_index + 1)
-    result = finalizable_tuning_result(report)
+    result = finalizable_tuning_result(without_stale_close(report))
     return {
         **common,
         "action": "finalize",
@@ -2332,7 +2351,7 @@ def authoritative_parent_incumbent(
     )
     if closing_present:
         try:
-            final = finalizable_tuning_result(report, require_applied=True)
+            final = applied_close_result(report)
         except ValueError as exc:
             raise ValueError(
                 f"primary parent {parent_run_id} has untrusted closing state: {exc}"
@@ -2654,11 +2673,20 @@ def materialize_parameter_transfer(
         else:
             previous_projection = previous.get("projection", {}).get("params")
             if child_defaults == previous_projection:
-                raise ValueError(
-                    "PARAM_SCHEMA changed but warm config 0 is still the prior "
-                    "projection; materialize explicit child defaults for the new "
-                    "schema before rebuilding inheritance"
-                )
+                # Config 0 is still the old projection, not new defaults. The
+                # original defaults remain the fallback when the new schema
+                # admits them (e.g. a log/linear-only repair).
+                child_defaults = previous_candidate["defaults"]
+                try:
+                    _validate_schema_values(
+                        child_defaults, current_schema, label="original defaults"
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "PARAM_SCHEMA changed but warm config 0 is still the prior "
+                        f"projection and {exc}; materialize explicit child "
+                        "defaults for the new schema before rebuilding inheritance"
+                    ) from None
             _validate_schema_values(
                 child_defaults,
                 current_schema,

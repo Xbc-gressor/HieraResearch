@@ -154,6 +154,33 @@ def _execution_material(run_dir: Path, records: list[dict], limit: int) -> dict:
             "notice": "Recorded completions only; missing completion time and diagnostics are unknown."}
 
 
+def _coverage(registry: dict, ledger: dict, history: dict) -> dict:
+    """Attempted and scored counts for every searchable hypothesis; never display-bounded."""
+    records = ledger.get("records", [])
+    attempted = coverage_from_records(registry, records, registry_history=history)
+    scored = coverage_from_records(registry, [r for r in records if r.get("status") in {"keep", "discard"}],
+                                   registry_history=history)
+    counts = {h["hypothesis_id"]: h["count"] for d in scored["dimensions"] for h in d["hypotheses"]}
+    runtime = replay_search_space_state(registry, ledger.get("search_space_state") or {})
+    status = compose_effective_selection(registry, derive_hypothesis_selection(registry), runtime)
+    tried, untried = [], []
+    for dimension in attempted["dimensions"]:
+        if dimension["mode"] != "searchable":
+            continue
+        for hypothesis in dimension["hypotheses"]:
+            hid = hypothesis["hypothesis_id"]
+            row = {"dimension_id": dimension["dimension_id"], "hypothesis_id": hid,
+                   "status": status[hid]["effective_status"]}
+            if hypothesis["count"]:
+                tried.append({**row, "attempts": hypothesis["count"], "scored": counts.get(hid, 0)})
+            else:
+                untried.append(row)
+    return {"space_revision": attempted["space_revision"], "n_valid_records": attempted["n_valid_records"],
+            "n_unique_points": attempted["n_unique_points"], "tried": tried, "untried": untried,
+            "n_invalid_records": len(attempted["invalid_records"]),
+            "invalid_records": _bounded(attempted["invalid_records"][-3:], 3, 600)}
+
+
 def build_review_material(background: Path, *, ledger: dict, limit: int = 12,
                           goal: str | None = None, remaining_seconds: float | None = None) -> dict:
     if not 1 <= limit <= 32:
@@ -176,9 +203,7 @@ def build_review_material(background: Path, *, ledger: dict, limit: int = 12,
         return {key: record.get(key) for key in ("run_id", "op", "source_run_ids", "status",
             "semantic_point", "best_warm_score", "final_best_score", "evaluation_depth",
             "unevaluated_receipt", "error", "failure", "cost", "tune_summary") if key in record}
-    coverage = coverage_from_records(registry, records, registry_history=history)
-    coverage["point_counts"] = dict(list(coverage["point_counts"].items())[-limit:])
-    coverage["invalid_records"] = coverage["invalid_records"][-limit:]
+    coverage = _coverage(registry, ledger, history)
     # Counts are computed over all records. Recent examples are not evidence of
     # the whole run's score distribution or of training/convergence behavior.
     packet = {
@@ -198,7 +223,7 @@ def build_review_material(background: Path, *, ledger: dict, limit: int = 12,
                    "scored_examples": _bounded([fact(r) for r in records if r.get("status") in {"keep", "discard"}][-3:], 3),
                    "attempt_observations": _bounded(ledger.get("attempt_observations", [])[-limit:], limit)},
         "execution": _execution_material(background.parent, records, limit),
-        "coverage": _bounded(coverage, 32),
+        "coverage": coverage,
         "experience": _bounded(ledger.get("experience") or {}, limit),
         "read_more": [str(background), str(manifest_path), str(background.parent / "ledger.json"),
                       str(background.parent / ".semantic/space-revisions.json")],
@@ -211,18 +236,23 @@ def build_review_material(background: Path, *, ledger: dict, limit: int = 12,
     display_limit = limit
     while len(json.dumps(packet, ensure_ascii=False)) > 60000 and display_limit > 1:
         display_limit = max(1, display_limit // 2)
-        for key in ("research", "space", "guidance", "coverage", "experience"):
+        for key in ("research", "space", "guidance", "experience"):
             packet[key] = _bounded(packet[key], display_limit, 600)
         for key in ("hits", "visits"):
             packet["research_index"][key] = _bounded(packet["research_index"][key], display_limit, 600)
+        # These lists are tails of the run; keep their most recent items.
         for key in ("recent", "failure_examples", "scored_examples", "attempt_observations"):
-            packet["search"][key] = _bounded(packet["search"][key], display_limit, 600)
-        packet["execution"]["candidate_diagnostics"] = _bounded(packet["execution"]["candidate_diagnostics"], display_limit, 600)
+            packet["search"][key] = _bounded(packet["search"][key][-display_limit:], display_limit, 600)
+        packet["execution"]["candidate_diagnostics"] = _bounded(
+            packet["execution"]["candidate_diagnostics"][-display_limit:], display_limit, 600)
     progress_path = background.parent / ".semantic/space-review-state.json"
     if progress_path.exists():
         state = json.loads(progress_path.read_text())
-        packet["expansion_progress"] = {"reviews": _bounded(state.get("reviews", []), 2),
-                                        "probes": _bounded(state.get("probes", {}), 2)}
+        packet["expansion_progress"] = {"reviews": _bounded(state["reviews"][-4:], 4),
+                                        "probes": _bounded(state["probes"], 4)}
+        # Each entry is the boundary where the system best (including
+        # rewrite/tune) was first seen lower, and the operation behind it.
+        packet["best_history"] = state["best_history"]
     packet["display_limit"] = display_limit
     return packet
 

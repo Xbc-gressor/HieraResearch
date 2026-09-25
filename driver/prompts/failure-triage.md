@@ -28,7 +28,9 @@ Pick exactly one scope from the payload's `menu`:
 - `disable_action` — the failure sits in machinery the action shares across
   targets (a driver or tool bug, an interface mismatch, a broken shared
   dependency): every other target would hit it too. The action stops for
-  the rest of the run; the other actions continue.
+  the rest of the run; the other actions continue. `GENERATION` only
+  pauses: it resumes after the next rewrite/tune round has changed the
+  candidate pool.
 - `retry_once` — the failure looks transient (a timeout, a relay or network
   error, a resource that was briefly busy). Nothing is excluded; if the
   same failure recurs, it is excluded anyway.

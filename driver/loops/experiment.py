@@ -459,8 +459,8 @@ def _note_seat_skip(run_dir, repo_root, cmd, events, *, role, problems,
         if _scheduler_policy(run_dir) != rounds.POLICY_ID:
             _or_block(run_dir, repo_root, cmd, events, reason,
                       cls=BlockClass.EMPTY_FRONTIER)
-        # round_v1: the failing action leaves the frontier; the run goes on
-        # with what remains and finishes degraded when nothing does
+        # round_v1: the failing action leaves the frontier (GENERATION only
+        # until the next optimization round) and the run goes on
         action = (recovery.TUNE if role == "tuner-orchestrator"
                   else recovery.GENERATION)
         recovery.disable(run_dir, events, action,
@@ -1506,11 +1506,6 @@ def _run_seat(runner, store, task, tag, run_dir, run_id, repo_root, cmd,
     """Materialize + implement one seat inside its unit boundary: an
     unexpected failure ends this seat (and feeds the recovery policy), not
     the run. ``RunBlocked`` still propagates."""
-    if recovery.disabled(run_dir, recovery.GENERATION):
-        _skip_candidate(run_dir, repo_root, cmd, events, run_id,
-                        role="driver", count_failure=False,
-                        problems=["generation disabled by recovery policy"])
-        return
     try:
         _materialize_candidate(task, tag, run_dir, run_id, repo_root, cmd)
         _implement_candidate(runner, store, task, tag, run_dir, run_id,
@@ -2247,14 +2242,14 @@ def _settle_pinned_tune(runner, store, task, tag, run_dir, round_no, repo_root,
     tuned_id = (receipt or {}).get("tuned_run_id", "none")
     # Deterministic close first: the report/action pair, not the receipt,
     # decides whether a bout landed — an exhausted bout must be closed and
-    # applied even under a missing or tuned=false ending.
-    if not _tune_flag(run_dir, run_id):
-        finalized = _phase_c_recover_close(run_dir, run_id, repo_root, cmd,
-                                           events, task)
-        if finalized is not None:
-            return {**(receipt or {}), **finalized, "tuned": True,
-                    "tuned_run_id": run_id, "ledger_updated": True,
-                    "outcome_status": "valid"}
+    # applied even under a missing or tuned=false ending. The ledger's tune
+    # flag is no gate: a continuation bout's candidate already carries it.
+    finalized = _phase_c_recover_close(run_dir, run_id, repo_root, cmd,
+                                       events, task)
+    if finalized is not None:
+        return {**(receipt or {}), **finalized, "tuned": True,
+                "tuned_run_id": run_id, "ledger_updated": True,
+                "outcome_status": "valid"}
     after = _tuning_snapshot(run_dir, run_id)
     if after == before:
         # Zero progress by persistent state: infra failure, no
@@ -3015,6 +3010,8 @@ def _round_step(runner, store, task, tag, run_dir, round_no, task_toml,
     progressed = rounds.optimization_phase(
         runner, store, task, tag, run_dir, round_no, task_toml, repo_root,
         cmd, events, tune=tune, config=view["config"])
+    # a paused generation resumes on the pool this round produced
+    recovery.lift(run_dir, events, recovery.GENERATION)
     return [], progressed
 
 
@@ -3197,15 +3194,6 @@ def run_experiment(task, tag, *, runner, model, repo_root=REPO_ROOT,
             # candidates), then one optimization phase over the full pool.
             # -----------------------------------------------------------------
             if _scheduler_policy(run_dir) == rounds.POLICY_ID:
-                if all(recovery.disabled(run_dir, action) for action in
-                       (recovery.GENERATION, recovery.REWRITE, recovery.TUNE)):
-                    events.emit("recovery_choice", layer="run",
-                                signature="empty_frontier",
-                                frontier=["finish_degraded"],
-                                choice="finish_degraded", chooser="default")
-                    _complete_run(run_dir, repo_root, cmd, events,
-                                  stop_condition="degraded_empty_frontier")
-                    break
                 recovery_version = recovery.version(run_dir)
                 actions, tuner_progressed = _round_step(
                     runner, store, task, tag, run_dir, round_no, task_toml,

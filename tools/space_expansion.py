@@ -10,12 +10,13 @@ from pathlib import Path
 from evaluation_budget import (time_budget, reserve_budget, settle_reservation,
     outstanding_reservations, BudgetReservationDenied, _read_budget_rows)
 from scheduler.contract import DEFAULT_K_EVAL
+from scheduler.round_policy import POLICY_ID as ROUND_POLICY, load_round_state
 from run_cfg import read_framework_cfg
 from semantic_evidence import LIFECYCLE_TERMINAL_STATUSES
 from space_revisions import load_revision_state
 
 DEFAULTS = {'enabled': False, 'stall_slates': 2, 'improvement_threshold': 0.0,
-            'max_reviews': 2, 'targeted_retrieval': False}
+            'review_seconds': 1800, 'targeted_retrieval': False}
 STATE = Path('.semantic/space-review-state.json')
 
 
@@ -35,7 +36,7 @@ def load_state(run):
     path = Path(run)/STATE
     if path.exists():
         return json.loads(path.read_text())
-    return {'seen_slates': [], 'best_by_domain': {}, 'stalled_slates': 0, 'reviews': [],
+    return {'seen_slates': [], 'best_history': [], 'stalled_slates': 0, 'reviews': [],
             'cancelled_reservations': [], 'probes': {},
             'initial_search_seconds': time_budget(run)['usable_seconds']}
 
@@ -63,6 +64,38 @@ def pending_expansion(run):
     return {'probe': probe, 'space': version['space'], 'review': version['review'], 'admission': admission}
 
 
+def _optimized(run):
+    """Whether current strategy has had an optimization round to act.
+
+    Seed slates precede any improve/crossover/rewrite/tune, so their stall says
+    nothing about the space. Non-round schedulers tune after every generation.
+    """
+    tuner = read_framework_cfg(run/'framework_cfg.json').get('tuner') or {}
+    return tuner.get('scheduler_policy') != ROUND_POLICY or int(load_round_state(run).get('cycle', 0)) >= 1
+
+
+def _score_source(record, score):
+    """Operation that produced a record's current score, from its settlement fields."""
+    warm = record.get('best_warm_score')
+    if record.get('tune') and isinstance(warm, (float, int)) and score < warm:
+        return 'tune'
+    if record.get('rewrite_bouts'):
+        return 'rewrite'
+    return record.get('op')
+
+
+def best_by_domain(state):
+    best = {}
+    for row in state['best_history']:
+        best[row['domain']] = min(row['score'], best.get(row['domain'], math.inf))
+    return best
+
+
+def stall_threshold(cfg, state):
+    """S_k = stall_slates * 2^k, k published expansions."""
+    return cfg['stall_slates'] * 2**sum(r['status'] == 'expanded' for r in state['reviews'])
+
+
 def observe_boundary(run, ledger):
     run = Path(run)
     cfg, state = config(run), load_state(run)
@@ -73,7 +106,7 @@ def observe_boundary(run, ledger):
             groups.setdefault(generation, []).append(row)
     unseen = [gid for gid, rows in groups.items() if gid not in state['seen_slates']
               and all(r.get('status') in LIFECYCLE_TERMINAL_STATUSES for r in rows)]
-    scores = {}
+    best = {}
     for record in ledger.get('records', []):
         if record.get('status') not in {'keep', 'discard'}:
             continue
@@ -85,20 +118,24 @@ def observe_boundary(run, ledger):
         # semantic explanation for a score delta.
         domain = record.get('evaluation_domain') or {'task': run.parent.name, 'surface': 'fixed-task-evaluator'}
         key = json.dumps(domain, sort_keys=True)
-        scores[key] = min(score, scores.get(key, math.inf))
-    prior = state['best_by_domain']
-    improved = (not prior and bool(scores)) or any(
-        key in prior and value < prior[key]-cfg['improvement_threshold'] for key, value in scores.items())
+        if score < best.get(key, (math.inf,))[0]:
+            best[key] = (score, record)
+    prior = best_by_domain(state)
+    improved = (not prior and bool(best)) or any(
+        key in prior and score < prior[key]-cfg['improvement_threshold'] for key, (score, _) in best.items())
     if improved:
         state['stalled_slates'] = 0
-    elif unseen:
+    elif unseen and _optimized(run):
         state['stalled_slates'] += len(unseen)
     # Seed observations and optimization progress are retained even between
     # completed slates. A new evaluation domain never counts as improvement.
-    state['best_by_domain'] = {**prior, **{key:min(value, prior.get(key, math.inf)) for key,value in scores.items()}}
+    for key, (score, record) in best.items():
+        if score < prior.get(key, math.inf):
+            state['best_history'].append({'observed_at': time.time(), 'domain': key, 'score': score,
+                'run_id': record.get('run_id'), 'source': _score_source(record, score)})
     state['seen_slates'].extend(unseen)
-    state['review_due'] = (cfg['enabled'] and bool(unseen) and state['stalled_slates'] >= cfg['stall_slates']
-        and len(state['reviews']) < cfg['max_reviews'] and pending_expansion(run) is None
+    state['review_due'] = (cfg['enabled'] and bool(unseen) and state['stalled_slates'] >= stall_threshold(cfg, state)
+        and pending_expansion(run) is None
         and not any(r.get('status') == 'pending' for r in ledger.get('records', [])))
     write_json(run/STATE, state)
     return state
@@ -125,20 +162,24 @@ def regular_cost(run):
 
 
 def reserve_review(run):
-    state, cost = load_state(run), regular_cost(run)
+    cfg, state, cost = config(run), load_state(run), regular_cost(run)
     initial = state['initial_search_seconds']
     if initial is None:
         raise BudgetReservationDenied('unbounded_search_time', 'review share requires a run deadline')
-    allowance = min(cost['implementation_seconds']+cost['screening_seconds'],
-                    .1*initial-sum(r['budget_seconds'] for r in state['reviews']))
+    # The review share is a backstop charged at actual wall clock; the session
+    # limit is fixed and independent of candidate cost.
+    allowance = min(cfg['review_seconds'], .1*initial-sum(r.get('elapsed_seconds', r['budget_seconds'])
+                                                            for r in state['reviews']))
     if allowance <= 0:
         raise BudgetReservationDenied('review_share_exhausted')
     candidate_seconds = cost['implementation_seconds']+cost['screening_seconds']+cost['planning_seconds']
     reservation = reserve_budget(run, label='space_probe_slate',
         seconds=2*candidate_seconds+allowance, evaluations=2*cost['evaluations'], note=cost['source'])
+    # The review runs synchronously on the driver's own clock; only the slate stays held.
     settle_reservation(run, reservation['reservation_id'], consumed_seconds=allowance)
-    review = {'index':len(state['reviews'])+1, 'budget_seconds':allowance,
-              'deadline_epoch':time.time()+allowance, 'reservation_id':reservation['reservation_id'], 'status':'reviewing'}
+    now = time.time()
+    review = {'index':len(state['reviews'])+1, 'budget_seconds':allowance, 'started_epoch':now,
+              'deadline_epoch':now+allowance, 'reservation_id':reservation['reservation_id'], 'status':'reviewing'}
     state['reviews'].append(review)
     state.update(stalled_slates=0, review_due=False)
     write_json(run/STATE,state)
@@ -147,7 +188,11 @@ def reserve_review(run):
 
 def finish_review(run, index, status, **details):
     state = load_state(run)
-    state['reviews'][index-1].update(status=status, **details)
+    review = state['reviews'][index-1]
+    review.update(status=status, **details)
+    if status != 'reviewing' and 'elapsed_seconds' not in review:
+        # Capped so downtime before an interrupted review's recovery is not charged.
+        review['elapsed_seconds'] = min(time.time()-review['started_epoch'], review['budget_seconds'])
     write_json(run/STATE,state)
 
 

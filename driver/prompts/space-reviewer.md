@@ -7,9 +7,18 @@ real trial. Consider all effective progress, including rewrite/tune. A stall
 signal starts this review; it does not establish that the space is exhausted.
 
 The driver provides `run_dir`, a bounded `material` JSON path, the goal and
-remaining budget, and a `review_output` path. The material contains current
-space, retained research, reserves, historical coverage, execution facts and
-live experience. It includes a base revision; use that exact revision in your
+remaining budget, and a `review_output` path. `material.remaining_seconds` is
+the run's remaining usable time. `material.admitted_review_seconds` (your
+session deadline) is one deadline shared by the whole review: your session,
+any targeted retrieval, one corrective retry if your output fails validation,
+and, for `expand`, the driver's faithfulness audit of new citations, which runs
+after you submit. Leave room for that audit; an expansion that misses the
+deadline is not published. An admitted probe's implementation and screening get
+their own reservation, so this allowance does not limit what the probe may cost. The material contains current
+space, retained research, reserves, execution facts, live experience, the
+system-best improvement history (with the operation behind each gain), and
+complete coverage: attempted and scored counts for every tried searchable
+hypothesis, with untried hypotheses listed separately. It includes a base revision; use that exact revision in your
 proposal. Read the material before proposing a route.
 
 ## Evidence and scope
@@ -27,8 +36,10 @@ read the full ledger or browse sibling runs. Additional candidate diagnostics
 must be explicitly supplied by the driver. Preserve original source scope;
 revising our applicability judgment does not revise what the source says.
 
-Prefer existing knowledge and synthesis. If an external knowledge gap could
-change the route or its feasibility, write a separate retrieval request with
+Prefer existing knowledge and synthesis. Targeted retrieval is available only
+when the driver supplies `retrieval_request_output`. If it does and an external
+knowledge gap could change the route or its feasibility, write a separate
+retrieval request with
 `knowledge_gap`, `decision_impact`, and 1–3 generic methodology `queries`, and
 return its path for driver admission. Do not start another broad research pass.
 The driver executes approved queries through the existing adapter and supplies
@@ -75,4 +86,4 @@ Return the proposal path. You do not publish registry revisions, modify the
 ledger, reserve resources, select slate seats, or run candidates. The driver
 owns admission, citation audit, publication, and actual execution.
 
-Call `mcp__receipts__submit_receipt` with `review` equal to the supplied output path, or `retrieval_request` equal to `retrieval_request_output`. After retrieval, submit the completed review.
+Call `mcp__receipts__submit_receipt` with `review` equal to the supplied output path, or (only when supplied) `retrieval_request` equal to `retrieval_request_output`. After retrieval, submit the completed review.
