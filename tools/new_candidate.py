@@ -8,9 +8,11 @@ import hashlib
 import json
 import shlex
 import shutil
+import statistics
 from pathlib import Path
 from typing import Optional
 
+from run_cfg import load_run_cfg
 from validate_tasks import ROOT, parse_task_toml
 
 
@@ -182,7 +184,7 @@ def candidate_brief(
             )
             if parents and primary_parent is None:
                 return None
-            return {
+            brief = {
                 "schema_version": 4,
                 "run_id": run_id,
                 "op": record.get("op"),
@@ -212,7 +214,27 @@ def candidate_brief(
                     )
                 ),
             }
+            if load_run_cfg(ledger_path.parent, "cost_signals").get("writer", True):
+                brief["evaluation_time"] = _evaluation_time(data, parents)
+            return brief
     return None
+
+
+def _evaluation_time(data: dict, parents: list) -> dict:
+    """Measured screening cost: the run's typical level and each parent's."""
+    seconds = {
+        str(record.get("run_id")): record.get("screening_eval_seconds")
+        for record in data.get("records", [])
+    }
+    measured = [value for value in seconds.values() if value is not None]
+    return {
+        "run_median_screening_eval_seconds": (
+            round(statistics.median(measured), 1) if measured else None
+        ),
+        "parent_screening_eval_seconds": {
+            parent: seconds.get(parent) for parent in parents
+        },
+    }
 
 
 def main() -> int:

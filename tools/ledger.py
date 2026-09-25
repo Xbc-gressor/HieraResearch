@@ -45,7 +45,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-from evaluation_budget import budget_status
+from evaluation_budget import budget_status, median_eval_seconds
 from space_revisions import load_registry_history
 from ledger_core import (
     CRASH_SENTINEL,
@@ -604,6 +604,13 @@ def record_run(
         record["candidate_name"] = candidate_name
     if description:
         record["description"] = description
+    if before_graph_value[0] not in ("keep", "discard"):
+        # Frozen with the screening observation: A1 replays render it from
+        # the ledger prefix, so later bouts never rewrite it.
+        seconds = median_eval_seconds(ledger_path.parent, "phase_a", run_id)
+        record["screening_eval_seconds"] = (
+            None if seconds is None else round(seconds, 1)
+        )
     if record.get("parameter_transfer") is None and status in ("keep", "discard"):
         rebuilt = _transfer_binding_from_receipt(
             record, ledger_path.parent / "candidates" / str(run_id)

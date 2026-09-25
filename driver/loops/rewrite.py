@@ -212,9 +212,14 @@ def _note_wait(waits, lease) -> None:
         waits.append(float((lease or {}).get("lease_wait_seconds") or 0.0))
 
 
+def _exempt_flag(round_quota_exempt: bool) -> list[str]:
+    return ["--round-quota-exempt"] if round_quota_exempt else []
+
+
 def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
                task_toml, *, waits: list | None = None,
-               wait_timeout: float | None = None) -> str | None:
+               wait_timeout: float | None = None,
+               round_quota_exempt: bool = False) -> str | None:
     """The task's no-score gate; returns an error tail on failure.
     ``waits`` collects the lease queueing seconds (not the candidate's cost)."""
     owner = {"task": task, "run_dir": str(candidate),
@@ -224,12 +229,14 @@ def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
         _note_wait(waits, lease)
         proc = cmd(["uv", "--project", common.task_project(task, task_toml), "run", "python",
                     repo_root / "tools" / "preflight_candidate.py",
-                    "--candidate-path", candidate / "train.py"],
+                    "--candidate-path", candidate / "train.py",
+                    *_exempt_flag(round_quota_exempt)],
                    repo_root, check=False, env=_leased_env(lease))
-    if proc.returncode in (0, 4):
-        # A budget cutoff supplies no feasibility evidence. Let rewrite_eval's
-        # admission gate return its existing budget exit, which reverts the edit
-        # without a repair session or a crash journal entry.
+    if proc.returncode in (0, 4, 5):
+        # A budget cutoff (run or round quota) supplies no feasibility
+        # evidence. Let rewrite_eval's admission gate return its budget exit,
+        # which reverts the edit without a repair session or a crash journal
+        # entry.
         return None
     return ("candidate preflight failed. stderr tail:\n"
             + (proc.stderr or "")[-3000:]
@@ -238,15 +245,18 @@ def _preflight(task: str, candidate: Path, repo_root: Path, cmd,
 
 def _evaluate(task: str, candidate: Path, repo_root: Path, cmd,
               task_toml, *, waits: list | None = None,
-              wait_timeout: float | None = None) -> tuple[int, dict]:
-    """One rewrite_eval call: (returncode, payload). Exit 4 = budget out;
-    stage "params" = BASE_PARAMS unreadable (no budget spent)."""
+              wait_timeout: float | None = None,
+              round_quota_exempt: bool = False) -> tuple[int, dict]:
+    """One rewrite_eval call: (returncode, payload). Exit 4 = run budget
+    out, exit 5 = round quota out; stage "params" = BASE_PARAMS unreadable
+    (no budget spent)."""
     owner = {"task": task, "run_dir": str(candidate), "kind": "rewrite_eval"}
     with task_resource_lease(task_toml or {}, owner=owner,
                              **_lease_kwargs(wait_timeout)) as lease:
         _note_wait(waits, lease)
         proc = cmd(["python", "tools/rewrite_eval.py", "--candidate",
-                    candidate], repo_root, check=False, env=_leased_env(lease))
+                    candidate, *_exempt_flag(round_quota_exempt)],
+                   repo_root, check=False, env=_leased_env(lease))
     try:
         payload = json.loads(proc.stdout or "")
     except ValueError:
@@ -351,25 +361,45 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
               noise_margin, context, task_toml, repo_root, cmd,
               events, *, reference: float | None = None,
               confirm: bool = False, run_best: float | None = None,
+              confirm_policy: str = "always",
+              round_quota_exempt: bool = False,
               lease_wait_timeout: float | None = None) -> dict:
     """Run one bout.
 
-    Returns {"status": "done" | "budget" | "no_reference", "outcome",
-    "score", "reference", "attempts", "lease_wait_seconds"}. ``reference``
-    overrides the journal-derived incumbent (the experiment loop passes the
-    ledger score); ``confirm`` re-evaluates a kept edit once and folds that
-    score into the reference so one lucky sample cannot anchor later
-    adjudications. ``lease_wait_seconds`` is the time this bout queued for
-    the device (another channel's GPU time, never this candidate's cost);
+    Returns {"status": "done" | "budget" | "round_quota" | "no_reference",
+    "outcome", "score", "reference", "attempts", "lease_wait_seconds"}.
+    ``reference`` overrides the journal-derived incumbent (the experiment
+    loop passes the ledger score); ``confirm`` re-evaluates a kept edit once
+    and folds that score into the reference so one lucky sample cannot
+    anchor later adjudications. Under ``confirm_policy="above_run_best"``
+    only a keep that beats ``run_best`` is confirmed — a trailing keep
+    cannot become the incumbent, so its kept score stands as the reference.
+    The confirmation is always round-quota-exempt; ``round_quota_exempt``
+    extends that to the whole bout (the round's released step).
+    ``lease_wait_seconds`` is the time this bout queued for the device
+    (another channel's GPU time, never this candidate's cost);
     ``lease_wait_timeout`` bounds that queueing.
     """
     waits: list[float] = []
-    lease = {"waits": waits, "wait_timeout": lease_wait_timeout}
+    lease = {"waits": waits, "wait_timeout": lease_wait_timeout,
+             "round_quota_exempt": round_quota_exempt}
 
     def _result(status: str, **fields) -> dict:  # noqa: F811 - bout-scoped
         return {"status": status, "outcome": None, "score": None,
                 "reference": None, "attempts": 0,
                 "lease_wait_seconds": sum(waits), **fields}
+
+    def _out_of_budget(returncode: int) -> dict | None:
+        # The unverified edit must not survive either refusal; exit 5 (the
+        # round quota) ends only the caller's climb, exit 4 the run.
+        if returncode not in (4, 5):
+            return None
+        _revert(candidate, snapshot, repo_root, cmd)
+        scope = "round_quota" if returncode == 5 else "run"
+        events.emit("budget_exhausted", candidate=candidate.name, bout=bout,
+                    scope=scope)
+        return _result("round_quota" if returncode == 5 else "budget",
+                       reference=best)
 
     bout = len(bouts) + 1
     _render_context(candidate, context, repo_root, cmd)
@@ -439,12 +469,9 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
         returncode, payload = _leased(
             lambda: _evaluate(task, candidate, repo_root, cmd, task_toml, **lease),
             candidate, snapshot, repo_root, cmd)
-        if returncode == 4:
-            # Budget exhausted: the unverified edit must not survive.
-            _revert(candidate, snapshot, repo_root, cmd)
-            events.emit("budget_exhausted", candidate=candidate.name,
-                        bout=bout)
-            return _result("budget", reference=best)
+        stopped = _out_of_budget(returncode)
+        if stopped is not None:
+            return stopped
         error_tail = _params_error(payload)
         if error_tail is not None:
             payload = None
@@ -480,11 +507,9 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
                     lambda: _evaluate(task, candidate, repo_root, cmd,
                                       task_toml, **lease),
                     candidate, snapshot, repo_root, cmd)
-                if returncode == 4:
-                    _revert(candidate, snapshot, repo_root, cmd)
-                    events.emit("budget_exhausted", candidate=candidate.name,
-                                bout=bout)
-                    return _result("budget", reference=best)
+                stopped = _out_of_budget(returncode)
+                if stopped is not None:
+                    return stopped
                 error_tail = _params_error(payload)
                 if error_tail is not None:
                     payload = None
@@ -504,23 +529,35 @@ def _run_bout(task, tag, run_dir, candidate, bouts, runner, store, metric,
     new_reference = result["best"]
     if result["outcome"] == "kept" and confirm:
         # Confirmation re-eval: the keep stands; only the reference moves.
-        try:
-            returncode, confirmation = _evaluate(task, candidate, repo_root,
-                                                 cmd, task_toml, **lease)
-        except ResourceUnavailable as exc:
-            # The keep is already journaled: skip only the reference move.
-            events.emit("resource_unavailable", candidate=candidate.name,
-                        stage="confirm", reason=str(exc))
-            return _result("done", outcome=result["outcome"],
-                           score=payload.get("score"),
-                           reference=new_reference, attempts=attempts)
-        if returncode != 4:
+        # A skipped confirmation leaves the kept score as the reference.
+        skipped = None
+        if (confirm_policy == "above_run_best" and run_best is not None
+                and payload["score"] >= run_best):
+            skipped = "not_above_run_best"
+        else:
+            try:
+                returncode, confirmation = _evaluate(
+                    task, candidate, repo_root, cmd, task_toml,
+                    **{**lease, "round_quota_exempt": True})
+            except ResourceUnavailable as exc:
+                skipped, detail = "resource_unavailable", str(exc)
+            else:
+                if returncode in (4, 5):
+                    skipped = "round_quota" if returncode == 5 else "run_budget"
+                    detail = confirmation.get("error")
+        if skipped is None:
             entry = _confirm(candidate, bout, confirmation, repo_root, cmd)
             new_reference = entry["reference"]
             attempts += 1 if confirmation.get("attempt_id") else 0
             events.emit("bout_confirmed", candidate=candidate.name, bout=bout,
                         score=confirmation.get("score"),
                         reference=new_reference)
+        else:
+            events.emit("confirm_skipped", candidate=candidate.name, bout=bout,
+                        reason=skipped, score=payload["score"],
+                        run_best=run_best,
+                        **({} if skipped == "not_above_run_best"
+                           else {"detail": detail}))
     return _result("done", outcome=result["outcome"],
                    score=payload.get("score"), reference=new_reference,
                    attempts=attempts)

@@ -4,6 +4,9 @@
 This is the hillclimb counterpart to the tuners' preflight path.  It reads the
 params used by the standalone entrypoint, then delegates to the same isolated,
 timeout-bounded task hook.  It never reserves an objective slot.
+
+Exit codes: 0 ok / not declared, 3 preflight failed, 4 run budget exhausted,
+5 the open round's quota exhausted (``--round-quota-exempt`` skips that gate).
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ def read_standalone_params(candidate_path: Path) -> tuple[str, dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-path", required=True, type=Path)
+    parser.add_argument("--round-quota-exempt", action="store_true")
     args = parser.parse_args()
     candidate_path = args.candidate_path.resolve()
     if not candidate_path.is_file():
@@ -61,10 +65,12 @@ def main() -> int:
 
     try:
         params_name, params = read_standalone_params(candidate_path)
-        result = timed_preflight(params, candidate_path)
+        result = timed_preflight(
+            params, candidate_path, round_quota_exempt=args.round_quota_exempt
+        )
     except EvaluationBudgetExhausted as exc:
         print(json.dumps({"status": "budget_exhausted", "scope": exc.scope, "objective_calls": 0}))
-        return 4
+        return 5 if exc.scope == "round_quota" else 4
     except Exception as exc:
         print(
             json.dumps(

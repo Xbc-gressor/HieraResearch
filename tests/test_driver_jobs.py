@@ -104,6 +104,39 @@ def test_warmstart_job_no_donor_binding_adds_no_flag(tmp_path: Path) -> None:
     assert "--donor-snapshot" not in argv
 
 
+def test_warmstart_job_injects_screening_cost_stop_scalars(tmp_path: Path) -> None:
+    repo, ctx = _fixture(tmp_path)
+    request = {"kind": "warmstart", "run_id": "007", "k_eval": 2}
+    # First candidate of the run: no median, no incumbent -> no flags.
+    assert "--cost-stop-incumbent" not in build_driver_job(
+        "driver", ctx, request, repo_root=repo)[0]
+    rows = []
+    for index, (phase, seconds) in enumerate(
+            [("phase_a", 10), ("phase_a", 50), ("phase_a", 30), ("rewrite", 900)]):
+        rows += [{"schema_version": 1, "kind": "score_attempt",
+                  "attempt_id": f"a{index}", "phase": phase},
+                 {"schema_version": 1, "kind": "score_completion",
+                  "attempt_id": f"a{index}", "duration_seconds": seconds}]
+    (ctx.run_dir / "evaluation_attempts.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows))
+    (ctx.run_dir / "ledger.json").write_text(json.dumps({"records": [
+        {"run_id": "001", "best_warm_score": 0.3},
+        {"run_id": "002", "best_warm_score": 0.1, "rewrite_bouts": 2},
+        {"run_id": "007", "best_warm_score": 0.2},
+    ]}))
+    argv = build_driver_job("driver", ctx, request, repo_root=repo)[0]
+    assert float(argv[argv.index("--cost-stop-threshold-seconds") + 1]) == 120
+    assert float(argv[argv.index("--cost-stop-incumbent") + 1]) == 0.3
+    (ctx.run_dir / "framework_cfg.json").write_text(json.dumps(
+        {"screening_cost_stop": {"multiplier": 5, "floor_seconds": 60}}))
+    argv = build_driver_job("driver", ctx, request, repo_root=repo)[0]
+    assert float(argv[argv.index("--cost-stop-threshold-seconds") + 1]) == 150
+    (ctx.run_dir / "framework_cfg.json").write_text(json.dumps(
+        {"screening_cost_stop": {"enabled": False}}))
+    assert "--cost-stop-incumbent" not in build_driver_job(
+        "driver", ctx, request, repo_root=repo)[0]
+
+
 def test_phase_c_job_must_match_deterministic_action(tmp_path: Path) -> None:
     repo, ctx = _fixture(tmp_path)
     request = {

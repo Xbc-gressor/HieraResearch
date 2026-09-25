@@ -464,10 +464,19 @@ def _validate_round_config(section: dict, path: Path) -> None:
         "rewrite_stall_after",
         "noise_margin",
         "session_overhead_seconds",
+        "rewrite_confirm_policy",
+        "rewrite_round_release",
     }
     unknown = sorted(set(section) - known)
     if unknown:
         raise RunConfigError(f"{path}: unknown round keys {unknown}")
+    if section.get("rewrite_confirm_policy", "always") not in (
+            "always", "above_run_best"):
+        raise RunConfigError(
+            f"{path}: round.rewrite_confirm_policy must be 'always' or "
+            "'above_run_best'")
+    if not isinstance(section.get("rewrite_round_release", True), bool):
+        raise RunConfigError(f"{path}: round.rewrite_round_release must be boolean")
     for key in ("new_candidates", "rewrite_top_k", "rewrite_max_bouts",
                 "rewrite_stall_after"):
         _validate_positive_int_override(section, key, path, label=f"round.{key}")
@@ -549,6 +558,27 @@ def _validate_framework_cfg(config: dict, path: Path) -> None:
         if not isinstance(judged_slate, dict):
             raise RunConfigError(f"{path}: judged_slate must be an object")
         _validate_judged_slate_config(judged_slate, path)
+
+    cost_stop = config.get("screening_cost_stop", {})
+    if not isinstance(cost_stop, dict):
+        raise RunConfigError(f"{path}: screening_cost_stop must be an object")
+    unknown = sorted(set(cost_stop) - {"enabled", "multiplier", "floor_seconds"})
+    if unknown:
+        raise RunConfigError(f"{path}: unknown screening_cost_stop keys {unknown}")
+    if "enabled" in cost_stop and not isinstance(cost_stop["enabled"], bool):
+        raise RunConfigError(f"{path}: screening_cost_stop.enabled must be boolean")
+    for key in ("multiplier", "floor_seconds"):
+        _validate_positive_number_override(cost_stop, key, path)
+
+    cost_signals = config.get("cost_signals", {})
+    if not isinstance(cost_signals, dict):
+        raise RunConfigError(f"{path}: cost_signals must be an object")
+    unknown = sorted(set(cost_signals) - {"judge", "writer"})
+    if unknown:
+        raise RunConfigError(f"{path}: unknown cost_signals keys {unknown}")
+    for key, value in cost_signals.items():
+        if not isinstance(value, bool):
+            raise RunConfigError(f"{path}: cost_signals.{key} must be boolean")
 
     pipeline = config.get("pipeline")
     if pipeline is not None:

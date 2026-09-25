@@ -12,9 +12,19 @@ One REWRITE decision opens one *climb* on the selected candidate: the
 driver hillclimbs it step by step (edit -> evaluate -> keep/revert, each
 step a journaled bout) until the candidate stalls, hits its bout cap, or
 the phase quota runs out. The ``expected_seconds`` priced here is the
-climb's admission ticket — its first step (one adjudication eval plus the
-confirmation re-eval after a keep, plus session overhead); the driver
-re-checks the quota between steps.
+climb's admission ticket — its first step, :func:`rewrite_step_seconds`
+(one adjudication eval plus session overhead, plus the confirmation re-eval
+when a keep must be confirmed); the driver re-checks the quota between
+steps with the same price.
+
+Under ``rewrite_confirm_policy="above_run_best"`` only a keep that beats
+the run best is confirmed, so only the run-best candidate pays the second
+eval up front ("always" confirms every keep). With
+``rewrite_round_release`` the round's first rewrite step is admitted
+against the run's usable time minus the tune reserve instead of the phase
+quota, and runs exempt from round-quota refusals (the flag
+``rewrite_released`` in the round state, reset per phase); a candidate
+whose step exceeds ``round_seconds`` is thereby not structurally excluded.
 
 Rewrite eligibility: finite reference score, no in-flight tuning bout,
 under the rewrite bout cap, not stalled, top-``k`` by current best. Among
@@ -56,6 +66,8 @@ DEFAULTS: dict = {
     "rewrite_stall_after": 5,
     "noise_margin": 0.0,
     "session_overhead_seconds": 600.0,
+    "rewrite_confirm_policy": "above_run_best",
+    "rewrite_round_release": True,
 }
 
 
@@ -201,6 +213,7 @@ def begin_optimization(run_dir: Path, *, now: float | None = None) -> dict:
     state["phase"] = "optimize"
     state["phase_started_at"] = now
     state["phase_deadline"] = None if quota is None else now + float(quota)
+    state["rewrite_released"] = False
     save_round_state(run_dir, state)
     return state
 
@@ -241,6 +254,62 @@ def overhead_estimate(config: dict, state: dict, kind: str) -> float:
     if observed:
         return sum(observed) / len(observed)
     return float(config["session_overhead_seconds"])
+
+
+def rewrite_step_seconds(config: dict, mean: float | None, overhead: float,
+                         *, leads_run: bool) -> float | None:
+    """One climb step's price: the adjudication eval plus session overhead,
+    plus the confirmation re-eval when a keep must be confirmed — every keep
+    under ``rewrite_confirm_policy="always"``, otherwise only when the
+    candidate leads the run (any keep of it then beats the run best)."""
+    if mean is None:
+        return None
+    confirms = config["rewrite_confirm_policy"] == "always" or leads_run
+    return (2.0 if confirms else 1.0) * float(mean) + float(overhead)
+
+
+def candidate_mean_seconds(status: dict, run_id: str) -> float | None:
+    """The candidate's mean eval seconds from a ``budget_status`` view,
+    falling back to the run-wide mean."""
+    row = next((r for r in status.get("per_candidate", [])
+                if r.get("run_id") == run_id), None)
+    mean = row.get("mean_seconds") if row else None
+    return status.get("mean_eval_seconds") if mean is None else mean
+
+
+def release_base(run_dir: Path, tune_reserve: float, *,
+                 now: float | None = None) -> float | None:
+    """The round release's admission base: usable run time (net of the
+    final reserve) minus the tune reserve."""
+    from evaluation_budget import time_budget
+
+    usable = time_budget(Path(run_dir), now=now)["usable_seconds"]
+    return None if usable is None else max(0.0, usable - float(tune_reserve))
+
+
+def claim_rewrite_release(run_dir: Path, expected: float | None,
+                          tune_reserve: float, *,
+                          now: float | None = None) -> dict:
+    """Claim this phase's one released rewrite step, atomically.
+
+    Released when the phase is open, no step has been released yet, and
+    ``expected`` fits :func:`release_base`; the claimed step is admitted
+    past the phase quota and runs round-quota-exempt."""
+    run_dir = Path(run_dir)
+    config = load_config(run_dir)
+    state = load_round_state(run_dir, for_update=True)
+    base = release_base(run_dir, tune_reserve, now=now)
+    released = (
+        bool(config["rewrite_round_release"])
+        and state.get("phase") == "optimize"
+        and not state.get("rewrite_released")
+        and _fits(expected, base)
+    )
+    if released:
+        state["rewrite_released"] = True
+    save_round_state(run_dir, state)
+    return {"released": released, "base_seconds": base,
+            "expected_seconds": expected}
 
 
 def quota_remaining(state: dict, *, now: float | None = None) -> float | None:
@@ -333,14 +402,18 @@ def select_rewrite(
 ) -> Decision:
     """``exclude``: candidates another rewrite channel is climbing right now
     (concurrent climbs); they are ineligible for this selection."""
+    from evaluation_budget import budget_status
+
     run_dir = Path(run_dir)
     exclude = {str(r) for r in exclude}
     config = load_config(run_dir)
     round_state = load_round_state(run_dir)
     quota = quota_remaining(round_state, now=now)
-    per_candidate, overall = _eval_seconds(run_dir)
+    status = budget_status(run_dir)
     overhead = overhead_estimate(config, round_state, "rewrite")
     top_k = int(config["rewrite_top_k"])
+    scores = [c.best_score for c in state.candidates if not c.crashed]
+    run_best = min(scores) if scores else None
 
     rows = []
     for candidate in sorted(state.candidates, key=lambda c: (c.best_score, c.run_id)):
@@ -358,10 +431,9 @@ def select_rewrite(
             reasons.append("rewrite bout cap")
         if facts["consecutive_non_kept"] >= int(config["rewrite_stall_after"]):
             reasons.append("stalled")
-        mean = per_candidate.get(candidate.run_id, overall)
-        # The climb's admission price — its first step: one adjudication
-        # eval plus the confirmation re-eval after a keep.
-        expected = None if mean is None else 2.0 * float(mean) + overhead
+        expected = rewrite_step_seconds(
+            config, candidate_mean_seconds(status, candidate.run_id), overhead,
+            leads_run=run_best is None or candidate.best_score <= run_best)
         rows.append({
             "run_id": candidate.run_id,
             "best_score": candidate.best_score,
@@ -380,7 +452,16 @@ def select_rewrite(
     }
     if not eligible:
         return Decision("STOP", None, "no rewrite-eligible candidate", evidence_mode=mode)
-    affordable = [row for row in eligible if _fits(row["expected_seconds"], quota)]
+    admission = quota
+    if (config["rewrite_round_release"] and quota is not None
+            and round_state.get("phase") == "optimize"
+            and not round_state.get("rewrite_released")):
+        # The round's first step is admitted against the run, not the quota.
+        admission = release_base(run_dir, tune_reserve(state, run_dir, config,
+                                                       now=now), now=now)
+        mode["release_base_seconds"] = admission
+    affordable = [row for row in eligible
+                  if _fits(row["expected_seconds"], admission)]
     if not affordable:
         return Decision(
             "STOP", None, "no rewrite bout fits the remaining round quota",
@@ -462,6 +543,23 @@ def select_tune(
         f"expected {target['expected_seconds']} s)",
         evidence_mode=mode,
     )
+
+
+def tune_reserve(state: SchedulerState, run_dir: Path, config: dict, *,
+                 now: float | None = None) -> float:
+    """The priced cost of the tune bout the phase would select now — the
+    tail rewrite keeps aside for tuning (0 when tuning is off or nothing
+    fits). The driver prices the same value via ``round select --kind tune
+    --peek``."""
+    if int(config["tune_bouts"]) <= 0:
+        return 0.0
+    decision = select_tune(state, run_dir, now=now)
+    if decision.action != "TUNE":
+        return 0.0
+    row = next(row for row in decision.evidence_mode["ranked"]
+               if row["run_id"] == decision.run_id)
+    expected = row["expected_seconds"]
+    return 0.0 if expected is None else max(0.0, float(expected))
 
 
 def decide(state: SchedulerState, run_dir: Path,

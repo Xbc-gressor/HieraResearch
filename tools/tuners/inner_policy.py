@@ -88,7 +88,10 @@ INITIAL bout.
 
 Under every regime-conditioned policy a bout's deferred-warm backlog
 occupies slots INSIDE ``B_q`` (design §2 rule 4); the legacy policy kept
-them as extra trials on top of the bout budget.
+them as extra trials on top of the bout budget. The backlog is every proposed
+warm config Phase A did not evaluate, for any reason: the K − K_eval sampling
+remainder or selected rows a circuit breaker deferred (config-infeasible
+streak, screening cost stop).
 
 The switch is per-run: ``framework_cfg.json`` ``tuner.inner_policy`` —
 ``hebo24-transfer10-hebo10`` (new-experiment default),

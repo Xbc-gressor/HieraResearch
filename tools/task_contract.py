@@ -23,8 +23,16 @@ def timeout_policy(config: dict) -> dict:
             'per_runtime_limit': config.get('per_runtime_limit')}
 
 
-def render_budget(policy: dict) -> str:
-    if policy['mode'] == 'run_budget':
+def render_budget(policy: dict, cost_signal: bool = True) -> str:
+    if policy['mode'] == 'run_budget' and cost_signal:
+        rule = ('No admitted evaluation is cut off by a per-evaluation time limit or by its '
+                'optimization-phase quota (only the run search deadline interrupts it), but its '
+                'wall-clock time counts against the run budget and against the candidate itself: for the same '
+                'wall-clock time, a slower candidate gets fewer evaluations. The scheduler checks '
+                'the phase quota before starting the next evaluation. Inner resampling (k-fold, '
+                'calibration folds, multiplied augmentation) multiplies evaluation cost; use it '
+                'only when the mechanism itself depends on it.')
+    elif policy['mode'] == 'run_budget':
         rule = ('There is no independent per-evaluation time limit. An admitted evaluation may run '
                 'until the run search deadline, including past its optimization-phase quota. '
                 'The scheduler checks the phase quota before starting the next evaluation.')
@@ -63,7 +71,8 @@ def stage_task_contract(repo_root: Path, run_dir: Path, task: str) -> Path | Non
     source = Path(repo_root) / 'tasks' / task
     if not (source / 'TASK.md').is_file() or not (source / 'task.toml').is_file():
         return None  # Standalone helpers/test repositories need not install tasks.
-    policy = timeout_policy(read_framework_cfg(Path(run_dir) / 'framework_cfg.json'))
+    config = read_framework_cfg(Path(run_dir) / 'framework_cfg.json')
+    policy = timeout_policy(config)
     target = Path(run_dir) / 'task_contract'
     receipt = target / 'budget.json'
     if receipt.is_file():
@@ -71,7 +80,7 @@ def stage_task_contract(repo_root: Path, run_dir: Path, task: str) -> Path | Non
             raise ValueError('cannot change evaluation timeout policy after task contract staging')
         return target
     task_text = (source / 'TASK.md').read_text()
-    budget_text = render_budget(policy)
+    budget_text = render_budget(policy, config.get('cost_signals', {}).get('writer', True))
     if START in task_text:
         before, rest = task_text.split(START, 1)
         _, after = rest.split(END, 1)

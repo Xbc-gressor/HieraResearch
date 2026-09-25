@@ -134,11 +134,20 @@ class TimeBudgetTests(unittest.TestCase):
                 evaluation_budget.reserve_evaluation(
                     train, params={}, phase="rewrite", method="rewrite")
             self.assertEqual(ctx.exception.scope, "round_quota")
+            # The exemption skips only the round quota, never the run clock.
+            self.assertIsNotNone(evaluation_budget.reserve_evaluation(
+                train, params={}, phase="rewrite", method="rewrite",
+                round_quota_exempt=True))
 
             cfg = json.loads((run_dir / "framework_cfg.json").read_text())
             cfg["deadline"] = time.time() - 1
             (run_dir / "framework_cfg.json").write_text(json.dumps(cfg))
             self.assertTrue(evaluation_budget.budget_status(run_dir)["reached"])
+            with self.assertRaises(evaluation_budget.EvaluationBudgetExhausted) as ctx:
+                evaluation_budget.reserve_evaluation(
+                    train, params={}, phase="rewrite", method="rewrite",
+                    round_quota_exempt=True)
+            self.assertEqual(ctx.exception.scope, "time")
 
 
 class RoundPolicyTests(unittest.TestCase):
@@ -233,6 +242,42 @@ class RoundPolicyTests(unittest.TestCase):
 
             # Outside a phase the orchestrator's tune query defers.
             self.assertEqual(round_policy.decide(state, run_dir).action, "DEFER")
+
+    def test_step_price_and_the_rounds_one_release(self) -> None:
+        price = round_policy.rewrite_step_seconds
+        config = dict(round_policy.DEFAULTS)
+        self.assertEqual(price(config, 100.0, 10.0, leads_run=False), 110.0)
+        self.assertEqual(price(config, 100.0, 10.0, leads_run=True), 210.0)
+        config["rewrite_confirm_policy"] = "always"
+        self.assertEqual(price(config, 100.0, 10.0, leads_run=False), 210.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _run_dir(
+                Path(tmp), deadline=time.time() + 86400,
+                round_cfg={"round_seconds": 100, "tune_bouts": 0,
+                           "session_overhead_seconds": 10})
+            ledger = run_dir / "ledger.json"
+            ledger.write_text(json.dumps({"records": [_record("000", 0.9)]}))
+            train = _candidate(run_dir, "000", 0.9) / "train.py"
+            receipt = evaluation_budget.reserve_evaluation(
+                train, params={}, phase="phase_a", method="warm")
+            evaluation_budget.record_evaluation_completion(
+                train, attempt_id=receipt["attempt_id"], duration_seconds=1000.0)
+            round_policy.begin_optimization(run_dir)
+            state = load_state(ledger, contract=contract_for(ledger))
+
+            # 2010 s never fits a 100 s quota; the unused release admits it.
+            decision = round_policy.select_rewrite(state, run_dir)
+            self.assertEqual((decision.action, decision.run_id), ("REWRITE", "000"))
+            self.assertTrue(round_policy.claim_rewrite_release(
+                run_dir, 2010.0, 0.0)["released"])
+            self.assertFalse(round_policy.claim_rewrite_release(
+                run_dir, 2010.0, 0.0)["released"])
+            self.assertEqual(round_policy.select_rewrite(state, run_dir).action,
+                             "STOP")
+            round_policy.begin_optimization(run_dir)
+            self.assertTrue(round_policy.claim_rewrite_release(
+                run_dir, 2010.0, 0.0)["released"])
 
     def test_tune_decision_reuse_is_scoped_to_the_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -676,6 +721,85 @@ class RewriteClimbTests(unittest.TestCase):
                              (0, "round_quota"))
 
 
+    def _one_step(self, tmp: Path, cmd, records, config=None):
+        from driver.events import EventsLog
+        from driver.loops import rounds
+        from driver.receipts import ReceiptStore
+        run_dir, candidate = cmd.run_dir, cmd.run_dir / "candidates" / "000"
+        (run_dir / "ledger.json").write_text(json.dumps({"records": records}))
+        runner = FakeSessionRunner([
+            {"receipt": {"edited": True, "summary": "a", "basis": "h"},
+             "side_effects": lambda ctx: (candidate / "train.py")
+             .write_text(ClimbCmd.V[1])}])
+        config = {**round_policy.DEFAULTS, "rewrite_bouts": 1,
+                  "rewrite_max_bouts": 1, "tune_bouts": 0,
+                  "noise_margin": 0.0, **(config or {})}
+        coord = rounds._ClimbCoordinator(1)
+        return rounds._rewrite_climb(
+            runner, ReceiptStore(run_dir), "fake-task", "t1", run_dir,
+            cmd.rewrite_selection, {"result": {"metric": "neg_acc"}}, config,
+            tmp, cmd, EventsLog(run_dir), coord=coord), coord
+
+    def test_trailing_keep_skips_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _ = self._setup_run(Path(tmp))
+            cmd = ClimbCmd(Path(tmp), run_dir, eval_script=[0.9, 0.95])
+            result, _ = self._one_step(
+                Path(tmp), cmd, [_record("000", 1.0), _record("001", 0.5)])
+            self.assertEqual((result["kept"], result["attempts"],
+                              result["reference"]), (1, 1, 0.9))
+            skipped = next(e for e in self._events(run_dir)
+                           if e.get("kind") == "confirm_skipped")
+            self.assertEqual(skipped["reason"], "not_above_run_best")
+
+            # "always" confirms the same trailing keep, round-quota-exempt.
+            run_dir2, _ = self._setup_run(Path(tmp) / "b")
+            cmd = ClimbCmd(Path(tmp), run_dir2, eval_script=[0.9, 0.95])
+            result, _ = self._one_step(
+                Path(tmp), cmd, [_record("000", 1.0), _record("001", 0.5)],
+                config={"rewrite_confirm_policy": "always"})
+            self.assertEqual(result["attempts"], 2)
+            evals = [c for c in cmd.calls if "tools/rewrite_eval.py" in c]
+            self.assertEqual(["--round-quota-exempt" in c for c in evals],
+                             [False, True])
+
+    def test_round_quota_refusal_ends_only_the_climb(self) -> None:
+        import subprocess
+
+        class QuotaOutCmd(ClimbCmd):
+            def __call__(self, args, repo_root, check=True, capture=True, **kw):
+                joined = " ".join(str(a) for a in args)
+                if "rewrite_eval.py" in joined:
+                    self.calls.append([str(a) for a in args])
+                    return subprocess.CompletedProcess(args, 5, json.dumps({
+                        "attempt_id": None, "score": None, "stage": "eval",
+                        "error": "round_quota"}), "")
+                if "scheduler/cli.py" in joined and " release" in joined:
+                    self.calls.append([str(a) for a in args])
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps({"released": self.release}), "")
+                return super().__call__(args, repo_root, check, capture, **kw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, candidate = self._setup_run(Path(tmp))
+            cmd = QuotaOutCmd(Path(tmp), run_dir, eval_script=[], quota=5000.0)
+            cmd.release = False
+            result, coord = self._one_step(Path(tmp), cmd, [_record("000", 1.0)])
+            self.assertEqual((result["status"], result["stop"]),
+                             ("done", "round_quota"))
+            self.assertFalse(coord.halt)
+            self.assertEqual((candidate / "train.py").read_text(), ClimbCmd.V[0])
+            self.assertNotIn("--round-quota-exempt", cmd.calls[-1])
+
+            # The released step runs every eval (and its preflight) exempt.
+            cmd.release = True
+            self._one_step(Path(tmp), cmd, [_record("000", 1.0)])
+            exempt = [c for c in cmd.calls[-6:]
+                      if "rewrite_eval.py" in " ".join(c)
+                      or "preflight_candidate.py" in " ".join(c)]
+            self.assertEqual(len(exempt), 2)
+            self.assertTrue(all("--round-quota-exempt" in c for c in exempt))
+
     def test_failed_climbs_are_closed_then_rewrite_is_disabled(self) -> None:
         import subprocess
         from driver.events import EventsLog
@@ -949,11 +1073,14 @@ class ConcurrentClimbTests(unittest.TestCase):
                         "per_candidate": [{"run_id": "000", "evals": 2,
                                            "mean_seconds": 20.0}]}), "")
 
-        # expected = 2 × 20 + 10 = 50 against a 90 s quota
+        # expected = 2 × 20 + 10 = 50 against a 90 s quota (the run best
+        # pays for its confirmation up front)
+        admit = dict(config=round_policy.DEFAULTS, leads_run=True)
         coord = rounds._ClimbCoordinator(2)
         coord.commitments[1] = (50.0, time.monotonic() - 20.0)  # 30 s left
         self.assertEqual(rounds._admit_step(
-            Path("."), "000", Path("."), QuotaCmd(), 10.0, 0.0, coord, 0), "ok")
+            Path("."), "000", Path("."), QuotaCmd(), 10.0, 0.0, coord, 0,
+            **admit), "ok")
         self.assertEqual(coord.commitments[0][0], 50.0)
         coord.commitments.pop(0)
 
@@ -962,7 +1089,8 @@ class ConcurrentClimbTests(unittest.TestCase):
 
         def channel0():
             admitted.append(rounds._admit_step(
-                Path("."), "000", Path("."), QuotaCmd(), 10.0, 0.0, coord, 0))
+                Path("."), "000", Path("."), QuotaCmd(), 10.0, 0.0, coord, 0,
+                **admit))
 
         thread = threading.Thread(target=channel0)
         thread.start()

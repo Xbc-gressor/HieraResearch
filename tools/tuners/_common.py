@@ -962,6 +962,8 @@ def timed_eval(
     method: str = "unknown",
     expected_execution_revision: dict | None = None,
     python_cmd: list[str] | None = None,
+    round_quota_exempt: bool = False,
+    completion: dict | None = None,
 ) -> float:
     """Run one config evaluation under the task's per-evaluation limit.
 
@@ -983,12 +985,17 @@ def timed_eval(
     Timeouts, child-process errors, missing results, and non-finite scores raise
     so callers record an auditable failed trial instead of caching ``+inf`` as
     if it were a successful score.
+
+    ``round_quota_exempt`` passes through to :func:`reserve_evaluation`.
+    A ``completion`` dict receives the admitted attempt's ``attempt_id`` and
+    ``duration_seconds`` (any outcome), as recorded in the attempt log.
     """
     receipt = reserve_evaluation(
         candidate_path,
         params=params,
         phase=phase,
         method=method,
+        round_quota_exempt=round_quota_exempt,
     )
     attempt_id = receipt.get("attempt_id") if receipt else None
     started = time.monotonic()
@@ -1011,12 +1018,15 @@ def timed_eval(
     finally:
         # Every admitted attempt — success, crash, or timeout — reports how
         # long it held the evaluator; the round scheduler prices bouts by it.
+        duration = time.monotonic() - started
         record_evaluation_completion(
             candidate_path,
             attempt_id=attempt_id,
-            duration_seconds=time.monotonic() - started,
+            duration_seconds=duration,
             time_cutoff=time_cutoff,
         )
+        if completion is not None:
+            completion.update(attempt_id=attempt_id, duration_seconds=duration)
 
 
 def _timed_eval_body(
@@ -1128,6 +1138,7 @@ def timed_preflight(
     expected_execution_revision: dict | None = None,
     probe_mode: str = "preflight",
     python_cmd: list[str] | None = None,
+    round_quota_exempt: bool = False,
 ) -> dict | None:
     """Run one task-owned no-score probe in an isolated subprocess.
 
@@ -1142,7 +1153,8 @@ def timed_preflight(
     Returns ``None`` when the task declares no hook for the requested mode, so
     callers should choose the mode from the task's declarations rather than
     treating the absence as a failure.  Crucially, neither mode ever reserves an
-    objective evaluation slot.
+    objective evaluation slot. ``round_quota_exempt`` gates a new probe on
+    the run's usable time only, like :func:`reserve_evaluation`.
     """
     if probe_mode not in {"preflight", "resource"}:
         raise ValueError(f"unknown probe_mode {probe_mode!r}")
@@ -1158,7 +1170,11 @@ def timed_preflight(
     if run_budget_mode:
         # Preflights spend time but no objective slot. A phase gates new probes,
         # while an admitted probe is bounded only by the global search deadline.
-        left = time_remaining(cfg.parent)
+        left = (
+            time_budget(cfg.parent)["usable_seconds"]
+            if round_quota_exempt
+            else time_remaining(cfg.parent)
+        )
         if left is not None and left <= 0:
             scope = "time_cutoff" if time_budget(cfg.parent)["usable_seconds"] <= 0 else "round_quota"
             raise EvaluationBudgetExhausted(used=0, budget=None, run_dir=cfg.parent, scope=scope)

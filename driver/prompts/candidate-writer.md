@@ -80,6 +80,11 @@ and selection context:
   provided_entrypoint` carries the copied task path/hash; `kind:
   primary_parent_snapshot` identifies the editable local copy for non-fresh
   candidates; `kind: generated` means a fresh writer-owned implementation.
+- **`evaluation_time`** (when present) — measured screening cost: the run's
+  typical seconds per screening evaluation and each parent's own. Evaluation
+  time is paid from the run budget and from this candidate's own evaluations
+  (see the budget section of `TASK.md`); keep the cost where the mechanism
+  needs it and no heavier.
 
 If the brief is missing, has the wrong `run_id`, lacks `idea`, or has no complete
 `semantic_point` / `policy_receipt`, stop and report that the upstream pipeline

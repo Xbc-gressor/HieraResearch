@@ -38,7 +38,11 @@ reserves an objective slot; a rejection is a per-point observation (a
 configs still run. Envelope feasibility belongs to the per-point runtime
 limit on the score surface. Two consecutive config-infeasible rows stop the
 remaining warm configs for this invocation (they move to the deferred set,
-params-only). Run from the task uv env:
+params-only). The screening cost stop defers them the same way when, once
+every mandatory row and one non-mandatory finite row are in, the latest
+evaluation exceeded the driver-injected threshold and the best warm score is
+not better than the run incumbent; the stop is persisted and replayed on
+resume. Run from the task uv env:
 `uv --project tasks/<task> run python tools/tuners/warmstart_eval.py ...`
 (`--project` selects the task env without chdir, so repo-relative paths resolve;
 `--directory` would chdir into the task dir and break them).
@@ -110,6 +114,7 @@ from tune_tools import (  # noqa: E402
 CRASHED = 3  # a not-yet-scored config raised; the caller diagnoses + fixes + resumes
 BUDGET_EXHAUSTED = 4  # no score_fn call was started; coordinator ends the run
 CONSECUTIVE_INFEASIBLE_LIMIT = 2  # circuit breaker: stop the remaining warm configs
+SCREENING_COST = "screening_cost"  # circuit-breaker reason of the cost stop
 
 
 # =============================================================================
@@ -420,6 +425,11 @@ class WarmstartRun:
     donor_warm_config_index: int | None
     donor_failure_row: dict | None
     donor_preflight_rejection: dict | None
+    cost_stop_threshold_seconds: float | None = None
+    cost_stop_incumbent: float | None = None
+    # A cost stop persisted by an earlier invocation of this code revision;
+    # cached rows replay without cost, so the stop replays instead.
+    cost_stop_replay: dict | None = None
     warm_rows: list[dict] = field(default_factory=list)
 
     @property
@@ -460,6 +470,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "a smaller terminal --k-eval, Phase A records tail_degraded fidelity"
         ),
     )
+    parser.add_argument(
+        "--cost-stop-threshold-seconds",
+        type=float,
+        default=None,
+        help=(
+            "screening cost stop (driver-injected with --cost-stop-incumbent): "
+            "once every mandatory row and one non-mandatory finite row are in, "
+            "defer the remaining selected configs when the latest evaluation "
+            "took longer than this and the best warm score is not better than "
+            "the incumbent"
+        ),
+    )
+    parser.add_argument("--cost-stop-incumbent", type=float, default=None)
     return parser
 
 
@@ -1147,6 +1170,16 @@ def _prepare_run(
         donor_warm_config_index=donor_index,
         donor_failure_row=donor_failure_row,
         donor_preflight_rejection=donor_preflight_rejection,
+        cost_stop_threshold_seconds=args.cost_stop_threshold_seconds,
+        cost_stop_incumbent=args.cost_stop_incumbent,
+        cost_stop_replay=(
+            previous_phase_a.get("circuit_breaker")
+            if phase_revision_matches
+            and previous_phase_a.get("parameter_transfer") == parameter_transfer
+            and (previous_phase_a.get("circuit_breaker") or {}).get("reason")
+            == SCREENING_COST
+            else None
+        ),
     )
 
 
@@ -1494,6 +1527,54 @@ def _finish_phase_a(run: WarmstartRun) -> int:
     return 0
 
 
+def _defer_remaining(run: WarmstartRun, position: int, breaker: dict) -> None:
+    """Move the selected configs after ``position`` to the deferred set."""
+    remaining = run.configs[position + 1:]
+    run.deferred = run.deferred + remaining
+    run.phase_a["deferred_configs"].extend(
+        {"params": cast_params_to_search_space(dict(config), run.search_space)}
+        for config in remaining
+    )
+    run.phase_a["circuit_breaker"] = {
+        **breaker,
+        "deferred_from_position": position + 1,
+    }
+    write_tune_report(run.report_path, run.report)
+
+
+def _screening_cost_stop(
+    run: WarmstartRun,
+    eval_seconds: float | None,
+) -> dict | None:
+    """Decide the cost stop once, at the screening checkpoint.
+
+    Expensive (the latest evaluation exceeded the driver's threshold) and not
+    competitive (the best finite warm row, donor rows included, is not better
+    than the run incumbent). Without either run-level scalar it never fires.
+    """
+    # A cached replay has no duration, so the expensive check cannot be
+    # re-decided; a fresh timing supersedes the persisted stop.
+    if run.cost_stop_replay is not None and eval_seconds is None:
+        return run.cost_stop_replay
+    if (
+        eval_seconds is None
+        or run.cost_stop_threshold_seconds is None
+        or run.cost_stop_incumbent is None
+        or eval_seconds <= run.cost_stop_threshold_seconds
+    ):
+        return None
+    best = min(row["score"] for row in finite_warm_incumbent_rows(run.warm_rows))
+    if best < run.cost_stop_incumbent:
+        return None
+    return {
+        "reason": SCREENING_COST,
+        "eval_seconds": round(eval_seconds, 1),
+        "threshold_seconds": run.cost_stop_threshold_seconds,
+        "best_warm_score": best,
+        "incumbent_score": run.cost_stop_incumbent,
+    }
+
+
 def _evaluate_selected_configs(run: WarmstartRun) -> int:
     """Evaluate selected configs sequentially, stopping at the first crash.
 
@@ -1503,9 +1584,13 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
     CONSECUTIVE_INFEASIBLE_LIMIT consecutive config-infeasible rows: further
     points of a candidate whose envelope twice exceeded the per-point limit
     are not worth another limit each, so they move to the deferred set
-    (params-only, no objective cost).
+    (params-only, no objective cost).  The screening cost stop defers the
+    same way, decided once at the checkpoint: every mandatory row processed
+    and one non-mandatory row finite.
     """
     consecutive_infeasible = 0
+    mandatory = set(run.selection.get("mandatory_indices", []))
+    cost_checked = False
 
     for position, raw in enumerate(run.configs):
         proposed_index = run.selected_indices[position]
@@ -1564,7 +1649,9 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
             # under this same code revision; neither costs an objective slot.
             run.warm_rows.append({**cached, **trial_receipt})
             row = run.warm_rows[-1]
+            eval_seconds = None
         else:
+            completion: dict = {}
             try:
                 score = timed_eval(
                     run.evaluate,
@@ -1573,6 +1660,7 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
                     run.candidate_path,
                     phase="phase_a",
                     method="warmstart",
+                    completion=completion,
                 )
             except EvaluationBudgetExhausted as exc:
                 return _finish_budget_exhausted(
@@ -1603,6 +1691,7 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
                 run.cache_rows[key] = {"params": params, "score": score}
                 run.phase_a["warm_score_cache"] = _cache_receipt(run)
                 row = run.warm_rows[-1]
+            eval_seconds = completion.get("duration_seconds")
 
         if row.get("status") == "failed" and row.get("config_infeasible"):
             consecutive_infeasible += 1
@@ -1613,26 +1702,26 @@ def _evaluate_selected_configs(run: WarmstartRun) -> int:
         _stamp_donor_facts(run)
         write_tune_report(run.report_path, run.report)
 
-        if (
-            consecutive_infeasible >= CONSECUTIVE_INFEASIBLE_LIMIT
-            and position + 1 < len(run.configs)
-        ):
-            run.deferred = run.deferred + run.configs[position + 1:]
-            run.phase_a["deferred_configs"].extend(
-                {
-                    "params": cast_params_to_search_space(
-                        dict(config), run.search_space
-                    )
-                }
-                for config in run.configs[position + 1:]
-            )
-            run.phase_a["circuit_breaker"] = {
+        if position + 1 >= len(run.configs):
+            continue
+        if consecutive_infeasible >= CONSECUTIVE_INFEASIBLE_LIMIT:
+            _defer_remaining(run, position, {
                 "reason": "consecutive_config_infeasible",
                 "consecutive": consecutive_infeasible,
-                "deferred_from_position": position + 1,
-            }
-            write_tune_report(run.report_path, run.report)
+            })
             break
+        if (
+            not cost_checked
+            and proposed_index not in mandatory
+            and is_finite_score(row.get("score"))
+        ):
+            # Mandatory rows lead the permutation, so the first finite
+            # non-mandatory row is the checkpoint.
+            cost_checked = True
+            stop = _screening_cost_stop(run, eval_seconds)
+            if stop is not None:
+                _defer_remaining(run, position, stop)
+                break
 
     return _finish_phase_a(run)
 

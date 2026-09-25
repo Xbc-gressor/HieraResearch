@@ -9,7 +9,7 @@ Decision/replay dispatch to the run's persisted policy: current
                                           --status valid --gain 0.012
     python tools/scheduler/cli.py replay  --ledger ... --decision-id ...
     python tools/scheduler/cli.py evidence --ledger ...
-    python tools/scheduler/cli.py round status|begin|end|select|overhead ...
+    python tools/scheduler/cli.py round status|begin|end|select|overhead|release ...
 
 `decide` is the tune command the orchestrator's `select-candidate` calls;
 the `round` family is what the driver's round_v1 loop calls. It prints
@@ -229,6 +229,9 @@ def cmd_round(args) -> int:
         )
     elif args.round_command == "overhead":
         view = round_policy.record_overhead(run_dir, args.kind, args.seconds)
+    elif args.round_command == "release":
+        view = round_policy.claim_rewrite_release(
+            run_dir, args.expected, args.tune_reserve)
     elif args.round_command == "select":
         exclude = [r for r in (args.exclude or "").split(",") if r]
         if args.peek and args.kind == "tune":
@@ -303,6 +306,10 @@ def build_parser() -> argparse.ArgumentParser:
     ovh = rnd_sub.add_parser("overhead", help="record one bout's non-eval seconds")
     ovh.add_argument("--kind", required=True, choices=("rewrite", "tune"))
     ovh.add_argument("--seconds", required=True, type=float)
+    rel = rnd_sub.add_parser("release", help="claim the phase's one rewrite "
+                             "step admitted past the round quota")
+    rel.add_argument("--expected", type=float)
+    rel.add_argument("--tune-reserve", type=float, default=0.0)
     rnd.set_defaults(func=cmd_round)
     return parser
 

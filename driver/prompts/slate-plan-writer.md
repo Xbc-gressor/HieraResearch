@@ -14,7 +14,9 @@ Your invocation context carries the frozen slot assignment inline: the slot
 number, reserved run id, candidate id, the complete semantic point, the frozen
 carrier (`op`/`parents`), the candidate summary exactly as the judges saw it
 (hypothesis diffs vs each carrier parent, non-baseline hypothesis titles and
-claims, deprioritized marks), and the bounded measured-history table.
+claims, deprioritized marks), and the bounded measured-history table (warm
+scores and, when shown, `eval≈Ns` measured screening evaluation seconds —
+the carrier's cost your plan inherits).
 
 You may additionally `Read` the task contract (`<task_contract_dir>/TASK.md`) and
 files your context explicitly names (e.g. a route-memory JSON). When the

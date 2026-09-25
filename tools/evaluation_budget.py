@@ -19,6 +19,7 @@ import json
 import math
 import os
 from pathlib import Path
+import statistics
 import time
 from typing import Any
 
@@ -330,6 +331,23 @@ def _durations(rows: list[dict]) -> tuple[list[float], dict[str, list[float]]]:
     return overall, per_candidate
 
 
+def median_eval_seconds(run_dir: Path, phase: str,
+                        run_id: str | None = None) -> float | None:
+    """Median duration of this run's (or one candidate's) completed attempts
+    of one phase."""
+    rows = _read_budget_rows(run_dir)
+    attempt_ids = {row.get("attempt_id") for row in _attempts(rows)
+                   if row.get("phase") == phase
+                   and (run_id is None or row.get("run_id") == run_id)}
+    durations = [
+        seconds for row in rows
+        if row.get("kind") == COMPLETION_KIND
+        and row.get("attempt_id") in attempt_ids
+        and (seconds := _finite_number(row.get("duration_seconds"))) is not None
+    ]
+    return statistics.median(durations) if durations else None
+
+
 def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
@@ -403,11 +421,14 @@ def reserve_evaluation(
     params: dict,
     phase: str,
     method: str,
+    round_quota_exempt: bool = False,
 ) -> dict | None:
     """Atomically reserve one objective slot and return its durable receipt.
 
     Paths outside ``runs/<task>/<tag>`` have no run-level budget and return
     ``None``; this keeps standalone/unit-test uses backward compatible.
+    ``round_quota_exempt`` skips only the open phase's quota check (a rewrite
+    confirmation or the round's released step); run-level caps still apply.
     """
     run_dir = find_run_dir(ref_path)
     if run_dir is None:
@@ -429,7 +450,7 @@ def reserve_evaluation(
             raise EvaluationBudgetExhausted(
                 used=used, budget=budget, run_dir=run_dir, scope="time"
             )
-        quota = phase_quota_remaining(run_dir)
+        quota = None if round_quota_exempt else phase_quota_remaining(run_dir)
         if quota is not None and quota <= 0:
             raise EvaluationBudgetExhausted(
                 used=used, budget=budget, run_dir=run_dir, scope="round_quota"

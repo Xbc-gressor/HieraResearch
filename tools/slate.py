@@ -31,6 +31,7 @@ import json
 import math
 import os
 import random
+import statistics
 import sys
 import tempfile
 from pathlib import Path
@@ -42,7 +43,7 @@ from ledger_core import (
     records_prefix_digest,
     search_space_state_revision,
 )
-from run_cfg import read_framework_cfg
+from run_cfg import load_run_cfg, read_framework_cfg
 from semantic_evidence import LIFECYCLE_TERMINAL_STATUSES
 from semantic_search import validate_proposal_set
 from semantic_space import (
@@ -283,7 +284,16 @@ def _finite_warm(record: dict) -> float | None:
     return None
 
 
-def _a1_row(record: dict, role: str, by_id: dict, idea_chars: int) -> dict:
+def _eval_seconds(record: dict) -> float | None:
+    value = record.get("screening_eval_seconds")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _a1_row(
+    record: dict, role: str, by_id: dict, idea_chars: int, eval_seconds: bool
+) -> dict:
     run_id = str(record.get("run_id"))
     parents = [str(item) for item in (record.get("source_run_ids") or [])]
     op = record.get("op")
@@ -307,8 +317,11 @@ def _a1_row(record: dict, role: str, by_id: dict, idea_chars: int) -> dict:
     line = f"run {run_id} [{bracket}] warm={warm_text}"
     if delta is not None:
         line += f" d={delta:+.6f}"
+    seconds = _eval_seconds(record) if eval_seconds else None
+    if seconds is not None:
+        line += f" eval≈{seconds:.0f}s"
     line += f" idea: {idea}"
-    return {
+    row = {
         "run_id": run_id,
         "role": role,
         "op": op,
@@ -319,9 +332,18 @@ def _a1_row(record: dict, role: str, by_id: dict, idea_chars: int) -> dict:
         "idea": idea,
         "line": line,
     }
+    if eval_seconds:
+        row["eval_seconds"] = seconds
+    return row
 
 
-def build_a1_context(ledger_prefix: dict, pool: dict, limits: dict = A1_LIMITS) -> dict:
+def build_a1_context(
+    ledger_prefix: dict,
+    pool: dict,
+    limits: dict = A1_LIMITS,
+    *,
+    eval_seconds: bool = False,
+) -> dict:
     """The single leak-safe measured-history view shared by all judge rollouts.
 
     Row budget: direct carrier parents (in pool coverage order), then each
@@ -331,6 +353,8 @@ def build_a1_context(ledger_prefix: dict, pool: dict, limits: dict = A1_LIMITS) 
     run already selected by an earlier category is skipped, so every emitted
     row is distinct and the total never exceeds
     12 parents + 12 ancestors + 12 siblings + 10 anchors = 46 rows.
+    ``eval_seconds`` (cost_signals.judge) adds each run's frozen median
+    screening evaluation seconds and the prefix-wide median to the view.
     """
     records = list(ledger_prefix.get("records", []))
     by_id = {
@@ -423,19 +447,35 @@ def build_a1_context(ledger_prefix: dict, pool: dict, limits: dict = A1_LIMITS) 
         take(run_id, "anchor_high")
 
     rows = [
-        _a1_row(by_id[run_id], role, by_id, int(limits["idea_chars"]))
+        _a1_row(by_id[run_id], role, by_id, int(limits["idea_chars"]), eval_seconds)
         for run_id, role in selected
     ]
     header = (
         "Measured history (lower-is-better warm screening scores; "
         "d = child minus primary parent):"
     )
+    if eval_seconds:
+        measured = [
+            seconds
+            for record in records
+            if (seconds := _eval_seconds(record)) is not None
+        ]
+        typical = (
+            f"{statistics.median(measured):.0f}s" if measured else "not measured yet"
+        )
+        header = (
+            "Measured history (lower-is-better warm screening scores; "
+            "d = child minus primary parent; eval≈Ns = median wall-clock "
+            "seconds of that run's screening evaluations; typical across "
+            f"all measured runs so far: {typical}):"
+        )
     lines = [row["line"] for row in rows]
     rendered_text = (
         "\n".join([header, *lines]) if lines else header + "\n(no measured runs yet)"
     )
     return {
         "limits": dict(limits),
+        "eval_seconds": eval_seconds,
         "prefix_record_count": len(records),
         "prefix_digest": records_prefix_digest(records),
         "rows": rows,
@@ -1206,7 +1246,11 @@ def cmd_construct(args: argparse.Namespace) -> int:
     }
     write_json_atomic(args.pool_output, pool_doc)
 
-    context_core = build_a1_context({"records": records}, pool_doc)
+    context_core = build_a1_context(
+        {"records": records},
+        pool_doc,
+        eval_seconds=load_run_cfg(ledger_path.parent, "cost_signals").get("judge", True),
+    )
     context_doc = {
         "schema_version": SCHEMA_VERSION,
         "gen_no": lanes_doc["gen_no"],
@@ -1594,7 +1638,11 @@ def _replay_context_errors(context_doc: dict, pool_doc: dict, prefix: list) -> l
     if context_doc.get("prefix_digest") != prefix_digest:
         errors.append("context prefix_digest does not match the ledger prefix")
     try:
-        rebuilt = build_a1_context({"records": prefix}, pool_doc)
+        rebuilt = build_a1_context(
+            {"records": prefix},
+            pool_doc,
+            eval_seconds=context_doc.get("eval_seconds", False),
+        )
     except ContractError as exc:
         return errors + [f"A1 context does not rebuild: {exc}"]
     if rebuilt["rows"] != context_doc.get("rows"):

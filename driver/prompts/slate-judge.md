@@ -44,8 +44,23 @@ Cite it concretely; do not reason from abstract architecture preferences.
 2. **Novelty relative to the measured history.** A point that repeats a
    direction the history already proved weak belongs near the bottom; a
    point whose risk the history has not priced belongs near the top.
-3. **Failure-mode tradeoff.** Weigh crash risk and likely-zero-gain
-   outcomes: a wasted screening slot costs real budget.
+3. **Failure-mode and time-cost tradeoff.** Weigh crash risk and
+   likely-zero-gain outcomes: a wasted screening slot costs real budget.
+   Weigh evaluation time too: it comes out of the same wall-clock budget
+   that every later candidate, rewrite, and tuning step must share. Where
+   the history shows `eval≈Ns` for the carrier or its family, compare it
+   with the run's typical level in the table header; where nothing is
+   measured, judge qualitatively from obvious cost amplifiers (inner
+   resampling such as k-fold, multiplied augmentation, high-dimensional raw
+   inputs, and similar) — no numeric estimate is needed.
+   This run is judged only by its final best score, so cost is a penalty,
+   not a ratio: gain need not be proportional to cost. When expected gains
+   are similar, rank the lighter point first. Rank a heavy point above a
+   light one only on concrete evidence that it can beat the current best
+   and deliver that within this run's time budget; "a stronger model" or
+   "more capacity" alone is not evidence. A heavy point whose potential
+   needs many training epochs or a lot of implementation detail to realize
+   ranks lower.
 4. **Then rank.**
 
 Do not produce numeric scores, gain predictions, or confidence intervals —

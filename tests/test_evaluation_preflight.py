@@ -766,6 +766,7 @@ class WarmstartProbeSemanticsTests(unittest.TestCase):
         *,
         score_fn,
         preflight_fn=None,
+        extra_args: tuple[str, ...] = (),
     ) -> tuple[int, mock.Mock, str]:
         timed_eval = mock.Mock(side_effect=score_fn)
         argv = [
@@ -773,6 +774,7 @@ class WarmstartProbeSemanticsTests(unittest.TestCase):
             "--candidate-path", str(train),
             "--configs-json", str(configs_path),
             "--tune-report-json", str(report_path),
+            *extra_args,
         ]
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
@@ -945,6 +947,58 @@ class WarmstartProbeSemanticsTests(unittest.TestCase):
             self.assertNotIn("circuit_breaker", phase_a)
             self.assertEqual(phase_a["best_warm_score"], 0.25)
             self.assertEqual(phase_a["deferred_configs"], [])
+
+    def test_screening_cost_stop_defers_after_checkpoint_and_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            configs = [{"x": 1}, {"x": 2}, {"x": 3}]
+            train, configs_path, report_path = self._candidate(
+                Path(tmp), configs, seed=5
+            )
+
+            def slow(_e, _m, params, *_a, completion, **_k) -> float:
+                completion["duration_seconds"] = 500.0
+                return float(params["x"])
+
+            args = ("--cost-stop-threshold-seconds", "120",
+                    "--cost-stop-incumbent", "0.5")
+            # Competitive: the best warm row beats the incumbent, no stop.
+            _code, timed_eval, _ = self._run(
+                train, configs_path, report_path, score_fn=slow,
+                extra_args=("--cost-stop-threshold-seconds", "120",
+                            "--cost-stop-incumbent", "5"),
+            )
+            self.assertEqual(timed_eval.call_count, 3)
+            report_path.write_text(json.dumps({"phase_a": {
+                "warm_config_selection":
+                    json.loads(report_path.read_text())["phase_a"][
+                        "warm_config_selection"]}}))
+
+            code, timed_eval, _ = self._run(
+                train, configs_path, report_path, score_fn=slow,
+                extra_args=args,
+            )
+            self.assertEqual(code, 0)
+            # Mandatory control 0 plus one non-mandatory row, then the stop.
+            self.assertEqual(timed_eval.call_count, 2)
+            phase_a = json.loads(report_path.read_text())["phase_a"]
+            breaker = phase_a["circuit_breaker"]
+            self.assertEqual(breaker["reason"], "screening_cost")
+            self.assertEqual(breaker["deferred_from_position"], 2)
+            self.assertEqual(len(phase_a["deferred_configs"]), 1)
+            self.assertEqual(phase_a["k_deferred"], 1)
+
+            # Resume: cached rows replay free, the persisted stop replays.
+            # A fresh timing (the flag re-injected) supersedes that stop.
+            code, timed_eval, _ = self._run(
+                train, configs_path, report_path, score_fn=slow,
+                extra_args=args,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(timed_eval.call_count, 0)
+            resumed = json.loads(report_path.read_text())["phase_a"]
+            self.assertEqual(resumed["circuit_breaker"], breaker)
+            self.assertEqual(resumed["deferred_configs"],
+                             phase_a["deferred_configs"])
 
 
 if __name__ == "__main__":

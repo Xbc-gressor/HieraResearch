@@ -3370,6 +3370,9 @@ def tuning_record(report: dict) -> dict:
         # recomputes both from the closed report.
         "tuning_bouts": 0,
         "last_bout_improved": None,
+        # Why Phase A deferred selected rows unevaluated (circuit-breaker
+        # reason, e.g. "screening_cost"); None when screening was complete.
+        "screening_incomplete": (phase_a.get("circuit_breaker") or {}).get("reason"),
         # Additive, durable comparator evidence.  The full transfer receipt
         # stays beside the compact control pointer and its actually scored row;
         # downstream code need not trust a best-score coincidence.

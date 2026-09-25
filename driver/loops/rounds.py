@@ -41,6 +41,10 @@ from ..status import budget_status
 from . import recovery, rewrite
 from .common import RunBlocked
 from tools.evaluation_budget import time_remaining
+from tools.scheduler.round_policy import (
+    candidate_mean_seconds,
+    rewrite_step_seconds,
+)
 
 POLICY_ID = "round_v1"
 
@@ -324,14 +328,19 @@ def _rewrite_climb(runner, store, task, tag, run_dir, selection, task_toml,
         if streak >= stall_after:
             stop = "stalled"
             break
+        run_best = _run_best(run_dir)
         admitted = _admit_step(run_dir, run_id, repo_root, cmd, overhead,
-                               tune_reserve, coord, channel)
-        if admitted != "ok":
+                               tune_reserve, coord, channel, config=config,
+                               leads_run=run_best is None or (
+                                   reference is not None
+                                   and reference <= run_best))
+        if admitted not in ("ok", "released"):
             status, stop = admitted
             break
-        run_best = _run_best(run_dir)
+        released = admitted == "released"
         snapshots.append({"step": steps + 1, "run_best": run_best,
-                          "space_revision": _space_revision(run_dir)})
+                          "space_revision": _space_revision(run_dir),
+                          "released": released})
         started = time.monotonic()
         evals_before, _ = _eval_seconds(run_dir, repo_root, cmd, run_id)
         try:
@@ -339,6 +348,8 @@ def _rewrite_climb(runner, store, task, tag, run_dir, selection, task_toml,
                 task, tag, run_dir, candidate, bouts, runner, store, metric,
                 noise_margin, "full", task_toml, repo_root, cmd, events,
                 reference=reference, confirm=True, run_best=run_best,
+                confirm_policy=config["rewrite_confirm_policy"],
+                round_quota_exempt=released,
                 lease_wait_timeout=_lease_wait_timeout(
                     run_dir, task_toml, concurrency))
         except InvocationFailed as exc:
@@ -367,6 +378,10 @@ def _rewrite_climb(runner, store, task, tag, run_dir, selection, task_toml,
         attempts += result["attempts"]
         if result["status"] == "budget":
             status, stop = "budget", "run_budget"
+            break
+        if result["status"] == "round_quota":
+            # Only this climb ends: the run (and the other channels) go on.
+            stop = "round_quota"
             break
         if result["status"] == "no_reference":
             stop = "no_reference"
@@ -397,12 +412,16 @@ def _rewrite_climb(runner, store, task, tag, run_dir, selection, task_toml,
 
 
 def _admit_step(run_dir, run_id, repo_root, cmd, overhead, tune_reserve,
-                coord, channel):
+                coord, channel, *, config, leads_run):
     """Admit one climb step against the phase quota.
 
     Returns "ok" (the step's expected cost is registered as this channel's
-    commitment) or a ``(status, stop)`` pair ending the climb. The quota
-    check is ``quota − tune_reserve``; under concurrency the other channels'
+    commitment), "released" (the same, for the phase's one step admitted
+    against the run instead — ``round release``; it runs round-quota-exempt)
+    or a ``(status, stop)`` pair ending the climb. The price is
+    ``round_policy.rewrite_step_seconds`` (``leads_run``: the candidate is
+    the run best, so a keep will be confirmed). The quota check is
+    ``quota − tune_reserve``; under concurrency the other channels'
     decaying commitments are subtracted too, and a step that only THEY
     squeeze out waits for a bout to close or the commitments to decay,
     rather than ending the climb — the reservation refusal stays the
@@ -413,8 +432,18 @@ def _admit_step(run_dir, run_id, repo_root, cmd, overhead, tune_reserve,
         if view.get("reached"):
             return "budget", "run_budget"
         quota = view.get("phase_quota_remaining_seconds")
-        _, mean = _eval_seconds(run_dir, repo_root, cmd, run_id)
-        expected = None if mean is None else 2.0 * float(mean) + overhead
+        expected = rewrite_step_seconds(
+            config, candidate_mean_seconds(view, run_id), overhead,
+            leads_run=leads_run)
+        if quota is not None and config["rewrite_round_release"]:
+            args = ["release", "--tune-reserve", str(tune_reserve)]
+            if expected is not None:
+                args += ["--expected", str(expected)]
+            if _round(run_dir, repo_root, cmd, *args).get("released"):
+                if coord is not None and expected is not None:
+                    with coord.cond:
+                        coord.commitments[channel] = (expected, time.monotonic())
+                return "released"
         base = None if quota is None else max(0.0, quota - tune_reserve)
         if base is not None and (
                 base <= 0 or (expected is not None and expected > base)):

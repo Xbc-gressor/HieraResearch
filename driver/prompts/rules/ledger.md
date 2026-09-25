@@ -108,6 +108,8 @@ Every record has all fields (unavailable tuning/result fields are `null`):
 | `status` | `pending`, `keep`, `discard`, `crash`, or evidence-neutral terminal `unevaluated` |
 | `unevaluated_receipt` | helper-owned stop-condition/zero-attempt proof; present only for `unevaluated` |
 | `best_warm_score`, `final_best_score` | inner-HPO and final candidate observations |
+| `screening_eval_seconds` | median wall-clock seconds of the candidate's screening (phase_a) evaluations; written by `record-run` at settlement and frozen afterwards |
+| `screening_incomplete` | circuit-breaker reason string if warm-start evaluation was cut short (e.g. `"screening_cost"`), or `null` when all warm configs were evaluated |
 | `n_dims`, `warm_start_K`, `warm_percentile` | tuning metadata, unrelated to semantic dimensions |
 | `phase_b_decision`, `phase_c_method`, `trials_completed`, `trials_attempted`, `elapsed_seconds`, `applied` | objective/tuning metadata; completed counts finite scores and attempted counts every admitted config→score call |
 | `preflight_attempts`, `preflight_failures`, `feasibility_rejections` | no-score engineering checks; auditable but excluded from the objective-call budget |

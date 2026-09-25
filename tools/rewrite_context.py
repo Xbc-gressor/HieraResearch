@@ -10,8 +10,9 @@ Six sections, fixed order:
                       newest (_traces/) first, source history (_traces_src/)
                       filling the remainder, with the stderr tail attached
                       for crashes;
-3. Experience       — related live ledger lessons and optional imported references, plus
-                      the dimension/hypothesis evidence hitting this point;
+3. Experience       — related live ledger lessons and optional imported references
+                      (experience.seed.json), plus the dimension/hypothesis
+                      evidence hitting this point;
 4. Semantic point   — the selected assignments anchored to the run-level
                       background.md registry (matching relations and guidance
                       first, then per-dimension blocks: dimension definition/
@@ -21,7 +22,11 @@ Six sections, fixed order:
                       resolved evidence -> sources[].url -> canonical_key ->
                       background_retrieval.json merged results (retained visit
                       content files as fallback);
-6. Candidate status — current best, baseline, tuning delta/summary, idea.
+6. Candidate status — current best and idea/change, plus origin-specific
+                      facts: an imported candidate (_import.json) shows its
+                      source baseline and warm→tuned delta/summary; a candidate
+                      from this run's ledger shows its ledger score and its
+                      tuning / kept-rewrite counts.
 
 Budgets: section 4 <= 10KB, every other section <= 4KB, total <= 20KB; long
 free-text fields <= 250 chars; truncation is marked with ...[truncated];
@@ -125,7 +130,10 @@ def _ledger_manifest(run_dir: Path, run_id: str) -> dict | None:
     if not isinstance(score, (int, float)):
         score = record.get("final_best_score")
     return {
+        "origin": "ledger",
         "baseline_score": score,
+        "tuning_bouts": record.get("tuning_bouts"),
+        "rewrite_bouts": record.get("rewrite_bouts"),
         "idea": record.get("idea"),
         "change": record.get("change"),
         "semantic_point": record.get("semantic_point"),
@@ -456,17 +464,26 @@ def _status_lines(candidate: Path, manifest: dict | None) -> list[str]:
         best_text = f"{current_best(candidate, manifest.get('baseline_score')):.6g}"
     except (TypeError, ValueError):
         best_text = NONE
-    tune_summary = manifest.get("tune_summary")
-    return [
-        f"- current_best: {best_text}",
-        f"- baseline_score: {_text(manifest.get('baseline_score'))}",
-        f"- warm_to_tuned_delta: {_text(manifest.get('warm_to_tuned_delta'))}",
-        "- tune_summary: "
-        + (
-            json.dumps(tune_summary, ensure_ascii=False, sort_keys=True)
-            if tune_summary is not None
-            else NONE
-        ),
+    lines = [f"- current_best: {best_text}"]
+    if manifest.get("origin") == "ledger":
+        lines += [
+            f"- ledger_score: {_text(manifest.get('baseline_score'))}",
+            f"- tuning_bouts_since_last_code_change: {_text(manifest.get('tuning_bouts') or 0)}",
+            f"- kept_rewrites: {_text(manifest.get('rewrite_bouts') or 0)}",
+        ]
+    else:
+        tune_summary = manifest.get("tune_summary")
+        lines += [
+            f"- baseline_score: {_text(manifest.get('baseline_score'))}",
+            f"- warm_to_tuned_delta: {_text(manifest.get('warm_to_tuned_delta'))}",
+            "- tune_summary: "
+            + (
+                json.dumps(tune_summary, ensure_ascii=False, sort_keys=True)
+                if tune_summary is not None
+                else NONE
+            ),
+        ]
+    return lines + [
         f"- idea: {_text(manifest.get('idea'))}",
         f"- change: {_text(manifest.get('change'))}",
     ]

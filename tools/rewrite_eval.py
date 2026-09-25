@@ -11,8 +11,11 @@ stdout:
 - unreadable/non-literal BASE_PARAMS -> stage "params", score null + error,
   exit 0, and no budget spent (params are read before timed_eval reserves a
   slot);
-- evaluation budget exhausted -> stage "eval", exit 4 (the loop's normal
-  stop signal);
+- run evaluation budget exhausted -> stage "eval", exit 4 (the loop's
+  normal stop signal);
+- open round's quota exhausted -> stage "eval", exit 5 (ends this climb
+  only); ``--round-quota-exempt`` skips that check (a confirmation re-eval
+  or the round's released step);
 - evaluation crash/timeout/non-finite -> stage "eval", score null + error,
   exit 0 (the reservation is already spent; its attempt_id is still
   reported);
@@ -23,7 +26,7 @@ timed_eval(..., python_cmd=...), never in this process; timed_eval writes the
 bounded stdout/stderr trace to <candidate>/_traces/<attempt_id>.log itself.
 
 Usage:
-    python tools/rewrite_eval.py --candidate <dir>
+    python tools/rewrite_eval.py --candidate <dir> [--round-quota-exempt]
 """
 
 from __future__ import annotations
@@ -145,6 +148,7 @@ def _emit(stage, attempt_id, score, error) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", required=True, type=Path)
+    parser.add_argument("--round-quota-exempt", action="store_true")
     args = parser.parse_args()
     train_path = args.candidate / "train.py"
     try:
@@ -162,10 +166,11 @@ def main() -> int:
             phase="rewrite",
             method="rewrite",
             python_cmd=_python_cmd(train_path),
+            round_quota_exempt=args.round_quota_exempt,
         )
     except EvaluationBudgetExhausted as exc:
         _emit("eval", None, None, str(exc))
-        return 4
+        return 5 if exc.scope == "round_quota" else 4
     except Exception as exc:
         _emit("eval", _new_attempt_id(log_path, rows_before), None,
               _summarize_error(exc))

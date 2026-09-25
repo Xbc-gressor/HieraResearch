@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -36,8 +37,9 @@ import threading
 import time
 
 from .resources import ResourceUnavailable, task_resource_lease
-from .roles import InvocationContext, REPO_ROOT
-from tools.evaluation_budget import time_budget
+from .roles import InvocationContext, REPO_ROOT, _ledger_records
+from tools.evaluation_budget import median_eval_seconds, time_budget
+from tools.run_cfg import load_run_cfg
 from tools.process_group import terminate_group
 
 # SIGTERM grace for a driver job's group before SIGKILL escalation.
@@ -199,6 +201,33 @@ def _phase_c_action(repo_root: Path, candidate_path: Path, report_path: Path) ->
         ) from exc
 
 
+def _screening_cost_stop_args(run_dir: Path, run_id: str) -> list[str]:
+    """Run-level scalars for warm screening's cost stop (tuner never reads the ledger).
+
+    Omitted, so the stop never fires, without a phase_a duration median or an
+    incumbent. The incumbent is the best screening score of never-rewritten
+    records: ``record_rewrite`` overwrites ``best_warm_score`` with a rewrite
+    reference, which is not a screening observation.
+    """
+    cfg = load_run_cfg(run_dir, "screening_cost_stop")
+    if not cfg.get("enabled", True):
+        return []
+    median = median_eval_seconds(run_dir, "phase_a")
+    scores = [
+        float(record["best_warm_score"])
+        for record in _ledger_records(run_dir)
+        if record.get("run_id") != run_id
+        and not record.get("rewrite_bouts")
+        and isinstance(record.get("best_warm_score"), (int, float))
+        and math.isfinite(record["best_warm_score"])
+    ]
+    if median is None or not scores:
+        return []
+    threshold = max(cfg.get("floor_seconds", 120), cfg.get("multiplier", 4) * median)
+    return ["--cost-stop-threshold-seconds", str(threshold),
+            "--cost-stop-incumbent", str(min(scores))]
+
+
 def build_driver_job(
     role_name: str,
     ctx: InvocationContext,
@@ -270,6 +299,7 @@ def build_driver_job(
         donor_snapshot = ctx.extra.get("donor_snapshot")
         if donor_snapshot is not None:
             argv += ["--donor-snapshot", str(donor_snapshot)]
+        argv += _screening_cost_stop_args(ctx.run_dir, run_id)
         return argv, candidate_path.parent / "_warmstart.log", run_id
 
     if kind != "phase_c":

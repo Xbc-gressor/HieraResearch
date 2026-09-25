@@ -78,6 +78,7 @@ RECORD_FIELDS = (
     "unevaluated_receipt",
     "best_warm_score",
     "final_best_score",
+    "screening_eval_seconds",
     "evaluation_depth",
     "n_dims",
     "warm_start_K",
@@ -94,6 +95,7 @@ RECORD_FIELDS = (
     "dag_revision",
     "tuning_bouts",
     "last_bout_improved",
+    "screening_incomplete",
 )
 
 TUNING_FIELDS = (
@@ -115,6 +117,7 @@ TUNING_FIELDS = (
     "applied_incumbent",
     "tuning_bouts",
     "last_bout_improved",
+    "screening_incomplete",
 )
 
 # Scores are always lower-is-better, so a crash is the worst possible score.
@@ -171,6 +174,7 @@ SELECTION_SAFE_RECORD_FIELDS = (
     "idea",
     "semantic_point",
     "best_warm_score",
+    "screening_eval_seconds",
 )
 
 
@@ -190,6 +194,7 @@ def selection_safe_record_projection(record: dict, selection_index: int) -> dict
         "idea": record.get("idea"),
         "semantic_point": record.get("semantic_point"),
         "best_warm_score": record.get("best_warm_score"),
+        "screening_eval_seconds": record.get("screening_eval_seconds"),
     }
 
 
